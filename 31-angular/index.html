@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Angular — Overview</title>
+<meta name="description" content="Why Angular suits .NET teams, what changed in modern Angular, and the three things that determine whether an Angular app performs.">
+<meta name="keywords" content="Angular overview for .NET developers standalone components signals change detection zoneless RxJS versions Angular vs React dependency injection TypeScript">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="31-angular/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Angular</h1>
+    <p class="subtitle">The framework most .NET shops chose, and the one whose interview questions are almost
+      entirely about change detection.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="why-dotnet-teams">Why .NET teams picked Angular <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Angular is opinionated, batteries-included and built around dependency injection and decorators — which
+      is the shape a C# developer already thinks in.</p>
+    <p>React gives you a rendering library and leaves the architecture to you. Angular gives you the
+      architecture.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Angular concept</th><th>The .NET equivalent</th></tr></thead>
+      <tbody>
+        <tr><td>Constructor injection with providers</td><td><strong>Nearly identical</strong> to <a href="../06-dotnet-platform/hosting-di-config.html">ASP.NET Core DI</a></td></tr>
+        <tr><td><code>@Injectable</code>, <code>@Component</code></td><td>Attributes</td></tr>
+        <tr><td>Service lifetimes via injector hierarchy</td><td>Singleton / scoped / transient</td></tr>
+        <tr><td>HTTP interceptors</td><td><a href="../07-aspnet-core/pipeline-routing.html">Middleware</a></td></tr>
+        <tr><td>Route guards</td><td>Authorization filters</td></tr>
+        <tr><td>Modules (historically)</td><td>Assemblies / feature folders</td></tr>
+        <tr><td>TypeScript throughout</td><td>Static typing you already expect</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The DI similarity is genuinely useful, not superficial</div>
+    <p style="margin:0">Angular's injector hierarchy behaves like ASP.NET Core's service scopes: a provider on
+      the root injector is effectively a singleton, one on a component is scoped to that component and its
+      children.
+      <br><br>
+      So the reasoning you already do about lifetimes transfers — including the failure mode. Injecting something
+      short-lived into something long-lived causes the same
+      <a href="../06-dotnet-platform/hosting-di-config.html">captive dependency</a> problem in both.
+      <br><br>
+      That's why Angular tends to feel natural to backend developers and React tends to feel foreign at
+      first.</p>
+  </div>
+
+  <h2 id="modern-angular">What changed in modern Angular <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Old way</th><th>Modern way</th><th>Since</th></tr></thead>
+      <tbody>
+        <tr><td><code>NgModule</code> for everything</td><td><strong>Standalone components</strong></td><td>v14 preview, v15 stable, default in v17+</td></tr>
+        <tr><td>Constructor injection only</td><td><code>inject()</code> function</td><td>v14</td></tr>
+        <tr><td><code>@Input()</code> / <code>@Output()</code> decorators</td><td><code>input()</code> / <code>output()</code> signal functions</td><td>v17.1 / v17.3</td></tr>
+        <tr><td>RxJS for all state</td><td><strong>Signals</strong> for state, RxJS for streams</td><td>v16 preview, v17 stable</td></tr>
+        <tr><td><code>*ngIf</code>, <code>*ngFor</code></td><td><code>@if</code>, <code>@for</code> control flow</td><td>v17</td></tr>
+        <tr><td>Zone.js change detection</td><td><strong>Zoneless</strong> with signals</td><td>v18 experimental, v20 stable</td></tr>
+        <tr><td>ViewEngine</td><td>Ivy compiler</td><td>v9 — long settled</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — know which era a codebase is in</div>
+    <p style="margin:0">Angular has changed substantially, and most real codebases are a <strong>mixture</strong>
+      — modules and standalone components side by side, some signals, mostly RxJS.
+      <br><br>
+      That's normal and not a problem. Standalone components interoperate with modules deliberately, so migration
+      is incremental.
+      <br><br>
+      What matters in an interview is being able to say <em>which</em> patterns you've used and why. "We're on
+      v17, mostly standalone, we introduced signals for component state but our data layer is still RxJS
+      because that's what the HTTP client returns" is a much stronger answer than reciting the newest features
+      — it shows you've worked in a real migration rather than a tutorial.</p>
+  </div>
+
+  <h2 id="the-three-things">The three things that decide performance <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Almost every Angular performance problem is one of these</span>
+    <ol>
+      <li><strong>Change detection running too often</strong>, or over too much of the tree. Default strategy
+        plus Zone.js checks everything on every async event.</li>
+      <li><strong>Expensive work inside a template.</strong> A method call or getter in a binding runs on
+        <em>every</em> change detection cycle.</li>
+      <li><strong>Subscriptions that are never cleaned up</strong>, leaking memory and running work for
+        destroyed components.</li>
+    </ol>
+    <p>All three are covered on the <a href="reactivity.html">reactivity page</a>, which is the highest-value
+      page in this section.</p>
+  </div>
+
+  <pre data-label="html — the single most common Angular performance bug" class="code-bad"><code class="language-html">&lt;!-- filteredItems() runs on EVERY change detection cycle,
+     which may be hundreds of times per second during scroll or typing --&gt;
+&lt;div *ngFor="let item of filteredItems()"&gt;{{ item.name }}&lt;/div&gt;
+
+&lt;!-- Same problem: a getter doing real work --&gt;
+&lt;span&gt;{{ calculateTotal() }}&lt;/span&gt;</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Why this is worse than it looks</div>
+    <p style="margin:0">Angular has no way to know whether a method's result changed, so it must call it again
+      every cycle. With the default change detection strategy and Zone.js, a cycle runs after
+      <strong>every</strong> click, HTTP response, timer tick and keystroke — across the whole component
+      tree.
+      <br><br>
+      So a filter over a thousand items, called from a template, can run hundreds of times per second while the
+      user types. The page becomes visibly slow and the cause is invisible in the code — it looks like a normal
+      binding.
+      <br><br>
+      The fixes, in order of preference: a <strong>computed signal</strong> (recalculates only when its inputs
+      change), a precomputed field updated when the data changes, or a <code>pure</code> pipe. Never a method
+      call in a hot binding.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">Components, Modules &amp; DI</a></td>
+          <td>The component model, templates and bindings, standalone components, the injector hierarchy,
+              lifecycle hooks, content projection</td>
+        </tr>
+        <tr>
+          <td><a href="reactivity.html">RxJS, Signals &amp; Change Detection</a></td>
+          <td><strong>The important one.</strong> How change detection actually works, <code>OnPush</code>,
+              Zone.js, signals versus observables, the operators worth knowing, and subscription cleanup</td>
+        </tr>
+        <tr>
+          <td><a href="forms-routing-http.html">Forms, Routing &amp; HTTP</a></td>
+          <td>Reactive forms and validation, typed forms, routing with guards and resolvers, interceptors,
+              lazy loading</td>
+        </tr>
+        <tr>
+          <td><a href="performance-testing.html">Performance, Testing &amp; Security</a></td>
+          <td>Bundle size and lazy loading, rendering cost, testing strategy, XSS and Angular's sanitization</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="vs-react">Angular or React <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Angular</th><th>React</th></tr></thead>
+      <tbody>
+        <tr><td>Scope</td><td><strong>Full framework</strong> — router, HTTP, forms, DI, testing included</td><td>A rendering library; you assemble the rest</td></tr>
+        <tr><td>Opinionation</td><td>High — one obvious way</td><td>Low — many valid approaches</td></tr>
+        <tr><td>Language</td><td>TypeScript, effectively mandatory</td><td>TypeScript optional but standard</td></tr>
+        <tr><td>Learning curve</td><td>Steeper up front — more concepts</td><td>Gentler start, decisions arrive later</td></tr>
+        <tr><td>Consistency across teams</td><td><strong>High</strong> — the framework decides</td><td>Varies by team</td></tr>
+        <tr><td>Ecosystem size</td><td>Smaller, more curated</td><td>Much larger</td></tr>
+        <tr><td>Fits .NET developers</td><td><strong>Naturally</strong> — DI, decorators, typing</td><td>Requires more adjustment</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the honest comparison</div>
+    <p style="margin:0">Both are good. The differentiator is <strong>what happens as the team grows</strong>.
+      <br><br>
+      Angular's opinionation means ten developers write similar code, because the framework has already made the
+      routing, HTTP, forms and DI decisions. That's genuinely valuable on a large or rotating team, and it's why
+      enterprises pick it.
+      <br><br>
+      React's flexibility means those decisions are yours — which is faster when the team is small and aligned,
+      and produces divergent codebases when it isn't. Two React projects at the same company can look nothing
+      alike.
+      <br><br>
+      The answer interviewers respond to: <strong>"whichever the team already knows"</strong> — because
+      familiarity outweighs the technical differences for almost every real project. Choosing the framework your
+      team doesn't know, on the basis of a benchmark, is the failure mode.</p>
+  </div>
+
+  <details class="qa">
+    <summary>Why is your Angular app slow? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd want to know <strong>which kind of slow</strong> first, because the causes are unrelated: slow
+          initial load, or sluggish interaction."</p>
+        <p>"<strong>Slow initial load</strong> is a bundle problem. I'd check the bundle with
+          <code>source-map-explorer</code>, look for whether routes are lazy-loaded, and look for the usual
+          offenders — moment.js, importing all of lodash rather than specific functions, an icon library pulling
+          in everything. Lazy-loading feature routes is usually the biggest single win, because the initial
+          bundle only needs the first screen."</p>
+        <p>"<strong>Sluggish interaction</strong> is almost always change detection, and there are three
+          specific causes I'd look for."</p>
+        <p>"<strong>Method calls in templates.</strong> This is the most common by a wide margin. Angular can't
+          know whether a method's result changed, so it calls it on every change detection cycle — and with the
+          default strategy plus Zone.js, that's after every click, HTTP response, timer and keystroke, across
+          the whole tree. A filter over a thousand items in a template can run hundreds of times a second while
+          someone types. It looks like an ordinary binding, which is why it survives review."</p>
+        <p>"<strong>Default change detection everywhere.</strong> Without <code>OnPush</code>, every async event
+          anywhere checks every component. Moving to <code>OnPush</code> means a component only re-checks when
+          its inputs change by reference, an event fires inside it, or an observable it subscribes to with the
+          async pipe emits."</p>
+        <p>"<strong>Missing <code>trackBy</code></strong> — or in modern Angular, a <code>track</code>
+          expression on <code>@for</code>. Without it, replacing an array causes Angular to destroy and recreate
+          every DOM node rather than reusing them. On a large list that's very visible."</p>
+        <p>"To confirm rather than guess, I'd use the Angular DevTools profiler, which shows change detection
+          cycles and how long each component took. That points directly at the component responsible instead of
+          me speculating."</p>
+        <p>"The modern structural answer is <strong>signals</strong>. A computed signal recalculates only when its
+          dependencies change, so the template-method problem disappears — and signals enable fine-grained
+          updates where Angular can re-render just what depends on the changed value rather than checking a
+          component tree. Combined with zoneless change detection, that removes the whole 'checks everything on
+          every event' model."</p>
+        <p>"And I'd check the obvious non-Angular causes too: are we making N+1 API calls, is a single endpoint
+          slow, are we loading far more data than the screen displays? A slow app is often a slow backend, and
+          it's worth ruling that out before profiling the framework."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you separate load time from interaction cost?</li>
+        <li>Do you know method-calls-in-templates is the usual culprit?</li>
+        <li>Do you know what triggers change detection under <code>OnPush</code>?</li>
+        <li>Do you profile rather than guess?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "Angular is just slow."</li>
+        <li><span class="redflag">Red flag:</span> adding <code>OnPush</code> everywhere with no diagnosis.</li>
+        <li><span class="redflag">Red flag:</span> no mention of the profiler.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What exactly triggers change detection?</li>
+          <li>How do signals change this?</li>
+          <li>What does <code>trackBy</code> do?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section assumes the <a href="../30-web-fundamentals/javascript.html">JavaScript
+      page</a> — the event loop in particular, because Zone.js works by patching the async APIs described there,
+      and change detection makes very little sense without that.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

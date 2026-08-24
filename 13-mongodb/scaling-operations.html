@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sharding, Change Streams &amp; Atlas — MongoDB</title>
+<meta name="description" content="Shard key selection, chunk balancing, targeted vs scatter-gather queries, change streams, pagination at scale and Atlas operations.">
+<meta name="keywords" content="MongoDB sharding shard key hashed ranged compound chunk balancer jumbo chunk targeted query scatter gather mongos config server resharding change streams resume token pagination skip limit Atlas backup monitoring">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="13-mongodb/scaling-operations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Sharding, Change Streams &amp; Atlas</h1>
+    <p class="subtitle">Sharding is the decision you can't easily take back. Change streams are the feature
+      most people don't know they have.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>The shard key is the whole decision.</strong> Get it wrong and every query hits every
+        shard.</li>
+      <li><strong>A query without the shard key is scatter-gather</strong> — broadcast to all shards, results
+        merged.</li>
+      <li><strong>Monotonically increasing keys create a hot shard.</strong> All writes land on one.</li>
+      <li><strong>Hashed keys distribute writes but kill range queries.</strong> That's the trade.</li>
+      <li><strong>Resharding exists since 5.0</strong> — but it's expensive, not a reason to be casual.</li>
+      <li><strong>Change streams</strong> read the oplog and give you a reliable, resumable event feed.</li>
+      <li><strong><code>skip</code> pagination degrades</strong> — and on a sharded cluster it's much
+        worse.</li>
+    </ul>
+  </div>
+
+  <h2 id="architecture">Sharded cluster architecture <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Component</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>mongos</code></strong></td><td>Router. The application connects here; it knows which shard holds what</td></tr>
+        <tr><td><strong>Config servers</strong></td><td>A replica set holding cluster metadata — the chunk map. Critical</td></tr>
+        <tr><td><strong>Shards</strong></td><td>Each is its own <a href="consistency.html#replica-sets">replica set</a> holding a subset of the data</td></tr>
+        <tr><td><strong>Chunk</strong></td><td>A contiguous range of shard-key values. The unit the balancer moves</td></tr>
+        <tr><td><strong>Balancer</strong></td><td>Migrates chunks to keep shards evenly loaded</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">The key consequence of this design</span>
+    <p><code>mongos</code> routes a query to specific shards <strong>only if it can work out where the data
+      is</strong> — which requires the shard key to be in the query.</p>
+    <p>Without it, the query is broadcast to <em>every</em> shard and the results merged. That's called
+      scatter-gather, and it means adding shards makes things worse, not better.</p>
+  </div>
+
+  <h2 id="shard-key">Choosing the shard key <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Three properties, all required</span>
+    <ol>
+      <li><strong>High cardinality</strong> — enough distinct values to split into many chunks. A shard key
+        with 3 values caps you at 3 chunks.</li>
+      <li><strong>Even distribution</strong> — no single value holding a disproportionate share of the data or
+        the writes.</li>
+      <li><strong>Present in your queries</strong> — otherwise every read is scatter-gather.</li>
+    </ol>
+    <p>The third is the one people forget, and it's the one that determines whether sharding helps at all.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Candidate</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>{ _id: 1 }</code> with <code>ObjectId</code></td>
+          <td><strong>Bad.</strong> ObjectIds increase monotonically, so every insert goes to the same chunk —
+              one hot shard</td>
+        </tr>
+        <tr>
+          <td><code>{ createdAt: 1 }</code></td>
+          <td><strong>Bad</strong> for the same reason. All new writes on one shard</td>
+        </tr>
+        <tr>
+          <td><code>{ _id: "hashed" }</code></td>
+          <td>Perfect write distribution. <strong>But every range query and most reads become
+              scatter-gather</strong></td>
+        </tr>
+        <tr>
+          <td><code>{ country: 1 }</code></td>
+          <td><strong>Bad</strong> — low cardinality, and hugely uneven</td>
+        </tr>
+        <tr>
+          <td><code>{ tenantId: 1, createdAt: 1 }</code></td>
+          <td><strong>Usually good</strong> in multi-tenant systems — queries are already tenant-scoped</td>
+        </tr>
+        <tr>
+          <td><code>{ userId: 1, timestamp: 1 }</code></td>
+          <td><strong>Good</strong> for per-user time-series — distributes by user, ranges within one</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the compound key resolves the dilemma</div>
+    <p style="margin:0">The apparent choice is between <strong>hashed</strong> (writes distribute, reads
+      scatter) and <strong>ranged</strong> (reads target, writes concentrate on one shard).
+      <br><br>
+      A <strong>compound key with a high-cardinality prefix</strong> gets both.
+      <code>{ userId: 1, timestamp: 1 }</code> spreads writes across shards because users hash out evenly, while
+      still allowing a targeted range query for one user's history — because <code>userId</code> identifies the
+      shard and <code>timestamp</code> orders within it.
+      <br><br>
+      That's the answer to "how do you shard time-series data without a hot shard?", and it's much stronger than
+      picking one of the two extremes.
+      <br><br>
+      The constraint: the prefix must be in your queries. If most reads are cross-user, no shard key saves
+      you — and that's a signal sharding is the wrong tool for that workload.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The monotonic-key hot shard</div>
+    <p style="margin:0">This is the most common sharding mistake. With <code>{ createdAt: 1 }</code> or a
+      default <code>ObjectId</code> <code>_id</code>, every new document has a higher key than the last, so
+      every insert lands in the <strong>highest chunk</strong> — which lives on one shard.
+      <br><br>
+      Result: one shard takes 100% of the write load while the others idle. You've paid for a sharded cluster
+      and got a single-node write path plus network hops.
+      <br><br>
+      The balancer then continuously splits and migrates that chunk, so you also get constant migration
+      overhead on the busiest shard. It's actively worse than not sharding.</p>
+  </div>
+
+  <h2 id="query-routing">Targeted vs scatter-gather <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="javascript — shard key { tenantId: 1, createdAt: 1 }"><code class="language-javascript">// TARGETED - mongos routes to one shard
+db.order.find({ tenantId: "acme", createdAt: { $gte: from } });
+
+// TARGETED - shard key prefix present
+db.order.find({ tenantId: "acme" });
+
+// SCATTER-GATHER - no shard key, broadcast to every shard
+db.order.find({ status: "pending" });
+
+// SCATTER-GATHER, and worse - every shard must sort, then mongos merges
+db.order.find({ status: "pending" }).sort({ createdAt: -1 }).limit(20);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Targeted</th><th>Scatter-gather</th></tr></thead>
+      <tbody>
+        <tr><td>Shards contacted</td><td>One (or few)</td><td><strong>All</strong></td></tr>
+        <tr><td>Latency</td><td>Single-shard latency</td><td><strong>The slowest shard's</strong></td></tr>
+        <tr><td>Scales with shard count</td><td><strong>Yes</strong> — more shards, more throughput</td><td><strong>No</strong> — more shards is worse</td></tr>
+        <tr><td>Sorting</td><td>Done on the shard</td><td>Each shard sorts, then <code>mongos</code> merges</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Scatter-gather latency is the slowest shard's latency, every time.</strong></p>
+    <p>With 10 shards, every query waits for whichever one is currently slowest — so you've made your tail
+      latency the maximum of 10 samples instead of one.</p>
+    <p>That's why "the shard key must be in your queries" isn't a nicety. A cluster where most queries are
+      scatter-gather performs worse than the single replica set it replaced.</p>
+  </div>
+
+  <h2 id="chunks">Chunks and the balancer <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concept</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Chunk size</strong></td><td>128 MB default. The balancer splits chunks that exceed it</td></tr>
+        <tr><td><strong>Migration</strong></td><td>Moves a chunk between shards. Uses I/O and network; can be windowed</td></tr>
+        <tr><td><strong>Jumbo chunk</strong></td><td>A chunk that <strong>cannot be split</strong> because all its documents share one shard-key value</td></tr>
+        <tr><td><strong>Balancing window</strong></td><td>Restrict migrations to off-peak hours</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Jumbo chunks — the unfixable case</div>
+    <p style="margin:0">A chunk is split by shard-key value. If a single value has more data than the chunk
+      size — say <code>tenantId: "biggest-customer"</code> holding 400 GB — that chunk
+      <strong>cannot be split</strong>. There's no boundary to split on.
+      <br><br>
+      It's marked jumbo, the balancer stops trying to move it, and that shard is permanently
+      oversized. You can't fix it by adding shards.
+      <br><br>
+      This is why <strong>cardinality within a shard-key value matters</strong>, not just cardinality across
+      values. A compound key gives you finer boundaries:
+      <code>{ tenantId: 1, createdAt: 1 }</code> can split <em>within</em> a large tenant, where
+      <code>{ tenantId: 1 }</code> alone cannot.
+      <br><br>
+      Being able to explain jumbo chunks is a strong signal, because it's the failure that reveals whether
+      someone has actually operated a sharded cluster.</p>
+  </div>
+
+  <h3 id="resharding">Resharding</h3>
+
+  <div class="note info">
+    <div class="note-title">Possible since 5.0, still not cheap</div>
+    <p style="margin:0"><code>reshardCollection</code> rewrites the entire collection with a new shard key. That
+      was previously impossible — the only route was a full manual migration to a new collection.
+      <br><br>
+      But it duplicates the collection during the operation, so it needs the disk space and I/O headroom, and it
+      takes as long as it takes on a large dataset. There's also a brief write-blocking period at the end for
+      the cutover.
+      <br><br>
+      So it's an escape hatch, not permission to be casual. <strong>Choose the shard key as though you can't
+      change it</strong>, and treat resharding as the recovery plan rather than the plan.</p>
+  </div>
+
+  <h2 id="change-streams">Change streams <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A change stream is a <strong>subscribable feed of changes</strong> to a collection, database or the whole
+      cluster. It reads the oplog, so it sees every change regardless of which application made it.</p>
+    <p>Crucially, it's <strong>resumable</strong>: each event carries a resume token you can store and restart
+      from.</p>
+  </div>
+
+  <pre data-label="csharp — a resumable consumer" class="code-good"><code class="language-csharp">var options = new ChangeStreamOptions
+{
+    FullDocument = ChangeStreamFullDocumentOption.UpdateLookup,   // whole doc, not just the delta
+    StartAfter   = savedResumeToken                              // pick up where we left off
+};
+
+// Filter server-side so we only receive what we care about
+var pipeline = new EmptyPipelineDefinition&lt;ChangeStreamDocument&lt;Order&gt;&gt;()
+    .Match(c =&gt; c.OperationType == ChangeStreamOperationType.Update
+             || c.OperationType == ChangeStreamOperationType.Insert);
+
+using var cursor = await orders.WatchAsync(pipeline, options, ct);
+
+await cursor.ForEachAsync(async change =&gt;
+{
+    await Handle(change.FullDocument);
+    await SaveResumeToken(change.ResumeToken);   // AFTER handling, for at-least-once
+}, ct);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Use for</th><th>Instead of</th></tr></thead>
+      <tbody>
+        <tr><td>Publishing domain events</td><td>Dual-writing to a message broker</td></tr>
+        <tr><td>Keeping a search index or cache in sync</td><td>Polling for changed documents</td></tr>
+        <tr><td>Maintaining a denormalized copy</td><td>Application code remembering to update both</td></tr>
+        <tr><td>Audit trails</td><td>Manual logging on every write path</td></tr>
+        <tr><td>Real-time UI updates</td><td>Client polling</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — change streams solve the dual-write problem</div>
+    <p style="margin:0">The classic <a href="../19-architecture/distributed-data.html#outbox">dual-write
+      problem</a>: save to the database, then publish an event. If the publish fails, the data changed and
+      nothing downstream knows.
+      <br><br>
+      A change stream inverts it. You only write to the database, and the event feed is <em>derived</em> from
+      the oplog — the same durable record the database already committed. There's nothing to keep in sync,
+      because there's only one write.
+      <br><br>
+      That's effectively a built-in outbox, and it's genuinely one of MongoDB's better features. It's also how
+      CDC tools integrate with Mongo.
+      <br><br>
+      Two things to get right: <strong>store the resume token after handling</strong>, not before, so a crash
+      replays rather than skips — which makes it at-least-once, so handlers must be
+      <a href="../19-architecture/distributed-data.html#idempotency">idempotent</a>. And
+      <strong>filter server-side</strong> with a pipeline, or you're streaming every change in the collection to
+      your process and discarding most of it.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Change stream limits</div>
+    <p style="margin:0"><strong>Requires a replica set</strong> — they read the oplog, so a standalone node
+      can't serve them. That catches people whose dev environment is standalone.
+      <br><br>
+      <strong>The resume token expires with the oplog.</strong> If a consumer is down longer than the oplog
+      window, its token is gone and it cannot resume — you're into a full resync. So oplog size is effectively
+      your maximum consumer downtime, and it's worth sizing deliberately.
+      <br><br>
+      <strong><code>UpdateLookup</code> is a second read.</strong> It fetches the current document, so you get
+      the <em>latest</em> version rather than the state at the time of the change — and if the document changed
+      again since, you'll see the newer value. For ordering-sensitive logic, use the change description rather
+      than the looked-up document.</p>
+  </div>
+
+  <h2 id="pagination">Pagination at scale <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="javascript — skip: correct but degrades" class="code-bad"><code class="language-javascript">db.order.find({ tenantId: "acme" })
+        .sort({ createdAt: -1 })
+        .skip(100000)          // reads and discards 100,000 documents
+        .limit(20);</code></pre>
+
+  <pre data-label="javascript — keyset: constant cost" class="code-good"><code class="language-javascript">db.order.find({
+    tenantId:  "acme",
+    $or: [
+      { createdAt: { $lt: lastCreatedAt } },
+      { createdAt: lastCreatedAt, _id: { $lt: lastId } }   // tiebreaker
+    ]
+})
+.sort({ createdAt: -1, _id: -1 })
+.limit(20);</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Why <code>skip</code> is worse on a sharded cluster</div>
+    <p style="margin:0">On a single replica set, <code>skip(100000)</code> reads and discards 100,000
+      documents — bad but linear.
+      <br><br>
+      On a sharded cluster it's worse: <code>mongos</code> cannot know how the skipped documents are distributed,
+      so <strong>each shard must return its first 100,020 documents</strong> for merging. Ten shards means a
+      million documents transferred to return twenty.
+      <br><br>
+      Keyset pagination avoids this entirely, and the tiebreaker on <code>_id</code> is mandatory — without it,
+      documents sharing a timestamp get skipped or duplicated across page boundaries. Same mechanics as
+      <a href="../10-sql/querying.html#pagination">SQL keyset pagination</a>.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">If you need a total count as well</div>
+    <pre data-label="javascript"><code class="language-javascript">db.order.aggregate([
+  { $match: { tenantId: "acme" } },
+  { $facet: {
+      page:  [ { $sort: { createdAt: -1 } }, { $limit: 20 } ],
+      total: [ { $count: "count" } ]
+  }}
+]);</code></pre>
+    <p style="margin:0"><code>$facet</code> gets both in one round trip. But an exact count over a large
+      collection is still a full scan — so for big datasets, prefer an approximate count
+      (<code>estimatedDocumentCount</code>), a capped count ("1000+"), or no total at all.</p>
+  </div>
+
+  <h2 id="atlas">Atlas and operations <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Capability</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Continuous backup / PITR</strong></td><td>Point-in-time restore. The equivalent of WAL archiving</td></tr>
+        <tr><td><strong>Performance Advisor</strong></td><td>Suggests indexes from real slow queries. Treat as evidence, not instructions</td></tr>
+        <tr><td><strong>Atlas Search</strong></td><td>Lucene-based. <strong>Far better than the built-in text index</strong></td></tr>
+        <tr><td><strong>Analytics nodes</strong></td><td>Dedicated read-only members so reporting doesn't compete with production</td></tr>
+        <tr><td><strong>Online archive</strong></td><td>Tiers cold data to object storage, still queryable</td></tr>
+        <tr><td><strong>Private endpoints</strong></td><td>Keeps traffic off the public internet</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two operational settings worth checking</div>
+    <p style="margin:0"><strong>IP access list.</strong> An Atlas cluster open to <code>0.0.0.0/0</code> — which
+      people set during development and forget — is reachable from anywhere with only the password protecting
+      it. Use a private endpoint or VPC peering for anything real.
+      <br><br>
+      <strong>Oplog size.</strong> It bounds both how far a secondary can lag and still catch up, and how long a
+      change stream consumer can be down and still resume. The default is often too small for a write-heavy
+      workload, and the consequence only appears during an incident.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Monitoring that actually tells you something</div>
+    <p style="margin:0"><strong>Replication lag</strong> — rising lag means secondaries can't keep up, which
+      breaks secondary reads and threatens the oplog window.
+      <br><br>
+      <strong>Cache hit ratio / page faults</strong> — the working set no longer fits in memory, which is the
+      most common cause of a cluster suddenly getting slow.
+      <br><br>
+      <strong>Scanned-to-returned ratio</strong> — the equivalent of
+      <code>totalDocsExamined</code>/<code>nReturned</code> across the workload. A rising number means queries
+      are losing index support.
+      <br><br>
+      <strong>Connection count</strong> — a leaked <code>MongoClient</code> per request shows up here first.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The shard key needs high cardinality, even distribution, and presence in your queries.</li>
+      <li>Monotonic keys (<code>ObjectId</code>, <code>createdAt</code>) create a single hot shard.</li>
+      <li>Hashed distributes writes but makes reads scatter-gather.</li>
+      <li>A compound key with a high-cardinality prefix gets both.</li>
+      <li>Scatter-gather latency equals the slowest shard's, so it doesn't scale with shard count.</li>
+      <li>Jumbo chunks can't be split — cardinality within a key value matters too.</li>
+      <li>Resharding exists since 5.0 but is expensive; choose as if it's permanent.</li>
+      <li>Change streams give a resumable event feed and remove the dual-write problem.</li>
+      <li>Save the resume token after handling; handlers must be idempotent.</li>
+      <li>Oplog size bounds both secondary lag tolerance and consumer downtime.</li>
+      <li><code>skip</code> is much worse when sharded — use keyset with a tiebreaker.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Sharding on <code>ObjectId</code> or a timestamp</strong>, creating a hot shard.</li>
+    <li><strong>A shard key absent from most queries</strong>, so everything is scatter-gather.</li>
+    <li><strong>Low-cardinality shard keys</strong> such as country or status.</li>
+    <li><strong>Not anticipating jumbo chunks</strong> from a dominant key value.</li>
+    <li><strong>Sharding before exhausting vertical scale and indexing.</strong></li>
+    <li><strong>Storing the change stream resume token before handling</strong>, so a crash skips events.</li>
+    <li><strong>No server-side filter</strong> on a change stream.</li>
+    <li><strong>Change streams against a standalone node</strong> — they simply don't work.</li>
+    <li><strong>An undersized oplog</strong>, so consumers can't resume after downtime.</li>
+    <li><strong><code>skip</code>-based deep pagination</strong>, especially when sharded.</li>
+    <li><strong>Exact counts on large collections</strong> for every page load.</li>
+    <li><strong><code>0.0.0.0/0</code> left in the Atlas access list.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Choose a shard key for an events collection: 50 million events/day, queried by user and by time range. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd go with <strong><code>{ userId: 1, timestamp: 1 }</code></strong>, and I'd explain it by ruling
+          out the obvious alternatives, because each fails in an instructive way."</p>
+        <p>"<strong><code>{ timestamp: 1 }</code> is the trap.</strong> It matches the query pattern, and it's
+          monotonically increasing — so every new event has a higher key than the last and lands in the highest
+          chunk, which lives on one shard. That shard takes 100% of the write load while the others idle, and
+          the balancer continuously splits and migrates that chunk on top of it. At 50 million events a day
+          that's actively worse than not sharding. Same problem with <code>{ _id: 1 }</code>, since
+          <code>ObjectId</code> also increases over time."</p>
+        <p>"<strong><code>{ _id: "hashed" }</code> is the over-correction.</strong> Writes distribute
+          perfectly, and now <em>every</em> query is scatter-gather — including 'this user's events last week'.
+          That means every read waits for the slowest of N shards, so tail latency becomes the maximum of N
+          samples and adding shards makes reads worse. You've solved writes by breaking reads."</p>
+        <p>"<strong>The compound key gets both.</strong> <code>userId</code> as the prefix has high cardinality
+          and spreads writes across all shards, because concurrent users hash out evenly. And because
+          <code>userId</code> is in the query, <code>mongos</code> can route 'this user's events in this range'
+          to a single shard, where <code>timestamp</code> orders them within the chunk. Targeted read, distributed
+          write."</p>
+        <p>"The condition for that working is that <code>userId</code> is genuinely in most queries. Given the
+          stated pattern — queried by user and by time — it is. If a lot of queries were cross-user, like
+          'all events in the last hour', those would still be scatter-gather and I'd want to know how frequent
+          they are before committing."</p>
+        <p>"Two further things I'd raise."</p>
+        <p>"<strong>Jumbo chunks.</strong> If one user is enormously more active than the rest — a system
+          account, or a bot — their events could exceed the chunk size for a single <code>userId</code> value.
+          With a compound key that's survivable, because the chunk can be split on <code>timestamp</code> within
+          that user. With <code>{ userId: 1 }</code> alone it couldn't be split at all, would be marked jumbo,
+          and that shard would be permanently oversized. That's a direct argument for the compound key beyond
+          query routing."</p>
+        <p>"<strong>Retention.</strong> 50 million a day is 18 billion a year, and event data usually has a
+          finite useful life. I'd want a <strong>TTL index</strong> for automatic expiry, or better,
+          <strong>time-based collections or partitions</strong> so old data is dropped rather than deleted —
+          dropping is near-instant, deleting 50 million documents is expensive and churns the cache."</p>
+        <p>"And I'd question the premise slightly: for pure append-heavy telemetry, a <strong>time-series
+          collection</strong> (5.0+) is purpose-built for this and handles the bucketing internally. If the
+          events are genuinely metrics rather than domain events, that's likely a better fit than a
+          general-purpose sharded collection. I'd want to know which they are before finalising."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you spot the monotonic hot-shard trap?</li>
+        <li>Do you know hashed keys break range queries?</li>
+        <li>Do you reach the compound key and explain why it gets both?</li>
+        <li>Do you consider jumbo chunks?</li>
+        <li>Do you raise retention at that volume?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> <code>{ timestamp: 1 }</code> because it matches the
+          queries.</li>
+        <li><span class="redflag">Red flag:</span> hashed with no mention of the read cost.</li>
+        <li><span class="redflag">Red flag:</span> no retention plan for 18 billion documents a year.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if you also need "all events in the last hour" frequently?</li>
+          <li>How would you reshard if you got it wrong?</li>
+          <li>How does a time-series collection differ internally?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>You need to keep a search index in sync with a MongoDB collection. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd use a <strong>change stream</strong>, and I'd contrast it with the two approaches people reach
+          for first, because it's clearly better than both."</p>
+        <p>"<strong>Dual write</strong> — the application writes to Mongo and then to the search index — has the
+          classic dual-write problem. If the second write fails, the two diverge silently and there's no
+          mechanism to notice or recover. And it puts the responsibility on every code path that writes, so one
+          forgotten path is a permanent inconsistency."</p>
+        <p>"<strong>Polling for changed documents</strong> works, but it needs a reliable
+          <code>updatedAt</code> on every write, it misses deletes entirely, and there's a tradeoff between
+          polling frequency and load where neither end is good."</p>
+        <p>"<strong>A change stream</strong> avoids both. It reads the oplog — the durable record Mongo already
+          committed — so the event feed is <em>derived</em> from the write rather than being a second write.
+          There's nothing to keep in sync because there's only one write. It sees every change regardless of
+          which application or script made it, and it includes deletes."</p>
+        <p>"Implementation details that matter:"</p>
+        <p>"<strong>Store the resume token after handling, not before.</strong> Each event carries a token; if
+          the consumer crashes, it restarts from the last stored one. Storing it before handling means a crash
+          <em>skips</em> the event permanently. Storing it after means the event may be
+          <em>replayed</em> — so it's at-least-once, and the handler must be idempotent. For a search index
+          that's easy, since indexing the same document twice is naturally idempotent."</p>
+        <p>"<strong>Filter server-side</strong> with a <code>$match</code> in the watch pipeline, so I only
+          receive the operation types and fields I care about rather than streaming every change to my process
+          and discarding most of it."</p>
+        <p>"<strong><code>FullDocument = UpdateLookup</code></strong> so I get the whole document rather than
+          just the delta — a search index needs the full record. Worth knowing that's a second read and returns
+          the <em>current</em> version, so if the document changed again I'll see the newer state. For a search
+          index that's fine, arguably preferable. For ordering-sensitive logic it wouldn't be."</p>
+        <p>"<strong>Batch the writes</strong> to the search index rather than one call per event — at any real
+          volume, per-event indexing is the bottleneck, not the change stream."</p>
+        <p>"The risk I'd plan for explicitly: <strong>the resume token expires with the oplog</strong>. If the
+          consumer is down longer than the oplog window, the token is unusable and there's no way to resume —
+          I'd need a full rebuild. So I'd size the oplog for the longest realistic outage, alert on consumer lag
+          so I know before it's too late, and have a documented full-reindex procedure. That reindex path is
+          needed anyway for schema changes to the index."</p>
+        <p>"One alternative worth mentioning: if this is on Atlas, <strong>Atlas Search</strong> maintains a
+          Lucene index on the collection natively, with no consumer to run. That's less infrastructure and
+          less to go wrong, so I'd check whether it meets the search requirements before building a pipeline to
+          Elasticsearch."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know change streams exist and why they beat dual writes?</li>
+        <li>Do you get the resume-token ordering right?</li>
+        <li>Do you know it's at-least-once and require idempotency?</li>
+        <li>Do you plan for the token expiring?</li>
+        <li>Do you consider the managed option?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> dual write with no consistency mechanism.</li>
+        <li><span class="redflag">Red flag:</span> saving the resume token before processing.</li>
+        <li><span class="redflag">Red flag:</span> no plan for when the consumer falls behind.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle a full reindex without downtime?</li>
+          <li>What happens if the consumer processes events out of order?</li>
+          <li>How would you run multiple consumer instances?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

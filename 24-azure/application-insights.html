@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Application Insights — Azure</title>
+<meta name="description" content="The telemetry model, OpenTelemetry instrumentation, sampling and cost control, KQL for investigation, distributed tracing and useful alerting.">
+<meta name="keywords" content="Application Insights telemetry model requests dependencies traces exceptions custom events OpenTelemetry sampling adaptive ingestion sampling KQL Kusto queries distributed tracing operation id alerts cost data cap">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/application-insights.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Application Insights</h1>
+    <p class="subtitle">Your production debugger. Also, if you're careless with it, one of the larger lines on the
+      bill.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Five telemetry types matter:</strong> requests, dependencies, exceptions, traces, custom
+        events.</li>
+      <li><strong>Instrument with OpenTelemetry</strong>, export to App Insights.</li>
+      <li><strong>Billed per GB ingested.</strong> Verbose logging can cost more than the compute.</li>
+      <li><strong>Sampling is the primary cost control</strong> — and it changes what you can query.</li>
+      <li><strong><code>operation_Id</code> ties a distributed trace together.</strong></li>
+      <li><strong>KQL is worth learning properly</strong> — it's how you actually investigate.</li>
+      <li><strong>Alert on symptoms users feel</strong>, not on every error.</li>
+    </ul>
+  </div>
+
+  <h2 id="telemetry-model">The telemetry model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Is</th><th>KQL table</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Request</strong></td><td>An incoming call handled by your app</td><td><code>requests</code></td></tr>
+        <tr><td><strong>Dependency</strong></td><td><strong>An outgoing call</strong> — SQL, HTTP, Service Bus, Redis</td><td><code>dependencies</code></td></tr>
+        <tr><td><strong>Exception</strong></td><td>An unhandled or explicitly tracked exception</td><td><code>exceptions</code></td></tr>
+        <tr><td><strong>Trace</strong></td><td>A log line from <code>ILogger</code></td><td><code>traces</code></td></tr>
+        <tr><td><strong>Custom event</strong></td><td>A business event you chose to record</td><td><code>customEvents</code></td></tr>
+        <tr><td><strong>Metric</strong></td><td>A numeric measurement, pre-aggregated</td><td><code>customMetrics</code></td></tr>
+        <tr><td><strong>Availability</strong></td><td>Result of a synthetic ping test</td><td><code>availabilityResults</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — dependencies are the most useful and least used</div>
+    <p style="margin:0">Most teams look at <code>requests</code> and <code>exceptions</code>. The
+      <strong><code>dependencies</code></strong> table is where the answers usually are.
+      <br><br>
+      It records <em>every outgoing call</em> — each SQL query, HTTP request, Service Bus operation and Redis
+      command — with its duration, success and target. Automatically, with no code.
+      <br><br>
+      So "the endpoint takes 3 seconds" becomes answerable: one dependency shows 2.8 seconds and it's a specific
+      SQL query, or there are 400 dependency records for one request, which is an
+      <a href="../11-ef-core/querying.html">N+1</a>.
+      <br><br>
+      That second case is the one worth knowing: <strong>counting dependencies per operation finds N+1 problems
+      that no single slow query would reveal</strong> — each call is 2ms and there are four hundred of them.
+      Nothing in the request telemetry shows that; the dependency count does.</p>
+  </div>
+
+  <h2 id="opentelemetry">Instrumenting with OpenTelemetry <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the current recommended setup" class="code-good"><code class="language-csharp">builder.Services.AddOpenTelemetry()
+    .UseAzureMonitor(o =&gt;
+    {
+        o.ConnectionString = builder.Configuration["ApplicationInsights:ConnectionString"];
+        o.SamplingRatio = 0.2f;              // 20% - see the cost section
+    })
+    .WithTracing(t =&gt; t
+        .AddAspNetCoreInstrumentation()      // incoming requests
+        .AddHttpClientInstrumentation()      // outgoing HTTP, with context propagation
+        .AddSqlClientInstrumentation(s =&gt; s.SetDbStatementForText = true))
+    .WithMetrics(m =&gt; m
+        .AddAspNetCoreInstrumentation()
+        .AddRuntimeInstrumentation());       // GC, thread pool, exceptions
+
+// Enrich every telemetry item with the things you'll want to filter by
+builder.Services.AddSingleton&lt;ITelemetryInitializer, TenantEnricher&gt;();</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why OpenTelemetry rather than the App Insights SDK</div>
+    <p style="margin:0">The classic SDK works and couples your instrumentation to Azure. OpenTelemetry is now
+      Microsoft's recommended path, and the reason is portability: <strong>you instrument once against a
+      vendor-neutral standard</strong> and export to App Insights.
+      <br><br>
+      If you later add Grafana, or move to Datadog, or run a service in another cloud, you change the
+      <em>exporter</em> rather than reinstrumenting the application.
+      <br><br>
+      It also standardises trace context propagation across languages, which matters in a polyglot estate — a
+      Node service and a .NET service produce traces that join up correctly.
+      <br><br>
+      The practical caveat: some App Insights features are still richer through the native SDK, and a few
+      instrumentation libraries lag. So it's worth checking that the specific dependency you care about — a
+      particular Azure SDK, EF Core — is instrumented before assuming full coverage.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — enrich telemetry with the dimension you'll filter by</div>
+    <p style="margin:0">The single highest-value customisation is adding your own dimensions to every telemetry
+      item — most importantly <strong>tenant id</strong>, and often user id, feature flag state or API version.
+      <br><br>
+      Because the first question in any incident is <em>"is this one customer or everyone?"</em>, and without a
+      tenant dimension you cannot answer it. You end up correlating timestamps against support tickets.
+      <br><br>
+      A telemetry initialiser adds it once, globally, rather than per log statement. Then every request,
+      dependency, exception and trace carries it and every KQL query can filter or group by it.
+      <br><br>
+      Do it early. Retrofitting means you can't investigate anything historical by tenant, and it's exactly the
+      dimension you'll want during the first serious incident. Same reasoning as
+      <a href="../23-multi-tenant-saas/tenant-context.html#observability">per-tenant observability</a>.
+      <br><br>
+      One caution: <strong>enrich with identifiers, never with data.</strong> A telemetry item containing another
+      customer's record is itself a leak, and telemetry is usually readable by more people than the database.</p>
+  </div>
+
+  <h2 id="cost">Cost, and the sampling trade <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The billing model</span>
+    <p>You're billed per <strong>GB of telemetry ingested</strong>. Not per request, not per instance — per
+      gigabyte of data sent.</p>
+    <p>Which means <strong>logging volume is a cost decision</strong>, and on a busy application it can exceed
+      what you're paying for the compute that generated it.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What inflates ingestion</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>Information</code> level for framework categories</strong></td><td>Set <code>Microsoft.*</code> and <code>System.*</code> to <code>Warning</code></td></tr>
+        <tr><td><strong>Every dependency call recorded</strong></td><td>Sampling</td></tr>
+        <tr><td><strong>Logging request and response bodies</strong></td><td>Don't — and it's a data-protection risk too</td></tr>
+        <tr><td><strong>A chatty health check every 5 seconds</strong></td><td>Filter it out entirely</td></tr>
+        <tr><td><strong>Debug logging left on in production</strong></td><td>Log level from configuration, reviewed</td></tr>
+        <tr><td><strong>Long exception stack traces at volume</strong></td><td>Fix the exception; it's telling you something</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Sampling type</th><th>Where</th><th>Behaviour</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Adaptive</strong></td>
+          <td>In the SDK</td>
+          <td>Adjusts rate automatically to a target volume. Default for ASP.NET Core</td>
+        </tr>
+        <tr>
+          <td><strong>Fixed-rate</strong></td>
+          <td>In the SDK</td>
+          <td>A set percentage. Predictable, and you choose it</td>
+        </tr>
+        <tr>
+          <td><strong>Ingestion</strong></td>
+          <td>Server side</td>
+          <td>Discards after transmission — <strong>you pay for the bandwidth</strong>, not the storage</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — sampling keeps traces whole, and that's the important part</div>
+    <p style="margin:0">Naive sampling would drop individual telemetry items, which would leave you with a request
+      whose dependencies are missing — useless for investigation.
+      <br><br>
+      App Insights sampling is <strong>consistent across an operation</strong>: it hashes the
+      <code>operation_Id</code>, so if a request is sampled in, <em>all</em> its dependencies, traces and
+      exceptions come with it. You get complete traces for a subset of operations rather than fragments of all of
+      them.
+      <br><br>
+      Which makes the trade clear: <strong>you lose the ability to find a specific individual request</strong>, but
+      the ones you keep are fully diagnosable.
+      <br><br>
+      Two things to know. <strong>Sampling affects counts</strong> — App Insights scales them by
+      <code>itemCount</code> to compensate, so aggregate figures remain roughly right, but exact counts and rare
+      events become unreliable. And you can <strong>exclude exceptions from sampling</strong>, which is usually the
+      right choice: sample the successful requests heavily, keep every failure.
+      <br><br>
+      "Sample aggressively on success, never on exceptions" is a good concrete answer.</p>
+  </div>
+
+  <pre data-label="csharp — filter noise before it costs anything" class="code-good"><code class="language-csharp">// A processor drops telemetry client-side, so you don't pay to send it
+public sealed class HealthCheckFilter(ITelemetryProcessor next) : ITelemetryProcessor
+{
+    public void Process(ITelemetry item)
+    {
+        // Health probes fire constantly and tell you nothing
+        if (item is RequestTelemetry r &&
+            r.Url?.AbsolutePath.StartsWith("/health", StringComparison.OrdinalIgnoreCase) == true &&
+            r.Success == true)
+        {
+            return;                      // dropped - never transmitted
+        }
+
+        next.Process(item);
+    }
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Set a daily cap, and understand what it does</div>
+    <p style="margin:0">A daily ingestion cap prevents a runaway bill — a logging loop or a traffic spike can
+      otherwise generate an enormous amount of telemetry.
+      <br><br>
+      The consequence is blunt: once the cap is hit, <strong>telemetry is discarded for the rest of the day</strong>.
+      So you're blind exactly when something unusual is happening, which is when you most need visibility.
+      <br><br>
+      So a cap is a <strong>financial safety net, not a cost strategy</strong>. Set it well above normal volume,
+      alert when you approach it, and control cost through log levels, filtering and sampling instead.
+      <br><br>
+      The failure mode to avoid: a cap set close to normal usage, hit during an incident, so the incident is
+      undiagnosable.</p>
+  </div>
+
+  <h2 id="kql">KQL, practically <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="kql — the queries worth knowing"><code class="language-kql">// Slowest endpoints by p95
+requests
+| where timestamp &gt; ago(24h)
+| summarize p50 = percentile(duration, 50),
+            p95 = percentile(duration, 95),
+            count() by name
+| order by p95 desc
+
+// Failure rate per endpoint
+requests
+| where timestamp &gt; ago(1h)
+| summarize total = count(),
+            failed = countif(success == false) by name
+| extend failureRate = round(100.0 * failed / total, 2)
+| where failureRate &gt; 1
+| order by failureRate desc
+
+// N+1 detection: operations making an unusual number of dependency calls
+dependencies
+| where timestamp &gt; ago(1h)
+| summarize calls = count() by operation_Id, operation_Name
+| where calls &gt; 50
+| summarize operations = count(), avgCalls = avg(calls) by operation_Name
+| order by avgCalls desc
+
+// Everything for one trace - the incident-investigation query
+union requests, dependencies, exceptions, traces
+| where operation_Id == "abc123..."
+| project timestamp, itemType, name, message, duration, success
+| order by timestamp asc
+
+// Errors grouped by tenant - only possible if you enriched telemetry
+exceptions
+| where timestamp &gt; ago(6h)
+| extend tenant = tostring(customDimensions.TenantId)
+| summarize count() by tenant, type
+| order by count_ desc</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The two queries that earn their keep</div>
+    <p style="margin:0"><strong>The <code>union ... where operation_Id</code> query</strong> is the one to
+      remember. Given a trace id from an error response, it returns every request, dependency, exception and log
+      line for that one operation, in order — across services. That's the distributed stack trace you don't
+      otherwise have.
+      <br><br>
+      Which is why <a href="../20-microservices/operations.html#tracing">returning the trace id to the
+      client</a> matters so much: a user quotes a reference and you retrieve the complete picture rather than
+      searching by timestamp.
+      <br><br>
+      <strong>The dependency-count query</strong> finds N+1 problems, which are invisible in request telemetry
+      because each call is fast. An operation making 400 dependency calls is a problem no percentile on
+      <code>requests</code> would reveal.
+      <br><br>
+      Both are worth saving as workbook queries so they're available during an incident rather than being written
+      under pressure.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Percentiles, not averages</div>
+    <p style="margin:0">An average hides the distribution. A 200ms average can be 90% of requests at 50ms and 10%
+      at 1.5 seconds — and the 10% is what users complain about.
+      <br><br>
+      So <code>percentile(duration, 95)</code> and <code>percentile(duration, 99)</code> are the numbers that
+      describe experience. p50 alongside them shows the spread.
+      <br><br>
+      Same reasoning applies to alerting: alerting on average latency misses the case where a minority of requests
+      are terrible, which is the more common failure shape.</p>
+  </div>
+
+  <h2 id="tracing">Distributed tracing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>operation_Id</code></strong></td><td><strong>The trace id.</strong> Shared by everything in one end-to-end operation</td></tr>
+        <tr><td><code>operation_ParentId</code></td><td>The parent span, which builds the call tree</td></tr>
+        <tr><td><code>operation_Name</code></td><td>The logical operation — usually the entry-point route</td></tr>
+        <tr><td><code>cloud_RoleName</code></td><td>Which service produced it</td></tr>
+        <tr><td><code>customDimensions</code></td><td>Your enrichment — tenant, user, version</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Trace context doesn't cross a message broker by itself</div>
+    <p style="margin:0">HTTP calls propagate <code>traceparent</code> automatically, so a chain of service calls
+      joins up without effort.
+      <br><br>
+      A <strong>message publish does not</strong>, unless the library adds it. So without handling, the trace ends
+      at "published a message" and the consumer's work appears as an unrelated root trace — and correlating them
+      means matching timestamps and guessing.
+      <br><br>
+      That's precisely where the hard bugs live, because asynchronous flows are the ones you can't reason about by
+      reading code.
+      <br><br>
+      The Azure SDKs and MassTransit handle this now. It's worth <strong>verifying on a real trace</strong> rather
+      than assuming: publish a message, consume it, and confirm both appear under one
+      <code>operation_Id</code>. If they don't, put <code>traceparent</code> in the message headers and restore it
+      in the consumer.</p>
+  </div>
+
+  <h2 id="alerting">Alerting <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Alert on</th><th>Don't alert on</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Failure rate above a threshold</strong> — users are affected</td><td>Every individual exception</td></tr>
+        <tr><td><strong>p95 latency degradation</strong></td><td>A single slow request</td></tr>
+        <tr><td><strong>Availability test failing</strong> from multiple regions</td><td>One region blipping</td></tr>
+        <tr><td><strong>Dependency failure rate</strong> — the database or an API</td><td>A single dependency timeout</td></tr>
+        <tr><td><strong>Queue depth or consumer lag growing</strong></td><td>Momentary queue depth</td></tr>
+        <tr><td><strong>Dead-letter queue depth &gt; 0</strong></td><td>—</td></tr>
+        <tr><td><strong>A business metric stopping</strong> — no orders in an hour</td><td>Normal variation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — alert on symptoms, and the business metric is the best one</div>
+    <p style="margin:0">The failure mode of alerting is <strong>volume</strong>. Alert on every exception and
+      within a month nobody reads them, so the one that mattered is missed. An ignored alert is worse than no
+      alert, because it creates a false sense of coverage.
+      <br><br>
+      So alert on things a <em>user would notice</em>: elevated failure rate, degraded p95, availability tests
+      failing.
+      <br><br>
+      The most valuable alert though is usually a <strong>business metric that stopped</strong>. "No orders
+      completed in the last hour" catches an enormous range of failures — a broken payment integration, a failed
+      deployment, a full database, a certificate expiry — <em>including ones you didn't anticipate and have no
+      specific alert for</em>.
+      <br><br>
+      Technical alerts detect known failure modes. A business-metric alert detects <em>unknown</em> ones, which is
+      strictly more valuable and much rarer to find configured.
+      <br><br>
+      It needs care with normal variation — quiet periods overnight, weekends — so it's usually a comparison
+      against the same period last week rather than a fixed threshold.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Requests, dependencies, exceptions, traces, custom events — dependencies are the most underused.</li>
+      <li>Counting dependencies per operation is how you find N+1 problems.</li>
+      <li>Instrument with OpenTelemetry and export to App Insights.</li>
+      <li>Enrich every item with tenant id — identifiers only, never data.</li>
+      <li>Billed per GB ingested; log levels, filtering and sampling are cost controls.</li>
+      <li>Sampling is consistent per <code>operation_Id</code>, so traces stay whole.</li>
+      <li>Sample success heavily, keep every exception.</li>
+      <li>A daily cap is a financial safety net that blinds you when it triggers.</li>
+      <li>The <code>union ... operation_Id</code> query is your distributed stack trace.</li>
+      <li>Percentiles, not averages.</li>
+      <li>Trace context doesn't cross a broker automatically — verify it.</li>
+      <li>Alert on user-visible symptoms; a stopped business metric catches unknown failures.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Verbose framework logging in production</strong>, dominating ingestion cost.</li>
+    <li><strong>Logging request and response bodies</strong> — expensive and a data-protection risk.</li>
+    <li><strong>Health checks recorded as requests</strong>, inflating volume and skewing metrics.</li>
+    <li><strong>No tenant enrichment</strong>, so incidents can't be scoped to a customer.</li>
+    <li><strong>Sampling exceptions away</strong>, losing the rare failures.</li>
+    <li><strong>A daily cap set near normal volume</strong>, so it triggers during incidents.</li>
+    <li><strong>Alerting on every exception</strong> until nobody reads alerts.</li>
+    <li><strong>Alerting on averages</strong> rather than percentiles.</li>
+    <li><strong>Assuming trace context crosses the message broker.</strong></li>
+    <li><strong>No trace id returned to clients</strong>, so support tickets can't be correlated.</li>
+    <li><strong>Only looking at <code>requests</code> and <code>exceptions</code></strong>, ignoring
+      dependencies.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>An endpoint is slow in production. How do you find out why? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start in Application Insights and work from the aggregate to the specific, rather than guessing."</p>
+        <p>"First, <strong>confirm and characterise it</strong> with a KQL query on <code>requests</code> —
+          percentiles by endpoint name, not averages. An average hides the distribution: 200ms average could be
+          90% at 50ms and 10% at 1.5 seconds, and the 10% is what users complain about. So p50, p95 and p99, and
+          whether it's <em>all</em> requests or a tail."</p>
+        <p>"Then I'd look at the <strong><code>dependencies</code></strong> table for that operation, which is
+          where the answer usually is. It records every outgoing call — SQL, HTTP, Service Bus, Redis — with
+          duration and success, automatically."</p>
+        <p>"Two shapes to look for."</p>
+        <p>"<strong>One slow dependency.</strong> If a single SQL query is 2.8 seconds of a 3-second request,
+          that's the answer and I'd take the query to an execution plan."</p>
+        <p>"<strong>Many fast dependencies.</strong> This is the one people miss. If there are 400 dependency
+          records for one operation, each 2ms, that's an <strong>N+1</strong> — and no percentile on
+          <code>requests</code> would reveal it, because nothing is individually slow. I'd find it by summarising
+          dependency count per <code>operation_Id</code>."</p>
+        <p>"For a specific slow request I'd use the <strong>end-to-end transaction view</strong>, or the KQL
+          equivalent — a <code>union</code> across requests, dependencies, exceptions and traces filtered by
+          <code>operation_Id</code>. That gives the full waterfall in order, including across services if
+          it's distributed. That's the distributed stack trace you don't otherwise have."</p>
+        <p>"If the dependencies don't account for the time, then it's <strong>in-process</strong> — CPU work,
+          serialisation, or contention. I'd check the runtime metrics for thread pool starvation and GC pressure,
+          both of which produce latency that doesn't appear in any dependency. Thread pool starvation from sync-over-async
+          is a classic cause of exactly this pattern: nothing slow, everything queued."</p>
+        <p>"I'd also check <strong>whether it's always slow or only sometimes</strong>, because the causes differ.
+          Intermittent points at cold start, a specific instance, lock contention, or
+          <a href="../10-sql/performance.html#parameter-sniffing">parameter sniffing</a> in SQL. Consistently
+          slow points at the code path itself."</p>
+        <p>"And I'd scope it by dimension — <strong>is it one tenant or everyone?</strong> Which is only answerable
+          if telemetry was enriched with tenant id, and is the reason to do that early. One tenant being slow
+          usually means their data volume exposed a missing index."</p>
+        <p>"One caveat on the data: if <strong>sampling</strong> is on, a specific request may not have been
+          captured. Sampling is consistent per operation so the ones I do have are complete, but I can't
+          necessarily find one particular user's request from an hour ago. Worth knowing before concluding the
+          telemetry is broken."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you use percentiles rather than averages?</li>
+        <li>Do you go to the dependencies table?</li>
+        <li>Do you know how to spot N+1 in telemetry?</li>
+        <li>Do you consider in-process causes when dependencies don't explain it?</li>
+        <li>Do you scope by tenant, and know sampling affects what you can find?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add more logging" as the first step.</li>
+        <li><span class="redflag">Red flag:</span> looking only at average duration.</li>
+        <li><span class="redflag">Red flag:</span> no mention of dependencies.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Write the KQL for that.</li>
+          <li>How would you confirm thread pool starvation?</li>
+          <li>What if the slow dependency is a third-party API?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Your Application Insights bill is larger than your compute bill. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That's common and entirely fixable. App Insights is billed <strong>per GB ingested</strong>, so this is
+          a volume problem — and I'd find out what's generating the volume before changing anything."</p>
+        <p>"There's a KQL query for it: group by <code>itemType</code> to see the split between traces,
+          dependencies, requests and exceptions, and then break down the largest category. Usually one thing
+          dominates, and it's usually <code>traces</code>."</p>
+        <p>"Then, in order of impact and how safe each is:"</p>
+        <p>"<strong>Log levels.</strong> The most common cause is <code>Information</code> level for
+          <code>Microsoft.*</code> and <code>System.*</code> categories — EF Core logs every query, ASP.NET Core
+          logs routing details. Setting framework categories to <code>Warning</code> while keeping your own at
+          <code>Information</code> often removes most of the volume immediately, and loses almost nothing you'd
+          actually read."</p>
+        <p>"<strong>Filter obvious noise.</strong> Health-check requests firing every few seconds from the load
+          balancer, and any successful high-frequency polling endpoint. A telemetry processor drops these
+          <em>client-side</em>, so you don't even pay to transmit them."</p>
+        <p>"<strong>Sampling.</strong> The main lever. And the important property is that App Insights sampling is
+          <strong>consistent per <code>operation_Id</code></strong> — it hashes the trace id, so if a request is
+          sampled in, all its dependencies, traces and exceptions come with it. You get <em>complete</em> traces
+          for a subset of operations rather than fragments of everything."</p>
+        <p>"So I'd sample successful requests aggressively — 10 or 20% is usually plenty for diagnosing patterns —
+          and <strong>exclude exceptions from sampling entirely</strong>. Failures are rare and individually
+          valuable; successes are numerous and interchangeable. 'Sample success heavily, keep every exception' is
+          the rule."</p>
+        <p>"The trade to state honestly: <strong>I lose the ability to find one specific request</strong> from an
+          hour ago. For diagnosing patterns that's fine; for investigating a named customer's specific complaint
+          it's a real loss. And <strong>counts become approximate</strong> — App Insights scales by
+          <code>itemCount</code> so aggregates stay roughly right, but exact counts and rare-event detection get
+          unreliable."</p>
+        <p>"<strong>Stop logging request and response bodies</strong> if that's happening. It's expensive and it's
+          a data-protection problem — telemetry is typically readable by more people than the database."</p>
+        <p>"For longer-term control: a <strong>daily cap</strong> as a financial safety net, set
+          <em>well above</em> normal volume with an alert as it's approached. I'd be explicit that a cap is not a
+          cost strategy — once it triggers, telemetry stops for the rest of the day, so you're blind exactly when
+          something unusual is happening. A cap set close to normal usage means undiagnosable incidents."</p>
+        <p>"And I'd consider <strong>retention</strong>: the default is 90 days, and shorter retention costs less.
+          If nobody queries beyond 30 days, that's a straightforward saving, with an export to cheaper storage if
+          there's a compliance reason to keep it."</p>
+        <p>"The framing I'd bring: <strong>observability has a price, and the goal isn't minimum cost — it's the
+          right information at a defensible cost.</strong> Cutting telemetry until incidents become
+          undiagnosable is a false economy that shows up as longer outages instead of a smaller bill."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you measure what's generating volume first?</li>
+        <li>Do you know log levels are usually the biggest win?</li>
+        <li>Do you know sampling is consistent per operation?</li>
+        <li>Do you keep exceptions out of sampling?</li>
+        <li>Do you know a cap blinds you when it fires?</li>
+        <li>Do you frame it as value versus cost, not minimising cost?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "turn off logging."</li>
+        <li><span class="redflag">Red flag:</span> setting a tight daily cap as the solution.</li>
+        <li><span class="redflag">Red flag:</span> sampling everything uniformly, including exceptions.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What sampling rate would you pick, and how would you validate it?</li>
+          <li>How do you keep exceptions unsampled?</li>
+          <li>What would you export for long-term retention?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

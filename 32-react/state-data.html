@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>State Management &amp; Data Fetching — React</title>
+<meta name="description" content="Server state versus client state, React Query, when Redux is justified, forms with React Hook Form, and routing.">
+<meta name="keywords" content="React state management server state client state TanStack React Query caching stale-while-revalidate optimistic update Redux Toolkit Zustand Context React Hook Form Zod React Router loader">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="32-react/state-data.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>State Management &amp; Data Fetching</h1>
+    <p class="subtitle">The most practically valuable page in this section. One distinction eliminates most
+      state-management complexity.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Server state and client state are different problems.</strong> Conflating them causes most
+        state-management pain.</li>
+      <li><strong>Server state belongs in React Query</strong> — it's a cache, not application state.</li>
+      <li><strong>Most apps then need very little global client state.</strong></li>
+      <li><strong>Start with <code>useState</code>, lift when shared</strong>, reach for a store only when
+        that's genuinely awkward.</li>
+      <li><strong>Context is for low-frequency values</strong> — theme, user, locale.</li>
+      <li><strong>React Hook Form</strong> for forms; uncontrolled by default, so fewer re-renders.</li>
+      <li><strong>Validate with Zod</strong> — TypeScript types don't exist at runtime.</li>
+    </ul>
+  </div>
+
+  <h2 id="the-distinction">Server state vs client state <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The distinction that solves most of this</span>
+    <p><strong>Server state</strong> is data you don't own. It lives in a database, other people change it, and
+      your copy is a <em>cache</em> that can go stale.</p>
+    <p><strong>Client state</strong> is data you do own. A modal being open, a form's current values, which tab
+      is selected. Nobody else can change it and it doesn't exist anywhere else.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Server state</th><th>Client state</th></tr></thead>
+      <tbody>
+        <tr><td>Owned by</td><td><strong>The server</strong></td><td>The browser session</td></tr>
+        <tr><td>Can go stale</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Needs loading/error states</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Needs caching, refetch, invalidation</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Shared between users</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Belongs in</td><td><strong>React Query</strong></td><td><code>useState</code>, or a small store</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Why putting server data in Redux was a mistake</div>
+    <p style="margin:0">A generic store has no concept of staleness. So every feature had to hand-write: a
+      loading flag, an error field, a "have we fetched this yet?" check, cache invalidation on mutation, refetch
+      on window focus, request deduplication, and retry logic.
+      <br><br>
+      That's hundreds of lines of near-identical boilerplate per feature — actions, reducers, thunks, selectors —
+      reimplementing a cache badly.
+      <br><br>
+      <strong>React Query does all of it as a library concern.</strong> Once server data moves there, what's left
+      as genuine global client state is usually tiny: the current user, a theme, maybe a sidebar toggle. Which is
+      why "do we need Redux?" is now usually answered "probably not".
+      <br><br>
+      This shift is the single most useful thing to understand about modern React state management, and it's why
+      older tutorials feel so much heavier than current practice.</p>
+  </div>
+
+  <h2 id="react-query">React Query <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="tsx — what you get for four lines" class="code-good"><code class="language-tsx">function OrderList({ customerId }: { customerId: string }) {
+  const { data, isPending, isError, error, refetch } = useQuery({
+    queryKey: ['orders', customerId],          // identity of this cached data
+    queryFn: ({ signal }) =&gt; fetchOrders(customerId, signal),
+    staleTime: 30_000                          // fresh for 30s; no refetch
+  });
+
+  if (isPending) return &lt;Skeleton /&gt;;
+  if (isError)   return &lt;Error message={error.message} onRetry={refetch} /&gt;;
+
+  return &lt;ul&gt;{data.map(o =&gt; &lt;li key={o.id}&gt;{o.reference}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>You get, without writing it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Caching</strong> keyed by <code>queryKey</code> — two components asking for the same data share one request</td></tr>
+        <tr><td><strong>Deduplication</strong> — simultaneous identical requests become one</td></tr>
+        <tr><td><strong>Stale-while-revalidate</strong> — show cached data instantly, refresh in the background</td></tr>
+        <tr><td><strong>Refetch on window focus and reconnect</strong></td></tr>
+        <tr><td><strong>Retry with backoff</strong> on failure</td></tr>
+        <tr><td><strong>Request cancellation</strong> via the <code>signal</code></td></tr>
+        <tr><td><strong>Loading, error and pending states</strong></td></tr>
+        <tr><td><strong>Garbage collection</strong> of unused cache entries</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The <code>queryKey</code> is the whole design</div>
+    <p style="margin:0">The key <em>is</em> the cache identity. <code>['orders', customerId]</code> means each
+      customer's orders are cached separately, and changing <code>customerId</code> automatically fetches the new
+      set — no effect, no manual refetch.
+      <br><br>
+      It's also how invalidation works: after a mutation,
+      <code>invalidateQueries({ queryKey: ['orders'] })</code> marks every orders query stale, so any mounted
+      component refetches. Hierarchical keys make that precise — invalidate all orders, or just one customer's.
+      <br><br>
+      Getting keys right is most of using React Query well. Include every value the query depends on, in a
+      consistent order.</p>
+  </div>
+
+  <pre data-label="tsx — mutations with invalidation" class="code-good"><code class="language-tsx">const queryClient = useQueryClient();
+
+const { mutate, isPending } = useMutation({
+  mutationFn: (order: NewOrder) =&gt; createOrder(order),
+  onSuccess: () =&gt; {
+    // Anything cached under ['orders'] is now stale - refetch it
+    queryClient.invalidateQueries({ queryKey: ['orders'] });
+  }
+});</code></pre>
+
+  <pre data-label="tsx — optimistic update with rollback" class="code-good"><code class="language-tsx">const { mutate } = useMutation({
+  mutationFn: toggleDone,
+
+  onMutate: async (id) =&gt; {
+    await queryClient.cancelQueries({ queryKey: ['todos'] });
+    const previous = queryClient.getQueryData&lt;Todo[]&gt;(['todos']);
+
+    // Update the UI immediately, before the server responds
+    queryClient.setQueryData&lt;Todo[]&gt;(['todos'], old =&gt;
+      old?.map(t =&gt; t.id === id ? { ...t, done: !t.done } : t));
+
+    return { previous };                    // context for rollback
+  },
+
+  onError: (_err, _id, context) =&gt; {
+    queryClient.setQueryData(['todos'], context?.previous);   // roll back
+  },
+
+  onSettled: () =&gt; {
+    queryClient.invalidateQueries({ queryKey: ['todos'] });   // reconcile
+  }
+});</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — optimistic updates need all three handlers</div>
+    <p style="margin:0">The pattern is only correct with the full set: <code>onMutate</code> applies the change
+      and <strong>captures the previous state</strong>, <code>onError</code> restores it, and
+      <code>onSettled</code> invalidates so the cache reconciles with whatever the server actually did.
+      <br><br>
+      Skipping the rollback means a failed mutation leaves the UI showing a change that didn't happen — worse
+      than no optimism, because the user believes it succeeded.
+      <br><br>
+      Skipping <code>cancelQueries</code> means an in-flight refetch can land after your optimistic write and
+      overwrite it, so the change appears to revert briefly.
+      <br><br>
+      Worth being calibrated about when to use it: optimistic updates suit <strong>high-confidence, low-stakes,
+      easily-reversible</strong> actions — toggling a checkbox, liking something. Not for a payment, where showing
+      success before confirmation is actively dangerous.</p>
+  </div>
+
+  <h2 id="client-state">Choosing a client state approach <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Escalate only when you have to</span>
+    <ol>
+      <li><strong><code>useState</code> in the component</strong> — the default. Most state is local.</li>
+      <li><strong>Lift to the nearest common parent</strong> when siblings need it.</li>
+      <li><strong><code>useReducer</code></strong> when several fields change together with real
+        transitions.</li>
+      <li><strong>Context</strong> for genuinely global, low-frequency values.</li>
+      <li><strong>A store (Zustand)</strong> when context re-renders become a problem or the state is
+        complex.</li>
+      <li><strong>Redux Toolkit</strong> for large applications needing strict conventions and time-travel
+        debugging.</li>
+    </ol>
+    <p>Most applications should stop at step 4.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>Strength</th><th>Weakness</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>useState</code></strong></td><td>Simplest; colocated with use</td><td>Prop drilling if shared widely</td></tr>
+        <tr><td><strong><code>useReducer</code></strong></td><td>Explicit transitions, testable</td><td>More ceremony</td></tr>
+        <tr><td><strong>Context</strong></td><td>No library; no prop drilling</td><td><strong>Re-renders all consumers</strong></td></tr>
+        <tr><td><strong>Zustand</strong></td><td>Tiny; selector-based subscriptions</td><td>Less structure than Redux</td></tr>
+        <tr><td><strong>Redux Toolkit</strong></td><td>Conventions, devtools, middleware</td><td>Most boilerplate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="tsx — Zustand: selectors avoid the context problem" class="code-good"><code class="language-tsx">const useCartStore = create&lt;CartState&gt;((set) =&gt; ({
+  items: [],
+  add: (item) =&gt; set(s =&gt; ({ items: [...s.items, item] })),
+  clear: () =&gt; set({ items: [] })
+}));
+
+// This component re-renders ONLY when the count changes,
+// not when any other part of the store does.
+function CartBadge() {
+  const count = useCartStore(s =&gt; s.items.length);
+  return &lt;span&gt;{count}&lt;/span&gt;;
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why a store beats context for frequently-changing state</div>
+    <p style="margin:0">Context has no selector mechanism. Any change to the context value re-renders
+      <strong>every</strong> consumer, whether or not it uses the field that changed. So a cart context also
+      holding the user means a cart update re-renders everything reading the user.
+      <br><br>
+      A store like Zustand subscribes per-selector. <code>useCartStore(s =&gt; s.items.length)</code> only
+      re-renders when that derived value changes, so adding an item doesn't disturb unrelated components.
+      <br><br>
+      That's the concrete technical reason to reach for a store, and it's a better answer than "context doesn't
+      scale". Context is excellent for what it's designed for — <strong>low-frequency, widely-read</strong>
+      values like theme, locale and current user, where the re-render cost is irrelevant because it happens
+      rarely.</p>
+  </div>
+
+  <h2 id="forms">Forms <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="tsx — React Hook Form with Zod" class="code-good"><code class="language-tsx">const schema = z.object({
+  reference: z.string().min(1, 'Required').max(20),
+  email:     z.string().email('Invalid email'),
+  quantity:  z.coerce.number().int().min(1)
+});
+
+type FormValues = z.infer&lt;typeof schema&gt;;    // types derived from the schema
+
+function OrderForm() {
+  const { register, handleSubmit, formState: { errors, isSubmitting } } =
+    useForm&lt;FormValues&gt;({ resolver: zodResolver(schema) });
+
+  return (
+    &lt;form onSubmit={handleSubmit(save)}&gt;
+      &lt;label htmlFor="reference"&gt;Reference&lt;/label&gt;
+      &lt;input id="reference" {...register('reference')}
+             aria-invalid={!!errors.reference}
+             aria-describedby="reference-error" /&gt;
+      {errors.reference &amp;&amp;
+        &lt;p id="reference-error" role="alert"&gt;{errors.reference.message}&lt;/p&gt;}
+
+      &lt;button disabled={isSubmitting}&gt;Save&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Controlled (<code>useState</code> per field)</th><th>React Hook Form</th></tr></thead>
+      <tbody>
+        <tr><td>Re-renders</td><td><strong>Every keystroke re-renders the form</strong></td><td>Uncontrolled — minimal re-renders</td></tr>
+        <tr><td>Boilerplate</td><td>A state and handler per field</td><td><code>register</code> per field</td></tr>
+        <tr><td>Validation</td><td>Hand-written</td><td>Schema-based via a resolver</td></tr>
+        <tr><td>Best for</td><td>One or two fields</td><td><strong>Anything real</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Zod earns its place because TypeScript doesn't exist at runtime</div>
+    <p style="margin:0">A TypeScript type is <strong>erased at compile time</strong>. Declaring an API response
+      as <code>Order</code> guarantees nothing about what the server sent — if it sends something different,
+      TypeScript is content and your code fails later with a confusing error.
+      <br><br>
+      Zod validates at runtime <em>and</em> derives the TypeScript type from the same schema via
+      <code>z.infer</code>. So there's one definition, and the type is guaranteed to match what was actually
+      validated.
+      <br><br>
+      That makes it valuable at every trust boundary — form input, API responses, <code>localStorage</code>, URL
+      parameters. Same principle as
+      <a href="../07-aspnet-core/apis.html">validating incoming models server-side</a>: never trust a declared
+      type across a boundary.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Client validation is still not security</div>
+    <p style="margin:0">A Zod schema in the browser is trivially bypassed — DevTools, a direct API call, a
+      modified bundle.
+      <br><br>
+      So the same schema logic must run <strong>server-side</strong>. Sharing the schema between client and
+      server is genuinely valuable when both are TypeScript; with a .NET backend you're maintaining the rules
+      twice, which is a real cost worth acknowledging.
+      <br><br>
+      Client validation exists so the user gets immediate feedback.
+      <a href="../07-aspnet-core/apis.html">Server validation</a> is what protects the system.</p>
+  </div>
+
+  <h2 id="routing">Routing <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Code splitting</strong></td><td><code>lazy()</code> plus <code>Suspense</code>, per route</td></tr>
+        <tr><td><strong>Protected routes</strong></td><td>A wrapper component that redirects — <strong>UX, not security</strong></td></tr>
+        <tr><td><strong>Data loading</strong></td><td>React Query in the component, or a router loader</td></tr>
+        <tr><td><strong>URL as state</strong></td><td>Search params for filters, so links are shareable</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — put filter state in the URL</div>
+    <p style="margin:0">A filtered, sorted, paginated list stored in <code>useState</code> means the user can't
+      bookmark it, can't share it, loses it on refresh, and the back button doesn't work as they expect.
+      <br><br>
+      Putting it in search parameters — <code>?status=open&amp;page=2&amp;sort=date</code> — makes the URL the
+      source of truth. It's shareable, refresh-safe, back-button-correct, and it pairs naturally with React
+      Query because the params become part of the <code>queryKey</code>.
+      <br><br>
+      It also removes a piece of state you'd otherwise have to manage and synchronise.
+      <br><br>
+      That's a design instinct interviewers notice, because it shows you think about the user's actual
+      behaviour rather than just component structure.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Server state is a cache; client state is owned. Separating them removes most complexity.</li>
+      <li>React Query gives caching, deduplication, revalidation, retries and cancellation for free.</li>
+      <li>The <code>queryKey</code> is the cache identity and the invalidation handle.</li>
+      <li>Optimistic updates need <code>onMutate</code>, <code>onError</code> rollback and
+        <code>onSettled</code>.</li>
+      <li>Escalate state: <code>useState</code> → lift → <code>useReducer</code> → context → store. Most stop
+        at context.</li>
+      <li>Context re-renders every consumer; a store subscribes per selector.</li>
+      <li>React Hook Form is uncontrolled, so typing doesn't re-render the form.</li>
+      <li>Zod validates at runtime and derives the type — TypeScript types are erased.</li>
+      <li>Client validation is UX; the server enforces.</li>
+      <li>Filter and pagination state belongs in the URL.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Server data in Redux</strong>, hand-writing cache logic.</li>
+    <li><strong>Reaching for Redux by default</strong> before trying local state.</li>
+    <li><strong>One large context</strong> for unrelated concerns.</li>
+    <li><strong>Unmemoised context values.</strong></li>
+    <li><strong>Controlled inputs with a <code>useState</code> per field</strong> on a large form.</li>
+    <li><strong>Trusting TypeScript types for API responses.</strong></li>
+    <li><strong>Optimistic updates without rollback.</strong></li>
+    <li><strong>Optimistic updates on payments</strong> or other irreversible actions.</li>
+    <li><strong>Filter state in component state</strong> rather than the URL.</li>
+    <li><strong>Duplicating server state into local state</strong>, so the two drift.</li>
+    <li><strong>Route guards treated as authorisation.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How do you manage state in a React application? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The first thing I'd do is <strong>separate server state from client state</strong>, because conflating
+          them is what makes state management feel hard."</p>
+        <p>"<strong>Server state</strong> is data I don't own — it lives in a database, other people change it,
+          and my copy is a cache that can go stale. It needs loading and error states, caching, refetching and
+          invalidation."</p>
+        <p>"<strong>Client state</strong> is data I own — is this modal open, which tab is selected, what's in
+          this form. Nobody else can change it and it doesn't exist anywhere else."</p>
+        <p>"Server state goes in <strong>React Query</strong>. That's the single highest-value decision, because
+          a generic store has no concept of staleness — so putting fetched data in Redux means hand-writing a
+          loading flag, an error field, cache invalidation, refetch-on-focus, deduplication and retry logic for
+          every feature. That's hundreds of lines of near-identical boilerplate reimplementing a cache badly.
+          React Query does all of it as a library concern."</p>
+        <p>"Once server data moves there, <strong>what's left as global client state is usually tiny</strong> —
+          the current user, a theme, maybe a sidebar toggle. Which is why 'do we need Redux?' is now normally
+          answered 'probably not'."</p>
+        <p>"For the client state that remains, I'd escalate only as needed. <code>useState</code> in the
+          component by default, since most state is genuinely local. Lift it to the nearest common parent when
+          siblings need it. <code>useReducer</code> when several fields change together with real state
+          transitions — that's more testable and makes invalid combinations harder. <strong>Context</strong> for
+          genuinely global low-frequency values."</p>
+        <p>"I'd reach for a <strong>store</strong> when context becomes a performance problem, and I'd be
+          specific about why: context has no selector mechanism, so any change to the value re-renders every
+          consumer regardless of which field they read. A store like Zustand subscribes per selector, so
+          <code>useCartStore(s =&gt; s.items.length)</code> only re-renders when that derived value changes."</p>
+        <p>"<strong>Redux Toolkit</strong> I'd justify by team and scale rather than technology — a large
+          codebase with many contributors benefits from enforced conventions and the devtools time-travel
+          debugging. It's not wrong, it's just more machinery than most applications need now that server state
+          is handled elsewhere."</p>
+        <p>"Two other things I'd mention. <strong>URL as state</strong> for filters, sorting and pagination — it
+          makes links shareable, survives refresh, makes the back button behave, and the params become part of
+          the React Query key naturally. And <strong>don't copy server state into local state</strong>, because
+          then you have two sources of truth that drift; derive from the query result instead."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you lead with the server/client distinction?</li>
+        <li>Do you know what React Query replaces and why?</li>
+        <li>Do you escalate rather than defaulting to Redux?</li>
+        <li>Do you know the technical reason context struggles?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "Redux" as the immediate answer.</li>
+        <li><span class="redflag">Red flag:</span> no distinction between cached server data and owned
+          state.</li>
+        <li><span class="redflag">Red flag:</span> "context doesn't scale" with no mechanism.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does React Query know when to refetch?</li>
+          <li>When would Redux genuinely be the right call?</li>
+          <li>How do you handle an optimistic update?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Implement an optimistic update. What can go wrong? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"An optimistic update applies the change to the UI <strong>before</strong> the server confirms it, so
+          the interaction feels instant. With React Query that's three handlers on the mutation, and all three
+          are necessary."</p>
+        <p>"<strong><code>onMutate</code></strong> runs before the request. It cancels any in-flight refetch for
+          that key, <strong>captures the current cached value</strong>, then writes the optimistic change into
+          the cache and returns the previous value as context."</p>
+        <p>"<strong><code>onError</code></strong> restores that captured value — the rollback."</p>
+        <p>"<strong><code>onSettled</code></strong> invalidates the query so the cache reconciles with whatever
+          the server actually did, on both success and failure."</p>
+        <p>"Now what goes wrong."</p>
+        <p>"<strong>No rollback.</strong> The most common omission. A failed mutation leaves the UI showing a
+          change that never happened — which is worse than no optimism, because the user believes it
+          succeeded and moves on."</p>
+        <p>"<strong>Not cancelling in-flight queries.</strong> If a refetch is already running, it can land
+          <em>after</em> your optimistic write and overwrite it with server data that doesn't include the change.
+          The user sees their change appear and then revert, which looks like a random glitch. That's what
+          <code>cancelQueries</code> prevents."</p>
+        <p>"<strong>Assuming the server produces the same result.</strong> If the server assigns an id, a
+          timestamp, or applies business rules — a discount, a status transition — the optimistic value won't
+          match. So the <code>onSettled</code> invalidation isn't optional; it's what reconciles the guess with
+          reality. For a created item that means a temporary id in the cache that gets replaced, and any code
+          keyed on that id has to tolerate it changing."</p>
+        <p>"<strong>Concurrent mutations.</strong> Two rapid toggles both capture 'previous' state, and if one
+          fails the rollback can restore a value that's already stale, undoing the other change. React Query's
+          <code>cancelQueries</code> plus invalidation handles most of this, but for genuinely
+          high-frequency mutations I'd consider serialising them or debouncing."</p>
+        <p>"Then the judgement call, which is the more important part: <strong>optimism is only appropriate for
+          high-confidence, low-stakes, easily-reversible actions.</strong> Toggling a checkbox, liking a post,
+          reordering a list — where failure is rare and the correction is unremarkable."</p>
+        <p>"<strong>Never for a payment, an order submission, or anything irreversible.</strong> Showing 'payment
+          successful' before the server confirms is actively harmful — the user leaves believing they've paid.
+          There, a pending state is correct even though it feels slower."</p>
+        <p>"And it interacts with the <a href="../08-http-web-apis/reliability.html#idempotency-keys">idempotency
+          question</a>: if the mutation is retried after an ambiguous timeout, the server needs an idempotency
+          key so the retry doesn't create a duplicate. Optimistic UI plus automatic retry without idempotency is
+          how you get two orders from one click."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know all three handlers and why each is needed?</li>
+        <li>Do you know about cancelling in-flight refetches?</li>
+        <li>Do you know the server may produce a different result?</li>
+        <li>Do you know when optimism is inappropriate?</li>
+        <li>Do you connect retries to idempotency?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> no rollback.</li>
+        <li><span class="redflag">Red flag:</span> applying it to payments.</li>
+        <li><span class="redflag">Red flag:</span> no reconciliation with the server result.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle the temporary id for a created item?</li>
+          <li>What if two mutations race?</li>
+          <li>How would you show a failure to the user gracefully?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

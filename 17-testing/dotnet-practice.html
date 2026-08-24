@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing in .NET — Testing</title>
+<meta name="description" content="xUnit mechanics, Moq and NSubstitute, async pitfalls, WebApplicationFactory, Testcontainers, and testing EF Core against a real database.">
+<meta name="keywords" content="xUnit NUnit MSTest theory inlinedata fixture Moq NSubstitute FluentAssertions async test pitfalls WebApplicationFactory integration test Testcontainers EF Core in-memory provider sqlite respawn HttpMessageHandler">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="17-testing/dotnet-practice.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Testing in .NET</h1>
+    <p class="subtitle">The tooling is good. The traps are the in-memory provider, async misuse, and integration
+      tests that share state.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>xUnit creates a new class instance per test</strong> — that's your isolation.</li>
+      <li><strong><code>[Theory]</code> with <code>[InlineData]</code></strong> for the same behaviour across
+        inputs.</li>
+      <li><strong>Never <code>async void</code> in a test</strong> — failures are silently swallowed.</li>
+      <li><strong>Don't use EF Core's in-memory provider</strong> to test queries.</li>
+      <li><strong><code>WebApplicationFactory</code></strong> for real end-to-end API tests in-process.</li>
+      <li><strong>Testcontainers</strong> for a real database in CI, per test run.</li>
+      <li><strong>Reset state between integration tests</strong>, or they interfere.</li>
+    </ul>
+  </div>
+
+  <h2 id="frameworks">The frameworks <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>xUnit</th><th>NUnit</th><th>MSTest</th></tr></thead>
+      <tbody>
+        <tr><td>Test attribute</td><td><code>[Fact]</code> / <code>[Theory]</code></td><td><code>[Test]</code> / <code>[TestCase]</code></td><td><code>[TestMethod]</code></td></tr>
+        <tr><td>Setup</td><td><strong>Constructor</strong></td><td><code>[SetUp]</code></td><td><code>[TestInitialize]</code></td></tr>
+        <tr><td>Teardown</td><td><code>IDisposable</code> / <code>IAsyncDisposable</code></td><td><code>[TearDown]</code></td><td><code>[TestCleanup]</code></td></tr>
+        <tr><td>Instance per test</td><td><strong>Yes — enforced</strong></td><td>Configurable</td><td>Yes</td></tr>
+        <tr><td>Parallelism</td><td><strong>By default, across classes</strong></td><td>Opt in</td><td>Opt in</td></tr>
+        <tr><td>Ecosystem default</td><td><strong>Most common for new .NET</strong></td><td>Common in older codebases</td><td>Less common now</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Why xUnit's design nudges you toward better tests</div>
+    <p style="margin:0">xUnit constructs a <strong>new instance of the test class for every test</strong>, and has
+      no <code>[SetUp]</code> attribute — you use the constructor.
+      <br><br>
+      That's a deliberate constraint: it makes <strong>shared mutable state between tests structurally
+      awkward</strong>, which is the main cause of order-dependent, intermittently-failing suites.
+      <br><br>
+      It also runs test classes in parallel by default, so tests that quietly depended on shared state fail
+      immediately rather than after six months of growth.
+      <br><br>
+      When you genuinely need expensive shared setup — a database container, a
+      <code>WebApplicationFactory</code> — that's an explicit <code>IClassFixture</code> or
+      <code>ICollectionFixture</code>, so sharing is a visible decision rather than the default.</p>
+  </div>
+
+  <pre data-label="csharp — theory: same behaviour, many inputs" class="code-good"><code class="language-csharp">[Theory]
+[InlineData(999, 999)]        // below threshold - no discount
+[InlineData(1000, 1000)]      // at the boundary - no discount
+[InlineData(1001, 950.95)]    // just above - 5% applies
+[InlineData(5000, 4750)]
+public void Volume_discount_applies_above_1000(decimal subtotal, decimal expected)
+{
+    new StandardDiscount().Apply(Money.Of(subtotal)).Amount
+        .Should().Be(expected);
+}
+
+// MemberData for cases you can't express as constants
+[Theory]
+[MemberData(nameof(ExpiryCases))]
+public void Expiry_is_calculated_correctly(DateTime start, int days, DateTime expected) { }
+
+public static TheoryData&lt;DateTime, int, DateTime&gt; ExpiryCases =&gt; new()
+{
+    { new DateTime(2024, 1, 31), 1, new DateTime(2024, 2, 1) },
+    { new DateTime(2024, 2, 28), 1, new DateTime(2024, 2, 29) },   // leap year
+    { new DateTime(2024, 12, 31), 1, new DateTime(2025, 1, 1) }
+};</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Theories are where boundary conditions belong</div>
+    <p style="margin:0">The value isn't avoiding duplication — it's that a theory <strong>makes the boundary
+      explicit and visible</strong>.
+      <br><br>
+      Writing 999, 1000 and 1001 as three cases documents where the threshold is and proves which side it falls
+      on. That's exactly the off-by-one that ships, and a single test with one representative value doesn't catch
+      it.
+      <br><br>
+      Same for dates: month ends, leap years, year boundaries. Those are the cases that break in production, and
+      they're trivial to add as theory rows.
+      <br><br>
+      One caution: <strong>keep the test body logic-free</strong>. If a theory needs an <code>if</code> to handle
+      different cases, it's really two tests wearing one name.</p>
+  </div>
+
+  <h2 id="mocking-libs">Moq and NSubstitute <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — the same thing, both libraries"><code class="language-csharp">// Moq
+var repo = new Mock&lt;IOrderRepository&gt;();
+repo.Setup(r =&gt; r.GetAsync(orderId, It.IsAny&lt;CancellationToken&gt;()))
+    .ReturnsAsync(order);
+var sut = new OrderService(repo.Object);       // note .Object
+
+// NSubstitute - no .Object, reads more naturally
+var repo = Substitute.For&lt;IOrderRepository&gt;();
+repo.GetAsync(orderId, Arg.Any&lt;CancellationToken&gt;()).Returns(order);
+var sut = new OrderService(repo);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Detail</th><th>Moq</th><th>NSubstitute</th></tr></thead>
+      <tbody>
+        <tr><td>Syntax</td><td>Lambda-based, <code>.Object</code> everywhere</td><td><strong>Cleaner</strong> — the substitute <em>is</em> the interface</td></tr>
+        <tr><td>Argument matchers</td><td><code>It.IsAny&lt;T&gt;()</code></td><td><code>Arg.Any&lt;T&gt;()</code></td></tr>
+        <tr><td>Verification</td><td><code>Verify(...)</code></td><td><code>Received()</code></td></tr>
+        <tr><td>Strict by default</td><td>No — unstubbed calls return defaults</td><td>No</td></tr>
+        <tr><td>Ubiquity</td><td><strong>Most common</strong></td><td>Growing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Loose mocking hides bugs, and it's the default</div>
+    <p style="margin:0">By default both libraries return <code>default</code> for anything you didn't stub — so an
+      unstubbed method returning a reference type gives <code>null</code>.
+      <br><br>
+      That's convenient and it means <strong>a test can pass while silently exercising a null path</strong> you
+      never intended. You stub two of five methods, the other three return null, and the code under test happens
+      not to dereference them today. Then a refactor makes it dereference one, and the test fails for a reason
+      that looks unrelated.
+      <br><br>
+      <code>MockBehavior.Strict</code> throws on any unstubbed call, which surfaces this — at the cost of tests
+      that break whenever the code calls something new, even harmlessly.
+      <br><br>
+      My preference is loose mocking plus <strong>fewer mocks overall</strong>. If you're stubbing five methods on
+      one dependency, the more useful signal is that the test is over-mocked — a
+      <a href="fundamentals.html#doubles">fake</a> would be clearer and wouldn't have null holes.</p>
+  </div>
+
+  <h2 id="async">Async testing pitfalls <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the failure that passes silently" class="code-bad"><code class="language-csharp">[Fact]
+public async void Order_is_saved()          // async VOID
+{
+    await _sut.PlaceAsync(order);
+    Assert.True(false);                     // this test PASSES
+}
+// The test runner cannot await async void. The exception is raised on a
+// different context, after the test has already been reported as passed.
+// Worst case: it crashes the test host with no attribution.</code></pre>
+
+  <pre data-label="csharp — async Task" class="code-good"><code class="language-csharp">[Fact]
+public async Task Order_is_saved()          // async Task - awaited properly
+{
+    await _sut.PlaceAsync(order);
+    (await _db.Orders.SingleAsync()).Should().NotBeNull();
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mistake</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>async void</code> test</strong></td><td><strong>Failures silently pass.</strong> The worst bug in a test suite</td></tr>
+        <tr><td><code>.Result</code> or <code>.Wait()</code></td><td>Can deadlock; wraps exceptions in <code>AggregateException</code></td></tr>
+        <tr><td>Not awaiting inside the test</td><td>The assertion runs before the work completes</td></tr>
+        <tr><td>Asserting on an unawaited task</td><td>Tests the task object, not the result</td></tr>
+        <tr><td><code>Thread.Sleep</code> to "wait for" async work</td><td>Slow and flaky — use <code>TimeProvider</code> or a proper wait</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title"><code>async void</code> is the most dangerous mistake in a test suite</div>
+    <p style="margin:0">Everything else on this page makes tests worse. This one makes them <strong>lie</strong>.
+      <br><br>
+      An <code>async void</code> test cannot be awaited by the runner, so the runner reports it as passed the
+      moment it hits the first <code>await</code>. Any assertion after that point — and any exception — happens
+      after the result was recorded.
+      <br><br>
+      So you can have a suite of green tests that assert nothing, and nobody notices because green is green.
+      <br><br>
+      <strong>Enable the analyser</strong>: xUnit1001 flags this, and it should be an error rather than a warning.
+      It's one of the few analyser rules that catches a correctness problem in the tests themselves.
+      <br><br>
+      Related: an <code>async void</code> <em>event handler</em> in production code has the same
+      unobservable-exception problem, which is why it's only acceptable at genuine event-handler boundaries.</p>
+  </div>
+
+  <pre data-label="csharp — asserting that something throws" class="code-good"><code class="language-csharp">// The async overload matters - the sync one won't observe the exception
+var act = async () =&gt; await _sut.PlaceAsync(invalidOrder);
+
+await act.Should().ThrowAsync&lt;ValidationException&gt;()
+         .WithMessage("*quantity*");
+
+// xUnit's built-in equivalent
+await Assert.ThrowsAsync&lt;ValidationException&gt;(() =&gt; _sut.PlaceAsync(invalidOrder));</code></pre>
+
+  <h2 id="ef-testing">Testing EF Core <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="note danger">
+    <div class="note-title">Don't use the in-memory provider to test queries</div>
+    <p style="margin:0">It's the most common .NET testing mistake, because it's convenient and Microsoft's own
+      docs now advise against it.
+      <br><br>
+      The in-memory provider is <strong>not a relational database</strong>. It has no SQL, so:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>It doesn't enforce constraints</strong> — unique indexes, foreign keys, required columns,
+        max lengths. So a test passes and production throws a constraint violation.</li>
+      <li><strong>It doesn't translate LINQ.</strong> Queries that cannot be translated to SQL run happily in
+        memory — so your test passes and the real query throws
+        <code>InvalidOperationException</code> at runtime.</li>
+      <li><strong>Case sensitivity, collation and null ordering differ</strong>, so string comparisons and
+        <code>ORDER BY</code> behave differently.</li>
+      <li><strong>No transactions, no concurrency tokens</strong> behaving realistically.</li>
+      <li><strong>Migrations aren't exercised</strong> at all.</li>
+    </ul>
+    <p style="margin:8px 0 0">The result is a suite that's green while the application is broken —
+      <a href="index.html#what-for">a false negative</a>, which is precisely what tests exist to prevent.
+      <br><br>
+      <strong>Use a real database.</strong> Testcontainers makes it straightforward, and SQLite is a middle
+      option — closer to real SQL, still not identical to SQL Server on collation, date handling or schema
+      features.</p>
+  </div>
+
+  <pre data-label="csharp — a real database per test run, via Testcontainers" class="code-good"><code class="language-csharp">public sealed class DatabaseFixture : IAsyncLifetime
+{
+    private readonly MsSqlContainer _container = new MsSqlBuilder()
+        .WithImage("mcr.microsoft.com/mssql/server:2022-latest")
+        .Build();
+
+    public string ConnectionString =&gt; _container.GetConnectionString();
+
+    public async Task InitializeAsync()
+    {
+        await _container.StartAsync();
+
+        // Run the REAL migrations - so migrations are tested too
+        await using var db = new AppDbContext(
+            new DbContextOptionsBuilder&lt;AppDbContext&gt;()
+                .UseSqlServer(ConnectionString).Options);
+        await db.Database.MigrateAsync();
+    }
+
+    public Task DisposeAsync() =&gt; _container.DisposeAsync().AsTask();
+}
+
+// One container shared across a collection - starting it is the expensive part
+[CollectionDefinition(nameof(DatabaseCollection))]
+public sealed class DatabaseCollection : ICollectionFixture&lt;DatabaseFixture&gt; { }</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — running real migrations is the underrated benefit</div>
+    <p style="margin:0">Calling <code>MigrateAsync()</code> in the fixture rather than
+      <code>EnsureCreated()</code> means <strong>every test run exercises your migration chain against a real
+      database engine</strong>.
+      <br><br>
+      That catches a class of failure nothing else does: a migration that fails on a real provider, two migrations
+      that conflict, a migration that works on an empty database and breaks with data present, or a model that has
+      drifted from the migrations so the schema doesn't match the code.
+      <br><br>
+      Migration failures are among the worst production incidents because they happen <em>during deployment</em> —
+      so the application is already down and the rollback is a database operation. Catching them in CI is
+      disproportionately valuable.
+      <br><br>
+      <code>EnsureCreated()</code> builds the schema from the model and bypasses migrations entirely, so it
+      specifically doesn't test the thing that breaks.</p>
+  </div>
+
+  <pre data-label="csharp — resetting state between tests" class="code-good"><code class="language-csharp">// Respawn deletes all data while preserving the schema - much faster than
+// recreating the database, and it respects foreign-key order automatically.
+public sealed class IntegrationTestBase : IAsyncLifetime
+{
+    private static Respawner? _respawner;
+    protected AppDbContext Db = null!;
+
+    public async Task InitializeAsync()
+    {
+        _respawner ??= await Respawner.CreateAsync(_connectionString, new RespawnerOptions
+        {
+            TablesToIgnore = ["__EFMigrationsHistory"],
+            DbAdapter = DbAdapter.SqlServer
+        });
+
+        await _respawner.ResetAsync(_connectionString);   // clean slate per test
+        Db = CreateContext();
+    }
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Shared state is what makes integration suites flaky</div>
+    <p style="margin:0">Integration tests share a database, so without isolation they interfere: one test's data
+      makes another's count assertion wrong, and failures become <strong>order-dependent</strong> — passing
+      locally, failing in CI where the order differs.
+      <br><br>
+      Three options, in order of preference. <strong>Respawn between tests</strong> — deletes data, keeps schema,
+      fast, and handles foreign-key ordering for you. <strong>A transaction per test, rolled back</strong> — very
+      fast, and it breaks if the code under test manages its own transactions, which is common. <strong>A
+      database per test</strong> — perfect isolation, far too slow.
+      <br><br>
+      And be careful with <strong>parallelism</strong>: xUnit runs collections in parallel by default, so tests in
+      different collections sharing one database will interfere. Either put all database tests in one collection
+      (serialising them) or give each collection its own database.
+      <br><br>
+      That's a real trade — serialising integration tests makes them slower, and it's usually the right choice over
+      intermittent failures nobody can reproduce.</p>
+  </div>
+
+  <h2 id="webapplicationfactory">Testing the whole API <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — in-process, real pipeline, real DI" class="code-good"><code class="language-csharp">public sealed class ApiFactory : WebApplicationFactory&lt;Program&gt;
+{
+    private readonly string _connectionString;
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.UseEnvironment("Testing");
+
+        builder.ConfigureTestServices(services =&gt;
+        {
+            // Point at the test database
+            services.RemoveAll&lt;DbContextOptions&lt;AppDbContext&gt;&gt;();
+            services.AddDbContext&lt;AppDbContext&gt;(o =&gt; o.UseSqlServer(_connectionString));
+
+            // Replace ONLY genuine external boundaries
+            services.RemoveAll&lt;IPaymentGateway&gt;();
+            services.AddSingleton&lt;IPaymentGateway, FakePaymentGateway&gt;();
+
+            services.RemoveAll&lt;IEmailSender&gt;();
+            services.AddSingleton&lt;IEmailSender, RecordingEmailSender&gt;();
+
+            // Bypass auth so tests don't need real tokens
+            services.AddAuthentication("Test")
+                    .AddScheme&lt;AuthenticationSchemeOptions, TestAuthHandler&gt;("Test", _ =&gt; { });
+        });
+    }
+}
+
+[Fact]
+public async Task Posting_a_valid_order_returns_201_and_persists_it()
+{
+    var client = _factory.CreateClient();
+
+    var response = await client.PostAsJsonAsync("/api/orders",
+        new { customerId = _customerId, lines = new[] { new { sku = "KB-01", qty = 2 } } });
+
+    response.StatusCode.Should().Be(HttpStatusCode.Created);
+
+    // Real routing, model binding, validation, filters, EF Core, SQL, serialisation
+    var saved = await _db.Orders.SingleAsync();
+    saved.Status.Should().Be(OrderStatus.Placed);
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this is the highest value-per-test in .NET</div>
+    <p style="margin:0"><code>WebApplicationFactory</code> starts your <strong>actual application</strong>
+      in-process — real <code>Program.cs</code>, real middleware pipeline, real DI container, real model binding,
+      real filters, real serialisation — and gives you an <code>HttpClient</code> that talks to it without a
+      network hop.
+      <br><br>
+      So one test covers routing, binding, validation, authorisation, the handler, EF Core, real SQL and JSON
+      serialisation. That's the entire class of integration failure that mocked unit tests cannot catch — a missing
+      DI registration, a JSON property name mismatch, a filter not applied, a query that won't translate.
+      <br><br>
+      And it's fast, because there's no network and no process start.
+      <br><br>
+      The discipline that matters: <strong>replace only genuine external boundaries.</strong> Payment gateway,
+      email, third-party APIs — yes. Your own services, the database, the DI container — no, because replacing
+      those is exactly what stops the test catching integration problems. The temptation is to stub more and more
+      until it's a unit test with extra ceremony.
+      <br><br>
+      If I could have only one kind of test in a .NET API, it would be this.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Testing outbound HTTP calls</div>
+    <pre data-label="csharp"><code class="language-csharp">// Don't mock HttpClient. Substitute the handler - you keep real HTTP semantics.
+public sealed class StubHandler(HttpStatusCode code, string body) : HttpMessageHandler
+{
+    protected override Task&lt;HttpResponseMessage&gt; SendAsync(
+        HttpRequestMessage request, CancellationToken ct) =&gt;
+        Task.FromResult(new HttpResponseMessage(code)
+        {
+            Content = new StringContent(body, Encoding.UTF8, "application/json")
+        });
+}
+
+services.AddHttpClient&lt;PricingClient&gt;()
+        .ConfigurePrimaryHttpMessageHandler(() =&gt; new StubHandler(HttpStatusCode.OK, json));</code></pre>
+    <p style="margin:0">This tests your real client code — serialisation, status handling, retry policies,
+      <code>EnsureSuccessStatusCode</code> — against a controlled response.
+      <br><br>
+      Mocking <code>HttpClient</code> itself skips all of that and bakes in assumptions about a class you don't
+      own. For richer scenarios, WireMock.Net gives you a real local HTTP server with request matching and
+      verification.</p>
+  </div>
+
+  <h2 id="assertions">Assertions <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — readability and failure messages"><code class="language-csharp">// Built-in xUnit
+Assert.Equal(OrderStatus.Placed, order.Status);
+// Failure: "Assert.Equal() Failure: Expected: Placed, Actual: Draft"
+
+// FluentAssertions - reads as a sentence, richer failures
+order.Status.Should().Be(OrderStatus.Placed, "because a valid order is placed immediately");
+
+order.Lines.Should().HaveCount(2)
+     .And.OnlyContain(l =&gt; l.Quantity &gt; 0);
+
+// Object graph comparison, ignoring generated values
+actual.Should().BeEquivalentTo(expected, o =&gt; o.Excluding(x =&gt; x.Id)
+                                              .Excluding(x =&gt; x.CreatedUtc));</code></pre>
+
+  <div class="note info">
+    <div class="note-title">A licensing note worth knowing</div>
+    <p style="margin:0">FluentAssertions changed to a commercial licence from version 8 for
+      non-open-source use. Version 7 remains free under the old terms.
+      <br><br>
+      So for a new commercial project the realistic options are: stay on version 7, pay, use
+      <strong>Shouldly</strong>, or use xUnit's built-in assertions with
+      <code>Assert.Multiple</code>. <strong>AwesomeAssertions</strong> is a community fork of the version 7
+      API.
+      <br><br>
+      Worth mentioning because it's recent and a lot of existing material assumes FluentAssertions is simply free —
+      and it's the kind of thing that surfaces during a licence audit rather than at adoption.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>xUnit's instance-per-test and default parallelism make shared state structurally awkward — that's a
+        feature.</li>
+      <li>Use theories for boundary conditions; keep the body logic-free.</li>
+      <li><strong><code>async void</code> tests silently pass.</strong> Enable xUnit1001 as an error.</li>
+      <li>Loose mocking returns nulls for unstubbed calls — a sign you're over-mocking.</li>
+      <li><strong>Don't test queries against EF Core's in-memory provider</strong> — no constraints, no SQL
+        translation.</li>
+      <li>Testcontainers gives a real database in CI; run real <code>MigrateAsync</code> so migrations are
+        tested.</li>
+      <li>Reset state between integration tests with Respawn, and mind xUnit parallelism.</li>
+      <li><code>WebApplicationFactory</code> is the highest value-per-test in .NET — replace only external
+        boundaries.</li>
+      <li>Test outbound HTTP by substituting <code>HttpMessageHandler</code>, not by mocking
+        <code>HttpClient</code>.</li>
+      <li>FluentAssertions v8 is commercially licensed; v7, Shouldly or built-ins are the alternatives.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>async void</code> tests</strong> that pass regardless of assertions.</li>
+    <li><strong><code>.Result</code> or <code>.Wait()</code></strong> instead of awaiting.</li>
+    <li><strong>EF Core in-memory provider</strong> for query or constraint testing.</li>
+    <li><strong><code>EnsureCreated</code> instead of <code>MigrateAsync</code></strong>, so migrations are never
+      exercised.</li>
+    <li><strong>No state reset</strong> between integration tests, causing order-dependent failures.</li>
+    <li><strong>Parallel collections sharing one database.</strong></li>
+    <li><strong>Stubbing your own services in <code>WebApplicationFactory</code></strong>, defeating the
+      point.</li>
+    <li><strong>Mocking <code>HttpClient</code></strong> rather than the handler.</li>
+    <li><strong>Five <code>Setup</code> calls on one mock</strong> — use a fake instead.</li>
+    <li><strong><code>Thread.Sleep</code></strong> to wait for async work.</li>
+    <li><strong>Logic inside a theory body.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How would you test a service that uses EF Core? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd use a <strong>real database</strong>, via Testcontainers — and I'd start by explaining why not the
+          in-memory provider, because that's the common answer and it's actively harmful."</p>
+        <p>"<strong>The in-memory provider isn't a relational database.</strong> There's no SQL underneath, so it
+          doesn't enforce unique indexes, foreign keys, required columns or max lengths — a test passes and
+          production throws a constraint violation. And it doesn't translate LINQ, so a query that cannot be
+          translated to SQL runs happily in memory and then throws
+          <code>InvalidOperationException</code> at runtime against the real provider."</p>
+        <p>"So it produces the worst kind of test: <strong>green while the application is broken</strong>. That's
+          a false negative, which is precisely what tests exist to prevent. Microsoft's own guidance now advises
+          against it for this reason."</p>
+        <p>"With Testcontainers I start a real SQL Server in Docker for the test run. One container shared across
+          a test collection, since starting it is the expensive part — a few seconds once, not per test."</p>
+        <p>"The detail I'd highlight: <strong>run <code>MigrateAsync()</code> rather than
+          <code>EnsureCreated()</code></strong>. That means every test run exercises the real migration chain
+          against a real engine — so it catches a migration that fails on the real provider, two migrations that
+          conflict, or a model that's drifted from the migrations. Migration failures are among the worst
+          production incidents because they happen <em>during deployment</em>, so the app is already down.
+          <code>EnsureCreated</code> builds the schema from the model and bypasses migrations entirely, so it
+          specifically doesn't test the thing that breaks."</p>
+        <p>"For <strong>isolation between tests</strong> I'd use Respawn — it deletes all data while keeping the
+          schema, respects foreign-key ordering, and is much faster than recreating the database. Without a reset,
+          one test's data breaks another's count assertion and failures become order-dependent: passing locally,
+          failing in CI."</p>
+        <p>"A transaction per test rolled back is faster still, and it breaks if the code under test manages its
+          own transactions — which is common — so I'd default to Respawn."</p>
+        <p>"And I'd be careful with <strong>xUnit parallelism</strong>: collections run in parallel by default, so
+          database tests in different collections will interfere. Either put them all in one collection, which
+          serialises them, or give each collection its own database. Serialising is slower and better than
+          intermittent failures nobody can reproduce."</p>
+        <p>"Where SQLite fits: it's a reasonable middle option — real SQL, real constraints, in-memory and fast —
+          and it isn't SQL Server. Collation, date handling, and some schema features differ, so it catches more
+          than the in-memory provider and less than the real thing. I'd use it if Docker weren't available in
+          CI."</p>
+        <p>"For anything above the repository, I'd go further and use <strong><code>WebApplicationFactory</code>
+          with the real database</strong> — that covers routing, binding, validation, DI, EF Core, SQL and
+          serialisation in one test, which is the whole class of failure that mocked unit tests can't reach."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reject the in-memory provider, with specific reasons?</li>
+        <li>Do you know Testcontainers?</li>
+        <li>Do you run real migrations?</li>
+        <li>Do you handle state isolation and parallelism?</li>
+        <li>Do you know where SQLite sits?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "use the in-memory provider."</li>
+        <li><span class="redflag">Red flag:</span> mocking <code>DbSet</code> or <code>DbContext</code>.</li>
+        <li><span class="redflag">Red flag:</span> no mention of resetting state.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you keep that fast enough for CI?</li>
+          <li>How would you test a concurrency token?</li>
+          <li>What about testing a raw SQL query?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How would you write an integration test for an ASP.NET Core API? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong><code>WebApplicationFactory&lt;Program&gt;</code></strong> with a real database from
+          Testcontainers. I'd argue that's the highest value-per-test available in .NET."</p>
+        <p>"It starts the <strong>actual application in-process</strong> — real <code>Program.cs</code>, real
+          middleware pipeline, real DI container, real model binding, real filters, real serialisation — and gives
+          me an <code>HttpClient</code> that talks to it with no network hop."</p>
+        <p>"So one test exercises routing, binding, validation, authorisation, the handler, EF Core, real SQL and
+          JSON serialisation. That's exactly the class of failure a mocked unit test cannot catch: a missing DI
+          registration, a JSON property name mismatch, a filter not applied, a query that won't translate to
+          SQL, a migration that fails. And it's fast, because there's no process start and no network."</p>
+        <p>"The important discipline is <strong>replacing only genuine external boundaries</strong>. The payment
+          gateway, the email sender, third-party HTTP APIs — those get fakes, and I'd use a
+          <em>recording</em> fake for email so I can assert what would have been sent. But <strong>not</strong> my
+          own services, <strong>not</strong> the database, <strong>not</strong> the DI container — replacing those
+          is precisely what stops the test catching integration problems."</p>
+        <p>"There's a real temptation to keep stubbing until the test is easy, and at that point it's a unit test
+          with extra ceremony and none of the value."</p>
+        <p>"For <strong>authentication</strong> I'd register a test authentication handler so tests don't need real
+          tokens, with a way to vary the claims per test — because authorisation logic is exactly the thing worth
+          testing here, and I want to assert that a user without a role gets 403 rather than bypassing auth
+          entirely."</p>
+        <p>"For <strong>configuration</strong>, <code>UseEnvironment("Testing")</code> plus
+          <code>ConfigureTestServices</code>, which runs <em>after</em> the app's own registrations so my
+          replacements win. Using <code>ConfigureServices</code> instead is a common mistake — the app's
+          registrations run after and overwrite yours."</p>
+        <p>"State isolation as before: Respawn between tests, and all database tests in one xUnit collection so
+          they don't run in parallel against a shared database."</p>
+        <p>"I'd assert on <strong>both the response and the persisted state</strong> — status code, response body
+          shape, and then query the database to confirm what was actually written. Checking only the status code
+          misses a handler that returns 201 without saving."</p>
+        <p>"What I'd <em>not</em> do is push everything to this level. These are slower than unit tests, so I'd
+          use them for the <strong>main path through each endpoint plus its important failure cases</strong> —
+          validation rejection, not found, unauthorised, conflict — and keep detailed branch coverage of
+          calculations in fast unit tests where they belong."</p>
+        <p>"One practical caveat: <code>WebApplicationFactory</code> requires the app's
+          <code>Program.cs</code> to be reachable, which with top-level statements means either making the
+          assembly's internals visible to the test project or having a partial <code>Program</code> class. That's
+          a small friction people hit on first setup."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>WebApplicationFactory</code> runs the real pipeline?</li>
+        <li>Do you replace only external boundaries?</li>
+        <li>Do you know <code>ConfigureTestServices</code> vs <code>ConfigureServices</code>?</li>
+        <li>Do you test authorisation rather than bypassing it?</li>
+        <li>Do you assert on persisted state, not just the status code?</li>
+        <li>Are you deliberate about what belongs at this level?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> stubbing the database and internal services.</li>
+        <li><span class="redflag">Red flag:</span> asserting only on the status code.</li>
+        <li><span class="redflag">Red flag:</span> proposing to test everything at this level.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you test a 401 versus a 403?</li>
+          <li>How do you keep the suite under a few minutes?</li>
+          <li>How would you test a background service?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

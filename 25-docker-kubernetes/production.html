@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Containers in Production</title>
+<meta name="description" content="Requests and limits, probes, graceful shutdown, .NET runtime behaviour inside containers, rollouts, cost and how to debug when there is no shell.">
+<meta name="keywords" content="Kubernetes resource requests limits QoS classes OOMKilled CPU throttling readiness liveness startup probe PodDisruptionBudget graceful shutdown SIGTERM preStop .NET GC in containers Server GC thread pool kubectl debug spot nodes cost">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="25-docker-kubernetes/production.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Containers in Production</h1>
+    <p class="subtitle">Where the interesting failures live. Most of them come from four numbers and two probes
+      being wrong.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Requests decide scheduling; limits decide what happens under pressure.</strong></li>
+      <li><strong>Memory limit exceeded = killed. CPU limit exceeded = throttled.</strong></li>
+      <li><strong>Set memory request = limit.</strong> Memory is incompressible.</li>
+      <li><strong>Readiness removes traffic; liveness restarts; startup protects slow boots.</strong></li>
+      <li><strong>Never check a shared dependency in a liveness probe.</strong></li>
+      <li><strong>Handle SIGTERM</strong> and add a <code>preStop</code> delay, or you drop requests on every
+        deploy.</li>
+      <li><strong>.NET sizes the GC heap from the container limit.</strong></li>
+      <li><strong>No shell in the image?</strong> <code>kubectl debug</code> brings one.</li>
+    </ul>
+  </div>
+
+  <h2 id="resources">Requests, limits and QoS <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Request</th><th>Limit</th></tr></thead>
+      <tbody>
+        <tr><td>Used by</td><td><strong>The scheduler</strong></td><td><strong>The kernel, at runtime</strong></td></tr>
+        <tr><td>Means</td><td>Reserved for this container</td><td>A hard ceiling</td></tr>
+        <tr><td>Exceeding it — CPU</td><td>Allowed to burst if the node has spare</td><td><strong>Throttled</strong></td></tr>
+        <tr><td>Exceeding it — memory</td><td>Allowed if the node has spare</td><td><strong>OOM-killed immediately</strong></td></tr>
+        <tr><td>Affects</td><td><strong>Which node, and node capacity accounting</strong></td><td>Behaviour under pressure and eviction order</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>QoS class</th><th>When</th><th>Eviction order under node pressure</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Guaranteed</strong></td><td>Requests equal limits for CPU <em>and</em> memory</td><td><strong>Last</strong></td></tr>
+        <tr><td><strong>Burstable</strong></td><td>Requests set, limits higher or absent</td><td>Middle</td></tr>
+        <tr><td><strong>BestEffort</strong></td><td><strong>Nothing set</strong></td><td><strong>First — evicted immediately</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Memory and CPU need opposite treatment</div>
+    <p style="margin:0">They behave differently under pressure, and configuring them the same way is the underlying
+      mistake.
+      <br><br>
+      <strong>Memory is incompressible.</strong> A process either has the memory it needs or it dies — there's no
+      degraded mode. So overcommitting memory means an OOM kill rather than a slowdown. <strong>Set request equal to
+      limit</strong>: the scheduler reserves what the container can actually use, and the pod gets a better QoS class
+      so it isn't the first thing evicted when the node runs short.
+      <br><br>
+      <strong>CPU is compressible.</strong> A process short of CPU runs slower, which is a perfectly acceptable
+      degraded mode. So <strong>set a request and consider omitting the limit</strong> — then a burst uses spare node
+      capacity instead of being throttled while the node sits idle.
+      <br><br>
+      CPU throttling is worth understanding because it's counterintuitive: the limit is enforced per 100ms period,
+      so a container at its limit is <em>paused</em> for the rest of each period. For a request that needs a short
+      burst of work, that turns a 20ms operation into 100ms+ of wall-clock latency — while <code>kubectl top</code>
+      reports modest average CPU. Latency that doesn't correlate with visible CPU usage is the signature, and
+      <code>container_cpu_cfs_throttled_seconds_total</code> is the metric that confirms it.
+      <br><br>
+      The counterargument for setting CPU limits is predictability and preventing one noisy pod monopolising a node.
+      That's legitimate on shared clusters — but then the limit needs to be generous, not equal to the request.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Nothing set is the worst option</div>
+    <p style="margin:0">A pod with no requests is <strong>BestEffort</strong>: the scheduler assumes it needs
+      nothing, so it packs it onto any node, and it's <strong>the first thing evicted</strong> when that node comes
+      under memory pressure.
+      <br><br>
+      Worse, it distorts the whole cluster. The scheduler's view of node capacity is built from requests, so
+      unrequested pods make nodes <em>look</em> free when they're not. The result is nodes that appear to have
+      headroom and are actually overloaded — and the cluster autoscaler won't add capacity, because by its
+      accounting there's plenty.
+      <br><br>
+      Then everything on that node degrades together, and the pod that gets killed is often not the one causing the
+      problem.
+      <br><br>
+      A <strong>LimitRange</strong> per namespace applies defaults so an unspecified pod still gets sensible numbers,
+      and a <strong>ResourceQuota</strong> caps the namespace total. Both are worth having — they make the good
+      configuration the default rather than something every team must remember.</p>
+  </div>
+
+  <h2 id="probes">Probes <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Probe</th><th>On failure</th><th>Should check</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Startup</strong></td>
+          <td>Keeps waiting; <strong>suspends the other probes</strong> until it passes</td>
+          <td>Has the app finished booting?</td>
+        </tr>
+        <tr>
+          <td><strong>Readiness</strong></td>
+          <td><strong>Removed from Service endpoints.</strong> Container keeps running</td>
+          <td>Can this instance serve traffic right now?</td>
+        </tr>
+        <tr>
+          <td><strong>Liveness</strong></td>
+          <td><strong>Container is restarted</strong></td>
+          <td>Only what a restart could fix — deadlock, corrupted state</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — health checks that respect the distinction" class="code-good"><code class="language-csharp">builder.Services.AddHealthChecks()
+    // Liveness: is THIS PROCESS functioning? No dependencies.
+    .AddCheck("self", () =&gt; HealthCheckResult.Healthy(), tags: ["live"])
+
+    // Readiness: can this instance serve requests? Dependencies allowed.
+    .AddNpgSql(connectionString, name: "db",    tags: ["ready"])
+    .AddRedis(redisConnection,   name: "cache", tags: ["ready"],
+              failureStatus: HealthStatus.Degraded);   // cache down != cannot serve
+
+var app = builder.Build();
+
+// Liveness - never touches the database
+app.MapHealthChecks("/health/live", new HealthCheckOptions
+{
+    Predicate = r =&gt; r.Tags.Contains("live")
+});
+
+// Readiness - Degraded still returns 200, so a soft dependency
+// does not remove the pod from load balancing
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = r =&gt; r.Tags.Contains("ready"),
+    ResultStatusCodes =
+    {
+        [HealthStatus.Healthy]   = StatusCodes.Status200OK,
+        [HealthStatus.Degraded]  = StatusCodes.Status200OK,
+        [HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable
+    }
+});</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">A liveness probe that checks the database causes the outage it was meant to prevent</div>
+    <p style="margin:0">This is the most damaging probe mistake, and it's common because it looks thorough.
+      <br><br>
+      If liveness checks the database, then a 30-second database blip fails liveness on
+      <strong>every pod simultaneously</strong>. Kubernetes restarts them all. Now you have a full outage, a
+      thundering herd of reconnections when the database recovers, and a cold cache — from a transient issue that
+      would have resolved itself.
+      <br><br>
+      <strong>Liveness must only check what a restart could fix.</strong> A restart doesn't fix the database. So the
+      liveness endpoint should confirm the process is responsive and nothing more.
+      <br><br>
+      Readiness <em>may</em> check dependencies, because removing a pod from load balancing is reversible and
+      harmless. But even there, be careful: if every pod's readiness fails at once, the Service has no endpoints and
+      you're returning errors anyway — you've just chosen a different failure mode.
+      <br><br>
+      Which is why the <strong>Degraded</strong> status above matters. Redis being unavailable usually means slower
+      responses, not an inability to serve — so it maps to 200 and the pod stays in rotation. Distinguishing hard
+      from soft dependencies in the health check is a genuinely senior detail.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Startup probes exist because slow boots get killed</div>
+    <p style="margin:0">A .NET app doing JIT warm-up, migrations, or loading a large cache can take 30+ seconds to
+      be useful. If the liveness probe starts checking immediately with a 3-failure threshold, it kills the container
+      <em>during startup</em> — every time, forever.
+      <br><br>
+      The result is a permanent <code>CrashLoopBackOff</code> that looks like a broken application and is a broken
+      probe.
+      <br><br>
+      Tuning <code>initialDelaySeconds</code> is the old workaround and it's a bad trade: set it long enough for the
+      worst-case boot and you've also delayed detection of a genuine hang by that long.
+      <br><br>
+      <strong><code>startupProbe</code></strong> solves it properly. It gets a generous window —
+      <code>failureThreshold × periodSeconds</code> — and <em>liveness doesn't run at all</em> until it passes. So
+      slow starts are tolerated and, once running, liveness reacts quickly. Long window for boot, short window for
+      hangs, no compromise.</p>
+  </div>
+
+  <h2 id="shutdown">Graceful shutdown <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — what happens when a pod is deleted"><code class="language-text">  t=0    Pod marked Terminating
+         TWO THINGS START IN PARALLEL:
+           (a) removal from Service endpoints  -- takes time to propagate
+           (b) preStop hook, then SIGTERM to the container
+
+  t=0..n  Endpoint removal propagates to every kube-proxy / ingress.
+          UNTIL IT DOES, NEW REQUESTS STILL ARRIVE.
+
+  SIGTERM  app should: stop accepting new work, finish in-flight, close cleanly
+
+  t=30s   terminationGracePeriodSeconds elapsed -> SIGKILL. No cleanup.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the race is why you need a <code>preStop</code> sleep</div>
+    <p style="margin:0">Endpoint removal and SIGTERM happen <strong>concurrently</strong>, not in sequence. So there's
+      a window where the pod has been told to shut down but the load balancer is still sending it traffic.
+      <br><br>
+      That window is small — usually a second or two — and it produces exactly the symptom teams report:
+      <strong>a handful of 502s on every deployment</strong>, too few to be obviously broken and consistent enough to
+      be annoying.
+      <br><br>
+      A <code>preStop</code> hook that simply sleeps for a few seconds fixes it. The pod keeps serving normally
+      during the sleep while endpoint removal propagates, and only then does the application receive SIGTERM.
+      <br><br>
+      <strong>Sleeping is the correct implementation</strong>, which feels wrong and isn't. There's no signal that
+      says "endpoint removal is complete", so waiting a fixed short period is the mechanism Kubernetes gives you.
+      <br><br>
+      On the application side, .NET handles SIGTERM through <code>IHostApplicationLifetime</code> automatically:
+      Kestrel stops accepting connections and waits for in-flight requests up to the shutdown timeout. The default
+      timeout is 30 seconds and worth setting explicitly — it must be
+      <strong>shorter than <code>terminationGracePeriodSeconds</code></strong>, or the kernel kills the process
+      mid-request while it's still politely draining.</p>
+  </div>
+
+  <pre data-label="yaml — the shutdown-related settings" class="code-good"><code class="language-yaml">spec:
+  terminationGracePeriodSeconds: 45      # must exceed app shutdown timeout + preStop
+  containers:
+    - name: api
+      lifecycle:
+        preStop:
+          exec:
+            command: ["/bin/sleep", "5"]  # let endpoint removal propagate
+      env:
+        # Kestrel drains for up to 30s; 30 + 5 preStop < 45 grace period
+        - name: HOSTOPTIONS__SHUTDOWNTIMEOUT
+          value: "00:00:30"
+---
+# Stop a node drain taking every replica at once
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: orders-api }
+spec:
+  minAvailable: 2                        # NOT equal to replicas - see the note
+  selector:
+    matchLabels: { app: orders-api }</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">A PodDisruptionBudget that's too strict blocks drains forever</div>
+    <p style="margin:0">A PDB tells Kubernetes the minimum that must stay available during
+      <em>voluntary</em> disruption — a node drain, a cluster upgrade, the autoscaler removing a node.
+      <br><br>
+      Without one, a drain can evict every replica of a service simultaneously and you get an outage during a routine
+      upgrade.
+      <br><br>
+      With <code>minAvailable</code> set equal to <code>replicas</code>, nothing can ever be evicted. The drain
+      <strong>hangs indefinitely</strong>, the cluster upgrade stalls, and the autoscaler can't remove empty nodes so
+      you keep paying for them. That's its own incident, and a confusing one because everything looks healthy.
+      <br><br>
+      So <code>minAvailable</code> must leave slack — 2 of 3, or a percentage. And note a PDB protects against
+      voluntary disruption only: a node failing hard takes its pods regardless, which is what
+      <strong>topology spread constraints</strong> across zones are for.</p>
+  </div>
+
+  <h2 id="dotnet">.NET inside a container <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Behaviour</th><th>What to know</th></tr></thead>
+      <tbody>
+        <tr><td><strong>GC heap sizing</strong></td><td><strong>Derived from the container memory limit</strong>, not the host</td></tr>
+        <tr><td><strong>Server GC</strong></td><td>Default for ASP.NET Core. Per-core heaps, holds more memory</td></tr>
+        <tr><td><strong>Thread pool sizing</strong></td><td>Based on visible cores, which respects CPU limits in modern .NET</td></tr>
+        <tr><td><strong><code>DOTNET_GCHeapHardLimitPercent</code></strong></td><td>Cap heap as a share of the limit, leaving room for non-GC memory</td></tr>
+        <tr><td><strong>Startup</strong></td><td>ReadyToRun helps; AOT helps more with constraints</td></tr>
+        <tr><td>Certificates</td><td>Chiseled images include CA certs; some minimal bases don't</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the memory limit changes runtime behaviour, not just the kill threshold</div>
+    <p style="margin:0">.NET reads the container's memory limit and sizes its GC heap from it. So the limit is
+      <strong>an input to the runtime</strong>, not merely a boundary the kernel enforces.
+      <br><br>
+      Set it too tight and the GC runs far more aggressively to stay inside — burning CPU, adding pause time, and
+      possibly still being killed. Which produces a genuinely confusing profile: high CPU, poor latency, and memory
+      that looks fine because the GC is working hard to keep it that way.
+      <br><br>
+      Raising the memory limit can therefore <em>reduce</em> CPU usage. That's the counterintuitive result worth
+      knowing.
+      <br><br>
+      <strong>Server GC</strong> is another consideration. It's the ASP.NET Core default and tuned for throughput:
+      one heap per core, and it holds memory rather than returning it. In a container with a 256Mi limit and 16
+      visible cores that's a poor fit. Either switch to Workstation GC, or keep Server GC with
+      <code>DOTNET_GCConserveMemory</code> / <code>GCHeapCount</code> tuned. It's a real trade — Workstation is more
+      memory-efficient and somewhat lower throughput — so measure rather than assume.
+      <br><br>
+      Also leave <strong>headroom below the limit</strong>: the GC heap isn't the only memory the process uses.
+      Native allocations, thread stacks and the runtime itself all count against the cgroup limit, so a heap limit at
+      100% of the container limit will still get OOM-killed.
+      <br><br>
+      Being able to explain that .NET is container-aware — and how — is a strong signal, because most candidates
+      treat the limit as purely a ceiling.</p>
+  </div>
+
+  <h2 id="debugging">Debugging in production <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="bash — when there's no shell in the image"><code class="language-bash"># Ephemeral debug container sharing the target's namespaces.
+# Gives you a shell and tooling next to a chiseled/distroless image.
+kubectl debug -it orders-api-7d4f-x2n \
+  --image=mcr.microsoft.com/dotnet/sdk:9.0 \
+  --target=api
+
+# Inside it, the .NET diagnostic tools work against the target process:
+dotnet-counters monitor -p 1                  # GC, thread pool, request rate, live
+dotnet-stack report   -p 1                    # all thread stacks - finds deadlocks
+dotnet-gcdump collect -p 1                    # heap contents for leak hunting
+dotnet-trace collect  -p 1 --profile cpu-sampling
+
+# Copy a pod with a debug-friendly command, leaving the original running
+kubectl debug orders-api-7d4f-x2n --copy-to=debug-pod --container=api -- sleep infinity
+
+# Pull an artefact out
+kubectl cp orders-api-7d4f-x2n:/tmp/dump.gcdump ./dump.gcdump</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">This is what makes minimal images practical</div>
+    <p style="margin:0">The usual objection to chiseled or distroless images is "how do I debug it with no shell?"
+      The answer is that you <strong>bring the tooling when you need it</strong> rather than shipping it
+      permanently.
+      <br><br>
+      <code>kubectl debug</code> attaches an ephemeral container in the pod's namespaces, so it sees the same
+      network, the same process tree, and (with <code>--target</code>) can attach diagnostics to the running
+      process. The debug container disappears afterwards; the image stays minimal.
+      <br><br>
+      For .NET the payoff is real: <code>dotnet-counters</code> for live GC and thread-pool statistics,
+      <code>dotnet-stack</code> for a full thread dump — which is how you identify a deadlock or thread-pool
+      starvation — and <code>dotnet-gcdump</code> for what's actually on the heap.
+      <br><br>
+      <strong>Thread pool starvation</strong> is worth knowing by its signature: rising queue length with low CPU,
+      requests queuing behind blocked threads. Almost always sync-over-async — a <code>.Result</code> or
+      <code>.Wait()</code> on a hot path. <code>dotnet-counters</code> shows it directly, and it's very hard to
+      diagnose from logs alone.
+      <br><br>
+      The prerequisite: <strong>set this up before you need it.</strong> RBAC must permit
+      <code>pods/ephemeralcontainers</code>, and the first time you use it shouldn't be during an incident.</p>
+  </div>
+
+  <h2 id="cost">Cost <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lever</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Right-size requests from observed usage</strong></td><td><strong>Usually the largest single saving</strong></td></tr>
+        <tr><td>Cluster autoscaler with a sensible minimum</td><td>Removes idle nodes</td></tr>
+        <tr><td><strong>Spot node pools for interruptible work</strong></td><td>Large discount; can be evicted at any time</td></tr>
+        <tr><td>Reserved instances or savings plans</td><td>Discount for committed baseline capacity</td></tr>
+        <tr><td><strong>KEDA scale-to-zero</strong></td><td>Idle consumers cost nothing</td></tr>
+        <tr><td>Fewer, larger nodes</td><td>Less per-node system overhead — with a bigger blast radius</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Over-requesting is the usual cost problem</div>
+    <p style="margin:0">Because the scheduler allocates on <em>requests</em>, a cluster where every pod requests
+      four times what it uses looks full at 25% real utilisation. The autoscaler dutifully adds nodes nobody
+      needs.
+      <br><br>
+      So the highest-value cost exercise is comparing <code>kubectl top</code> — or better, p95 usage over a couple
+      of weeks — against the declared requests, and closing the gap. It's common to find a
+      <strong>2–4× over-allocation</strong> and reclaim it with no code change and no risk to capacity.
+      <br><br>
+      The Vertical Pod Autoscaler can recommend values based on observed usage, which is a good input even if you
+      don't let it apply them automatically.
+      <br><br>
+      Two cautions. Don't right-size down to <em>average</em> usage — requests need to cover normal peaks, or you're
+      trading cost for latency. And on <strong>spot nodes</strong>, the discount is real but eviction is arbitrary
+      and can take a whole node pool at once, so they suit batch, CI and stateless workloads with plenty of
+      replicas — not your only API pool.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Requests drive scheduling; limits drive runtime behaviour under pressure.</li>
+      <li>Memory: request = limit, because memory is incompressible.</li>
+      <li>CPU: set a request, consider omitting the limit; throttling is per-100ms.</li>
+      <li>Nothing set is worst — BestEffort, evicted first, and it distorts scheduling.</li>
+      <li>LimitRange and ResourceQuota make good defaults structural.</li>
+      <li>Startup protects slow boots; readiness removes traffic; liveness restarts.</li>
+      <li>Never check a shared dependency in liveness.</li>
+      <li>Map Degraded to 200 so soft dependencies don't drop the pod.</li>
+      <li>Endpoint removal races SIGTERM — a <code>preStop</code> sleep is the fix.</li>
+      <li>App shutdown timeout must be shorter than the grace period.</li>
+      <li>PDB with slack; <code>minAvailable</code> = replicas blocks drains forever.</li>
+      <li>.NET sizes the GC heap from the container limit — leave headroom.</li>
+      <li><code>kubectl debug</code> plus <code>dotnet-counters</code>/<code>-stack</code>/<code>-gcdump</code>.</li>
+      <li>Right-sizing requests is usually the biggest cost win.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No requests or limits at all</strong>, giving BestEffort QoS.</li>
+    <li><strong>Memory request below the limit</strong>, so nodes are overcommitted.</li>
+    <li><strong>A tight CPU limit</strong>, causing throttling that looks like slow code.</li>
+    <li><strong>Liveness checking the database</strong>, restarting every pod during a blip.</li>
+    <li><strong>No startup probe</strong> on a slow-starting app, so liveness kills it forever.</li>
+    <li><strong>No readiness probe</strong>, so rollouts replace healthy pods with broken ones.</li>
+    <li><strong>No <code>preStop</code> hook</strong>, producing 502s on every deployment.</li>
+    <li><strong>Shutdown timeout longer than the grace period</strong>, so SIGKILL interrupts draining.</li>
+    <li><strong><code>minAvailable</code> equal to replicas</strong>, blocking drains and upgrades.</li>
+    <li><strong>Ignoring Server GC</strong> in a small-memory container.</li>
+    <li><strong>A GC heap limit at 100%</strong> of the container limit.</li>
+    <li><strong>Requests set from guesswork</strong>, over-allocating the cluster several times over.</li>
+    <li><strong>Spot nodes for the primary API pool.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Every deployment produces a handful of 502s. Why, and how do you fix it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That's the classic shutdown race, and it happens because <strong>endpoint removal and SIGTERM are
+          concurrent, not sequential</strong>."</p>
+        <p>"When a pod is deleted, Kubernetes does two things in parallel: it removes the pod from the Service
+          endpoints, and it sends SIGTERM to the container. But endpoint removal has to
+          <strong>propagate</strong> — to every kube-proxy on every node, and to the ingress controller. That takes a
+          second or two."</p>
+        <p>"So there's a window where the application has been told to shut down while the load balancer is still
+          sending it requests. Those requests hit a closing listener and become 502s. Small enough not to look
+          broken, consistent enough to be irritating — which is exactly the symptom described."</p>
+        <p>"The fix has three parts."</p>
+        <p>"<strong>A <code>preStop</code> hook that sleeps</strong> for about five seconds. The pod keeps serving
+          normally during the sleep while endpoint removal propagates, and only then does the app receive SIGTERM.
+          Sleeping feels like a hack and it's the correct implementation — there's no signal that says 'endpoint
+          removal is complete', so a fixed short wait is the mechanism Kubernetes provides."</p>
+        <p>"<strong>Handle SIGTERM properly.</strong> .NET does most of this: Kestrel stops accepting new
+          connections and waits for in-flight requests up to the host shutdown timeout. What I'd check is that
+          nothing else exits early — background services should observe the cancellation token and drain rather
+          than abandoning work, and a message consumer should stop pulling new messages while finishing the current
+          one."</p>
+        <p>"<strong>Get the timeouts in the right order.</strong> The application shutdown timeout must be
+          <em>shorter</em> than <code>terminationGracePeriodSeconds</code>, with the <code>preStop</code> sleep
+          accounted for. If the grace period expires first, SIGKILL lands mid-request and you've reintroduced the
+          problem you were fixing. So something like 5 seconds preStop plus a 30-second drain inside a 45-second
+          grace period."</p>
+        <p>"There's a second cause worth checking, because it produces the same symptom from the other
+          direction: <strong>pods being added before they're ready</strong>. If there's no readiness probe,
+          Kubernetes considers a started container ready and routes traffic to it immediately — before the app has
+          finished booting. So you get errors from the new pods as well as the old ones."</p>
+        <p>"And on the caller side, in Kubernetes specifically: <strong>connection reuse.</strong> A long-lived
+          <code>HttpClient</code> holding a pooled connection to a pod that's now gone will fail on that connection.
+          <code>IHttpClientFactory</code> with a bounded <code>PooledConnectionLifetime</code> handles it, and a
+          retry policy on idempotent requests covers the remaining race — because with a rolling deployment there's
+          always <em>some</em> window."</p>
+        <p>"To verify the fix I'd run a load test through a deployment and watch for non-200s. That's the only real
+          confirmation, and it's worth having as a test rather than an assumption, because every one of these
+          settings can silently regress."</p>
+        <p>"The general principle: <strong>graceful shutdown is a distributed-systems problem, not a process
+          one.</strong> The application exiting cleanly isn't sufficient — the rest of the system has to stop
+          pointing at it first, and nothing tells you when that's happened."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know endpoint removal and SIGTERM are concurrent?</li>
+        <li>Do you know <code>preStop</code> sleep is the correct fix?</li>
+        <li>Do you get the timeout ordering right?</li>
+        <li>Do you also consider readiness on the way in?</li>
+        <li>Do you handle client-side connection reuse?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add retries" as the only fix.</li>
+        <li><span class="redflag">Red flag:</span> assuming endpoint removal completes before SIGTERM.</li>
+        <li><span class="redflag">Red flag:</span> a longer grace period with no shutdown handling.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if a request legitimately takes two minutes?</li>
+          <li>How do you drain a message consumer?</li>
+          <li>How would you prove the fix works?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A service is slow but CPU looks low. Where do you look? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Low CPU with high latency is a distinctive combination — it means the work isn't CPU-bound, so something
+          is <strong>waiting</strong> or <strong>being prevented from running</strong>. I'd check four things, in
+          rough order of how often they're the cause in containers."</p>
+        <p>"<strong>CPU throttling.</strong> The container-specific one, and the most commonly missed. A CPU limit
+          is enforced per 100ms period, so a container that consumes its quota is <em>paused</em> for the rest of
+          that period. A request needing a short burst of work gets suspended repeatedly — turning 20ms of work into
+          100ms+ of wall-clock time."</p>
+        <p>"And crucially, <strong>average CPU looks low</strong>, because the container spends most of each period
+          idle-because-throttled. So <code>kubectl top</code> is reassuring and wrong. The metric that confirms it is
+          <code>container_cpu_cfs_throttled_seconds_total</code>. The fix is a more generous CPU limit, or removing
+          it and relying on the request — CPU is compressible, so absorbing a burst is better than throttling."</p>
+        <p>"<strong>Thread pool starvation.</strong> The .NET-specific one. Sync-over-async — a
+          <code>.Result</code> or <code>.Wait()</code> on a hot path — blocks pool threads. The pool injects new
+          threads slowly, so requests queue behind blocked threads while CPU sits idle. Latency climbs with
+          concurrency and CPU doesn't."</p>
+        <p>"<code>dotnet-counters</code> shows it directly: queue length rising, thread count climbing.
+          <code>dotnet-stack</code> gives every thread's stack, and if dozens are parked on the same
+          <code>.Result</code>, that's the answer. Both are runnable in production via
+          <code>kubectl debug</code> without shipping a shell in the image."</p>
+        <p>"<strong>Waiting on a dependency.</strong> A slow SQL query, a slow HTTP call, lock contention, or
+          connection-pool exhaustion. Application Insights' dependency telemetry answers this quickly — either one
+          dependency is slow, or there are hundreds of fast ones, which is an N+1 and invisible in any latency
+          percentile because nothing is individually slow."</p>
+        <p>"Connection-pool exhaustion is worth calling out because it mimics everything else: requests wait for a
+          free connection, so latency is high and nothing is busy. Usually caused by connections not being disposed,
+          or a pool size that's fine on one instance and inadequate once you've scaled out — the database has a
+          finite total."</p>
+        <p>"<strong>GC pressure.</strong> If the memory limit is tight, .NET's GC — which sizes its heap from the
+          container limit — runs aggressively to stay inside it. That produces pause time and, oddly,
+          <em>higher</em> CPU rather than lower, so it wouldn't fit this symptom perfectly. But high allocation rates
+          with frequent Gen2 collections can add latency that looks like waiting, and
+          <code>dotnet-counters</code> shows GC counts and pause time per generation."</p>
+        <p>"Server GC is a factor here too: it's the ASP.NET Core default, allocates per-core heaps and holds memory.
+          In a small container with many visible cores that's a poor fit, and Workstation GC can be measurably
+          better."</p>
+        <p>"How I'd narrow it: <strong>does latency scale with concurrency?</strong> If yes, it's queueing —
+          throttling, thread pool, or connection pool. If latency is constant regardless of load, it's a slow
+          dependency or a slow code path. That one question splits the four causes into two pairs and saves a lot of
+          time."</p>
+        <p>"The general point: <strong>in containers, low CPU with high latency should make you suspect throttling
+          before anything else</strong>, because the metric everyone looks at actively hides it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you suspect CPU throttling, and know average CPU hides it?</li>
+        <li>Do you know the thread-pool starvation signature?</li>
+        <li>Do you use <code>dotnet-counters</code>/<code>dotnet-stack</code> in a container?</li>
+        <li>Do you consider connection-pool exhaustion?</li>
+        <li>Do you have a way to narrow it — latency versus concurrency?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "scale out" without a diagnosis.</li>
+        <li><span class="redflag">Red flag:</span> concluding it's fine because CPU is low.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of CPU throttling in containers.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you prove throttling is happening?</li>
+          <li>How do you find sync-over-async in a large codebase?</li>
+          <li>Server GC or Workstation GC here?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

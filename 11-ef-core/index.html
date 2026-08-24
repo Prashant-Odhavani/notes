@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entity Framework Core — Overview</title>
+<meta name="description" content="What EF Core actually is, the mental model that prevents most bugs, and how this section is organised.">
+<meta name="keywords" content="EF Core overview ORM unit of work change tracking LINQ translation Dapper comparison leaky abstraction">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="11-ef-core/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Entity Framework Core</h1>
+    <p class="subtitle">The default data-access layer in .NET, and the most common source of production
+      performance problems. Both facts are worth understanding.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="mental-model">The mental model that prevents most EF bugs <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>EF Core does two distinct jobs, and almost every confusing behaviour comes from mixing them up:</p>
+    <ol>
+      <li><strong>It translates LINQ into SQL.</strong> Your C# query becomes a database query.</li>
+      <li><strong>It tracks objects in memory</strong> and works out the <code>INSERT</code>,
+        <code>UPDATE</code> and <code>DELETE</code> statements needed to make the database match.</li>
+    </ol>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>The <code>DbContext</code> is a <strong>notepad</strong>, not a live connection to the database.</p>
+    <p>You load some rows onto the notepad. You scribble changes. Nothing happens in the database.</p>
+    <p>Then you call <code>SaveChanges</code>, and EF reads the notepad, works out what changed, and sends the
+      minimum set of statements to make it so.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Three questions answer most EF Core problems:</p>
+    <ol>
+      <li><strong>Is this running in the database or in memory?</strong> — explains performance surprises.</li>
+      <li><strong>Is this entity tracked?</strong> — explains why <code>SaveChanges</code> did nothing, or did
+        too much.</li>
+      <li><strong>How many queries did that just make?</strong> — explains almost everything else.</li>
+    </ol>
+  </div>
+
+  <h2 id="scope">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">DbContext &amp; Change Tracking</a></td>
+          <td>Lifetime and why it's scoped, entity states, tracking vs <code>AsNoTracking</code>, identity
+              resolution, what <code>SaveChanges</code> actually does</td>
+        </tr>
+        <tr>
+          <td><a href="modeling-migrations.html">Modelling &amp; Migrations</a></td>
+          <td>Fluent API vs attributes, relationships, owned types, value converters, and how to write
+              migrations that deploy without downtime</td>
+        </tr>
+        <tr>
+          <td><a href="querying.html">Querying &amp; Loading</a></td>
+          <td>Eager, lazy and explicit loading; split queries; projection; when to drop to raw SQL; what
+              can't be translated</td>
+        </tr>
+        <tr>
+          <td><a href="transactions-concurrency.html">Transactions &amp; Concurrency</a></td>
+          <td><code>SaveChanges</code> transaction semantics, optimistic concurrency with
+              <code>rowversion</code>, execution strategies, the outbox problem</td>
+        </tr>
+        <tr>
+          <td><a href="performance.html">Performance</a></td>
+          <td>N+1, cartesian explosion, compiled queries, bulk operations, context pooling, and how to
+              measure any of it</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Version context</div>
+    <p style="margin:0">Content targets <strong>EF Core 8/9</strong>. Where a feature arrived in a specific
+      version it's named — <code>ExecuteUpdate</code>/<code>ExecuteDelete</code> in EF Core 7, complex types
+      and primitive collections in 8, <code>LeftJoin</code>/<code>RightJoin</code> operators in 10.
+      <br><br>
+      Two behaviours that changed and still cause confusion: <strong>client-side evaluation of
+      <code>WHERE</code> clauses was removed in EF Core 3.0</strong> — it now throws instead of silently
+      loading the table — and <strong>EF Core 3.0 stopped generating implicit
+      <code>ToList()</code> boundaries</strong>. If someone describes EF behaviour that doesn't match what you
+      see, they may be remembering EF6 or EF Core 2.</p>
+  </div>
+
+  <h2 id="ef-vs-dapper">EF Core vs Dapper vs raw ADO.NET <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>EF Core</th><th>Dapper</th><th>ADO.NET</th></tr></thead>
+      <tbody>
+        <tr><td>Writes the SQL</td><td>EF does</td><td><strong>You do</strong></td><td>You do</td></tr>
+        <tr><td>Change tracking</td><td>Yes</td><td>No</td><td>No</td></tr>
+        <tr><td>Migrations</td><td>Yes</td><td>No</td><td>No</td></tr>
+        <tr><td>CRUD speed to write</td><td><strong>Fastest</strong></td><td>Moderate</td><td>Slowest</td></tr>
+        <tr><td>Control over the query</td><td>Indirect</td><td><strong>Total</strong></td><td>Total</td></tr>
+        <tr><td>Complex read queries</td><td>Can generate awkward SQL</td><td><strong>Ideal</strong></td><td>Ideal</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The position worth holding</span>
+    <p><strong>These aren't competitors. Use EF Core for the write side and Dapper for awkward reads.</strong></p>
+    <p>Change tracking is genuinely valuable when you're mutating an object graph. It's pure overhead when
+      you're producing a read-only report — and that's exactly where hand-written SQL wins.</p>
+    <p>They can share the same connection and transaction, so mixing them costs nothing architecturally.</p>
+  </div>
+
+  <h2 id="leaky">EF Core is a leaky abstraction, and that's fine <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The honest framing</span>
+    <p>EF Core hides SQL, but it cannot hide the database. Indexes, execution plans, transactions and locking
+      all still apply.</p>
+    <p>So <strong>you can't use EF Core well without understanding the database underneath.</strong> Every
+      serious EF problem is really a database problem wearing a C# costume.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Looks like an EF problem</th><th>Is actually</th></tr></thead>
+      <tbody>
+        <tr><td>"EF is slow"</td><td>An N+1 pattern, or a missing index</td></tr>
+        <tr><td>"<code>Include</code> returns way too much data"</td><td>A cartesian explosion from multiple collection includes</td></tr>
+        <tr><td>"Saving takes forever"</td><td>Thousands of round trips instead of a set-based statement</td></tr>
+        <tr><td>"Random timeouts under load"</td><td>Lock contention, or a long-running transaction</td></tr>
+        <tr><td>"It worked in dev"</td><td>Dev has 200 rows; production has 8 million</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The habit that makes you good at EF Core</div>
+    <p style="margin:0"><strong>Log the SQL in development and read it.</strong></p>
+    <pre data-label="csharp"><code class="language-csharp">options.UseSqlServer(cs)
+       .LogTo(Console.WriteLine, LogLevel.Information)
+       .EnableSensitiveDataLogging();     // DEV ONLY - logs parameter values</code></pre>
+    <p style="margin:0">Most EF performance problems are obvious within seconds of seeing the generated SQL,
+      and invisible otherwise. Developers who look at the SQL write dramatically better EF code than those who
+      don't — it's the single highest-leverage habit in this section.
+      <br><br>
+      <code>EnableSensitiveDataLogging</code> must never be on in production: it writes parameter values,
+      which means personal data and secrets in your logs.</p>
+  </div>
+
+  <h2 id="interview-focus">What interviewers actually probe</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>What they're really testing</th></tr></thead>
+      <tbody>
+        <tr><td>"What's the N+1 problem?"</td><td>Do you know EF generates SQL you didn't see?</td></tr>
+        <tr><td>"When would you use <code>AsNoTracking</code>?"</td><td>Do you understand change tracking has a cost?</td></tr>
+        <tr><td>"Why is <code>DbContext</code> scoped?"</td><td>Do you know it isn't thread-safe and accumulates state?</td></tr>
+        <tr><td>"How do you handle concurrent edits?"</td><td>Optimistic concurrency, and lost updates</td></tr>
+        <tr><td>"How do you update 100,000 rows?"</td><td>Do you know when to stop using the ORM?</td></tr>
+        <tr><td>"How do you deploy a migration with no downtime?"</td><td>Real production experience</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <details class="qa">
+    <summary>Would you use an ORM at all? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Yes, for most of an application — and I'd expect to drop out of it in specific places rather than
+          treat that as a failure."</p>
+        <p>"What EF Core is genuinely good at is the <strong>write side</strong>. Loading an object graph,
+          mutating it, and having the right <code>INSERT</code>s and <code>UPDATE</code>s worked out in
+          dependency order is real work that I don't want to hand-write. Migrations are the other big one —
+          having schema changes versioned alongside the code that needs them is worth a lot."</p>
+        <p>"Where it's weaker is <strong>complex reads</strong>. A reporting query with several aggregates and
+          window functions is easier to write, read and tune as SQL. And EF can generate awkward SQL for it —
+          not wrong, but not what I'd have written."</p>
+        <p>"So my default shape is EF Core for the domain and CRUD, and Dapper or raw SQL for reporting and
+          the few hot read paths. They can share a connection and transaction, so there's no architectural
+          cost to mixing them."</p>
+        <p>"The thing I'd be clear about is that <strong>EF Core doesn't remove the need to understand the
+          database</strong>. It hides SQL; it doesn't hide indexes, execution plans, transactions or locking.
+          Nearly every 'EF is slow' problem I've dealt with was an N+1 pattern, a missing index, or a
+          cartesian explosion from multiple collection includes — database problems in C# clothing."</p>
+        <p>"The failure mode I'd watch for is treating it as a black box. Teams that never look at the
+          generated SQL ship queries that load whole tables to filter three rows. Turning on SQL logging in
+          development is a cheap habit that prevents most of it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have a reasoned position rather than a preference?</li>
+        <li>Do you know where an ORM is weak?</li>
+        <li>Do you know EF doesn't excuse you from knowing SQL?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Give an example of SQL you'd rather write by hand.</li>
+          <li>How do you share a transaction between EF and Dapper?</li>
+          <li>What's the cost of change tracking?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section assumes <a href="../10-sql/indexing.html">SQL indexing</a> and
+      <a href="../10-sql/transactions.html">transactions and isolation levels</a>, because EF Core problems are
+      usually those problems. It also builds on
+      <a href="../06-dotnet-platform/hosting-di-config.html">DI lifetimes</a> — the reason
+      <code>DbContext</code> is scoped only makes sense once those are clear.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

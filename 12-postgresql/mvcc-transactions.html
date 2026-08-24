@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MVCC, Transactions &amp; Locking — PostgreSQL</title>
+<meta name="description" content="How MVCC works, why readers never block writers, the three isolation levels, serialization failures, row locks, SKIP LOCKED and advisory locks.">
+<meta name="keywords" content="PostgreSQL MVCC snapshot xmin xmax transaction id isolation level read committed repeatable read serializable SSI serialization failure 40001 row lock FOR UPDATE SKIP LOCKED NOWAIT advisory lock deadlock idle in transaction dead tuples">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="12-postgresql/mvcc-transactions.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>MVCC, Transactions &amp; Locking</h1>
+    <p class="subtitle">The one genuinely different thing about PostgreSQL. Understand MVCC and half the
+      operational behaviour follows from it.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Every row version carries <code>xmin</code> and <code>xmax</code></strong> — the transactions
+        that created and deleted it.</li>
+      <li><strong>Readers never block writers, writers never block readers.</strong> No exceptions, no
+        setting.</li>
+      <li><strong>An <code>UPDATE</code> is delete-plus-insert.</strong> Old versions stay in the table until
+        vacuumed.</li>
+      <li><strong>Three isolation levels:</strong> Read Committed (default), Repeatable Read, Serializable.
+        There's no Read Uncommitted.</li>
+      <li><strong>PostgreSQL's <code>SERIALIZABLE</code> is real</strong> — SSI, not locking. It can raise
+        serialization failures you must retry.</li>
+      <li><strong><code>SELECT ... FOR UPDATE SKIP LOCKED</code></strong> is the queue primitive.</li>
+      <li><strong>Long-running transactions are the enemy</strong> — they block vacuum and cause bloat.</li>
+    </ul>
+  </div>
+
+  <h2 id="mvcc">How MVCC works <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>PostgreSQL never overwrites a row in place. An <code>UPDATE</code> writes a <strong>new version</strong>
+      and marks the old one as expired.</p>
+    <p>Each version records which transaction created it (<code>xmin</code>) and which deleted it
+      (<code>xmax</code>). Your transaction has a <strong>snapshot</strong> — a set of transaction IDs it
+      considers visible — and reads whichever version that snapshot says it should see.</p>
+  </div>
+
+  <pre data-label="sql — the hidden columns are queryable"><code class="language-sql">SELECT xmin, xmax, ctid, * FROM "order" WHERE id = 42;
+-- xmin: transaction that created this version
+-- xmax: transaction that expired it (0 if still current)
+-- ctid: physical location (page, offset)</code></pre>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A document with tracked changes that are never accepted or rejected — just accumulated.</p>
+    <p>Everyone reading gets a view filtered to "the state as of when I started reading". Nobody waits for
+      anyone else, because nobody is editing the copy you're looking at.</p>
+    <p>Eventually someone has to go through and delete the superseded revisions. That's
+      <code>VACUUM</code>.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Everything follows from this one design</span>
+    <ul>
+      <li><strong>Readers never block writers</strong> — a reader looks at an older version, so a writer
+        creating a new one doesn't interfere.</li>
+      <li><strong><code>VACUUM</code> exists</strong> because dead versions are in the table, not a separate
+        version store.</li>
+      <li><strong>Tables bloat</strong> if vacuum can't keep up.</li>
+      <li><strong><code>COUNT(*)</code> is a scan</strong> — visibility must be checked per row.</li>
+      <li><strong>Updates are expensive</strong> — a new row version usually means updating every index.</li>
+      <li><strong>Long transactions are harmful</strong> — they hold a snapshot, so nothing newer than it can
+        be cleaned up.</li>
+    </ul>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the comparison to SQL Server</div>
+    <p style="margin:0">SQL Server's default is <strong>locking</strong> Read Committed: readers take shared
+      locks, so readers block writers. Row versioning is <em>optional</em>, and when enabled with RCSI the
+      versions go to <strong>tempdb</strong>.
+      <br><br>
+      PostgreSQL has no locking-reads mode at all. Versions live in the table.
+      <br><br>
+      So the trade is visible: Postgres gets non-blocking reads for free and pays with vacuum and bloat. SQL
+      Server gets no vacuum but blocks readers unless you opt into versioning, and then pays in tempdb.
+      <br><br>
+      Framing it as a trade rather than "Postgres is better" is the answer that lands.</p>
+  </div>
+
+  <h2 id="isolation">Isolation levels <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Level</th><th>Dirty read</th><th>Non-repeatable</th><th>Phantom</th><th>Write skew</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>READ UNCOMMITTED</code></td>
+          <td colspan="4"><em>Accepted as syntax, behaves as Read Committed. Dirty reads are impossible in
+              this architecture</em></td>
+        </tr>
+        <tr>
+          <td><strong><code>READ COMMITTED</code></strong> <em>(default)</em></td>
+          <td>✅</td><td>❌</td><td>❌</td><td>❌</td>
+        </tr>
+        <tr>
+          <td><code>REPEATABLE READ</code></td>
+          <td>✅</td><td>✅</td><td><strong>✅</strong></td><td>❌</td>
+        </tr>
+        <tr>
+          <td><code>SERIALIZABLE</code></td>
+          <td>✅</td><td>✅</td><td>✅</td><td><strong>✅</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Two differences from the SQL Server table</div>
+    <p style="margin:0"><strong>Dirty reads cannot happen.</strong> MVCC means you always read a committed
+      version — there's no mechanism to see uncommitted data. <code>READ UNCOMMITTED</code> is accepted for
+      compatibility and does nothing.
+      <br><br>
+      <strong>PostgreSQL's <code>REPEATABLE READ</code> prevents phantom reads.</strong> The ANSI standard
+      allows them at that level, and SQL Server does allow them — but Postgres implements it as a full snapshot
+      taken at the start of the transaction, so no new rows can appear. It's closer to SQL Server's
+      <code>SNAPSHOT</code> than to its <code>REPEATABLE READ</code>.</p>
+  </div>
+
+  <h3 id="read-committed">Read Committed — the per-statement subtlety</h3>
+
+  <div class="simple">
+    <span class="sm-label">What it actually guarantees</span>
+    <p>Each <strong>statement</strong> gets a fresh snapshot. So two identical queries in one transaction can
+      return different results.</p>
+    <p>Fine for most work. Wrong when you need several statements to agree on one consistent view — a report
+      with subtotals, or a balance check followed by a transfer.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The Read Committed behaviour that surprises everyone</div>
+    <p style="margin:0">If an <code>UPDATE</code> is blocked waiting for another transaction's row lock, and
+      that transaction commits a change to the row, PostgreSQL <strong>re-evaluates the
+      <code>WHERE</code> clause against the new version</strong> and proceeds if it still matches.
+      <br><br>
+      So <code>UPDATE accounts SET balance = balance - 100 WHERE id = 1 AND balance &gt;= 100</code> is safe —
+      it re-checks against the committed value.
+      <br><br>
+      But a <code>SELECT</code> earlier in the transaction saw the <em>old</em> value. So read-then-update
+      logic can act on a value that's already stale, even though the <code>UPDATE</code> itself is atomic.
+      That's why <a href="../10-sql/transactions.html#atomic-update">putting the condition in the
+      <code>UPDATE</code></a> matters here too.</p>
+  </div>
+
+  <h2 id="serializable">Serializable — genuinely different <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>SQL Server implements <code>SERIALIZABLE</code> with <strong>range locks</strong> — it physically
+      prevents conflicting access, which blocks a lot.</p>
+    <p>PostgreSQL uses <strong>Serializable Snapshot Isolation (SSI)</strong>: transactions run optimistically
+      with no extra locking, and Postgres <em>detects</em> whether the outcome could differ from some serial
+      order. If so, it aborts one with a <strong>serialization failure</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>SQL Server <code>SERIALIZABLE</code></th><th>PostgreSQL <code>SERIALIZABLE</code></th></tr></thead>
+      <tbody>
+        <tr><td>Mechanism</td><td>Range locks — pessimistic</td><td><strong>SSI — optimistic detection</strong></td></tr>
+        <tr><td>Blocking</td><td>Heavy; locks rows that don't exist</td><td><strong>None added</strong></td></tr>
+        <tr><td>Failure mode</td><td>Blocking and deadlocks</td><td>Error <strong>40001</strong>, must retry</td></tr>
+        <tr><td>Prevents write skew</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td>Cost</td><td>Concurrency</td><td>Retries, and predicate-tracking memory</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="write-skew">Write skew — the anomaly only Serializable catches</h3>
+
+  <pre data-label="sql — both succeed, and the invariant is broken" class="code-bad"><code class="language-sql">-- Rule: at least one doctor must always be on call.
+-- Currently two are: Alice and Bob.
+
+-- Transaction A (Alice)              -- Transaction B (Bob)
+BEGIN;                                BEGIN;
+SELECT count(*) FROM shift            SELECT count(*) FROM shift
+ WHERE on_call = true;   -- 2          WHERE on_call = true;   -- 2
+-- "2 &gt; 1, safe to go off call"       -- "2 &gt; 1, safe to go off call"
+UPDATE shift SET on_call = false      UPDATE shift SET on_call = false
+ WHERE doctor = 'Alice';               WHERE doctor = 'Bob';
+COMMIT;                               COMMIT;
+-- Nobody is on call. Neither transaction did anything wrong.</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">Why lower levels can't catch this</span>
+    <p>They wrote <strong>different rows</strong>. There's no update conflict, no lost update, no phantom in
+      either transaction's own reads.</p>
+    <p>The problem is that each decision was based on data the other invalidated. Under
+      <code>SERIALIZABLE</code>, Postgres tracks the read/write dependencies, spots the cycle, and aborts one
+      with error 40001.</p>
+  </div>
+
+  <pre data-label="csharp — Serializable requires retry logic" class="code-good"><code class="language-csharp">// 40001 = serialization_failure, 40P01 = deadlock_detected. Both retryable.
+var policy = Policy
+    .Handle&lt;PostgresException&gt;(e =&gt; e.SqlState is "40001" or "40P01")
+    .WaitAndRetryAsync(3, attempt =&gt;
+        TimeSpan.FromMilliseconds(Random.Shared.Next(20, 60) * attempt));   // jitter
+
+await policy.ExecuteAsync(async () =&gt;
+{
+    await using var tx = await db.Database
+        .BeginTransactionAsync(IsolationLevel.Serializable);
+    // ... work ...
+    await tx.CommitAsync();
+});</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Serializable without retry logic is broken</div>
+    <p style="margin:0">Serialization failures aren't errors in the usual sense — they're the mechanism working
+      as designed. The transaction was rolled back cleanly and re-running it will normally succeed.
+      <br><br>
+      So if you enable <code>SERIALIZABLE</code> and don't retry, you've converted a correctness guarantee into
+      intermittent user-facing 500s under load.
+      <br><br>
+      Two requirements: the retried block must be <strong>idempotent</strong> (no emails sent, no messages
+      published inside it), and retries need <strong>jitter</strong> so two conflicting transactions don't
+      collide again immediately.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — when Serializable is the right call</div>
+    <p style="margin:0">The strongest case is <strong>a multi-row invariant you can't express as a
+      constraint</strong> — "at least one doctor on call", "total allocations must not exceed budget", "no
+      overlapping bookings across these rules". Those are write-skew problems, and Serializable solves them
+      correctly with far less code than hand-rolled locking.
+      <br><br>
+      Where I wouldn't use it: as a general default. It costs retries, and the predicate-tracking structures
+      have a memory limit — exceed it and Postgres escalates to coarser tracking, producing
+      <em>false</em> serialization failures on transactions that weren't really conflicting.
+      <br><br>
+      So: Serializable for the specific operations with a genuine multi-row invariant, Read Committed
+      everywhere else. Saying "I'd apply it per transaction, not globally" is the discriminating answer.</p>
+  </div>
+
+  <h2 id="row-locks">Row-level locking <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Clause</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>FOR UPDATE</code></td><td>Exclusive row lock. Blocks other <code>FOR UPDATE</code> and writes</td></tr>
+        <tr><td><code>FOR NO KEY UPDATE</code></td><td>Weaker — allows concurrent FK reference checks</td></tr>
+        <tr><td><code>FOR SHARE</code></td><td>Shared — others can read-lock, nobody can write</td></tr>
+        <tr><td><code>FOR KEY SHARE</code></td><td>Weakest. What an FK check takes</td></tr>
+        <tr><td><code>NOWAIT</code></td><td><strong>Fail immediately</strong> instead of waiting</td></tr>
+        <tr><td><code>SKIP LOCKED</code></td><td><strong>Skip locked rows</strong> and return the rest</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="skip-locked">SKIP LOCKED — a proper work queue</h3>
+
+  <pre data-label="sql — many workers, no contention, no duplicates" class="code-good"><code class="language-sql">WITH claimed AS (
+    SELECT id
+    FROM   job
+    WHERE  status = 'pending'
+    ORDER BY created_at
+    LIMIT  10
+    FOR UPDATE SKIP LOCKED          -- each worker gets a different 10
+)
+UPDATE job j
+SET    status = 'processing', started_at = now(), worker_id = $1
+FROM   claimed c
+WHERE  j.id = c.id
+RETURNING j.*;</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Why this matters</span>
+    <p><strong>Without <code>SKIP LOCKED</code>, workers queue behind each other</strong> on the same rows —
+      ten workers effectively process one at a time.</p>
+    <p>With it, each worker takes rows nobody else has locked. Linear scaling, no duplicate processing, and
+      it's all one atomic statement.</p>
+    <p>This is a legitimately good answer to "how would you build a job queue without a message broker?" —
+      combined with <code>RETURNING</code>, the claim and the fetch are a single round trip.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">When a database queue is the right choice</div>
+    <p style="margin:0"><strong>Good:</strong> moderate throughput, you already have Postgres, and you want the
+      job enqueue to be <em>transactional with your business data</em> — which is exactly the
+      <a href="../19-architecture/distributed-data.html#outbox">outbox</a> requirement. No dual write, no extra
+      infrastructure.
+      <br><br>
+      <strong>Reaches its limit at:</strong> very high throughput, fan-out to many independent consumers, or
+      needing replay and long retention. Then a real broker earns its keep.
+      <br><br>
+      Two operational notes: index the queue as a <a href="indexing.html#partial">partial index</a> on pending
+      rows only, and vacuum that table aggressively — a queue table is the classic high-churn bloat case,
+      because every claim is an update.</p>
+  </div>
+
+  <h2 id="advisory">Advisory locks <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="sql — application-defined mutual exclusion"><code class="language-sql">-- Session-scoped: held until released or the connection ends
+SELECT pg_try_advisory_lock(hashtext('nightly-reconciliation'));
+-- returns true if acquired, false if someone else holds it
+SELECT pg_advisory_unlock(hashtext('nightly-reconciliation'));
+
+-- Transaction-scoped: released automatically at commit or rollback
+SELECT pg_advisory_xact_lock(hashtext('tenant-42-import'));</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Use for</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td>Only one instance runs a scheduled job</td><td>Simpler than a distributed lock if you already have Postgres</td></tr>
+        <tr><td>Serialising work per tenant or per key</td><td>Lock on a hash of the key</td></tr>
+        <tr><td>Preventing concurrent migrations</td><td>What EF Core's migration lock effectively does</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two advisory-lock traps</div>
+    <p style="margin:0"><strong>Prefer <code>pg_advisory_xact_lock</code></strong> — it's released
+      automatically. A session-scoped lock leaked by code that forgot to unlock stays held until the connection
+      closes, and with connection pooling that connection is reused, so the next request inherits the lock.
+      <br><br>
+      <strong>They don't survive failover.</strong> An advisory lock is in-memory on one instance. After a
+      failover it's gone, so two workers can run simultaneously. Fine for "avoid duplicate work"; not a
+      correctness guarantee — for that you need a database row with a unique constraint.</p>
+  </div>
+
+  <h2 id="long-transactions">Long transactions are the real hazard <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why they're worse here than on SQL Server</span>
+    <p>A transaction holds a snapshot. Vacuum <strong>cannot remove any row version that snapshot might still
+      need</strong> — even in completely unrelated tables.</p>
+    <p>So one forgotten open transaction stops cleanup database-wide. Dead rows accumulate, tables and indexes
+      bloat, and queries slow down as they scan through the debris.</p>
+  </div>
+
+  <pre data-label="sql — find them"><code class="language-sql">SELECT pid, state, now() - xact_start AS duration,
+       now() - state_change AS idle_for,
+       left(query, 80) AS query
+FROM   pg_stat_activity
+WHERE  state IN ('idle in transaction', 'active')
+  AND  xact_start &lt; now() - interval '5 minutes'
+ORDER BY xact_start;</code></pre>
+
+  <div class="note danger">
+    <div class="note-title"><code>idle in transaction</code> is the state to alert on</div>
+    <p style="margin:0">That means an application opened a transaction and then did something else — waited on
+      an HTTP call, waited for user input, or hit an exception path that never committed or rolled back.
+      <br><br>
+      It holds locks and blocks vacuum while doing no work at all. It's the single most damaging thing an
+      application can do to a Postgres database.
+      <br><br>
+      Defences: set <code>idle_in_transaction_session_timeout</code> so the server kills them, and
+      <code>statement_timeout</code> to bound individual queries. In .NET, make sure every transaction is in a
+      <code>using</code> block so an exception disposes and rolls it back — and never put a network call inside
+      one.</p>
+  </div>
+
+  <h2 id="deadlocks">Deadlocks <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="sql — deadlock_timeout controls detection, not prevention"><code class="language-sql">SHOW deadlock_timeout;   -- default 1s: how long to wait before checking for a cycle</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>PostgreSQL error</th><th>Meaning</th><th>Retryable?</th></tr></thead>
+      <tbody>
+        <tr><td><strong>40001</strong> <code>serialization_failure</code></td><td>SSI detected a conflict</td><td><strong>Yes</strong></td></tr>
+        <tr><td><strong>40P01</strong> <code>deadlock_detected</code></td><td>Lock cycle; you were the victim</td><td><strong>Yes</strong></td></tr>
+        <tr><td><strong>55P03</strong> <code>lock_not_available</code></td><td><code>NOWAIT</code> couldn't get the lock</td><td>Depends on intent</td></tr>
+        <tr><td><strong>23505</strong> <code>unique_violation</code></td><td>Duplicate key</td><td>No — handle it</td></tr>
+        <tr><td><strong>57014</strong> <code>query_canceled</code></td><td><code>statement_timeout</code> hit</td><td>Usually no</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Prevention is the same as anywhere: <a href="../10-sql/transactions.html#deadlock-prevention">consistent
+    access order</a>, short transactions, and the right indexes so statements lock fewer rows. Postgres has no
+    lock escalation, so a large <code>DELETE</code> won't suddenly take a table lock — but it will create a
+    huge number of dead rows for vacuum to deal with.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>MVCC keeps old row versions in the table, tagged with <code>xmin</code>/<code>xmax</code>.</li>
+      <li>Readers never block writers — that's architectural, not configurable.</li>
+      <li>No dirty reads possible; <code>READ UNCOMMITTED</code> behaves as Read Committed.</li>
+      <li><code>REPEATABLE READ</code> here also prevents phantoms — closer to SQL Server's
+        <code>SNAPSHOT</code>.</li>
+      <li>Read Committed takes a fresh snapshot per statement, and re-evaluates a blocked
+        <code>UPDATE</code>'s <code>WHERE</code>.</li>
+      <li><code>SERIALIZABLE</code> uses SSI — optimistic, no extra locking, raises 40001.</li>
+      <li>Serializable without retry logic converts correctness into intermittent 500s.</li>
+      <li>Write skew is the anomaly only Serializable catches.</li>
+      <li><code>FOR UPDATE SKIP LOCKED</code> plus <code>RETURNING</code> is a solid job queue.</li>
+      <li>Prefer transaction-scoped advisory locks; they don't survive failover.</li>
+      <li><code>idle in transaction</code> blocks vacuum database-wide. Set the timeouts.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>SERIALIZABLE</code> with no retry on 40001.</strong></li>
+    <li><strong>Assuming <code>SERIALIZABLE</code> blocks like SQL Server's does.</strong></li>
+    <li><strong>Looking for <code>NOLOCK</code></strong> — it doesn't exist and isn't needed.</li>
+    <li><strong>Read-then-update</strong> instead of putting the condition in the <code>UPDATE</code>.</li>
+    <li><strong>Transactions held open across HTTP calls or user think-time.</strong></li>
+    <li><strong>No <code>idle_in_transaction_session_timeout</code>.</strong></li>
+    <li><strong>A worker queue without <code>SKIP LOCKED</code></strong>, so workers serialise.</li>
+    <li><strong>Session-scoped advisory locks with connection pooling.</strong></li>
+    <li><strong>Treating advisory locks as a correctness guarantee across failover.</strong></li>
+    <li><strong>Retrying without jitter</strong>, so conflicting transactions collide repeatedly.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How does PostgreSQL's MVCC differ from SQL Server's concurrency model? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The one-sentence version: <strong>PostgreSQL keeps old row versions in the table itself; SQL Server
+          keeps them in tempdb, and only if you opt in.</strong>"</p>
+        <p>"In Postgres, an <code>UPDATE</code> never overwrites in place — it writes a new row version and
+          marks the old one expired. Each version carries <code>xmin</code> and <code>xmax</code>, the
+          transactions that created and deleted it, and your transaction has a snapshot that decides which
+          version it sees."</p>
+        <p>"SQL Server's default is <em>locking</em> Read Committed: readers take shared locks, so readers block
+          writers. You can enable row versioning with RCSI, and then versions go to tempdb."</p>
+        <p>"A surprising amount follows from that one difference, which is why I'd lead with it."</p>
+        <p>"<strong>Readers never block writers in Postgres</strong> — not as a setting, as architecture.
+          There's no <code>NOLOCK</code> because there's nothing to avoid."</p>
+        <p>"<strong><code>VACUUM</code> exists</strong> because dead versions are in the table. That's a real
+          operational responsibility with no SQL Server equivalent — tables bloat if autovacuum can't keep
+          up."</p>
+        <p>"<strong><code>COUNT(*)</code> is a full scan</strong>, because visibility has to be checked per row
+          and lives in the heap."</p>
+        <p>"<strong>Long transactions are much more damaging.</strong> A transaction holds a snapshot, and
+          vacuum can't remove any version that snapshot might need — including in unrelated tables. So one
+          session sitting <code>idle in transaction</code> blocks cleanup database-wide. On SQL Server a long
+          transaction holds locks and grows tempdb; on Postgres it degrades the whole database."</p>
+        <p>"<strong>Updates are relatively expensive</strong>, because a new row version usually means adding an
+          entry to every index. Postgres mitigates this with HOT updates — if no indexed column changed and
+          there's space on the page, no index is touched at all. Which is a good argument for not indexing
+          volatile columns unnecessarily."</p>
+        <p>"I'd frame it as a genuine trade rather than one being better. Postgres gets non-blocking reads for
+          free and pays with vacuum and bloat. SQL Server has no vacuum but blocks readers by default, and
+          pays in tempdb once you enable versioning."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you name where versions are stored — the key difference?</li>
+        <li>Do you derive consequences rather than list features?</li>
+        <li>Do you know why long transactions matter more here?</li>
+        <li>Do you present it as a trade-off?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What exactly does vacuum do?</li>
+          <li>Why is <code>COUNT(*)</code> slow?</li>
+          <li>What's a HOT update?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>You need to enforce "at most one active subscription per customer" but the rule spans several rows. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd try to make it a <strong>constraint</strong> first, because a constraint is enforced regardless
+          of which code path writes, and only reach for isolation levels if the rule genuinely can't be
+          expressed that way."</p>
+        <p>"For this specific rule, a <strong>partial unique index</strong> does it exactly:
+          <code>CREATE UNIQUE INDEX ux_one_active ON subscription (customer_id) WHERE status =
+          'active'</code>."</p>
+        <p>"That's ideal. It's a real constraint, so two concurrent inserts can't both win — one gets a unique
+          violation I catch and handle. No isolation level needed, no retry loop, and nobody can bypass it with
+          a script. This is also a case where Postgres is nicer than SQL Server, because partial indexes here
+          work with parameterised queries."</p>
+        <p>"If the rule were about <strong>overlapping date ranges</strong> — no two active periods may overlap
+          for a customer — I'd use an <strong>exclusion constraint</strong> with GiST:
+          <code>EXCLUDE USING gist (customer_id WITH =, active_period WITH &amp;&amp;)</code>. Same benefit:
+          the database enforces it."</p>
+        <p>"Where neither works is a rule involving an <em>aggregate</em> across rows — 'total allocated must
+          not exceed the budget', or the classic 'at least one doctor must remain on call'. You can't express
+          those as a unique or exclusion constraint, and they're vulnerable to <strong>write skew</strong>:
+          two transactions each read the aggregate, each independently conclude their change is safe, and both
+          commit. They touched <em>different rows</em>, so there's no update conflict — no lower isolation level
+          catches it."</p>
+        <p>"For that, <code>SERIALIZABLE</code> is the correct tool. Postgres implements it as SSI, which is
+          genuinely different from SQL Server's range-locking version — it adds no locks, runs optimistically,
+          and detects whether the outcome could differ from a serial order. If it could, one transaction is
+          aborted with error 40001."</p>
+        <p>"Which means <strong>retry logic is mandatory</strong>, not optional. A serialization failure isn't
+          an error, it's the mechanism working — the transaction rolled back cleanly and re-running it will
+          usually succeed. I'd wrap it in a retry policy handling 40001 and 40P01, with jitter so two
+          conflicting transactions don't collide again immediately. And the retried block has to be idempotent,
+          so no emails or published messages inside it."</p>
+        <p>"I'd apply Serializable <strong>per transaction, not globally</strong>. It costs retries, and the
+          predicate-tracking structures have a memory limit — exceed it and Postgres falls back to coarser
+          tracking, which produces false serialization failures on transactions that weren't actually
+          conflicting."</p>
+        <p>"The alternative to Serializable, if I wanted to avoid retries, is to <strong>serialise on a single
+          row</strong> — <code>SELECT ... FOR UPDATE</code> on the customer row before checking the aggregate.
+          That gives a clear lock ordering and no retries, at the cost of throughput per customer. For a
+          per-customer rule that's often perfectly acceptable, since contention is naturally partitioned."</p>
+        <p>"So the order I'd work through: unique or exclusion constraint if the rule fits, then a row lock on
+          the natural parent, then Serializable with retries. Constraint first, because it's the only option
+          nothing can bypass."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reach for a constraint before an isolation level?</li>
+        <li>Do you know partial unique and exclusion constraints?</li>
+        <li>Can you identify write skew and why lower levels miss it?</li>
+        <li>Do you know Postgres Serializable is SSI and needs retries?</li>
+        <li>Do you offer the row-lock alternative?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> checking in application code with no database
+          enforcement.</li>
+        <li><span class="redflag">Red flag:</span> <code>SERIALIZABLE</code> with no retry handling.</li>
+        <li><span class="redflag">Red flag:</span> assuming it blocks like SQL Server's Serializable.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Write the exclusion constraint.</li>
+          <li>How do you surface a unique violation as a friendly error?</li>
+          <li>What causes false serialization failures?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Build a job queue in PostgreSQL for ten worker instances. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The core of it is <code>SELECT ... FOR UPDATE SKIP LOCKED</code>, which is what makes this viable
+          rather than a bad idea."</p>
+        <p>"Each worker runs a single statement: a CTE that selects the next N pending jobs ordered by creation
+          time with <code>FOR UPDATE SKIP LOCKED</code>, then updates those rows to 'processing' with
+          <code>RETURNING</code> to get them back. One round trip, atomic claim and fetch."</p>
+        <p>"<code>SKIP LOCKED</code> is the essential part. Without it, all ten workers queue behind each other
+          on the same top rows, so you effectively get one worker. With it, each takes rows nobody else has
+          locked — linear scaling and no duplicate processing."</p>
+        <p>"The reason I'd consider a database queue at all rather than a broker: the enqueue can be
+          <strong>transactional with the business data</strong>. Creating an order and queueing its
+          confirmation email happen in one transaction, so there's no dual-write problem. That's the outbox
+          pattern, and getting it for free is a genuine advantage over a separate broker."</p>
+        <p>"Details I'd get right:"</p>
+        <p>"<strong>A partial index on pending jobs</strong> — <code>ON job (created_at) WHERE status =
+          'pending'</code>. The queue table may hold millions of completed rows; the index should only cover
+          the few thousand that are claimable. Rows leave the index as they're processed, so it stays tiny."</p>
+        <p>"<strong>Aggressive autovacuum on that table.</strong> Every claim is an update, so a queue table is
+          the classic high-churn bloat case — I'd set per-table autovacuum thresholds much lower than the
+          default rather than relying on the global settings."</p>
+        <p>"<strong>Stuck-job recovery.</strong> If a worker dies mid-job the row stays 'processing' forever.
+          So I'd record <code>started_at</code> and <code>worker_id</code>, and have a sweeper reset rows in
+          processing beyond a timeout back to pending. Plus an attempt counter and a dead-letter status, so a
+          job that fails repeatedly stops being retried and gets surfaced rather than looping."</p>
+        <p>"<strong>Archiving.</strong> Completed jobs need moving out or the table grows unbounded. Either a
+          delete-after-retention job, or partition by month and drop old partitions — which is far cheaper
+          than deleting rows."</p>
+        <p>"<strong>Avoid polling every 100ms from ten workers.</strong> That's a constant load for nothing. I'd
+          use <code>LISTEN</code>/<code>NOTIFY</code> to wake workers when a job is enqueued, with a slow poll
+          as a fallback — because <code>NOTIFY</code> isn't durable, so a missed notification needs the poll to
+          catch it."</p>
+        <p>"Where I'd say this stops being the right choice: very high throughput, fan-out to many independent
+          consumers, or needing replay and long retention. Then a real broker earns its complexity. But for
+          moderate volumes in a system already on Postgres, this is less infrastructure, transactionally
+          correct, and easier to inspect — you can just query the queue."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>SKIP LOCKED</code> and why it's essential?</li>
+        <li>Do you raise the transactional-enqueue advantage?</li>
+        <li>Do you handle stuck jobs and dead-lettering?</li>
+        <li>Do you think about bloat and archiving?</li>
+        <li>Do you know when a broker is the better answer?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> <code>SELECT</code> then <code>UPDATE</code> in separate
+          statements, allowing duplicate claims.</li>
+        <li><span class="redflag">Red flag:</span> no recovery for crashed workers.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of bloat on a high-churn table.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you guarantee ordering per customer?</li>
+          <li>What are the limits of <code>LISTEN</code>/<code>NOTIFY</code>?</li>
+          <li>How would you add scheduled/delayed jobs?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

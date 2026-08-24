@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vacuum, Partitioning, Replication &amp; HA — PostgreSQL</title>
+<meta name="description" content="Autovacuum tuning, bloat, transaction-ID wraparound, declarative partitioning, streaming replication, connection pooling and failover.">
+<meta name="keywords" content="autovacuum VACUUM FULL bloat transaction id wraparound freeze declarative partitioning attach detach partition streaming replication WAL replication slot logical replication hot standby synchronous commit PgBouncer connection pooling Patroni failover pg_dump PITR">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="12-postgresql/operations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Vacuum, Partitioning, Replication &amp; HA</h1>
+    <p class="subtitle">The operational side. Vacuum and connection pooling are the two things that catch teams
+      moving from SQL Server.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Vacuum reclaims dead row versions</strong> and updates the visibility map. It's not optional
+        maintenance — it's part of how the engine works.</li>
+      <li><strong>Bloat</strong> is space held by dead rows. Autovacuum prevents it; it doesn't shrink an
+        already-bloated table.</li>
+      <li><strong>Transaction-ID wraparound</strong> is the emergency case. Postgres will refuse writes to
+        protect itself.</li>
+      <li><strong>Never <code>VACUUM FULL</code> in production</strong> — it takes an exclusive lock. Use
+        <code>pg_repack</code>.</li>
+      <li><strong>Declarative partitioning</strong> — and <code>DETACH</code> is the near-instant archive.</li>
+      <li><strong>One process per connection</strong>, so you need PgBouncer beyond a few hundred.</li>
+      <li><strong>Replication is physical (streaming) or logical.</strong> Different tools for different
+        jobs.</li>
+    </ul>
+  </div>
+
+  <h2 id="vacuum">Vacuum <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><a href="mvcc-transactions.html#mvcc">MVCC</a> leaves dead row versions in the table. Vacuum does three
+      things:</p>
+    <ol>
+      <li><strong>Marks dead row space reusable</strong> for future inserts in that table.</li>
+      <li><strong>Updates the visibility map</strong>, which is what enables
+        <a href="indexing.html#index-only">index-only scans</a>.</li>
+      <li><strong>Freezes old transaction IDs</strong> to prevent wraparound.</li>
+    </ol>
+    <p>All three matter. People know about the first and are surprised by the other two.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>VACUUM</code></th><th><code>VACUUM FULL</code></th></tr></thead>
+      <tbody>
+        <tr><td>Lock taken</td><td>Light — reads and writes continue</td><td><strong><code>ACCESS EXCLUSIVE</code> — blocks everything</strong></td></tr>
+        <tr><td>Returns space to the OS</td><td>No — reuses it internally</td><td>Yes — rewrites the table</td></tr>
+        <tr><td>Disk needed</td><td>None extra</td><td><strong>A second full copy</strong></td></tr>
+        <tr><td>Rebuilds indexes</td><td>No</td><td>Yes</td></tr>
+        <tr><td>Production-safe</td><td><strong>Yes</strong></td><td><strong>No</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title"><code>VACUUM FULL</code> is an outage</div>
+    <p style="margin:0">It takes an <code>ACCESS EXCLUSIVE</code> lock — no reads, no writes, for as long as it
+      takes to rewrite the table. On a 200 GB table that's hours, and it needs 200 GB of free disk.
+      <br><br>
+      Use <strong><code>pg_repack</code></strong> instead. It achieves the same compaction by building a copy
+      and swapping it in, taking only a brief exclusive lock at the very end. It needs the same extra disk, and
+      it doesn't take your application down.
+      <br><br>
+      Knowing <code>pg_repack</code> exists is a good operational signal, because the obvious answer to bloat is
+      the dangerous one.</p>
+  </div>
+
+  <h3 id="autovacuum">Autovacuum tuning</h3>
+
+  <pre data-label="sql — the default threshold is too lax for big tables"><code class="language-sql">-- Default: vacuum when dead rows > 50 + 20% of the table.
+-- On a 100-million-row table that's 20 MILLION dead rows first.
+SHOW autovacuum_vacuum_scale_factor;   -- 0.2
+
+-- Per-table override for a high-churn table
+ALTER TABLE job SET (
+    autovacuum_vacuum_scale_factor  = 0.01,   -- 1% instead of 20%
+    autovacuum_vacuum_cost_delay    = 0,      -- don't throttle
+    autovacuum_analyze_scale_factor = 0.02
+);</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>The autovacuum defaults are tuned for small tables.</strong></p>
+    <p>The 20% scale factor means a large table accumulates a huge amount of bloat before vacuum even starts —
+      and then the vacuum is enormous and slow.</p>
+    <p>For big or high-churn tables, <strong>set per-table thresholds</strong>. Small and frequent beats large
+      and rare.</p>
+  </div>
+
+  <pre data-label="sql — check dead rows and last vacuum"><code class="language-sql">SELECT relname,
+       n_live_tup, n_dead_tup,
+       round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       last_autovacuum, last_autoanalyze
+FROM   pg_stat_user_tables
+WHERE  n_dead_tup &gt; 10000
+ORDER BY n_dead_tup DESC;</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Three things that stop vacuum working</div>
+    <p style="margin:0"><strong>1. Long-running transactions.</strong> Vacuum can't remove any version a live
+      snapshot might need — anywhere in the database. One session
+      <code>idle in transaction</code> stalls cleanup globally. This is the most common cause by far.
+      <br><br>
+      <strong>2. Abandoned replication slots.</strong> A slot holds WAL and an <code>xmin</code> horizon for a
+      replica that may no longer exist. Bloat grows and the WAL directory fills the disk. Check
+      <code>pg_replication_slots</code> for inactive slots — this one has taken down real systems.
+      <br><br>
+      <strong>3. Cost-based throttling.</strong> Autovacuum deliberately pauses to limit I/O impact. On a busy
+      table it can fall permanently behind. <code>autovacuum_vacuum_cost_delay</code> defaults to 2ms — setting
+      it to 0 for specific tables lets vacuum keep up.</p>
+  </div>
+
+  <h3 id="wraparound">Transaction-ID wraparound <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Transaction IDs are 32-bit — about 4 billion. Visibility is decided by comparing them, so they can't
+      simply wrap around; old rows would appear to be from the future and become invisible.</p>
+    <p>Vacuum prevents this by <strong>freezing</strong> old rows — marking them as visible to everyone, so
+      their original transaction ID no longer matters.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">What happens if freezing falls behind</div>
+    <p style="margin:0">Postgres escalates: warnings in the log, then more aggressive autovacuum that
+      <strong>cannot be cancelled</strong>, and finally at around 3 million remaining IDs it
+      <strong>refuses all writes</strong> and requires a single-user-mode vacuum to recover.
+      <br><br>
+      That's a full outage with a recovery measured in hours, and it's the classic Postgres horror story.
+      <br><br>
+      The causes are always the same three: a very long-lived transaction, an abandoned replication slot, or
+      autovacuum throttled so hard it can't keep up on a high-write table. Monitor
+      <code>age(datfrozenxid)</code> and alert well before it matters.</p>
+  </div>
+
+  <pre data-label="sql — how close are we?"><code class="language-sql">SELECT datname, age(datfrozenxid) AS xid_age
+FROM   pg_database
+ORDER BY xid_age DESC;
+-- autovacuum_freeze_max_age default 200,000,000. Limit ~2,000,000,000.
+-- Alert well before 500 million.</code></pre>
+
+  <div class="note info">
+    <div class="note-title">Worth mentioning: 64-bit transaction IDs</div>
+    <p style="margin:0">This whole class of problem is being addressed by moving to 64-bit transaction IDs, work
+      that's been in progress across recent versions. On any version you'll meet in production today, it's still
+      a 32-bit counter you need to monitor.</p>
+  </div>
+
+  <h2 id="partitioning">Declarative partitioning <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="sql — partition by month"><code class="language-sql">CREATE TABLE metric (
+    id          bigserial,
+    recorded_at timestamptz NOT NULL,
+    value       numeric NOT NULL,
+    PRIMARY KEY (recorded_at, id)          -- partition key must be in the PK
+) PARTITION BY RANGE (recorded_at);
+
+CREATE TABLE metric_2024_06 PARTITION OF metric
+    FOR VALUES FROM ('2024-06-01') TO ('2024-07-01');
+
+CREATE TABLE metric_2024_07 PARTITION OF metric
+    FOR VALUES FROM ('2024-07-01') TO ('2024-08-01');
+
+-- Catch-all so an out-of-range insert doesn't fail
+CREATE TABLE metric_default PARTITION OF metric DEFAULT;</code></pre>
+
+  <pre data-label="sql — archiving: metadata only" class="code-good"><code class="language-sql">-- Detach: instant, the partition becomes a standalone table
+ALTER TABLE metric DETACH PARTITION metric_2023_01 CONCURRENTLY;
+
+-- Then archive, compress or drop it
+DROP TABLE metric_2023_01;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Gains</th><th>Costs</th></tr></thead>
+      <tbody>
+        <tr><td>Instant archive via <code>DETACH</code> / <code>DROP</code></td><td>The partition key must be in every unique constraint, including the PK</td></tr>
+        <tr><td>Partition pruning skips irrelevant partitions</td><td>Queries not filtering on the key touch every partition</td></tr>
+        <tr><td>Vacuum and index builds per partition</td><td>Too many partitions slows planning noticeably</td></tr>
+        <tr><td>Cheaper, smaller indexes per partition</td><td>Needs a job to create future partitions</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — partitioning is a vacuum strategy here</div>
+    <p style="margin:0">On SQL Server, <a href="../10-sql/scaling-operations.html#partitioning">partitioning is
+      about manageability</a> — mainly switching.
+      <br><br>
+      On PostgreSQL it's <strong>also a vacuum strategy</strong>, and that's the extra reason. Vacuum operates
+      per table, so a single 2 TB table means one enormous vacuum that may never finish inside its window.
+      Partitioned into monthly chunks, only the current partition is churning; older ones get frozen once and
+      then need almost nothing.
+      <br><br>
+      And dropping old data becomes <code>DROP TABLE</code> on a partition rather than a <code>DELETE</code>
+      that creates a billion dead rows for vacuum to chase. That's the argument that makes partitioning
+      compelling on Postgres specifically.
+      <br><br>
+      The counterweight: don't over-partition. Query planning time grows with partition count, so hundreds of
+      partitions can measurably slow simple queries.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Two practical details</div>
+    <p style="margin:0"><strong><code>DETACH CONCURRENTLY</code></strong> (PostgreSQL 14+) avoids the brief
+      exclusive lock that plain <code>DETACH</code> takes on the parent — worth using on a busy table.
+      <br><br>
+      <strong>Create partitions ahead of time.</strong> A scheduled job that maintains the next few months, or
+      an extension like <code>pg_partman</code>. Without it, inserts land in the <code>DEFAULT</code> partition
+      (or fail if there isn't one) — and attaching a new partition afterwards requires scanning the default
+      partition to check for rows that belong elsewhere, which is slow and takes locks.</p>
+  </div>
+
+  <h2 id="replication">Replication <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Streaming (physical)</th><th>Logical</th></tr></thead>
+      <tbody>
+        <tr><td>Replicates</td><td>WAL — byte-level block changes</td><td><strong>Row changes</strong>, decoded</td></tr>
+        <tr><td>Granularity</td><td>Whole cluster</td><td><strong>Per table / per publication</strong></td></tr>
+        <tr><td>Replica is</td><td>Read-only, identical</td><td>Writable; can have extra tables and indexes</td></tr>
+        <tr><td>Cross-version</td><td>No — same major version</td><td><strong>Yes</strong></td></tr>
+        <tr><td>Use for</td><td>HA, read replicas, DR</td><td>Zero-downtime upgrades, CDC, selective sync</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to choose</span>
+    <p><strong>Streaming for high availability.</strong> One command to set up, minimal lag, an exact copy.</p>
+    <p><strong>Logical for moving data between systems</strong> — a major-version upgrade with no downtime, or
+      feeding a data warehouse or search index.</p>
+    <p>Logical replication is also how CDC tools work — Debezium reads the logical decoding stream, which is how
+      you get an event feed out of Postgres without triggers.</p>
+  </div>
+
+  <h3 id="sync">Synchronous vs asynchronous</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th><code>synchronous_commit</code></th><th>Commit waits until</th><th>On failover</th></tr></thead>
+      <tbody>
+        <tr><td><code>off</code></td><td>Nothing — not even local disk</td><td>Can lose recent local commits</td></tr>
+        <tr><td><code>local</code></td><td>Local WAL flushed</td><td>Can lose whatever hadn't replicated</td></tr>
+        <tr><td><code>on</code> <em>(default)</em></td><td>Local flush, and standby flush if configured</td><td>Depends on <code>synchronous_standby_names</code></td></tr>
+        <tr><td><code>remote_apply</code></td><td>Standby has <strong>applied</strong> it</td><td>No loss, and reads on the standby are current</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Synchronous replication with one standby is a liability</div>
+    <p style="margin:0">If you require synchronous commit and the only synchronous standby becomes unavailable,
+      <strong>the primary stops accepting writes</strong> — it's waiting for an acknowledgement that will never
+      arrive.
+      <br><br>
+      You've made a durability improvement into an availability risk. So synchronous replication needs
+      <em>at least two</em> candidate standbys (<code>ANY 1 (s1, s2)</code>), or a monitoring system that
+      demotes to asynchronous automatically.
+      <br><br>
+      This is a good thing to raise unprompted, because "use synchronous replication for zero data loss" sounds
+      unambiguously correct until you think about the failure mode.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Replica lag and read-your-own-writes</div>
+    <p style="margin:0">Asynchronous replicas lag. A user creates a record, gets redirected, and the replica
+      hasn't received it — a 404 on something they just made.
+      <br><br>
+      Same problem and same fixes as <a href="../10-sql/scaling-operations.html#replication-lag">SQL Server read
+      replicas</a>: route per query rather than globally, or return the entity you already have instead of
+      re-reading.
+      <br><br>
+      Postgres-specific detail: a long query on a hot standby can conflict with WAL replay. Either replay pauses
+      (increasing lag) or the query is cancelled, depending on
+      <code>hot_standby_feedback</code> and <code>max_standby_streaming_delay</code>. Enabling
+      <code>hot_standby_feedback</code> avoids the cancellations but lets replica queries hold back vacuum on
+      the primary — another route to bloat.</p>
+  </div>
+
+  <h2 id="pooling">Connection pooling <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why this matters more than on SQL Server</span>
+    <p>PostgreSQL forks <strong>one OS process per connection</strong>. Each has its own memory, and the
+      scheduler has to manage all of them.</p>
+    <p>So a few hundred connections is genuinely a lot. Thousands will degrade the instance badly even if most
+      are idle.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Layer</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Npgsql pool</strong> (in-process)</td><td>Reuses connections within one application instance. On by default</td></tr>
+        <tr><td><strong>PgBouncer</strong> (external)</td><td>Multiplexes <em>many</em> clients onto few server connections</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Where a .NET service breaks</div>
+    <p style="margin:0">Npgsql's pool is per <strong>process</strong>. So 20 container replicas with
+      <code>Maximum Pool Size=100</code> can demand 2,000 connections — and
+      <code>max_connections</code> is probably 100 or 200.
+      <br><br>
+      You get <em>"remaining connection slots are reserved"</em> errors under load, and it looks like a database
+      problem when it's an arithmetic one.
+      <br><br>
+      <strong>Two fixes, and you usually want both:</strong> size the per-instance pool for the replica count
+      (<code>max_connections</code> ÷ replicas, with headroom), and put PgBouncer in front so many client
+      connections share few server ones. Serverless platforms that scale to many instances essentially require
+      a pooler.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>PgBouncer mode</th><th>Server connection held for</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>session</code></td><td>The client's whole session</td><td>Safest, least benefit</td></tr>
+        <tr><td><strong><code>transaction</code></strong></td><td>One transaction</td><td><strong>The usual choice</strong> — big gain, some restrictions</td></tr>
+        <tr><td><code>statement</code></td><td>One statement</td><td>Breaks multi-statement transactions</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">What transaction-mode pooling breaks</div>
+    <p style="margin:0">Because a different server connection may serve your next transaction, anything that
+      relies on <strong>session state</strong> stops working: <code>SET</code> outside a transaction, session
+      advisory locks, <code>LISTEN</code>/<code>NOTIFY</code>, temporary tables, and
+      <code>WITH HOLD</code> cursors.
+      <br><br>
+      Two .NET-specific ones. Server-side prepared statements are tied to a connection — Npgsql handles this if
+      you disable them or use a compatible setup, but a naive configuration produces
+      <em>"prepared statement already exists"</em> errors that are confusing to diagnose.
+      <br><br>
+      And a schema-per-tenant design switching <code>search_path</code> per request is <strong>unsafe</strong>
+      in transaction mode, because the next request inherits it. Set it inside the transaction, or use
+      <code>SET LOCAL</code>.</p>
+  </div>
+
+  <h2 id="ha">High availability <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="note info">
+    <div class="note-title">Postgres has no built-in automatic failover</div>
+    <p style="margin:0">Unlike SQL Server Always On, core PostgreSQL provides replication but <em>not</em>
+      automatic promotion. You need an external orchestrator:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Patroni</strong> — the de facto standard. Uses etcd or Consul for leader election.</li>
+      <li><strong>repmgr</strong>, <strong>pg_auto_failover</strong> — lighter alternatives.</li>
+      <li><strong>Managed services</strong> — Azure Flexible Server, RDS, Aurora do it for you. Which is a
+        strong reason to use one.</li>
+    </ul>
+    <p style="margin:8px 0 0">Saying "I'd use a managed service, or Patroni if self-hosting" is the right answer.
+      Hand-rolling failover with scripts is how you get split-brain, because correct leader election needs a
+      consensus store — not a health check and a promotion script.</p>
+  </div>
+
+  <h3 id="backup">Backup and PITR</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>Gives you</th></tr></thead>
+      <tbody>
+        <tr><td><code>pg_dump</code> / <code>pg_dumpall</code></td><td>Logical dump. Portable across versions; slow to restore at scale; <strong>no PITR</strong></td></tr>
+        <tr><td><code>pg_basebackup</code> + WAL archive</td><td><strong>Point-in-time recovery.</strong> The real answer</td></tr>
+        <tr><td><code>pgBackRest</code> / <code>barman</code></td><td>Production tooling — parallel, incremental, compressed, verified</td></tr>
+        <tr><td>Snapshots</td><td>Fast, but must be crash-consistent across all volumes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong><code>pg_dump</code> is not a backup strategy for a production database.</strong></p>
+    <p>It gives no point-in-time recovery, so your RPO is "since the last dump". Restoring a large dump is also
+      very slow because it replays every insert and rebuilds every index.</p>
+    <p>For real RPO you need a base backup plus continuous WAL archiving — <code>pgBackRest</code> or the
+      managed service's equivalent. <code>pg_dump</code> is for moving a database, not for protecting one.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">And the same rule as everywhere</div>
+    <p style="margin:0">A backup that has never been restored is not a backup. Automate a restore into a
+      separate environment, measure how long it takes so you know your real RTO, and keep offsite immutable
+      copies — replication does not protect you from
+      <code>DELETE</code> without a <code>WHERE</code> clause, or from ransomware.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Vacuum reclaims dead rows, maintains the visibility map, and freezes transaction IDs.</li>
+      <li>Autovacuum defaults suit small tables — set per-table thresholds for big or high-churn ones.</li>
+      <li>Long transactions and abandoned replication slots are what stop vacuum working.</li>
+      <li>Wraparound eventually blocks all writes. Monitor <code>age(datfrozenxid)</code>.</li>
+      <li>Never <code>VACUUM FULL</code> in production — use <code>pg_repack</code>.</li>
+      <li>Partitioning is also a vacuum strategy here; <code>DETACH</code> replaces mass deletes.</li>
+      <li>Streaming replication for HA, logical for upgrades and CDC.</li>
+      <li>Synchronous replication with a single standby can halt writes.</li>
+      <li>One process per connection — size pools for replica count and use PgBouncer.</li>
+      <li>Transaction-mode pooling breaks session state, including <code>search_path</code> tricks.</li>
+      <li>No built-in failover — managed service or Patroni.</li>
+      <li><code>pg_dump</code> is not a backup strategy; you need WAL archiving for PITR.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Ignoring vacuum</strong> until a table is 5× its necessary size.</li>
+    <li><strong><code>VACUUM FULL</code> on production</strong>, causing an unplanned outage.</li>
+    <li><strong>Leaving default autovacuum settings</strong> on a 200-million-row table.</li>
+    <li><strong>Abandoned replication slots</strong> filling the disk and blocking cleanup.</li>
+    <li><strong>Not monitoring transaction-ID age.</strong></li>
+    <li><strong>Deleting old rows in bulk</strong> instead of dropping a partition.</li>
+    <li><strong>Hundreds of partitions</strong>, slowing query planning.</li>
+    <li><strong>Sizing Npgsql pools per instance</strong> without multiplying by replica count.</li>
+    <li><strong>Transaction-mode PgBouncer with session-scoped <code>SET</code></strong> or advisory locks.</li>
+    <li><strong>Synchronous replication with one standby.</strong></li>
+    <li><strong><code>pg_dump</code> as the only backup.</strong></li>
+    <li><strong>Hand-rolled failover scripts</strong> with no consensus store.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What is vacuum, and what happens if it doesn't run? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Vacuum exists because of MVCC. An <code>UPDATE</code> in PostgreSQL doesn't overwrite a row — it
+          writes a new version and marks the old one dead. Those dead versions stay in the table, so something
+          has to clean them up."</p>
+        <p>"It actually does three jobs, and people usually only know the first."</p>
+        <p>"<strong>One, it marks dead row space reusable</strong> for future inserts into that table. Note it
+          doesn't normally return space to the operating system — it recycles it internally."</p>
+        <p>"<strong>Two, it updates the visibility map</strong>, which is what makes index-only scans possible.
+          That means <em>vacuum is a read-performance feature</em>, not just cleanup. A table that hasn't been
+          vacuumed recently loses index-only scans and queries get slower with no plan change that looks
+          meaningful."</p>
+        <p>"<strong>Three, it freezes old transaction IDs</strong> to prevent wraparound. That's the one with
+          catastrophic consequences."</p>
+        <p>"If it falls behind, three things happen in order of severity."</p>
+        <p>"<strong>Bloat.</strong> The table and its indexes grow far beyond the live data. Every scan reads
+          more pages, so everything slows down — and importantly, you can't fix that with query tuning."</p>
+        <p>"<strong>Lost index-only scans</strong>, from the visibility map going stale."</p>
+        <p>"<strong>Transaction-ID wraparound.</strong> IDs are 32-bit, and visibility is decided by comparing
+          them, so they can't just wrap. If freezing falls far enough behind, Postgres escalates: warnings, then
+          an aggressive autovacuum that can't be cancelled, and finally it <strong>refuses all writes</strong>
+          and needs single-user-mode recovery. That's a multi-hour outage and it's the classic Postgres
+          horror story."</p>
+        <p>"The causes are consistently the same three. <strong>Long-running transactions</strong> — vacuum
+          can't remove any version a live snapshot might need, so one session sitting
+          <code>idle in transaction</code> blocks cleanup across the whole database. <strong>Abandoned
+          replication slots</strong>, which hold an <code>xmin</code> horizon for a replica that may not exist
+          any more, and also fill the disk with retained WAL. And <strong>cost-based throttling</strong>, where
+          autovacuum's deliberate pauses mean it can never catch up on a high-churn table."</p>
+        <p>"What I'd actually do: monitor <code>n_dead_tup</code> and <code>last_autovacuum</code> in
+          <code>pg_stat_user_tables</code>, alert on <code>age(datfrozenxid)</code>, alert on inactive
+          replication slots, and set <code>idle_in_transaction_session_timeout</code> so the server kills
+          abandoned transactions."</p>
+        <p>"And I'd tune per table. The default scale factor is 20%, which on a 100-million-row table means
+          waiting for 20 million dead rows — then the vacuum is enormous. For high-churn tables I'd set it to
+          1% and remove the cost delay. Small and frequent beats large and rare."</p>
+        <p>"One thing I'd avoid: <code>VACUUM FULL</code> to fix existing bloat. It takes an
+          <code>ACCESS EXCLUSIVE</code> lock, so nothing can read or write for however long it takes to rewrite
+          the table. <code>pg_repack</code> does the same compaction with only a brief lock at the end."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you connect vacuum to MVCC rather than treating it as generic maintenance?</li>
+        <li>Do you know the visibility map / read-performance angle?</li>
+        <li>Do you know about wraparound and what it does?</li>
+        <li>Do you name the three blockers?</li>
+        <li>Do you know <code>VACUUM FULL</code> is unsafe and what to use instead?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "it's like a defrag, autovacuum handles it."</li>
+        <li><span class="redflag">Red flag:</span> recommending <code>VACUUM FULL</code>.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you find out if a table is bloated?</li>
+          <li>Why does a long transaction block vacuum in an unrelated table?</li>
+          <li>What does freezing actually change on the row?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Your .NET API scaled from 3 to 20 replicas and Postgres is refusing connections. What's happening? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Almost certainly connection exhaustion, and it's arithmetic rather than a database fault."</p>
+        <p>"Npgsql pools connections <strong>per process</strong>. So if the connection string has
+          <code>Maximum Pool Size=100</code> — and 100 is a common default people set without thinking — then
+          20 replicas can demand 2,000 connections. <code>max_connections</code> is probably 100 or 200. At 3
+          replicas it fit; at 20 it doesn't."</p>
+        <p>"The error is <em>'remaining connection slots are reserved for superusers'</em>, or Npgsql timing out
+          waiting for a pooled connection."</p>
+        <p>"Why Postgres can't just be told to allow more: it uses <strong>one OS process per
+          connection</strong>, not a thread. Each has its own memory and the scheduler has to manage all of
+          them. So raising <code>max_connections</code> to 2,000 doesn't fix it — it converts a clear error
+          into severe performance degradation, plus a real out-of-memory risk because
+          <code>work_mem</code> is allocated per operation per connection."</p>
+        <p>"<strong>Immediate mitigation:</strong> reduce the per-instance pool size. Twenty replicas against
+          <code>max_connections = 200</code> means something like 8 per instance with headroom for migrations
+          and admin sessions. That's a config change and a restart. Worth noting most services need far fewer
+          connections than people assume — if requests are mostly async and queries are fast, a small pool
+          handles high throughput."</p>
+        <p>"<strong>The proper fix: PgBouncer</strong> in transaction mode. Clients connect to PgBouncer, which
+          multiplexes many client connections onto a small number of server connections. A server connection is
+          only held for the duration of a transaction, so a few dozen server connections can serve thousands of
+          clients. That's the standard answer, and it's essentially mandatory on a platform that scales to many
+          instances."</p>
+        <p>"But I'd check what transaction-mode pooling breaks before switching, because it's not
+          transparent. Anything relying on <strong>session state</strong> stops working: <code>SET</code>
+          outside a transaction, session-scoped advisory locks, <code>LISTEN</code>/<code>NOTIFY</code>,
+          temporary tables."</p>
+        <p>"Two that specifically bite .NET. <strong>Server-side prepared statements</strong> are tied to a
+          connection, so a naive setup produces <em>'prepared statement already exists'</em> errors — Npgsql
+          needs configuring for this. And if there's a <strong>schema-per-tenant design switching
+          <code>search_path</code></strong>, that's now unsafe, because the next request can inherit the
+          previous tenant's setting. It has to move inside the transaction as <code>SET LOCAL</code> — and
+          that's a cross-tenant data leak if missed, so I'd check for it specifically."</p>
+        <p>"Then I'd look at whether the connections are being used or just held. Long-running or
+          <code>idle in transaction</code> sessions hold a connection while doing nothing — and on Postgres
+          those also block vacuum, so it's two problems. I'd set
+          <code>idle_in_transaction_session_timeout</code> and <code>statement_timeout</code> regardless of
+          how this resolves."</p>
+        <p>"And I'd double-check the total: background workers, scheduled jobs, migrations, monitoring agents
+          and any BI tool all consume from the same budget, and they're the ones people forget when doing the
+          arithmetic."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know Npgsql pools per process?</li>
+        <li>Do you know why raising <code>max_connections</code> isn't the fix?</li>
+        <li>Do you know PgBouncer and what transaction mode breaks?</li>
+        <li>Do you catch the <code>search_path</code> tenancy hazard?</li>
+        <li>Do you account for non-API consumers?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "increase <code>max_connections</code>" as the whole
+          answer.</li>
+        <li><span class="redflag">Red flag:</span> not knowing the pool is per process.</li>
+        <li><span class="redflag">Red flag:</span> recommending PgBouncer with no awareness of its
+          restrictions.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you size the pool properly?</li>
+          <li>How do prepared statements work with PgBouncer?</li>
+          <li>What monitoring would tell you this was coming?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

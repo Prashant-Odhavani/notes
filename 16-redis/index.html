@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis &amp; Caching — Overview</title>
+<meta name="description" content="What Redis is actually for beyond caching, the questions to ask before adding a cache, and how this section is organised.">
+<meta name="keywords" content="Redis overview caching when to add a cache in-memory data structure store IDistributedCache StackExchange.Redis Azure Cache for Redis vs memory cache">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="16-redis/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Redis &amp; Caching</h1>
+    <p class="subtitle">Redis is the default answer to "make it faster", and adding a cache is one of the
+      easiest ways to introduce a correctness bug. Both halves matter.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="what-it-is">More than a cache <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Redis is an <strong>in-memory data structure server</strong>. Not a key-value store that happens to be
+      fast — a server that exposes hashes, sorted sets, lists and streams as network-accessible primitives.</p>
+    <p>Caching is its most common use, and it's the least interesting thing it does.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Use</th><th>Why Redis rather than something else</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Cache</strong></td><td>Sub-millisecond reads, shared across all instances</td></tr>
+        <tr><td><strong>Distributed lock</strong></td><td>Atomic set-if-not-exists with expiry, in one operation</td></tr>
+        <tr><td><strong>Rate limiter</strong></td><td>Atomic counters with TTL; sorted sets for sliding windows</td></tr>
+        <tr><td><strong>Leaderboard</strong></td><td>Sorted sets give ranked queries in log time — genuinely hard elsewhere</td></tr>
+        <tr><td><strong>Session store</strong></td><td>Fast, shared, and expiry is built in</td></tr>
+        <tr><td><strong>Queue / stream</strong></td><td>Lists for simple queues, Streams for consumer groups</td></tr>
+        <tr><td><strong>Pub/sub</strong></td><td>Fan-out to subscribers — fire-and-forget, no persistence</td></tr>
+        <tr><td><strong>Deduplication</strong></td><td><code>SET NX</code> as an idempotency key store</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the sorted set is the differentiator</div>
+    <p style="margin:0">Most of what Redis does you could approximate elsewhere. The <strong>sorted set</strong>
+      is the one that's genuinely difficult to replicate.
+      <br><br>
+      "Give me ranks 50–100 by score, and tell me this user's rank" is O(log n) in Redis and awkward in every
+      relational database — you'd need a window function over the whole table on each query.
+      <br><br>
+      Sorted sets are also the right answer for sliding-window rate limiting, time-series with range queries,
+      priority queues, and "top N by score" of any kind.
+      <br><br>
+      Knowing Redis for its data structures rather than as a key-value cache is what separates using it from
+      using it well.</p>
+  </div>
+
+  <h2 id="before-caching">Before you add a cache <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The questions to ask first</span>
+    <ol>
+      <li><strong>Is the slow thing actually slow, or just called too often?</strong> An N+1 pattern isn't
+        fixed by caching — it's fixed by not doing it.</li>
+      <li><strong>Would an index fix it?</strong> Far cheaper, and it doesn't add a consistency problem.</li>
+      <li><strong>How stale can this be?</strong> If the answer is "not at all", caching is the wrong
+        tool.</li>
+      <li><strong>What happens when the cache is empty or down?</strong> If the answer is "the site falls
+        over", you've added a dependency, not a cache.</li>
+    </ol>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A cache is a second source of truth</div>
+    <p style="margin:0">That's the framing that matters. Every cache entry is a copy of data that can now
+      <strong>disagree with the database</strong>.
+      <br><br>
+      So you've traded a performance problem for a correctness problem — usually a good trade, and it is a
+      trade. The bugs that follow are the worst kind: intermittent, environment-dependent, and impossible to
+      reproduce locally because your local cache is empty.
+      <br><br>
+      "Add caching" is the most common answer to a performance question in interviews, and the strongest version
+      of that answer names the invalidation strategy in the same breath. Without one, you've described half a
+      solution.</p>
+  </div>
+
+  <h2 id="local-vs-distributed">In-process or Redis <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>IMemoryCache</code> (in-process)</th><th>Redis (distributed)</th></tr></thead>
+      <tbody>
+        <tr><td>Latency</td><td><strong>Nanoseconds</strong> — it's a dictionary</td><td>Sub-millisecond, plus network</td></tr>
+        <tr><td>Shared across instances</td><td><strong>No</strong></td><td><strong>Yes</strong></td></tr>
+        <tr><td>Survives a restart</td><td>No</td><td>Yes</td></tr>
+        <tr><td>Serialization</td><td>None — live objects</td><td>Required, and it costs</td></tr>
+        <tr><td>Memory</td><td>Consumes app memory</td><td>Separate</td></tr>
+        <tr><td>Invalidation across instances</td><td><strong>Hard</strong></td><td>Natural</td></tr>
+        <tr><td>Extra failure mode</td><td>None</td><td><strong>A network dependency</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The answer is often both</div>
+    <p style="margin:0"><strong>Hybrid caching</strong>: a short-lived in-process cache in front of Redis. The
+      L1 absorbs repeated reads with no network hop; the L2 keeps instances roughly consistent and survives
+      restarts.
+      <br><br>
+      .NET 9 ships <code>HybridCache</code> which does exactly this, and also solves
+      <a href="caching-patterns.html#stampede">stampede</a> — which is the harder problem and the reason to use
+      it rather than hand-rolling the two layers.
+      <br><br>
+      The trade-off to state: the L1 makes staleness worse, because now each instance can hold a different
+      version for the duration of its local TTL. Keep local TTLs short — seconds — and treat them as a
+      throughput optimisation rather than the primary cache.</p>
+  </div>
+
+  <h2 id="dotnet">The .NET side <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>API</th><th>Gives you</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>IDistributedCache</code></td>
+          <td>A provider-agnostic byte-array cache</td>
+          <td>Simple get/set caching you may want to swap out</td>
+        </tr>
+        <tr>
+          <td><code>HybridCache</code> (.NET 9)</td>
+          <td>L1 + L2, stampede protection, tag-based invalidation</td>
+          <td><strong>The default choice for new caching code</strong></td>
+        </tr>
+        <tr>
+          <td><code>IConnectionMultiplexer</code> (StackExchange.Redis)</td>
+          <td><strong>Everything</strong> — data structures, Lua, transactions, pub/sub</td>
+          <td>Anything beyond get/set</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — registration" class="code-good"><code class="language-csharp">// The multiplexer is EXPENSIVE to create and designed to be shared.
+// One per application, as a singleton. Never per-request.
+builder.Services.AddSingleton&lt;IConnectionMultiplexer&gt;(_ =&gt;
+    ConnectionMultiplexer.Connect(new ConfigurationOptions
+    {
+        EndPoints = { "cache.redis.cache.windows.net:6380" },
+        Ssl = true,
+        Password = password,
+        AbortOnConnectFail = false,   // keep retrying rather than failing at startup
+        ConnectRetry = 3,
+        ConnectTimeout = 5000
+    }));</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Two registration mistakes that cause production incidents</div>
+    <p style="margin:0"><strong>1. Creating a multiplexer per request.</strong> It's a heavyweight object that
+      multiplexes all commands over a small number of connections. Creating one per request exhausts sockets and
+      produces timeouts under load — and it looks fine in development. <strong>Singleton, always.</strong>
+      <br><br>
+      <strong>2. <code>AbortOnConnectFail = true</code></strong> (the historical default). If Redis is briefly
+      unavailable at startup, the multiplexer throws and <em>never reconnects</em>. A transient blip during a
+      deployment permanently breaks caching until the app is restarted. Setting it to <code>false</code> means
+      it keeps retrying in the background, which is what you want in every managed-Redis environment.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title"><code>IDistributedCache</code> is a lowest-common-denominator API</div>
+    <p style="margin:0">It gives you byte arrays keyed by string — get, set, refresh, remove. That's it.
+      <br><br>
+      No hashes, no sorted sets, no atomic increments, no Lua, no pub/sub. So it can't do locks, rate limiting,
+      leaderboards or anything else in the table at the top of this page.
+      <br><br>
+      It's fine for straightforward caching where provider-independence matters. For anything else you need
+      <code>IConnectionMultiplexer</code> directly — and that's not a failure of abstraction, it's the point
+      where you've stopped using Redis as a cache and started using it as a data structure server.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">Architecture &amp; Data Types</a></td>
+          <td>The single-threaded model and why it matters, each data type and what it's actually for, key
+              design, atomicity and Lua</td>
+        </tr>
+        <tr>
+          <td><a href="caching-patterns.html">Caching Patterns &amp; Invalidation</a></td>
+          <td>Cache-aside and the alternatives, TTL strategy, stampede, penetration, the delete-vs-update
+              question, and why invalidation is the hard part</td>
+        </tr>
+        <tr>
+          <td><a href="distributed-primitives.html">Locks, Rate Limiting &amp; Pub/Sub</a></td>
+          <td>Distributed locks and the honest limits of them, the Redlock debate, rate-limiting algorithms,
+              pub/sub vs Streams</td>
+        </tr>
+        <tr>
+          <td><a href="operations.html">Persistence, Clustering &amp; Failure</a></td>
+          <td>RDB and AOF, eviction policies, replication and failover, cluster mode, hot keys, and what your
+              application does when Redis is gone</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <details class="qa">
+    <summary>Your API is slow. Would you add caching? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Probably eventually, but not first — because caching hides a performance problem rather than fixing
+          it, and it introduces a second source of truth."</p>
+        <p>"I'd want to know <strong>why</strong> it's slow before deciding. Three possibilities, with very
+          different answers."</p>
+        <p>"<strong>Too many queries rather than slow ones.</strong> If it's an N+1 pattern — 400 queries at 2ms
+          each — caching would mask it, but the fix is to not issue 400 queries. That's a data-access change and
+          it's strictly better than caching, because there's no staleness."</p>
+        <p>"<strong>One genuinely slow query.</strong> Then I'd look at the execution plan first. If a missing
+          index is the cause, an index is far cheaper than a cache — no extra infrastructure, no invalidation
+          logic, no new failure mode. Caching a query that should take 5ms is solving the wrong problem."</p>
+        <p>"<strong>Genuinely expensive work that's inherently repeated.</strong> An aggregate over millions of
+          rows, an external API call, a computed report. That's where caching is the right answer, because the
+          work is unavoidable and the result is reusable."</p>
+        <p>"If I do add a cache, I'd decide four things upfront rather than discovering them later."</p>
+        <p>"<strong>How stale can this be?</strong> That's a product question, not a technical one, and it sets
+          the TTL. If the answer is 'not at all', caching is the wrong tool."</p>
+        <p>"<strong>How does it get invalidated?</strong> This is the hard part and the part people skip. TTL
+          alone, explicit invalidation on write, or both. Without an answer here I've described half a
+          solution."</p>
+        <p>"<strong>What happens on a cache miss storm?</strong> If a popular key expires and a thousand
+          requests all miss simultaneously, they all hit the database at once — the stampede problem. That needs
+          handling deliberately, and it's the failure mode that turns a cache into an outage."</p>
+        <p>"<strong>What happens when Redis is down?</strong> If the answer is 'the site falls over', I've added
+          a dependency rather than a cache. It should degrade to hitting the database, slower but working."</p>
+        <p>"On the technology: for a single instance <code>IMemoryCache</code> is nanoseconds and needs no
+          infrastructure. The moment there are multiple instances, in-process caching means each one holds a
+          different version and invalidation becomes very hard — that's when Redis earns its place. In .NET 9
+          I'd reach for <code>HybridCache</code>, because it gives both layers plus stampede protection, which
+          is the piece that's genuinely awkward to write correctly by hand."</p>
+        <p>"The framing I'd land on: <strong>a cache is a second source of truth</strong>. Usually a good trade,
+          always a trade, and the bugs it produces are intermittent and environment-dependent — which is exactly
+          the kind you can't reproduce locally because your local cache is empty."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you diagnose before caching?</li>
+        <li>Do you know an index or fixing N+1 is usually better?</li>
+        <li>Do you name invalidation and staleness tolerance unprompted?</li>
+        <li>Do you consider stampede and cache-down behaviour?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add Redis" as the immediate answer.</li>
+        <li><span class="redflag">Red flag:</span> no invalidation strategy.</li>
+        <li><span class="redflag">Red flag:</span> no thought about what happens when the cache is
+          unavailable.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you handle a cache stampede?</li>
+          <li>Delete or update the cache on a write?</li>
+          <li>How do you pick a TTL?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section assumes <a href="../10-sql/indexing.html">SQL indexing</a>, because "would
+      an index fix this?" comes before "would a cache fix this?". The distributed-primitives page builds on
+      <a href="../19-architecture/distributed-data.html">distributed data patterns</a> and
+      <a href="../08-http-web-apis/reliability.html#idempotency-keys">idempotency</a>.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

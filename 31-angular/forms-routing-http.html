@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forms, Routing &amp; HTTP — Angular</title>
+<meta name="description" content="Reactive forms and typed forms, custom and async validators, routing with guards and resolvers, HTTP interceptors and lazy loading.">
+<meta name="keywords" content="Angular reactive forms FormGroup FormControl typed forms custom validator async validator FormArray routing guards canActivate resolver lazy loading loadComponent HttpClient interceptor retry error handling">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="31-angular/forms-routing-http.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Forms, Routing &amp; HTTP</h1>
+    <p class="subtitle">The three subsystems you use on every screen. Interceptors and guards will feel like
+      middleware and filters, because that's what they are.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Reactive forms for anything real.</strong> Template-driven only for trivial cases.</li>
+      <li><strong>A validator is a function returning errors or <code>null</code>.</strong></li>
+      <li><strong>Async validators need debouncing</strong>, or you'll hit the API on every keystroke.</li>
+      <li><strong>Guards are functions now</strong>, not classes.</li>
+      <li><strong>Interceptors are middleware</strong> — auth headers, retries, error mapping.</li>
+      <li><strong>Lazy load routes with <code>loadComponent</code></strong> — the biggest bundle win.</li>
+      <li><strong>Client validation is UX; the server enforces the rules.</strong></li>
+    </ul>
+  </div>
+
+  <h2 id="forms">Reactive vs template-driven <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Reactive</th><th>Template-driven</th></tr></thead>
+      <tbody>
+        <tr><td>Defined in</td><td><strong>TypeScript</strong></td><td>The template, via <code>ngModel</code></td></tr>
+        <tr><td>Validation</td><td>Explicit functions</td><td>Directives on the markup</td></tr>
+        <tr><td>Testable without the DOM</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Dynamic fields</td><td><strong>Straightforward</strong></td><td>Awkward</td></tr>
+        <tr><td>Type safety</td><td><strong>Yes</strong>, with typed forms</td><td>Minimal</td></tr>
+        <tr><td>Use for</td><td><strong>Anything non-trivial</strong></td><td>A one-field search box</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="typescript — a typed reactive form" class="code-good"><code class="language-typescript">export class OrderFormComponent {
+  private readonly fb = inject(NonNullableFormBuilder);
+
+  readonly form = this.fb.group({
+    reference: this.fb.control('', [Validators.required, Validators.maxLength(20)]),
+    email:     this.fb.control('', [Validators.required, Validators.email]),
+    quantity:  this.fb.control(1,  [Validators.required, Validators.min(1)]),
+    lines:     this.fb.array&lt;FormGroup&gt;([])
+  });
+
+  // form.value is fully typed - no `any`
+  submit() {
+    if (this.form.invalid) {
+      this.form.markAllAsTouched();   // reveal errors the user hasn't visited
+      return;
+    }
+    this.service.save(this.form.getRawValue());
+  }
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title"><code>NonNullableFormBuilder</code> saves a lot of noise</div>
+    <p style="margin:0">By default a <code>FormControl</code> is nullable, because <code>reset()</code> sets it
+      to <code>null</code>. So <code>form.value.email</code> is <code>string | null | undefined</code> and every
+      usage needs narrowing.
+      <br><br>
+      <code>NonNullableFormBuilder</code> makes <code>reset()</code> restore the initial value instead of
+      <code>null</code>, so the types are simply <code>string</code>. Considerably less friction, and it's what
+      you almost always want.
+      <br><br>
+      Also worth knowing: <code>form.value</code> <strong>omits disabled controls</strong>, which silently drops
+      fields from your payload. <code>getRawValue()</code> includes them. That's a real bug source when a field
+      is conditionally disabled.</p>
+  </div>
+
+  <h3 id="validators">Custom and async validators</h3>
+
+  <pre data-label="typescript — a sync validator is just a function" class="code-good"><code class="language-typescript">// Returns null when valid, an error object when not
+export function futureDate(control: AbstractControl): ValidationErrors | null {
+  if (!control.value) return null;                 // let `required` handle empty
+  return new Date(control.value) &gt; new Date()
+    ? null
+    : { futureDate: { actual: control.value } };
+}
+
+// Cross-field validation goes on the GROUP, not a control
+export function datesInOrder(group: AbstractControl): ValidationErrors | null {
+  const from = group.get('from')?.value;
+  const to   = group.get('to')?.value;
+  return !from || !to || from &lt;= to ? null : { datesOutOfOrder: true };
+}</code></pre>
+
+  <pre data-label="typescript — async validator with debouncing" class="code-good"><code class="language-typescript">export function uniqueReference(api: OrderApi): AsyncValidatorFn {
+  return (control: AbstractControl): Observable&lt;ValidationErrors | null&gt; =&gt;
+    timer(400).pipe(                    // debounce - do NOT hit the API per keystroke
+      switchMap(() =&gt; api.referenceExists(control.value)),
+      map(exists =&gt; (exists ? { referenceTaken: true } : null)),
+      catchError(() =&gt; of(null))        // don't block submission on a failed check
+    );
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Three async validator mistakes</div>
+    <p style="margin:0"><strong>1. No debounce.</strong> Async validators run on every value change, so without
+      the <code>timer</code> you issue a request per keystroke. <code>switchMap</code> cancels the previous one,
+      which limits the damage but still floods the server.
+      <br><br>
+      <strong>2. No error handling.</strong> If the check fails — network error, API down — an unhandled error
+      leaves the control in a <code>pending</code> state <em>forever</em>, so the form can never be submitted.
+      Returning <code>null</code> on error fails open, which is correct here because the server validates
+      anyway.
+      <br><br>
+      <strong>3. Forgetting the <code>pending</code> state.</strong> While an async validator runs the control is
+      neither valid nor invalid. A submit button bound only to <code>form.invalid</code> is enabled during that
+      window, so a fast user can submit before validation completes. Bind to
+      <code>form.invalid || form.pending</code>.</p>
+  </div>
+
+  <h2 id="routing">Routing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="typescript — lazy-loaded routes with a guard" class="code-good"><code class="language-typescript">export const routes: Routes = [
+  { path: '', component: HomeComponent },
+
+  {
+    path: 'orders',
+    // Lazy: this chunk isn't downloaded until the route is visited
+    loadComponent: () =&gt; import('./orders/order-list.component')
+      .then(m =&gt; m.OrderListComponent),
+    canActivate: [authGuard]
+  },
+  {
+    path: 'orders/:id',
+    loadComponent: () =&gt; import('./orders/order-detail.component')
+      .then(m =&gt; m.OrderDetailComponent),
+    canActivate: [authGuard],
+    resolve: { order: orderResolver }
+  },
+  {
+    path: 'admin',
+    // Lazy-load a whole route subtree
+    loadChildren: () =&gt; import('./admin/admin.routes').then(m =&gt; m.adminRoutes),
+    canMatch: [adminGuard]
+  },
+  { path: '**', component: NotFoundComponent }
+];</code></pre>
+
+  <pre data-label="typescript — functional guards" class="code-good"><code class="language-typescript">export const authGuard: CanActivateFn = (route, state) =&gt; {
+  const auth   = inject(AuthService);
+  const router = inject(Router);
+
+  if (auth.isAuthenticated()) return true;
+
+  // Preserve where they were going, so we can return after login
+  return router.createUrlTree(['/login'], {
+    queryParams: { returnUrl: state.url }
+  });
+};</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Guard</th><th>Runs</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><code>canActivate</code></td><td>Before activating a route</td><td>Authentication, authorisation</td></tr>
+        <tr><td><code>canActivateChild</code></td><td>Before any child route</td><td>Protecting a whole section</td></tr>
+        <tr><td><strong><code>canMatch</code></strong></td><td>Before the route is even matched</td><td><strong>Prevents downloading the lazy chunk at all</strong></td></tr>
+        <tr><td><code>canDeactivate</code></td><td>Before leaving</td><td>Unsaved-changes warnings</td></tr>
+        <tr><td><code>resolve</code></td><td>Before activation, to fetch data</td><td>Loading data before the view shows</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — <code>canMatch</code> versus <code>canActivate</code></div>
+    <p style="margin:0">With <code>canActivate</code> on a lazy route, Angular <strong>downloads the chunk
+      first</strong>, then runs the guard and rejects. So a non-admin user has still downloaded the entire admin
+      bundle.
+      <br><br>
+      <code>canMatch</code> runs <em>before</em> matching, so a failed check means the chunk is never fetched.
+      That's both a bundle-size and a mild information-disclosure improvement — the admin code isn't sitting in a
+      regular user's browser.
+      <br><br>
+      It also lets you serve <em>different components for the same path</em> based on a condition, which is a
+      clean way to handle feature flags or role-specific screens.
+      <br><br>
+      This is a genuinely useful distinction that most people don't know, and it's a good thing to raise
+      unprompted.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">A guard is not security</div>
+    <p style="margin:0">Route guards run in the browser. Anyone can bypass them — disable JavaScript, call the
+      API directly, edit the bundle.
+      <br><br>
+      So a guard is a <strong>navigation and UX control</strong>: don't show the user a screen they can't use.
+      The actual authorisation must be enforced
+      <a href="../07-aspnet-core/security.html">server-side on every endpoint</a>.
+      <br><br>
+      Same reasoning as <a href="../30-web-fundamentals/html.html#forms">client-side form validation</a> — the
+      client layer is convenience, the server layer is the control. Stating that unprompted is a good security
+      signal.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Resolvers: useful, with a caveat</div>
+    <p style="margin:0">A resolver fetches data <em>before</em> the route activates, so the component renders
+      with data already present — no loading spinner, no empty state.
+      <br><br>
+      The trade-off: <strong>navigation appears frozen while it runs</strong>. The old view stays on screen with
+      no feedback until the data arrives, which feels worse than a fast transition with a skeleton if the call is
+      slow.
+      <br><br>
+      So resolvers suit fast, essential data. For anything slow, navigate immediately and load in the component
+      with a loading state — the perceived performance is better even though the total time is the same.</p>
+  </div>
+
+  <h2 id="http">HttpClient and interceptors <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="typescript — functional interceptors" class="code-good"><code class="language-typescript">export const authInterceptor: HttpInterceptorFn = (req, next) =&gt; {
+  const token = inject(AuthService).token();
+  if (!token) return next(req);
+
+  // Requests are IMMUTABLE - clone to modify
+  return next(req.clone({
+    setHeaders: { Authorization: `Bearer ${token}` }
+  }));
+};
+
+export const errorInterceptor: HttpInterceptorFn = (req, next) =&gt; {
+  const router = inject(Router);
+
+  return next(req).pipe(
+    retry({ count: 2, delay: (_, n) =&gt; timer(1000 * 2 ** n) }),  // backoff
+    catchError((err: HttpErrorResponse) =&gt; {
+      if (err.status === 401) router.navigate(['/login']);
+      if (err.status === 403) router.navigate(['/forbidden']);
+      return throwError(() =&gt; err);
+    })
+  );
+};
+
+// Registration - order matters, they run in sequence
+provideHttpClient(withInterceptors([authInterceptor, errorInterceptor]));</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Don't retry non-idempotent requests</div>
+    <p style="margin:0">That <code>retry</code> above applies to <strong>every</strong> request including
+      <code>POST</code>. Retrying a POST can create two orders — and because the first request may have
+      succeeded before the response was lost, you can't tell from the client.
+      <br><br>
+      This is exactly the <a href="../08-http-web-apis/reliability.html#the-ambiguous-timeout">ambiguous
+      timeout</a> problem. Safe retry needs either idempotent methods only, or an
+      <a href="../08-http-web-apis/reliability.html#idempotency-keys">idempotency key</a>.
+      <br><br>
+      So the interceptor should check: retry <code>GET</code> freely; retry <code>POST</code> or
+      <code>PATCH</code> only if the server supports an idempotency key and you're sending one. A blanket retry
+      in an interceptor is a duplicate-submission bug waiting to happen, and it's a common one because the
+      interceptor looks like infrastructure code.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Interceptor use</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Auth headers</strong></td><td>The classic. Watch out for adding tokens to third-party URLs</td></tr>
+        <tr><td><strong>Error mapping</strong></td><td>401 → login, 403 → forbidden, 5xx → a toast</td></tr>
+        <tr><td><strong>Retry with backoff</strong></td><td><strong>Idempotent requests only</strong></td></tr>
+        <tr><td><strong>Loading indicator</strong></td><td>Count in-flight requests</td></tr>
+        <tr><td><strong>Correlation ID</strong></td><td>Add a header so a browser action traces to server logs</td></tr>
+        <tr><td><strong>Caching</strong></td><td>Possible, though a data layer is usually the better place</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Interceptors are middleware — the mental model transfers</div>
+    <p style="margin:0">They form a chain: each one can inspect the request, modify a clone, pass it on, and then
+      operate on the response coming back. Order matters.
+      <br><br>
+      That's exactly <a href="../07-aspnet-core/pipeline-routing.html">ASP.NET Core middleware</a>, on the client
+      side. The <code>next(req)</code> call is <code>await _next(context)</code>.
+      <br><br>
+      One important detail: <strong><code>HttpRequest</code> is immutable.</strong> You must
+      <code>clone()</code> to change anything. Mutating and passing the same object doesn't work — a mistake that
+      produces silently missing headers.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The auth-header leak</div>
+    <p style="margin:0">An interceptor that adds <code>Authorization</code> to every request will attach your
+      bearer token to <strong>third-party URLs too</strong> — a maps API, an analytics endpoint, a CDN.
+      <br><br>
+      That's a genuine credential leak to an external party, and it's easy to introduce because the interceptor
+      is written once and applies globally.
+      <br><br>
+      Guard it with a check on the request URL: only attach the token to your own API origin. Allow-list, don't
+      block-list.</p>
+  </div>
+
+  <h2 id="lazy-loading">Lazy loading <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The highest-leverage bundle optimisation</span>
+    <p>Without lazy loading, the initial bundle contains <strong>every screen in the application</strong> —
+      including admin pages, reports and settings the user may never visit.</p>
+    <p><code>loadComponent</code> or <code>loadChildren</code> splits each route into its own chunk, downloaded
+      on first visit. The initial load only needs the first screen.</p>
+    <p>On a large application this is routinely the difference between a multi-megabyte initial bundle and a
+      few hundred kilobytes.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>loadComponent</code></strong></td><td>One component per chunk. Finest granularity</td></tr>
+        <tr><td><strong><code>loadChildren</code></strong></td><td>A route subtree per chunk</td></tr>
+        <tr><td><strong><code>@defer</code></strong> (v17+)</td><td>Defer part of a <em>template</em> — on viewport, interaction, idle or timer</td></tr>
+        <tr><td><strong>Preloading strategy</strong></td><td>Fetch likely-next chunks during idle time</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="html — @defer for heavy below-the-fold content" class="code-good"><code class="language-html">&lt;!-- The chart library isn't downloaded until the block scrolls into view --&gt;
+@defer (on viewport) {
+  &lt;app-sales-chart [data]="data()" /&gt;
+} @placeholder {
+  &lt;div class="chart-skeleton"&gt;&lt;/div&gt;
+} @loading (minimum 200ms) {
+  &lt;app-spinner /&gt;
+} @error {
+  &lt;p&gt;Chart unavailable.&lt;/p&gt;
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title"><code>@defer</code> is more granular than route splitting</div>
+    <p style="margin:0">Route-level lazy loading is coarse — the whole screen or nothing. <code>@defer</code>
+      works <em>within</em> a template, so a heavy charting library on an otherwise-light dashboard loads only
+      when that section is actually reached.
+      <br><br>
+      The triggers are genuinely useful: <code>on viewport</code>, <code>on interaction</code>,
+      <code>on hover</code>, <code>on idle</code>, <code>on timer</code>, or <code>when</code> a condition.
+      <br><br>
+      <code>@placeholder</code> shows before loading starts and <code>@loading</code> during — with
+      <code>minimum</code> to prevent a spinner flashing for 50ms, which looks worse than no spinner. That's a
+      thoughtful detail worth mentioning.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Reactive forms for anything real; they're testable without the DOM.</li>
+      <li><code>NonNullableFormBuilder</code> removes null noise; <code>getRawValue()</code> includes disabled
+        controls.</li>
+      <li>Cross-field validation belongs on the group.</li>
+      <li>Async validators need debouncing, error handling, and a <code>pending</code> check on submit.</li>
+      <li>Guards are functions; <code>canMatch</code> avoids downloading a chunk the user can't use.</li>
+      <li>A guard is UX, not security — the server authorises.</li>
+      <li>Resolvers avoid spinners but freeze navigation; use for fast data only.</li>
+      <li>Interceptors are middleware, and requests are immutable — clone to modify.</li>
+      <li>Never blanket-retry POST; and never attach auth tokens to third-party URLs.</li>
+      <li>Lazy-load routes for the biggest bundle win; <code>@defer</code> for granular in-template
+        splitting.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Template-driven forms for complex requirements.</strong></li>
+    <li><strong><code>form.value</code> silently dropping disabled fields.</strong></li>
+    <li><strong>Async validators with no debounce</strong>, hitting the API per keystroke.</li>
+    <li><strong>No <code>catchError</code> in an async validator</strong>, leaving the form permanently
+      pending.</li>
+    <li><strong>Submit enabled during <code>pending</code></strong> validation.</li>
+    <li><strong>Cross-field validators on a control</strong> instead of the group.</li>
+    <li><strong><code>canActivate</code> on lazy routes</strong> where <code>canMatch</code> avoids the
+      download.</li>
+    <li><strong>Treating guards as authorisation.</strong></li>
+    <li><strong>Mutating an <code>HttpRequest</code></strong> instead of cloning.</li>
+    <li><strong>Blanket retry including POST.</strong></li>
+    <li><strong>Auth headers sent to third-party origins.</strong></li>
+    <li><strong>No lazy loading</strong>, shipping every screen in the initial bundle.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How would you implement an "is this username taken?" check on a form? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"An <strong>async validator</strong> on the control, and there are three details that make the
+          difference between it working and it being a problem."</p>
+        <p>"<strong>Debouncing.</strong> Async validators fire on every value change, so without a delay you're
+          issuing an API request per keystroke. I'd start the pipeline with <code>timer(400)</code> so it only
+          runs once the user pauses, and use <code>switchMap</code> so a newer check cancels the in-flight one —
+          otherwise a response for a shorter prefix can arrive later and overwrite the result for what's actually
+          in the box."</p>
+        <p>"<strong>Error handling.</strong> If the check fails — API down, network blip — an unhandled error
+          leaves the control stuck in <code>pending</code> <em>forever</em>, so the form can never be submitted.
+          I'd <code>catchError</code> and return <code>null</code>, which fails open. That's the right call
+          because the server validates on submit anyway, so the worst case is the user gets the error a bit
+          later rather than being permanently blocked."</p>
+        <p>"<strong>The pending state.</strong> While the validator runs, the control is neither valid nor
+          invalid. So a submit button bound only to <code>form.invalid</code> is <em>enabled</em> during that
+          window and a fast user can submit before the check completes. It needs to be
+          <code>form.invalid || form.pending</code>."</p>
+        <p>"For the UX I'd also show a spinner on the field while pending, so the user understands why the
+          button is briefly disabled rather than thinking it's broken."</p>
+        <p>"Then the point I'd make regardless of implementation: <strong>this is a convenience, not a
+          guarantee.</strong> Even with a perfect check there's a race — two users can both check 'available' and
+          both submit. So the server needs a <strong>unique constraint on the column</strong> and must handle the
+          violation, returning a field-level error the form can display."</p>
+        <p>"That's the same reasoning as everywhere else in the handbook: the client check improves the
+          experience, the database constraint is what actually enforces uniqueness. A check-then-insert in
+          application code has a race window; a unique constraint doesn't."</p>
+        <p>"One implementation note: I'd inject the API service via a factory function returning the
+          <code>AsyncValidatorFn</code>, rather than reaching for a service inside the validator — that keeps it
+          testable, since I can pass a stub."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you debounce and cancel?</li>
+        <li>Do you know an unhandled error leaves the form pending forever?</li>
+        <li>Do you handle the pending state on submit?</li>
+        <li>Do you know the client check can't guarantee uniqueness?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a request per keystroke.</li>
+        <li><span class="redflag">Red flag:</span> no server-side constraint mentioned.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does the server report the conflict?</li>
+          <li>How would you test this validator?</li>
+          <li>What if the check needs to exclude the current user's own value on edit?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Your Angular bundle is 4MB. How do you reduce it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd measure before changing anything — <code>ng build --stats-json</code> and then
+          <code>source-map-explorer</code> or <code>webpack-bundle-analyzer</code>. That shows what's actually
+          large, and it's frequently not what people assume."</p>
+        <p>"Then, in the order I'd expect the biggest wins:"</p>
+        <p>"<strong>Lazy loading routes.</strong> Usually the largest single improvement. Without it the initial
+          bundle contains every screen — admin, reports, settings — even for a user who only visits the
+          dashboard. <code>loadComponent</code> per route splits each into its own chunk. On a large app this
+          alone can take a multi-megabyte bundle down to a few hundred kilobytes."</p>
+        <p>"And I'd use <strong><code>canMatch</code> rather than <code>canActivate</code></strong> on
+          role-restricted routes, because <code>canActivate</code> downloads the chunk <em>then</em> rejects. A
+          non-admin shouldn't be downloading the admin bundle at all."</p>
+        <p>"<strong>Third-party libraries.</strong> The usual offenders: moment.js, which is large and has no
+          tree-shaking — replace with <code>date-fns</code> or the native
+          <code>Intl</code> APIs. Importing all of lodash rather than specific functions. A full icon set when
+          you use twelve icons. A charting library loaded on every page for one dashboard."</p>
+        <p>"<strong><code>@defer</code> for heavy in-template content.</strong> Route splitting is coarse — the
+          whole screen or nothing. If a dashboard has a light summary and a heavy chart,
+          <code>@defer (on viewport)</code> means the charting library only downloads when the chart scrolls into
+          view. That's finer-grained than routing can achieve."</p>
+        <p>"<strong>Check the build configuration.</strong> Production mode, optimisation on, source maps not
+          shipped. It's worth confirming rather than assuming — a misconfigured build can double the output, and
+          it's an embarrassing thing to discover after weeks of optimisation work."</p>
+        <p>"<strong>Standalone components help</strong>, because with <code>NgModule</code> importing a shared
+          module pulls in everything it declares whether you use it or not. Standalone components declare exactly
+          what they need, so tree-shaking is more effective."</p>
+        <p>"Then two things I'd be careful about."</p>
+        <p>"<strong>Don't over-split.</strong> Too many tiny chunks means many round trips, and on a
+          high-latency connection that can be slower than one larger bundle. Route-level granularity plus
+          <code>@defer</code> for genuinely heavy components is about right."</p>
+        <p>"And <strong>set a budget so it doesn't regress</strong>. Angular supports bundle budgets in
+          <code>angular.json</code> that fail the build past a threshold. Without that, the bundle grows back
+          over six months and you do this exercise again. That's the part people skip, and it's the part that
+          makes the fix durable."</p>
+        <p>"I'd also add a <strong>preloading strategy</strong> after splitting — fetching likely-next chunks
+          during idle time gives you small initial load <em>and</em> fast subsequent navigation, which is
+          otherwise the trade-off you accept with lazy loading."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you measure first?</li>
+        <li>Do you know lazy loading is the biggest lever?</li>
+        <li>Do you know <code>canMatch</code> avoids the download?</li>
+        <li>Do you know over-splitting is possible?</li>
+        <li>Do you prevent regression with a budget?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> optimising without measuring.</li>
+        <li><span class="redflag">Red flag:</span> no mention of lazy loading.</li>
+        <li><span class="redflag">Red flag:</span> no plan to stop it regressing.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the trade-off with preloading?</li>
+          <li>How does <code>@defer</code> differ from lazy routes?</li>
+          <li>How would you measure the real user impact?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

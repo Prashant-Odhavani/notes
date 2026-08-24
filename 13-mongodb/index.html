@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MongoDB — Overview</title>
+<meta name="description" content="When a document database is the right choice, the mental shift required, and how this section is organised for .NET developers.">
+<meta name="keywords" content="MongoDB overview document database when to use NoSQL vs relational schema design mindset C# driver polyglot persistence">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="13-mongodb/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>MongoDB</h1>
+    <p class="subtitle">The document database you're most likely to meet. The hard part isn't the API — it's
+      unlearning relational modelling habits at the right moments.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="mental-shift">The mental shift <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>In a relational database you model the <strong>data</strong>, normalise it, and let the query planner
+      work out how to answer questions.</p>
+    <p>In MongoDB you model the <strong>access pattern</strong>. You shape documents so that the queries your
+      application actually makes are single, cheap reads.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The question that drives every schema decision</span>
+    <p><strong>"What does the application read together?"</strong></p>
+    <p>Data read together should usually be stored together. That's the whole design philosophy, and it's the
+      opposite instinct to normalisation.</p>
+    <p>The corollary: <strong>you must know your queries before you design the schema.</strong> In a relational
+      database you can normalise first and figure out queries later. Here that gets you a document store
+      pretending to be a slow relational database.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A relational database is a filing system: every fact in exactly one drawer, and you walk between drawers
+      to assemble an answer.</p>
+    <p>A document database is a set of prepared folders — each one already contains everything needed for a
+      particular job. Faster to use, and if a shared fact changes you have to update several folders.</p>
+  </div>
+
+  <h2 id="when">When it's the right choice <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Good fit</th><th>Poor fit</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Documents with natural hierarchy</strong> — a product with variants and attributes, a CMS
+              page, an order with its lines</td>
+          <td><strong>Highly relational data</strong> queried many different ways — accounting, ERP</td>
+        </tr>
+        <tr>
+          <td><strong>Varying shape per record</strong> — product catalogues where every category has different
+              attributes</td>
+          <td><strong>Ad-hoc reporting</strong> across many entities. Aggregation exists, but SQL is better at
+              this</td>
+        </tr>
+        <tr>
+          <td><strong>Event and telemetry data</strong> — append-heavy, read by time range</td>
+          <td><strong>Multi-entity invariants</strong> — "total allocations must not exceed budget"</td>
+        </tr>
+        <tr>
+          <td><strong>Known, stable access patterns</strong></td>
+          <td><strong>Unknown future queries</strong> — normalisation is more flexible</td>
+        </tr>
+        <tr>
+          <td><strong>Horizontal scale-out</strong> built in from the start</td>
+          <td>Teams with strong SQL skills and no operational Mongo experience</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the honest position</div>
+    <p style="margin:0">"Schema-less" is the most misleading selling point in this space. There is
+      <strong>always</strong> a schema — the difference is whether it's declared in the database or implied by
+      your application code.
+      <br><br>
+      With MongoDB it's implied, which means the database won't stop a bad write, and after two years of
+      changing requirements a collection can contain four different document shapes. Every read path then needs
+      defensive code.
+      <br><br>
+      That flexibility is genuinely valuable during rapid iteration and genuinely expensive in a mature system
+      — which is why <strong>schema validation</strong> exists and should usually be on.
+      <br><br>
+      Being able to say that is worth more than either enthusiasm or dismissal. "It's flexible" and "it's not a
+      real database" are both weak answers.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">What changed, and why old objections are outdated</div>
+    <p style="margin:0">Several common criticisms are years out of date, and knowing that matters:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Multi-document ACID transactions</strong> exist — replica sets since 4.0, sharded clusters
+        since 4.2.</li>
+      <li><strong>The default write concern is <code>majority</code></strong> since 5.0. The old "it
+        acknowledges writes it hasn't stored" criticism referred to defaults that changed.</li>
+      <li><strong>Schema validation</strong> with JSON Schema since 3.6.</li>
+      <li><strong>Joins</strong> via <code>$lookup</code> in the aggregation pipeline.</li>
+    </ul>
+    <p style="margin:8px 0 0">So the real trade-offs today are about <em>modelling</em> and <em>operations</em>,
+      not durability. Content here targets <strong>MongoDB 7/8</strong> and the <strong>MongoDB.Driver</strong>
+      3.x C# driver.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">Documents &amp; Schema Design</a></td>
+          <td>BSON types, embedding vs referencing, the design patterns and anti-patterns, schema validation,
+              and the 16 MB limit</td>
+        </tr>
+        <tr>
+          <td><a href="indexing-aggregation.html">Indexing &amp; Aggregation</a></td>
+          <td>Compound index rules (ESR), multikey, text and TTL indexes, covered queries, and pipeline
+              stages with the optimisations that matter</td>
+        </tr>
+        <tr>
+          <td><a href="consistency.html">Transactions, Write &amp; Read Concerns</a></td>
+          <td>Replica sets and elections, the oplog, write and read concerns, read preference, causal
+              consistency, and when transactions are the wrong answer</td>
+        </tr>
+        <tr>
+          <td><a href="scaling-operations.html">Sharding, Change Streams &amp; Atlas</a></td>
+          <td>Shard key selection, chunk balancing, change streams, pagination at scale, and Atlas
+              operations</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="dotnet">The .NET side <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — the client is thread-safe and should be a singleton" class="code-good"><code class="language-csharp">// One MongoClient per application. It owns the connection pool.
+builder.Services.AddSingleton&lt;IMongoClient&gt;(_ =&gt;
+    new MongoClient(builder.Configuration.GetConnectionString("Mongo")));
+
+builder.Services.AddScoped(sp =&gt;
+    sp.GetRequiredService&lt;IMongoClient&gt;().GetDatabase("shop"));
+
+// Conventions: register once, at startup, before any mapping happens
+var pack = new ConventionPack
+{
+    new CamelCaseElementNameConvention(),          // C# PascalCase -> JSON camelCase
+    new IgnoreExtraElementsConvention(true),       // tolerate unknown fields on read
+    new EnumRepresentationConvention(BsonType.String)   // enums as strings, not ints
+};
+ConventionRegistry.Register("app", pack, _ =&gt; true);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Detail</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td><code>MongoClient</code> as a <strong>singleton</strong></td><td>It holds the connection pool. Creating one per request exhausts connections — the equivalent of the <code>HttpClient</code> mistake</td></tr>
+        <tr><td><code>IgnoreExtraElements</code></td><td>Without it, a document containing a field your class doesn't have <strong>throws on deserialisation</strong>. Essential during schema evolution</td></tr>
+        <tr><td>Enums as strings</td><td>Same <a href="../01-csharp-fundamentals/type-system.html#enums">ordinal trap</a> as EF Core — reorder the enum and existing documents change meaning</td></tr>
+        <tr><td>Conventions registered at startup</td><td>Class maps are built once and cached. Registering later has no effect on already-mapped types</td></tr>
+        <tr><td><code>[BsonId]</code> / <code>ObjectId</code></td><td><code>_id</code> is mandatory and indexed. <code>ObjectId</code> is time-ordered, so it sorts roughly by creation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The LINQ boundary is the same trap as EF Core</div>
+    <p style="margin:0">The C# driver translates LINQ to the aggregation pipeline — but only what it can
+      translate. Anything else either throws or, depending on the API surface used, silently pulls documents
+      into memory.
+      <br><br>
+      Same discipline as <a href="../11-ef-core/querying.html#deferred">EF Core</a>: know where the boundary is,
+      and log the generated command in development so you can see what's actually being sent.
+      <br><br>
+      In the driver that's <code>ClusterConfigurator</code> with a command-started event, or
+      <code>.ToString()</code> on a queryable to see the pipeline.</p>
+  </div>
+
+  <h2 id="vs-relational">Terminology map <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Relational</th><th>MongoDB</th></tr></thead>
+      <tbody>
+        <tr><td>Database</td><td>Database</td></tr>
+        <tr><td>Table</td><td><strong>Collection</strong></td></tr>
+        <tr><td>Row</td><td><strong>Document</strong> (BSON)</td></tr>
+        <tr><td>Column</td><td>Field</td></tr>
+        <tr><td>Primary key</td><td><code>_id</code> — mandatory, auto-indexed</td></tr>
+        <tr><td><code>JOIN</code></td><td><code>$lookup</code>, or embedding instead</td></tr>
+        <tr><td><code>GROUP BY</code></td><td><code>$group</code> in an aggregation pipeline</td></tr>
+        <tr><td>View</td><td>View, or an on-demand materialised view</td></tr>
+        <tr><td>Transaction</td><td>Transaction (multi-document, 4.0+)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <details class="qa">
+    <summary>When would you choose MongoDB over a relational database? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My default for a business application is still relational, and I'd want a specific reason to move
+          away from it. So I'd frame this as what makes MongoDB the better fit rather than as a general
+          preference."</p>
+        <p>"The strongest case is <strong>data with a natural document shape that's read as a
+          unit</strong>. A product with variants, options and category-specific attributes; a CMS page; an
+          order with its lines. In a relational schema that's five tables and a join every time you display
+          it. As a document it's one read, and the shape matches how the application thinks about it."</p>
+        <p>"The second case is <strong>genuinely varying structure</strong>. A catalogue where laptops have
+          screen size and RAM while shoes have size and colour. In SQL that's either sparse columns, an EAV
+          table, or a JSON column — and if you're reaching for a JSON column for most of the record, a document
+          database is the honest version of that."</p>
+        <p>"Third, <strong>scale-out as a starting assumption</strong>. Sharding is built in rather than
+          something you bolt on."</p>
+        <p>"Where I'd stay relational: anything with <strong>multi-entity invariants</strong> — 'total
+          allocations must not exceed the budget' is a constraint the relational engine can enforce and Mongo
+          can't. Anything needing <strong>ad-hoc reporting</strong> across many entities, because SQL is
+          genuinely better at queries nobody anticipated. And anything where <strong>the queries aren't known
+          yet</strong>, because normalisation is the more flexible starting point — document modelling requires
+          knowing the access patterns up front."</p>
+        <p>"I'd also correct a couple of outdated objections, because they come up. MongoDB has had
+          <strong>multi-document ACID transactions</strong> since 4.0, and 4.2 for sharded clusters. And the
+          default write concern has been <code>majority</code> since 5.0, so the old 'it acknowledges writes it
+          hasn't durably stored' criticism was about defaults that changed. The real trade-offs now are about
+          modelling and operations, not durability."</p>
+        <p>"The thing I'd be honest about is that <strong>'schema-less' is misleading</strong>. There's always a
+          schema — the question is whether the database enforces it or your application implies it. With Mongo
+          it's implied, so nothing stops a bad write, and after two years of changes a collection can hold four
+          document shapes and every read path needs defensive code. That flexibility is valuable while
+          iterating and costly in a mature system, which is why I'd turn on schema validation once the shape
+          settles."</p>
+        <p>"And practically: <strong>polyglot persistence is usually the right answer</strong>. Relational for
+          transactional core data, Mongo for the catalogue or the event log. The failure mode is picking one for
+          everything on principle."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have criteria, or a preference?</li>
+        <li>Do you know where document modelling is weak?</li>
+        <li>Are you current on transactions and write concerns?</li>
+        <li>Are you honest about "schema-less"?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "it's faster" or "it scales better" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> "it doesn't support transactions" — outdated by years.</li>
+        <li><span class="redflag">Red flag:</span> "schema-less means we can move faster" with no
+          acknowledgement of the cost.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you model an order and its lines?</li>
+          <li>What happens when a document needs to exceed 16 MB?</li>
+          <li>How do you handle schema changes across millions of documents?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section assumes the <a href="../10-sql/index.html">SQL section</a> for
+      comparison, and <a href="../19-architecture/distributed-data.html">distributed data patterns</a> for the
+      consistency discussion — replica sets, read preference and causal consistency are much easier once
+      eventual consistency and idempotency are familiar.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

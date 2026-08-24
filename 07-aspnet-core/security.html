@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authentication &amp; Authorization — ASP.NET Core</title>
+<meta name="description" content="Authentication vs authorization, JWT vs cookies, claims and policies, resource-based authorization, CORS and the security holes that actually happen.">
+<meta name="keywords" content="authentication authorization aspnet core JWT bearer cookies claims policies roles resource based authorization CORS CSRF antiforgery data protection token validation">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="07-aspnet-core/security.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Authentication &amp; Authorization</h1>
+    <p class="subtitle">Two words that get used interchangeably and mean completely different things — plus
+      the authorization mistake that causes most real data leaks.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Authentication</strong> = who are you? <strong>Authorization</strong> = are you allowed to
+        do this?</li>
+      <li>401 means "I don't know who you are". 403 means "I know, and you can't".</li>
+      <li><strong>JWT</strong> for APIs (stateless, but you can't revoke it).
+        <strong>Cookies</strong> for browser apps (revocable, but need CSRF protection).</li>
+      <li><strong>Claims</strong> are facts about the user. <strong>Policies</strong> are rules over those
+        claims. Prefer policies to hard-coded roles.</li>
+      <li>Endpoint-level authorization is <strong>not enough</strong>. "Can this user see <em>this
+        record</em>?" needs a resource check.</li>
+      <li>The most common real breach is <strong>authorization filtered after retrieval</strong>, not
+        enforced in the query.</li>
+    </ul>
+  </div>
+
+  <h2 id="authn-vs-authz">Authentication vs authorization <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Authentication</strong> establishes <em>identity</em>. It answers "who is this?"</p>
+    <p><strong>Authorization</strong> establishes <em>permission</em>. It answers "may they do this?"</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>Authentication</strong> is showing your passport at the airport — proving you are who you
+      claim.</p>
+    <p><strong>Authorization</strong> is your boarding pass — proving you may get on <em>this particular
+      flight</em>, in <em>this particular seat</em>.</p>
+    <p>A valid passport doesn't get you on the plane. And that's exactly the mistake people make in code.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Authentication</th><th>Authorization</th></tr></thead>
+      <tbody>
+        <tr><td>Question</td><td>Who are you?</td><td>May you do this?</td></tr>
+        <tr><td>Runs</td><td>First</td><td>After authentication</td></tr>
+        <tr><td>Failure status</td><td><strong>401</strong> Unauthorized</td><td><strong>403</strong> Forbidden</td></tr>
+        <tr><td>Produces</td><td>A <code>ClaimsPrincipal</code></td><td>A yes/no decision</td></tr>
+        <tr><td>Middleware</td><td><code>UseAuthentication()</code></td><td><code>UseAuthorization()</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The status codes are misnamed</div>
+    <p style="margin:0"><strong>401 Unauthorized</strong> actually means <em>unauthenticated</em> — "I don't
+      know who you are, try again with credentials".
+      <br><br>
+      <strong>403 Forbidden</strong> means <em>authenticated but not permitted</em> — "I know exactly who you
+      are, and the answer is no".
+      <br><br>
+      Getting this right matters practically: a client seeing 401 should try refreshing its token; a client
+      seeing 403 should not, because retrying won't help.</p>
+  </div>
+
+  <h2 id="jwt-vs-cookies">JWT or cookies? <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>JWT bearer token</th><th>Cookie</th></tr></thead>
+      <tbody>
+        <tr><td>State</td><td>Stateless — all data is in the token</td><td>Server holds (or encrypts) the session</td></tr>
+        <tr><td>Sent by</td><td>Client, in an <code>Authorization</code> header</td><td>Browser, automatically</td></tr>
+        <tr><td>Revocation</td><td><strong>Hard</strong> — valid until it expires</td><td>Easy — invalidate the session</td></tr>
+        <tr><td>CSRF risk</td><td>No (not sent automatically)</td><td><strong>Yes</strong> — needs antiforgery tokens</td></tr>
+        <tr><td>Scales across services</td><td>Well — any service can validate it</td><td>Needs shared session or sticky sessions</td></tr>
+        <tr><td>Best for</td><td>APIs, mobile clients, service-to-service</td><td>Server-rendered browser apps</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The trade-off in one line</span>
+    <p>JWTs buy you <strong>statelessness</strong> and pay for it with <strong>revocation</strong>.</p>
+    <p>You cannot un-issue a JWT. If a user is disabled, their token keeps working until it expires.</p>
+  </div>
+
+  <p>That's why access tokens should be <strong>short-lived</strong> — minutes, not days — paired with a
+    longer-lived refresh token you <em>can</em> revoke because it's checked against a store.</p>
+
+  <pre data-label="csharp — JWT validation, with the settings that matter" class="code-good"><code class="language-csharp">builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =&gt;
+    {
+        options.Authority = "https://login.example.com";   // fetches signing keys
+        options.Audience  = "orders-api";
+
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer           = true,
+            ValidateAudience         = true,
+            ValidateLifetime         = true,
+            ValidateIssuerSigningKey = true,           // never disable this
+            ClockSkew                = TimeSpan.FromSeconds(30)   // default is 5 MINUTES
+        };
+    });</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production traps in JWT validation</div>
+    <ul style="margin:8px 0 0">
+      <li><strong>Never disable signature validation.</strong> An unsigned or unverified token can be forged
+        trivially — anyone can claim to be an admin.</li>
+      <li><strong>Validate the audience.</strong> Without it, a token issued for a <em>different</em> service
+        by the same identity provider is accepted by yours.</li>
+      <li><strong>Default clock skew is 5 minutes.</strong> That means an expired token keeps working for up
+        to five minutes. Usually fine, occasionally not — know it's there.</li>
+      <li><strong>Don't put secrets in the payload.</strong> A JWT is signed, not encrypted — the payload is
+        base64, readable by anyone holding the token.</li>
+    </ul>
+  </div>
+
+  <h2 id="claims-policies">Claims, roles and policies <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A <strong>claim</strong> is a fact about the user: "email is x", "tenant is acme", "role is manager".</p>
+    <p>A <strong>policy</strong> is a named rule over those facts: "must be in the finance department and
+      over 18".</p>
+  </div>
+
+  <pre data-label="csharp — roles are just claims, and they get rigid fast" class="code-bad"><code class="language-csharp">[Authorize(Roles = "Admin,Manager,Supervisor,RegionalLead")]
+public async Task&lt;IActionResult&gt; Approve(Guid id) { /* ... */ }</code></pre>
+
+  <p>The problem: the <em>rule</em> ("who can approve") is now spelled out at every call site. Adding a role
+    means finding and editing every attribute — and missing one is a security bug.</p>
+
+  <pre data-label="csharp — name the rule once" class="code-good"><code class="language-csharp">// Program.cs - the rule lives in one place
+builder.Services.AddAuthorization(options =&gt;
+{
+    options.AddPolicy("CanApproveOrders", policy =&gt;
+        policy.RequireAuthenticatedUser()
+              .RequireClaim("permission", "orders:approve"));
+});
+
+// The endpoint states intent, not implementation
+[Authorize(Policy = "CanApproveOrders")]
+public async Task&lt;IActionResult&gt; Approve(Guid id) { /* ... */ }</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Authorize on <strong>what the user is doing</strong>, not on who they are.</p>
+    <p><code>"CanApproveOrders"</code> survives a reorganisation. <code>Roles = "Manager"</code> doesn't.</p>
+  </div>
+
+  <h2 id="resource-authorization">The mistake that causes real breaches <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>[Authorize]</code> answers "may this user call this endpoint?"</p>
+    <p>It does <strong>not</strong> answer "may this user see <em>this specific record</em>?"</p>
+  </div>
+
+  <pre data-label="csharp — authenticated, authorized, and leaking data" class="code-bad"><code class="language-csharp">[Authorize]
+[HttpGet("/api/orders/{id:guid}")]
+public async Task&lt;IActionResult&gt; Get(Guid id)
+{
+    var order = await _db.Orders.FindAsync(id);      // ANY order, from ANY tenant
+    return order is null ? NotFound() : Ok(order);
+}</code></pre>
+
+  <p>Every check passed. The user is authenticated and allowed to call this endpoint. And they can read
+    <em>anyone's</em> order by changing the ID in the URL.</p>
+
+  <p>This is <strong>IDOR</strong> — Insecure Direct Object Reference — and it's one of the most common real
+    vulnerabilities in business applications.</p>
+
+  <pre data-label="csharp — scope the query, don't filter afterwards" class="code-good"><code class="language-csharp">[Authorize]
+[HttpGet("/api/orders/{id:guid}")]
+public async Task&lt;IActionResult&gt; Get(Guid id, CancellationToken ct)
+{
+    var tenantId = User.FindFirst("tenant_id")!.Value;
+
+    var order = await _db.Orders
+        .Where(o =&gt; o.Id == id &amp;&amp; o.TenantId == tenantId)   // in the QUERY
+        .FirstOrDefaultAsync(ct);
+
+    return order is null ? NotFound() : Ok(order);
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Why "in the query" matters, not just "check it"</div>
+    <p style="margin:0">This version is also wrong, even though it looks safe:</p>
+    <pre data-label="csharp" class="code-bad"><code class="language-csharp">var order = await _db.Orders.FindAsync(id);
+if (order.TenantId != tenantId) return Forbid();     // fetched it first</code></pre>
+    <p style="margin:0">Three problems. You've already loaded another tenant's data into memory, where it can
+      leak into logs or an exception dump. Returning <strong>403 rather than 404</strong> confirms the record
+      exists, which is an information leak. And it relies on every developer remembering the check on every
+      query — which is exactly the kind of thing that gets missed.
+      <br><br>
+      Putting the tenant filter in the <em>query</em> makes the safe path the default. Better still, enforce
+      it centrally with a query filter — see
+      <a href="../23-multi-tenant-saas/tenant-context.html">tenant context</a>.</p>
+  </div>
+
+  <h3 id="resource-handlers">Resource-based authorization</h3>
+
+  <p>When the rule depends on the resource itself — "you can edit your own order, or any order if you're a
+    manager" — use <code>IAuthorizationService</code>:</p>
+
+  <pre data-label="csharp — a rule that needs the resource to decide" class="code-good"><code class="language-csharp">public sealed class OrderOwnerHandler : AuthorizationHandler&lt;SameOwnerRequirement, Order&gt;
+{
+    protected override Task HandleRequirementAsync(
+        AuthorizationHandlerContext context, SameOwnerRequirement requirement, Order order)
+    {
+        var userId = context.User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+        if (order.CreatedByUserId == userId || context.User.IsInRole("Manager"))
+            context.Succeed(requirement);
+
+        return Task.CompletedTask;
+    }
+}</code></pre>
+
+  <pre data-label="csharp — called explicitly, because it needs the loaded resource"><code class="language-csharp">var order = await _repo.GetForTenantAsync(id, tenantId, ct);
+if (order is null) return NotFound();
+
+var result = await _authorization.AuthorizeAsync(User, order, new SameOwnerRequirement());
+return result.Succeeded ? Ok(order) : Forbid();</code></pre>
+
+  <h2 id="cors">CORS <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>CORS is a <strong>browser</strong> mechanism. It lets your API say which other origins are allowed to
+      read its responses from JavaScript.</p>
+    <p>It is <strong>not</strong> a security control for your API — anything that isn't a browser ignores it
+      entirely.</p>
+  </div>
+
+  <pre data-label="csharp — explicit origins" class="code-good"><code class="language-csharp">builder.Services.AddCors(options =&gt;
+{
+    options.AddPolicy("spa", policy =&gt;
+        policy.WithOrigins("https://app.example.com")   // explicit, not wildcard
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials());
+});
+
+app.UseCors("spa");     // before UseAuthentication</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap</div>
+    <p style="margin:0"><code>AllowAnyOrigin()</code> combined with <code>AllowCredentials()</code> is
+      <strong>rejected by the framework</strong> — deliberately, because it would let any site make
+      authenticated requests on a user's behalf and read the response.
+      <br><br>
+      The wrong fix is to reflect the caller's <code>Origin</code> header back, which recreates exactly that
+      hole. List your origins explicitly, from configuration.
+      <br><br>
+      And remember: a CORS error in the browser console usually means <em>your API didn't allow it</em> — it
+      isn't a client bug. Also check ordering: CORS must run before authentication, or preflight
+      <code>OPTIONS</code> requests get rejected.</p>
+  </div>
+
+  <h2 id="csrf">CSRF <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>CSRF tricks a logged-in user's browser into making a request they didn't intend — because the browser
+      attaches their cookie <strong>automatically</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Auth method</th><th>Vulnerable to CSRF?</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Cookies</td><td><strong>Yes</strong></td><td>The browser sends them on any request to your domain</td></tr>
+        <tr><td>Bearer token in a header</td><td>No</td><td>The browser never adds it automatically — JS must</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Defences, in order of importance:</strong></p>
+
+  <ol class="steps">
+    <li><strong>Antiforgery tokens.</strong> ASP.NET Core generates and validates them; MVC forms include
+      them automatically, and <code>[ValidateAntiForgeryToken]</code> enforces it.</li>
+    <li><strong><code>SameSite=Lax</code> or <code>Strict</code> cookies.</strong> The browser then won't
+      send the cookie on cross-site requests. This is the default in modern browsers and blocks most CSRF on
+      its own.</li>
+    <li><strong>Never use GET for state changes.</strong> A GET that deletes something can be triggered by an
+      <code>&lt;img&gt;</code> tag.</li>
+  </ol>
+
+  <div class="note info">
+    <div class="note-title">The JWT-in-localStorage trade-off</div>
+    <p style="margin:0">Storing a token in <code>localStorage</code> removes CSRF risk — but adds
+      <strong>XSS</strong> risk, because any injected script can read it.
+      <br><br>
+      An <code>HttpOnly</code> cookie can't be read by JavaScript, so XSS can't steal it — but it needs CSRF
+      protection.
+      <br><br>
+      There's no free option. The usual recommendation for browser apps is an <code>HttpOnly</code>,
+      <code>Secure</code>, <code>SameSite</code> cookie plus antiforgery tokens, because XSS is the more
+      damaging of the two.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Authentication = identity (401). Authorization = permission (403).</li>
+      <li>JWTs are stateless but effectively unrevocable — keep access tokens short-lived.</li>
+      <li>Always validate signature, issuer and audience. Know that default clock skew is 5 minutes.</li>
+      <li>A JWT payload is readable. Signed ≠ encrypted.</li>
+      <li>Use named policies over hard-coded roles — authorize on the action, not the job title.</li>
+      <li><code>[Authorize]</code> protects endpoints, not rows. Scope the query.</li>
+      <li>Filtering after retrieval is still a leak, and 403-vs-404 confirms existence.</li>
+      <li>CORS is a browser feature, not API security. Never reflect the Origin header.</li>
+      <li>Cookies need CSRF protection; bearer tokens don't but are XSS-readable.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No tenant or owner filter in the query</strong> — IDOR, the most common real breach.</li>
+    <li><strong>Fetching then checking</strong>, so another tenant's data reaches memory and logs.</li>
+    <li><strong>403 where 404 is safer</strong>, confirming a record exists.</li>
+    <li><strong>Long-lived access tokens</strong> with no refresh mechanism, so revocation is impossible.</li>
+    <li><strong>Secrets in the JWT payload</strong> — it's readable by anyone with the token.</li>
+    <li><strong>Disabling issuer or audience validation</strong> to "make it work".</li>
+    <li><strong>Reflecting the <code>Origin</code> header</strong> to satisfy CORS.</li>
+    <li><strong>Cookie auth with no antiforgery token</strong>.</li>
+    <li><strong>Roles hard-coded in dozens of attributes</strong>, so changing the rule means editing them all.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What's the difference between authentication and authorization? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Authentication is identity — who are you. Authorization is permission — may you do this.
+          Authentication has to happen first, because you can't evaluate permissions for someone you haven't
+          identified."</p>
+        <p>"In ASP.NET Core they're separate middleware, and the order is load-bearing:
+          <code>UseAuthentication</code> then <code>UseAuthorization</code>. Reverse them and every protected
+          endpoint returns 401 even with a valid token, because authorization sees no identity."</p>
+        <p>"The status codes reflect the split, though they're badly named. 401 Unauthorized actually means
+          <em>unauthenticated</em> — I don't know who you are. 403 Forbidden means authenticated but not
+          permitted. That distinction matters to clients: a 401 should trigger a token refresh, a 403
+          shouldn't, because retrying won't help."</p>
+        <p>"The thing I'd add, because it's where real bugs come from, is that authorization has
+          <strong>two levels</strong>. <code>[Authorize]</code> handles 'may this user call this endpoint'.
+          It says nothing about 'may this user see <em>this record</em>'. That second question needs a filter
+          in the query or a resource-based check, and forgetting it is how you get IDOR vulnerabilities."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have the definitions crisp?</li>
+        <li>Do you know the status code semantics?</li>
+        <li>Bonus: raising resource-level authorization unprompted.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you stop a user reading another tenant's order?</li>
+          <li>Roles or policies — which and why?</li>
+          <li>Where does the identity actually come from?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>JWT or cookie authentication for a new application?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It depends on the client. For a public API, a mobile app, or service-to-service calls, JWT — it's
+          stateless, any service can validate it independently, and there's no shared session to worry about
+          when you scale out."</p>
+        <p>"For a server-rendered browser app, cookies. The browser handles them, they can be
+          <code>HttpOnly</code> so JavaScript can't read them, and crucially you can revoke a session
+          immediately."</p>
+        <p>"The trade-off I'd name explicitly is <strong>revocation</strong>. A JWT is valid until it expires
+          — you can't un-issue it. So if a user is disabled or a token is stolen, it keeps working. The
+          mitigation is short-lived access tokens, minutes rather than days, plus a refresh token that
+          <em>is</em> checked against a store and can be revoked. If someone tells me their JWTs last 24
+          hours, that's the thing I'd push on."</p>
+        <p>"There's also a security trade-off on the browser side that has no clean answer. A token in
+          <code>localStorage</code> avoids CSRF but is readable by any XSS. An <code>HttpOnly</code> cookie
+          is immune to XSS theft but needs CSRF protection. For a browser app I'd generally take the cookie
+          plus antiforgery tokens and <code>SameSite</code>, because XSS is the more damaging of the two."</p>
+        <p>"For a SPA talking to an API, the modern pattern is often a backend-for-frontend holding the
+          tokens server-side and using a cookie to the browser — you get cookie security without exposing
+          tokens to JavaScript at all."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you choose based on client type rather than fashion?</li>
+        <li>Do you raise revocation as the JWT weakness?</li>
+        <li>Bonus: the XSS/CSRF trade-off, and the BFF pattern.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "JWT, it's more modern."</li>
+        <li><span class="redflag">Red flag:</span> not knowing JWTs can't be revoked.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle logout with a JWT?</li>
+          <li>Where do you store a refresh token?</li>
+          <li>What validation would you configure on the bearer handler?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A user changes the ID in a URL and sees another customer's data. How did that happen and how do you prevent it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That's IDOR — insecure direct object reference. What happened is that the endpoint checked
+          <em>authentication</em> and <em>endpoint-level authorization</em>, but never checked whether this
+          user owns that particular record. So <code>[Authorize]</code> passed and the query fetched by ID
+          with no ownership filter."</p>
+        <p>"The immediate fix is to put the ownership condition <strong>in the query</strong> — filter by
+          tenant or owner as part of the <code>WHERE</code>, so a mismatched ID simply returns nothing and the
+          endpoint returns 404."</p>
+        <p>"I'd be specific about why 'fetch then check' isn't good enough, because that's the version people
+          write. If you load the record and then compare the tenant, you've already pulled another customer's
+          data into memory, where it can end up in a log line or an exception dump. And returning 403 rather
+          than 404 confirms the record exists, which is itself an information leak — an attacker can
+          enumerate valid IDs."</p>
+        <p>"But the real fix is structural, because relying on every developer remembering the filter on every
+          query will fail eventually. In EF Core I'd use a <strong>global query filter</strong> on tenant,
+          wired to the current tenant from the request context. Then the filter is applied automatically and
+          you have to explicitly opt out — the safe path becomes the default."</p>
+        <p>"I'd back that with tests: for each endpoint, a test that authenticates as tenant A and requests a
+          tenant B resource, asserting 404. That's cheap and it catches regressions."</p>
+        <p>"For anything genuinely sensitive I'd also add resource-based authorization via
+          <code>IAuthorizationService</code>, for rules that depend on the record — 'you can edit your own
+          order, managers can edit any'. That can't live in an attribute, because it needs the loaded
+          resource."</p>
+        <p>"And I'd audit for it rather than assume this was the only instance. If one endpoint was missing
+          the filter, others probably are — I'd grep for direct <code>FindAsync</code> or
+          <code>Where(x =&gt; x.Id == id)</code> without a tenant condition."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the vulnerability class by name?</li>
+        <li>Do you know 403-vs-404 leaks information?</li>
+        <li>Do you go for a structural fix rather than patching one endpoint?</li>
+        <li>Do you think to audit for other instances?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add <code>[Authorize]</code>" — it was already there.</li>
+        <li><span class="redflag">Red flag:</span> using GUIDs instead of sequential IDs as the fix — that's
+          obscurity, not authorization.</li>
+        <li><span class="redflag">Red flag:</span> fixing only the reported endpoint.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do global query filters work, and how do you handle admin queries that need to bypass them?</li>
+          <li>How would you test for this across every endpoint?</li>
+          <li>Where does the tenant ID come from, and can the client tamper with it?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

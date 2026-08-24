@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data &amp; Consistency — Microservices</title>
+<meta name="description" content="Sagas and compensation, orchestration versus choreography, eventual consistency, idempotency, and why two-phase commit isn't the answer.">
+<meta name="keywords" content="saga pattern orchestration choreography compensating transaction two phase commit 2PC eventual consistency idempotent consumer outbox inbox exactly once semantic lock CAP theorem distributed transaction">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="20-microservices/data-consistency.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Data &amp; Consistency</h1>
+    <p class="subtitle">The hardest part of microservices. You gave up transactions across services — this page
+      is about what replaces them.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>You can't have a transaction across services.</strong> Two-phase commit exists and you
+        shouldn't use it.</li>
+      <li><strong>A saga is a sequence of local transactions with compensating actions.</strong></li>
+      <li><strong>Compensation isn't rollback</strong> — it's a new action that undoes the effect.</li>
+      <li><strong>Orchestration</strong> = a coordinator drives it. <strong>Choreography</strong> = services
+        react to events.</li>
+      <li><strong>Every consumer must be idempotent.</strong> At-least-once delivery guarantees
+        redelivery.</li>
+      <li><strong>"Exactly once" doesn't exist</strong> at the transport level — you achieve it with
+        deduplication.</li>
+      <li><strong>Eventual consistency is a product decision</strong>, not just a technical one.</li>
+    </ul>
+  </div>
+
+  <h2 id="no-transactions">Why you can't just use a transaction <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The problem</span>
+    <p>Placing an order needs to reserve inventory, charge a card and create a shipment. In a monolith that's one
+      transaction — all of it commits or none of it does.</p>
+    <p>Across three services with three databases, there is no shared transaction. Each can succeed or fail
+      independently, so partial completion is <strong>the normal case</strong>, not an edge case.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Two-phase commit: why it's not the answer</div>
+    <p style="margin:0">2PC does provide atomicity across databases — a coordinator asks everyone to prepare, then
+      tells everyone to commit.
+      <br><br>
+      The problems are severe. It's <strong>blocking</strong>: participants hold locks from prepare until commit,
+      so a slow participant blocks everyone. It has a <strong>coordinator single point of failure</strong> — if
+      the coordinator dies after prepare, participants are stuck holding locks with no idea what to do.
+      <strong>Availability is the product of all participants</strong>, so it gets worse with each one. And it's
+      <strong>not supported</strong> by most modern data stores — Cosmos DB, DynamoDB, most message brokers, and
+      it doesn't work on Linux in .NET via MSDTC.
+      <br><br>
+      Most fundamentally, it's <strong>the opposite of what microservices are for</strong>: you deliberately
+      decoupled services, then reintroduced a runtime dependency where they all have to be available and
+      cooperating for anything to complete.
+      <br><br>
+      So the answer isn't a better distributed transaction. It's <strong>accepting eventual consistency and
+      designing for it</strong> — which is what sagas are.</p>
+  </div>
+
+  <h2 id="saga">The Saga pattern <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Break the distributed operation into a <strong>sequence of local transactions</strong>, each in one
+      service and each atomic on its own.</p>
+    <p>If a step fails, run <strong>compensating actions</strong> for the steps that already succeeded — working
+      backwards.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Booking a holiday: flight, hotel, car. Three separate companies, no shared transaction.</p>
+    <p>If the car booking fails, you don't get an atomic rollback — you <strong>cancel the hotel</strong> and
+      <strong>cancel the flight</strong>. Those are new actions with their own consequences: a cancellation
+      record, possibly a fee.</p>
+    <p>That's compensation, and the fact that it leaves a trace is the important difference from rollback.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Local transaction</th><th>Compensating action</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Create order (Pending)</td><td>Mark order Failed</td></tr>
+        <tr><td>2</td><td>Reserve inventory</td><td>Release reservation</td></tr>
+        <tr><td>3</td><td>Charge payment</td><td><strong>Refund</strong> — a new transaction, not an undo</td></tr>
+        <tr><td>4</td><td>Create shipment</td><td>Cancel shipment</td></tr>
+        <tr><td>5</td><td>Mark order Confirmed</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — compensation is not rollback, and the difference is visible</div>
+    <p style="margin:0">A database rollback leaves <strong>no trace</strong>. It's as if the transaction never
+      happened.
+      <br><br>
+      Compensation is a <strong>new business action</strong> with its own record. A refund isn't an un-charge —
+      the customer sees a charge <em>and</em> a refund on their statement, there may be a fee, and the accounting
+      shows both.
+      <br><br>
+      That has real consequences you have to design for. <strong>Some steps can't be compensated at all</strong>
+      — you can't un-send an email, un-ship a parcel, or un-disclose data. So the ordering matters: put
+      <strong>irreversible steps last</strong>, after everything that could still fail.
+      <br><br>
+      That single rule — irreversible steps last — is one of the most practically useful things about saga design,
+      and it's the part people miss. Sending the confirmation email before charging the card means a failed
+      payment leaves the customer with a confirmation for an order that doesn't exist.
+      <br><br>
+      There's also an <strong>intermediate-state visibility</strong> problem: during the saga, the order exists
+      in a Pending state that other parts of the system and possibly the user can see. That state has to be
+      meaningful in the domain, not an implementation artefact.</p>
+  </div>
+
+  <h2 id="orchestration-vs-choreography">Orchestration or choreography <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Orchestration</th><th>Choreography</th></tr></thead>
+      <tbody>
+        <tr><td>Who decides the next step</td><td><strong>A central coordinator</strong></td><td>Each service, reacting to events</td></tr>
+        <tr><td>The flow is visible</td><td><strong>Yes — in one place</strong></td><td>No — spread across services</td></tr>
+        <tr><td>Coupling</td><td>Coordinator knows all participants</td><td><strong>Services know only events</strong></td></tr>
+        <tr><td>Adding a step</td><td>Change the coordinator</td><td>Add a subscriber; touch nothing else</td></tr>
+        <tr><td>Debugging</td><td><strong>Easier</strong> — one place to look</td><td>Harder — follow the event chain</td></tr>
+        <tr><td>Failure handling</td><td><strong>Centralised and explicit</strong></td><td>Distributed and implicit</td></tr>
+        <tr><td>Best for</td><td><strong>Complex flows, many steps, real error handling</strong></td><td>Simple flows, loose coupling</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="text — choreography: services react to each other's events"><code class="language-text">  Order Service      --OrderCreated-->
+  Inventory Service  --InventoryReserved-->
+  Payment Service    --PaymentCharged-->
+  Shipping Service   --ShipmentCreated-->
+  Order Service      (marks Confirmed)
+
+  On failure, each service publishes a failure event and the
+  previous ones subscribe to compensate.
+  No component knows the whole flow.</code></pre>
+
+  <pre data-label="csharp — orchestration: the flow is explicit and readable" class="code-good"><code class="language-csharp">public sealed class PlaceOrderSaga(
+    IOrderService orders,
+    IInventoryService inventory,
+    IPaymentService payments,
+    IShippingService shipping,
+    ILogger&lt;PlaceOrderSaga&gt; logger)
+{
+    public async Task&lt;Result&gt; ExecuteAsync(PlaceOrderRequest req, CancellationToken ct)
+    {
+        // Track what needs undoing, in reverse order
+        var compensations = new Stack&lt;Func&lt;Task&gt;&gt;();
+
+        try
+        {
+            var order = await orders.CreateAsync(req, ct);
+            compensations.Push(() =&gt; orders.MarkFailedAsync(order.Id));
+
+            var reservation = await inventory.ReserveAsync(order.Lines, ct);
+            compensations.Push(() =&gt; inventory.ReleaseAsync(reservation.Id));
+
+            var charge = await payments.ChargeAsync(order.Total, req.PaymentToken, ct);
+            compensations.Push(() =&gt; payments.RefundAsync(charge.Id));
+
+            // Irreversible steps LAST - nothing after this can fail and need undoing
+            await shipping.CreateAsync(order.Id, ct);
+            await orders.ConfirmAsync(order.Id, ct);
+
+            return Result.Ok(order.Id);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Saga failed; compensating {Count} steps", compensations.Count);
+            await CompensateAsync(compensations);
+            return Result.Fail("Order could not be completed.");
+        }
+    }
+
+    private static async Task CompensateAsync(Stack&lt;Func&lt;Task&gt;&gt; compensations)
+    {
+        while (compensations.Count &gt; 0)
+        {
+            var undo = compensations.Pop();
+            try { await undo(); }
+            catch (Exception ex)
+            {
+                // A failed compensation needs a human. Do NOT swallow it.
+                // Continue compensating the rest, but raise an alert.
+                Alert.CompensationFailed(ex);
+            }
+        }
+    }
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — failed compensation is the case nobody plans for</div>
+    <p style="margin:0">Every saga example shows the happy path and the compensation path. Almost none address
+      <strong>what happens when the compensation itself fails</strong> — the refund API is down, the inventory
+      release times out.
+      <br><br>
+      You are now in a genuinely inconsistent state that the system cannot resolve on its own. The card is charged
+      and the order is failed.
+      <br><br>
+      So a production saga needs: <strong>retries with backoff</strong> on compensations, because most failures are
+      transient; <strong>persistence of saga state</strong> so it survives a process restart and can resume;
+      <strong>an alert to a human</strong>, because some cases require judgement; and often a
+      <strong>reconciliation job</strong> that finds sagas stuck in an intermediate state past a threshold.
+      <br><br>
+      Mentioning that compensation can fail — and that this requires an operational answer rather than a code
+      answer — is one of the strongest signals available on this topic. It's the difference between having read
+      about sagas and having run one.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Which to choose</div>
+    <p style="margin:0"><strong>Orchestration for anything non-trivial.</strong> The flow is in one readable
+      method, error handling is explicit, and you can answer "where is this order stuck?" by looking at one place.
+      With choreography, the flow exists only as an emergent property of subscriptions — and reconstructing it
+      means reading five services.
+      <br><br>
+      <strong>Choreography where the steps are genuinely independent reactions</strong> — "when an order is
+      placed, update the search index, send a receipt, award loyalty points". Those don't form a sequence, they're
+      parallel side effects, and each new one should be addable without touching the publisher.
+      <br><br>
+      The nuance worth stating: <strong>choreography is looser coupling but harder operations.</strong> Teams often
+      choose it for the coupling benefit and then can't debug the system. If you can't answer "why did this order
+      never complete?" in under a minute, the coupling you saved wasn't worth it.
+      <br><br>
+      In .NET, MassTransit provides both — a state-machine saga for orchestration and event consumers for
+      choreography — with saga state persistence built in, which is the part you don't want to hand-roll.</p>
+  </div>
+
+  <h2 id="idempotency">Idempotency <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The rule</span>
+    <p><strong>Message delivery is at-least-once. So every consumer will receive duplicates, and must handle
+      them.</strong></p>
+    <p>This isn't a rare edge case — it's guaranteed. A consumer that processes a message and crashes before
+      acknowledging <em>will</em> receive it again. That's the broker doing its job correctly.</p>
+    <p>So "charge the card" must be safe to receive twice.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>How</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Naturally idempotent operation</strong></td>
+          <td><code>SET status = 'Shipped'</code> — applying it twice changes nothing. <strong>Best where
+              possible</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Deduplication table (inbox)</strong></td>
+          <td>Record the message id in the same transaction as the work. A duplicate hits a unique constraint
+              and is skipped</td>
+        </tr>
+        <tr>
+          <td><strong>Version check</strong></td>
+          <td>Apply only if the entity's version matches — optimistic concurrency</td>
+        </tr>
+        <tr>
+          <td><strong>Idempotency key</strong></td>
+          <td>Caller supplies a key; the service returns the original result for a repeat</td>
+        </tr>
+        <tr>
+          <td><strong>State check</strong></td>
+          <td>"Already shipped? Then do nothing." Simple, and racy without a lock or a constraint</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — the inbox pattern: dedupe and work in one transaction" class="code-good"><code class="language-csharp">public async Task HandleAsync(OrderPlaced message, CancellationToken ct)
+{
+    await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+    // Unique constraint on MessageId is what makes this safe
+    _db.ProcessedMessages.Add(new ProcessedMessage(message.MessageId, DateTime.UtcNow));
+
+    try
+    {
+        await _db.SaveChangesAsync(ct);       // throws if already processed
+    }
+    catch (DbUpdateException) when (IsUniqueViolation)
+    {
+        return;                               // duplicate - already handled
+    }
+
+    // The work and the dedupe record commit TOGETHER.
+    // A crash before commit means neither happened, so redelivery is correct.
+    await DoTheWorkAsync(message, ct);
+    await _db.SaveChangesAsync(ct);
+    await tx.CommitAsync(ct);
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — "exactly once" does not exist</div>
+    <p style="margin:0">Brokers advertise it and it isn't achievable at the transport level. The reason is the
+      <a href="../08-http-web-apis/reliability.html#the-ambiguous-timeout">ambiguous timeout</a>: a consumer
+      processes a message and crashes before its acknowledgement lands. The broker cannot distinguish "processed
+      but unacknowledged" from "never processed", so it must redeliver — and if it didn't, it would lose
+      messages instead.
+      <br><br>
+      What you can have is <strong>at-least-once delivery plus idempotent processing</strong>, which produces
+      exactly-once <em>effect</em>. That's the accurate framing, and it's what "exactly-once" always means in
+      practice.
+      <br><br>
+      The critical detail in the inbox pattern is that <strong>the dedupe record and the work commit in the same
+      transaction</strong>. If you record the message id first and commit separately, a crash between them means
+      the message is marked processed but the work never happened — you've turned duplicate delivery into
+      <em>lost</em> work, which is worse.
+      <br><br>
+      Being precise about this — rather than accepting "exactly once" as a feature — is a strong distributed
+      systems signal.</p>
+  </div>
+
+  <h2 id="eventual-consistency">Eventual consistency <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Different services hold different views of the same fact, and they converge <em>eventually</em> — usually
+      within milliseconds, occasionally longer.</p>
+    <p>Which means there is a window where the system is observably inconsistent, and <strong>the business has to
+      agree that's acceptable</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Problem it creates</th><th>How to handle it</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>User doesn't see their own change</strong></td>
+          <td>Return the written entity rather than re-reading; or read from the write model briefly after a
+              write</td>
+        </tr>
+        <tr>
+          <td><strong>Two services disagree</strong></td>
+          <td>Define one as authoritative; reconcile the others against it</td>
+        </tr>
+        <tr>
+          <td><strong>An intermediate state is visible</strong></td>
+          <td>Make it a real domain state — "Pending", "Reserved" — with meaningful UI</td>
+        </tr>
+        <tr>
+          <td><strong>Replicas drift</strong></td>
+          <td><strong>A reconciliation job.</strong> Not optional</td>
+        </tr>
+        <tr>
+          <td><strong>An operation can't be honoured after the fact</strong></td>
+          <td>Semantic locks — reserve up front rather than checking later</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Eventual consistency is a product decision, not a technical one</div>
+    <p style="margin:0">"Your order is confirmed, but the stock count updates in a few seconds" is a
+      <strong>business rule</strong>, and someone who owns the product needs to agree to it.
+      <br><br>
+      The version that goes wrong: engineering adopts microservices, accepts eventual consistency as a technical
+      consequence, and the business discovers later that overselling is now possible. Nobody agreed to that trade —
+      it arrived as a side effect of an architecture decision.
+      <br><br>
+      So the conversation to have <em>before</em> building is: <strong>which inconsistencies are acceptable, for
+      how long, and what happens when the window is violated?</strong> For a retailer, overselling one item and
+      apologising may be entirely fine. For a pharmacy dispensing controlled drugs, it isn't.
+      <br><br>
+      Framing it that way — as a requirement to be agreed rather than a constraint to be worked around — is what
+      distinguishes an architect from an implementer on this topic.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Semantic locks: reserve rather than check</div>
+    <p style="margin:0">The trap with eventual consistency is <strong>checking a condition and acting on it
+      later</strong>. "Is there stock? Yes. Now charge the card." Between those, someone else took the stock.
+      <br><br>
+      The fix is to <strong>reserve</strong> instead of check. The inventory service atomically decrements
+      available stock and issues a reservation with a TTL. If the saga fails, the reservation is released; if it's
+      abandoned, the TTL expires and the stock returns.
+      <br><br>
+      That converts "hope it's still there" into a genuine claim, and it's the same
+      <a href="../10-sql/transactions.html#atomic-update">atomic conditional update</a> pattern applied across a
+      service boundary. It also gives you the "held for 10 minutes" checkout behaviour that a plain decrement
+      can't.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>There's no transaction across services; 2PC is blocking, fragile and largely unsupported.</li>
+      <li>A saga is local transactions plus compensating actions.</li>
+      <li>Compensation is a new business action, not a rollback — it leaves a trace.</li>
+      <li><strong>Put irreversible steps last.</strong> You can't un-send an email.</li>
+      <li>Orchestration for complex flows; choreography for independent reactions.</li>
+      <li>Choreography buys loose coupling and costs debuggability.</li>
+      <li>Plan for compensation itself failing — retries, persisted state, alerts, reconciliation.</li>
+      <li>Delivery is at-least-once, so every consumer must be idempotent.</li>
+      <li>Dedupe record and work must commit in the <em>same</em> transaction.</li>
+      <li>"Exactly once" is at-least-once plus idempotency.</li>
+      <li>Eventual consistency needs business agreement, not just engineering acceptance.</li>
+      <li>Reserve rather than check, and give reservations a TTL.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Reaching for two-phase commit.</strong></li>
+    <li><strong>Treating compensation as rollback</strong>, ignoring the trace it leaves.</li>
+    <li><strong>Irreversible steps early</strong> in the saga.</li>
+    <li><strong>No plan for failed compensation.</strong></li>
+    <li><strong>Saga state held in memory</strong>, lost on restart.</li>
+    <li><strong>Choreography for a complex flow</strong>, then being unable to debug it.</li>
+    <li><strong>Non-idempotent consumers.</strong></li>
+    <li><strong>Recording the dedupe key in a separate transaction</strong> from the work.</li>
+    <li><strong>Trusting a broker's "exactly once".</strong></li>
+    <li><strong>Check-then-act</strong> instead of reserve.</li>
+    <li><strong>No reconciliation job.</strong></li>
+    <li><strong>Accepting eventual consistency without business sign-off.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>An order must reserve stock, charge a card and create a shipment across three services. How? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"There's no transaction spanning three services, so this is a <strong>saga</strong> — a sequence of
+          local transactions, each atomic within its own service, with compensating actions if a later step
+          fails."</p>
+        <p>"I'd rule out two-phase commit explicitly. It technically provides atomicity, and it's blocking —
+          participants hold locks from prepare until commit — it has a coordinator single point of failure, its
+          availability is the product of all participants, and it isn't supported by most modern stores or by
+          .NET on Linux. More fundamentally it reintroduces exactly the runtime coupling that splitting the
+          services was meant to remove."</p>
+        <p>"So the steps: create the order as Pending, reserve inventory, charge the card, create the shipment,
+          mark the order Confirmed. Each has a compensation — mark failed, release the reservation, refund the
+          charge, cancel the shipment."</p>
+        <p>"<strong>I'd choose orchestration</strong> over choreography here. This is a real sequence with error
+          handling, and with orchestration the whole flow is one readable method — so when an order gets stuck I
+          look in one place. With choreography the flow only exists as an emergent property of five services'
+          subscriptions, and reconstructing it means reading all of them."</p>
+        <p>"Now the parts that distinguish a working saga from a diagram."</p>
+        <p>"<strong>Compensation is not rollback.</strong> A refund isn't an un-charge — the customer sees a
+          charge and a refund on their statement, there may be a fee, and accounting records both. So
+          compensation is a new business action with visible consequences, and the product needs to accept
+          that."</p>
+        <p>"<strong>Order the steps so irreversible ones are last.</strong> You can't un-send an email or
+          un-ship a parcel. So the confirmation email goes after the payment succeeds, not before — otherwise a
+          failed charge leaves the customer holding a confirmation for an order that doesn't exist. Getting that
+          ordering right is one of the most useful things in saga design and it's frequently missed."</p>
+        <p>"<strong>Reserve, don't check.</strong> The naive version checks stock then charges, and between those
+          someone else takes the stock. Instead inventory atomically decrements and issues a reservation with a
+          TTL — so it's a genuine claim. If the saga fails the reservation is released; if it's abandoned the TTL
+          returns the stock. That also gives you 'held for 10 minutes' at checkout, which a plain check
+          can't."</p>
+        <p>"<strong>Every step must be idempotent</strong>, because message delivery is at-least-once and a
+          consumer that crashes before acknowledging will receive the message again. For the charge that means an
+          idempotency key so a retry doesn't double-charge. For the inbox pattern, the critical detail is that the
+          dedupe record and the actual work commit in the <em>same</em> transaction — if you record the message id
+          separately, a crash between them means it's marked processed but never happened, which turns duplicate
+          delivery into lost work."</p>
+        <p>"<strong>And I'd plan for compensation failing</strong>, which is the case most designs skip. If the
+          refund API is down, we're in a state the system can't resolve itself — card charged, order failed. That
+          needs retries with backoff, saga state <em>persisted</em> so it survives a restart and can resume, an
+          alert to a human because some cases need judgement, and a reconciliation job that finds sagas stuck past
+          a threshold."</p>
+        <p>"One thing I'd raise with the business rather than decide alone: <strong>the intermediate state is
+          visible.</strong> The order exists as Pending for the duration. That has to be a meaningful domain state
+          with sensible UI, not an implementation artefact the user sees by accident."</p>
+        <p>"In .NET I'd use MassTransit's state-machine saga rather than hand-rolling this, mainly for the state
+          persistence and timeout handling — those are the parts that are tedious and easy to get wrong."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reject 2PC with reasons?</li>
+        <li>Do you know compensation isn't rollback?</li>
+        <li>Do you order irreversible steps last?</li>
+        <li>Do you reserve rather than check?</li>
+        <li>Do you require idempotency, with the same-transaction detail?</li>
+        <li>Do you plan for failed compensation?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a distributed transaction.</li>
+        <li><span class="redflag">Red flag:</span> "roll back the other services".</li>
+        <li><span class="redflag">Red flag:</span> no idempotency, so retries double-charge.</li>
+        <li><span class="redflag">Red flag:</span> no answer for compensation failing.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the refund fails three times?</li>
+          <li>How do you find sagas stuck in Pending?</li>
+          <li>How would the choreographed version differ?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

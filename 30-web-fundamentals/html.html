@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTML &amp; Accessibility — Web Fundamentals</title>
+<meta name="description" content="Semantic elements and why they matter, forms and validation, ARIA, the browser rendering path, and what actually affects SEO.">
+<meta name="keywords" content="semantic HTML accessibility a11y ARIA screen reader landmark roles form validation label focus management keyboard navigation WCAG rendering path DOM CSSOM render blocking defer async">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="30-web-fundamentals/html.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>HTML &amp; Accessibility</h1>
+    <p class="subtitle">Semantics aren't decoration — they're the API that assistive technology, search engines
+      and browsers all read.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Use the right element.</strong> A <code>button</code> gives you keyboard support, focus and
+        semantics for free; a <code>div</code> gives you none of it.</li>
+      <li><strong>Every input needs a <code>label</code></strong>, properly associated.</li>
+      <li><strong>The first rule of ARIA is not to use ARIA</strong> — native elements first.</li>
+      <li><strong>Accessibility is largely keyboard operability.</strong> Tab through it.</li>
+      <li><strong>CSS blocks rendering; scripts block parsing</strong> unless deferred.</li>
+      <li><strong>Alt text describes purpose</strong>, and decorative images take <code>alt=""</code>.</li>
+      <li><strong>Client validation is UX, server validation is security.</strong></li>
+    </ul>
+  </div>
+
+  <h2 id="semantics">Semantic elements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A <code>&lt;div&gt;</code> means nothing. A <code>&lt;button&gt;</code> tells the browser, the screen
+      reader and the search engine what the thing <em>is</em>.</p>
+    <p>That meaning is what makes it keyboard-operable, announceable and navigable — without you writing any
+      code.</p>
+  </div>
+
+  <pre data-label="html — what you lose with a div" class="code-bad"><code class="language-html">&lt;div class="btn" onclick="save()"&gt;Save&lt;/div&gt;
+
+&lt;!-- Not focusable with Tab
+     Doesn't respond to Enter or Space
+     Announced as "Save" with no role - the user doesn't know it's actionable
+     Not in the accessibility tree as a control
+     No :focus-visible ring, no disabled state --&gt;</code></pre>
+
+  <pre data-label="html — the native element" class="code-good"><code class="language-html">&lt;button type="button" onclick="save()"&gt;Save&lt;/button&gt;
+
+&lt;!-- Focusable, keyboard-activated, announced as "Save, button",
+     supports disabled, gets focus styling. All free. --&gt;</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Recreating a button correctly takes six attributes</div>
+    <pre data-label="html"><code class="language-html">&lt;div role="button"
+     tabindex="0"
+     aria-pressed="false"
+     aria-disabled="false"
+     onclick="save()"
+     onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); save(); }"&gt;
+  Save
+&lt;/div&gt;</code></pre>
+    <p style="margin:0">And that still doesn't fully match native behaviour — form submission, the
+      <code>disabled</code> attribute genuinely blocking clicks, or Windows High Contrast Mode.
+      <br><br>
+      This is the concrete answer to "why does semantic HTML matter?": <strong>the native element is a large
+      amount of behaviour you'd otherwise have to write and maintain.</strong> That's a much better argument than
+      "it's good practice".</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Element</th><th>Means</th><th>Instead of</th></tr></thead>
+      <tbody>
+        <tr><td><code>&lt;button&gt;</code></td><td>An action</td><td><code>div</code> with a click handler</td></tr>
+        <tr><td><code>&lt;a href&gt;</code></td><td>Navigation to a URL</td><td><code>button</code> that changes location</td></tr>
+        <tr><td><code>&lt;nav&gt;</code></td><td>A navigation region</td><td><code>div class="nav"</code></td></tr>
+        <tr><td><code>&lt;main&gt;</code></td><td>The primary content — one per page</td><td><code>div id="content"</code></td></tr>
+        <tr><td><code>&lt;header&gt;</code>, <code>&lt;footer&gt;</code></td><td>Introductory / closing content</td><td>Generic wrappers</td></tr>
+        <tr><td><code>&lt;table&gt;</code></td><td>Tabular data, with <code>th</code> and <code>scope</code></td><td>Nested divs with grid CSS</td></tr>
+        <tr><td><code>&lt;ul&gt;</code>/<code>&lt;ol&gt;</code></td><td>A list — announced with its item count</td><td>A stack of divs</td></tr>
+        <tr><td><code>&lt;dialog&gt;</code></td><td>A modal, with focus trapping built in</td><td>A hand-rolled overlay div</td></tr>
+        <tr><td><code>&lt;details&gt;</code></td><td>Expandable content, no JavaScript</td><td>A click-toggled div</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Button or link? The distinction interviewers check</div>
+    <p style="margin:0"><strong><code>&lt;a href&gt;</code> navigates. <code>&lt;button&gt;</code> acts.</strong>
+      <br><br>
+      That's not cosmetic. A link can be opened in a new tab, copied, bookmarked, crawled and middle-clicked; a
+      screen reader announces it as a link and lists it in the links index. A button does none of that and is
+      announced as a control.
+      <br><br>
+      So "Delete" is a button. "View order" is a link — even in a single-page application, where it should still
+      be an <code>&lt;a&gt;</code> with a real <code>href</code> that the router intercepts. A router link
+      implemented as a <code>div</code> breaks open-in-new-tab, which users notice immediately.</p>
+  </div>
+
+  <h2 id="forms">Forms <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="html — a properly built field" class="code-good"><code class="language-html">&lt;label for="email"&gt;Email address&lt;/label&gt;
+&lt;input type="email"
+       id="email"
+       name="email"
+       autocomplete="email"
+       required
+       aria-describedby="email-hint email-error"&gt;
+
+&lt;p id="email-hint"&gt;We'll only use this for order updates.&lt;/p&gt;
+&lt;p id="email-error" role="alert"&gt;&lt;/p&gt;   &lt;!-- announced when populated --&gt;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Detail</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>label for</code> matching <code>id</code></td><td>Announces the field, and <strong>clicking the label focuses the input</strong></td></tr>
+        <tr><td><code>type="email"</code></td><td>Mobile keyboards adapt; basic validation for free</td></tr>
+        <tr><td><code>autocomplete</code></td><td>Password managers and browser autofill work. Frequently omitted</td></tr>
+        <tr><td><code>aria-describedby</code></td><td>Associates hint and error text so both are announced</td></tr>
+        <tr><td><code>role="alert"</code></td><td>Announces dynamically without moving focus</td></tr>
+        <tr><td><code>name</code></td><td>Required for native form submission</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Placeholder is not a label</div>
+    <p style="margin:0">A placeholder disappears the moment the user types, so they can't check what the field
+      was for. It fails contrast requirements in most designs, isn't reliably announced, and vanishes entirely
+      when the browser autofills.
+      <br><br>
+      It's the single most common accessibility failure in forms, and it's usually done for visual reasons that
+      a floating label solves properly.
+      <br><br>
+      <strong>Placeholders are for examples</strong> — <code>placeholder="e.g. 07700 900000"</code> — not for
+      naming the field.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Client validation is a convenience, never a control</div>
+    <p style="margin:0"><code>required</code>, <code>type="email"</code> and <code>pattern</code> give fast
+      feedback and stop obvious mistakes. They are trivially bypassed — DevTools, a curl request, a disabled
+      JavaScript engine.
+      <br><br>
+      <strong>Every rule must be enforced server-side.</strong> Client validation exists so the user doesn't
+      wait for a round trip to learn their email is malformed;
+      <a href="../07-aspnet-core/apis.html">server validation</a> is what actually protects the system.
+      <br><br>
+      Same reasoning as <a href="../10-sql/fundamentals.html#constraints">database constraints versus
+      application validation</a> — the outer layer is UX, the inner layer is correctness.</p>
+  </div>
+
+  <h2 id="accessibility">Accessibility <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The 80% version</span>
+    <ol>
+      <li><strong>Use native elements.</strong> Most accessibility comes free.</li>
+      <li><strong>Label every input.</strong></li>
+      <li><strong>Tab through the page.</strong> Can you reach and operate everything, in a sensible order, and
+        see where you are?</li>
+      <li><strong>Alt text on meaningful images</strong>, <code>alt=""</code> on decorative ones.</li>
+      <li><strong>Don't rely on colour alone</strong> to convey information.</li>
+      <li><strong>Check contrast</strong> — 4.5:1 for body text.</li>
+    </ol>
+    <p>That covers the large majority of real failures. Everything below is refinement.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ARIA attribute</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><code>aria-label</code></td><td>Naming a control with no visible text — an icon-only button</td></tr>
+        <tr><td><code>aria-labelledby</code></td><td>Pointing at existing visible text as the name</td></tr>
+        <tr><td><code>aria-describedby</code></td><td>Supplementary hint or error text</td></tr>
+        <tr><td><code>aria-live</code></td><td>Announcing content that changes without a page load</td></tr>
+        <tr><td><code>aria-expanded</code></td><td>State of a disclosure or menu trigger</td></tr>
+        <tr><td><code>aria-current="page"</code></td><td>The active item in navigation</td></tr>
+        <tr><td><code>aria-hidden="true"</code></td><td>Hiding purely decorative content from assistive tech</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The first rule of ARIA is not to use ARIA</div>
+    <p style="margin:0">That's the actual wording in the specification, and it's the answer interviewers are
+      listening for.
+      <br><br>
+      <strong>Incorrect ARIA is worse than none.</strong> <code>role="button"</code> on a
+      <code>div</code> makes a screen reader announce "button" while the element still isn't keyboard-operable —
+      so you've promised a control that doesn't work. No ARIA at all would at least have been announced as
+      plain text.
+      <br><br>
+      ARIA doesn't add behaviour. It only changes what assistive technology reports. Every role you assert is a
+      contract you have to implement yourself.
+      <br><br>
+      So: native element first, ARIA only to fill a genuine gap — a custom combobox, a live region, an
+      icon-button name.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Focus management is the SPA-specific problem</div>
+    <p style="margin:0">In a traditional page load, the browser resets focus and screen readers announce the new
+      page. In a single-page application <strong>nothing happens</strong> — the URL changes, content swaps, and
+      focus stays wherever it was. A screen reader user gets no indication anything changed.
+      <br><br>
+      So route changes need explicit handling: move focus to the new content's heading, and announce the change
+      via a live region.
+      <br><br>
+      Same for modals: focus must move into the dialog, be <strong>trapped</strong> while it's open, and return
+      to the trigger element on close. The native <code>&lt;dialog&gt;</code> element does the trapping and
+      restoration for you, which is why it's now the right default rather than a hand-rolled overlay.</p>
+  </div>
+
+  <h2 id="rendering">The rendering path <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <ol class="steps">
+    <li><strong>Parse HTML → DOM.</strong> Incremental, as bytes arrive.</li>
+    <li><strong>Parse CSS → CSSOM.</strong> <strong>Render-blocking</strong> — nothing paints until it's
+      done.</li>
+    <li><strong>Combine into the render tree</strong> — DOM nodes plus computed styles.</li>
+    <li><strong>Layout (reflow)</strong> — compute geometry for every box.</li>
+    <li><strong>Paint</strong> — fill in pixels.</li>
+    <li><strong>Composite</strong> — assemble layers, potentially on the GPU.</li>
+  </ol>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Script tag</th><th>Behaviour</th></tr></thead>
+      <tbody>
+        <tr><td><code>&lt;script&gt;</code></td><td><strong>Blocks parsing</strong> — downloads and executes immediately</td></tr>
+        <tr><td><code>&lt;script defer&gt;</code></td><td>Downloads in parallel, runs after parsing, <strong>in order</strong></td></tr>
+        <tr><td><code>&lt;script async&gt;</code></td><td>Downloads in parallel, runs as soon as ready, <strong>order not guaranteed</strong></td></tr>
+        <tr><td><code>&lt;script type="module"&gt;</code></td><td>Deferred by default</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The practical rules</div>
+    <p style="margin:0"><strong>CSS in the <code>&lt;head&gt;</code></strong>, because it's render-blocking and
+      you want it as early as possible. Loading it late causes a flash of unstyled content.
+      <br><br>
+      <strong>Scripts with <code>defer</code></strong>, so parsing isn't blocked but execution order is
+      preserved. <code>async</code> only for genuinely independent scripts like analytics — with
+      <code>async</code>, script two can run before script one, which breaks anything with dependencies.
+      <br><br>
+      A blocking script in the <code>&lt;head&gt;</code> is the classic cause of a slow first paint: the browser
+      stops parsing, fetches, executes, and only then continues building the DOM.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Reflow versus repaint, and why it matters</div>
+    <p style="margin:0"><strong>Reflow</strong> recalculates geometry — triggered by changing width, height,
+      position, or adding elements. Expensive, because it can cascade to the whole subtree.
+      <br><br>
+      <strong>Repaint</strong> redraws pixels without changing geometry — colour, background, visibility.
+      Cheaper.
+      <br><br>
+      <strong>Compositing only</strong> — <code>transform</code> and <code>opacity</code> — can run on the GPU
+      without touching layout or paint at all. That's why animating <code>transform: translateX()</code> is
+      smooth and animating <code>left</code> stutters: one is a composite, the other is a reflow on every
+      frame.
+      <br><br>
+      Also worth knowing: <strong>reading a layout property forces a synchronous reflow.</strong> Reading
+      <code>offsetHeight</code> inside a loop that also writes styles causes layout thrashing — the browser must
+      recompute on every iteration. Batch reads, then writes.</p>
+  </div>
+
+  <h2 id="seo">What actually affects SEO <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Matters</th><th>Doesn't much</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Server-rendered content</strong> — client-only rendering is crawled inconsistently</td><td><code>&lt;meta keywords&gt;</code> — ignored for many years</td></tr>
+        <tr><td><strong><code>&lt;title&gt;</code> and meta description</strong></td><td>Exact heading-level nesting</td></tr>
+        <tr><td><strong>Core Web Vitals</strong> — LCP, CLS, INP are ranking inputs</td><td>Keyword density</td></tr>
+        <tr><td><strong>Semantic structure and headings</strong></td><td>Number of <code>h2</code>s</td></tr>
+        <tr><td><strong>Alt text</strong> — for image search and context</td><td></td></tr>
+        <tr><td><strong>Structured data</strong> (JSON-LD) — enables rich results</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the SPA/SEO trade-off</div>
+    <p style="margin:0">A client-rendered single-page application serves an almost-empty HTML document and builds
+      the content in JavaScript. Google can execute JavaScript, but it's queued, budgeted and unreliable — and
+      most other crawlers, plus link-preview generators for Slack, WhatsApp and social platforms, don't execute
+      it at all.
+      <br><br>
+      So for anything discoverability-dependent — marketing pages, product listings, articles — you need
+      <strong>server-side rendering or static generation</strong>. That's Angular Universal, Next.js, or
+      pre-rendering at build time.
+      <br><br>
+      The calibrated position: a CRUD application behind a login has no SEO requirement and a SPA is entirely
+      appropriate. A public catalogue does, and choosing pure client rendering there is a business problem
+      wearing a technical costume. Being able to make that distinction is the point.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Native elements carry behaviour — recreating a button properly takes six attributes and still falls
+        short.</li>
+      <li><code>&lt;a&gt;</code> navigates, <code>&lt;button&gt;</code> acts. Router links should still be
+        anchors.</li>
+      <li>Every input needs an associated <code>label</code>. A placeholder is not a label.</li>
+      <li>Client validation is UX; the server enforces the rules.</li>
+      <li>Incorrect ARIA is worse than none — it asserts behaviour you must then implement.</li>
+      <li>Tab through the page; keyboard operability is most of accessibility.</li>
+      <li>SPAs must manage focus on route change and trap it in modals.</li>
+      <li>CSS blocks rendering; use <code>defer</code> for scripts.</li>
+      <li>Animate <code>transform</code>/<code>opacity</code> to stay on the compositor.</li>
+      <li>Client-only rendering hurts SEO and link previews — server-render public content.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>div</code> with a click handler</strong> instead of a button.</li>
+    <li><strong>Placeholder used as the label.</strong></li>
+    <li><strong>Missing <code>autocomplete</code></strong>, breaking password managers.</li>
+    <li><strong>ARIA roles without the matching keyboard behaviour.</strong></li>
+    <li><strong>No focus management on SPA route change.</strong></li>
+    <li><strong>Colour as the only indicator</strong> of state or error.</li>
+    <li><strong>Blocking scripts in the <code>&lt;head&gt;</code>.</strong></li>
+    <li><strong>Animating <code>left</code>/<code>top</code></strong> instead of <code>transform</code>.</li>
+    <li><strong>Reading layout properties inside a write loop</strong> — layout thrashing.</li>
+    <li><strong>Relying on client validation for correctness.</strong></li>
+    <li><strong>Client-only rendering for public content.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Why does semantic HTML matter? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Because the element you choose is <strong>behaviour, not just meaning</strong> — and that's a more
+          concrete argument than 'good practice'."</p>
+        <p>"Take a <code>&lt;button&gt;</code> versus a <code>&lt;div&gt;</code> with a click handler. The button
+          is focusable with Tab, activates on Enter <em>and</em> Space, is announced as 'Save, button' so the
+          user knows it's actionable, supports the <code>disabled</code> attribute, appears in the accessibility
+          tree as a control, and gets a focus ring."</p>
+        <p>"To match that with a div you need <code>role="button"</code>, <code>tabindex="0"</code>, a
+          <code>keydown</code> handler for both Enter and Space with <code>preventDefault</code>,
+          <code>aria-disabled</code>, and focus styling. Six additions — and it <em>still</em> won't submit a
+          form or genuinely block clicks when disabled."</p>
+        <p>"So the honest framing is: <strong>the native element is a substantial amount of behaviour you'd
+          otherwise write and maintain.</strong>"</p>
+        <p>"Beyond that: <strong>assistive technology</strong> navigates by landmarks and headings, so
+          <code>nav</code>, <code>main</code> and proper heading levels let a screen reader user jump straight to
+          content instead of hearing everything. <strong>Search engines</strong> use structure to understand the
+          page. And <strong>browser features</strong> depend on it — reader mode, autofill, translation all read
+          semantics."</p>
+        <p>"One distinction I'd raise because it's frequently wrong: <strong>links navigate, buttons act.</strong>
+          An <code>&lt;a href&gt;</code> can be opened in a new tab, copied, bookmarked and crawled, and is
+          announced as a link. So even in a single-page application, a router link should be a real anchor with
+          an <code>href</code> that the router intercepts — implementing it as a div breaks middle-click and
+          open-in-new-tab, which users notice immediately."</p>
+        <p>"And it's increasingly a <strong>legal requirement</strong> — public sector and large commercial sites
+          in the UK, EU and US face accessibility obligations. So this isn't only a craft argument; shipping an
+          inaccessible interface is organisational risk."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's about behaviour, not just labels?</li>
+        <li>Can you enumerate what the native element gives you?</li>
+        <li>Do you know the link/button distinction?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>When would you use ARIA?</li>
+          <li>How do you make a custom dropdown accessible?</li>
+          <li>How would you test accessibility?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How would you make a single-page application accessible? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"SPAs break two things that traditional page loads handle automatically, and those are the
+          SPA-specific problems worth focusing on rather than general accessibility advice."</p>
+        <p>"<strong>Route changes are silent.</strong> On a normal navigation the browser resets focus and the
+          screen reader announces the new page. In a SPA the URL changes and content swaps, but focus stays
+          exactly where it was — so a screen reader user gets no indication anything happened. They may not even
+          realise they navigated."</p>
+        <p>"The fix is explicit: on route change, move focus to the new view's main heading — a container with
+          <code>tabindex="-1"</code> that you call <code>focus()</code> on — and announce the change through a
+          live region. Also update <code>document.title</code>, because some screen readers announce it and it
+          matters for browser history regardless."</p>
+        <p>"<strong>Dynamic content updates are silent too.</strong> If a form submission shows an error, or a
+          list filters, a sighted user sees it and a screen reader user doesn't. That needs a live region —
+          <code>aria-live="polite"</code> for status messages, or <code>role="alert"</code> for errors, which
+          announces without moving focus."</p>
+        <p>"The subtlety: <strong>the live region must exist in the DOM before the content changes.</strong> If
+          you insert the element and its text together, many screen readers announce nothing — they're watching
+          for changes <em>within</em> an existing region. That's a very common implementation mistake."</p>
+        <p>"Then <strong>focus management for modals</strong>. Focus must move into the dialog, be trapped while
+          open, and return to the triggering element on close — otherwise a keyboard user closes the modal and
+          finds themselves back at the top of the document. The native <code>&lt;dialog&gt;</code> element
+          handles trapping and restoration, so I'd use that rather than hand-rolling it."</p>
+        <p>"Beyond the SPA-specific parts, the fundamentals still apply: native elements, labelled inputs,
+          logical tab order, visible focus indicators, adequate contrast."</p>
+        <p>"On <strong>testing</strong>, because this is where teams go wrong: automated tools like axe catch
+          maybe 30–40% of issues — missing labels, contrast failures, invalid ARIA. They cannot tell you whether
+          the tab order is sensible, whether focus goes somewhere useful after an action, or whether the
+          announcements make sense. So I'd run axe in CI as a floor, and do manual keyboard-only testing plus
+          actual screen reader testing for the main flows."</p>
+        <p>"The single cheapest check: <strong>unplug the mouse and use the application.</strong> If you can't
+          complete the primary journey with only a keyboard, neither can a substantial group of users. That
+          finds more real problems in ten minutes than a scanner does."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know route changes need explicit focus and announcement?</li>
+        <li>Do you know the live-region-must-pre-exist detail?</li>
+        <li>Do you handle modal focus trapping and restoration?</li>
+        <li>Do you know automated tools only find a fraction?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "run axe and fix what it reports."</li>
+        <li><span class="redflag">Red flag:</span> adding ARIA roles broadly to "improve accessibility".</li>
+        <li><span class="redflag">Red flag:</span> no awareness that SPAs differ from static pages here.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you implement a focus trap?</li>
+          <li><code>aria-live="polite"</code> vs <code>assertive</code>?</li>
+          <li>How would you add this to an existing large app?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

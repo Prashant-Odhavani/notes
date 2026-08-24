@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTP Protocol — HTTP &amp; Web APIs</title>
+<meta name="description" content="HTTP methods and their semantics, safe vs idempotent, status codes that matter, PUT vs PATCH, caching with ETags, and HTTP/1.1 vs 2 vs 3.">
+<meta name="keywords" content="http methods GET POST PUT PATCH DELETE safe idempotent cacheable status codes 400 401 403 404 409 422 429 PUT vs PATCH ETag conditional request cache control HTTP2 HTTP3">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="08-http-web-apis/http-protocol.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>HTTP Protocol</h1>
+    <p class="subtitle">Methods, status codes and caching. Boring-sounding, and the source of a surprising
+      number of production bugs.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Safe</strong> = doesn't change state. <strong>Idempotent</strong> = doing it twice has the
+        same effect as once.</li>
+      <li><code>GET</code> is safe and idempotent. <code>PUT</code>/<code>DELETE</code> are idempotent but
+        not safe. <code>POST</code> is neither.</li>
+      <li><code>PUT</code> replaces the whole resource. <code>PATCH</code> applies a partial change — and is
+        <strong>not</strong> idempotent in general.</li>
+      <li><strong>401</strong> = I don't know who you are. <strong>403</strong> = I do, and no.</li>
+      <li><strong>409</strong> = conflicts with current state. <strong>422</strong> = well-formed but
+        semantically invalid.</li>
+      <li><strong>ETags</strong> give you both cheap caching and optimistic concurrency, from one header.</li>
+    </ul>
+  </div>
+
+  <h2 id="method-semantics">Safe, idempotent, cacheable <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Safe</strong> — the request doesn't change anything. You can send it freely.</p>
+    <p><strong>Idempotent</strong> — sending it five times leaves the same result as sending it once.</p>
+    <p>These are different. A <code>DELETE</code> is idempotent but definitely not safe.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>Safe</strong> is reading a page in a book. Do it as often as you like; nothing changes.</p>
+    <p><strong>Idempotent</strong> is a light switch set to "off". Flick it to off five times — still off.
+      Something changed, but repeating it changes nothing further.</p>
+    <p><strong>Neither</strong> is adding a line to a list. Do it five times and you have five lines.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>Safe</th><th>Idempotent</th><th>Cacheable</th><th>Has a body</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET</code></td><td>✅</td><td>✅</td><td>✅</td><td>No</td></tr>
+        <tr><td><code>HEAD</code></td><td>✅</td><td>✅</td><td>✅</td><td>No</td></tr>
+        <tr><td><code>OPTIONS</code></td><td>✅</td><td>✅</td><td>No</td><td>No</td></tr>
+        <tr><td><code>PUT</code></td><td>❌</td><td>✅</td><td>No</td><td>Yes</td></tr>
+        <tr><td><code>DELETE</code></td><td>❌</td><td>✅</td><td>No</td><td>Usually not</td></tr>
+        <tr><td><code>POST</code></td><td>❌</td><td>❌</td><td>Rarely</td><td>Yes</td></tr>
+        <tr><td><code>PATCH</code></td><td>❌</td><td><strong>❌ Not guaranteed</strong></td><td>No</td><td>Yes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Why idempotency is the important column</span>
+    <p>It determines whether a client can <strong>safely retry after a timeout</strong>.</p>
+    <p>A timeout means you don't know whether the request succeeded. If the method is idempotent, retrying is
+      free. If it isn't, retrying might duplicate the effect.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — <code>GET</code> that changes state</div>
+    <p style="margin:0">An endpoint like <code>GET /api/orders/123/cancel</code> looks harmless and is a real
+      hazard:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li>A browser <strong>prefetch</strong> or link preview can trigger it.</li>
+      <li>A crawler following links will fire every one it finds.</li>
+      <li>A proxy or CDN may <strong>cache</strong> the response, so the second call doesn't reach you.</li>
+      <li>An email client scanning links has been known to delete data this way.</li>
+    </ul>
+    <p style="margin:8px 0 0">State changes need <code>POST</code>, <code>PUT</code>, <code>PATCH</code> or
+      <code>DELETE</code>. This is also the root of the CSRF-via-image-tag attack.</p>
+  </div>
+
+  <h2 id="put-vs-patch">PUT vs PATCH <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>PUT</code> says <em>"make the resource look exactly like this"</em> — it's a full replacement.</p>
+    <p><code>PATCH</code> says <em>"apply this change to it"</em> — a partial modification.</p>
+  </div>
+
+  <pre data-label="http — PUT replaces everything"><code class="language-http">PUT /api/customers/42
+Content-Type: application/json
+
+{ "name": "Ada Lovelace", "email": "ada@example.com", "tier": "Gold" }
+
+# Omitting a field means "this field should be absent/default".
+# Send only { "name": "Ada" } and email and tier may be wiped.</code></pre>
+
+  <pre data-label="http — PATCH changes only what you send"><code class="language-http">PATCH /api/customers/42
+Content-Type: application/json
+
+{ "email": "ada@newdomain.com" }
+
+# Name and tier are untouched.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>PUT</code></th><th><code>PATCH</code></th></tr></thead>
+      <tbody>
+        <tr><td>Semantics</td><td>Full replacement</td><td>Partial update</td></tr>
+        <tr><td>Missing fields mean</td><td>"remove / reset this"</td><td>"leave this alone"</td></tr>
+        <tr><td>Idempotent?</td><td><strong>Yes</strong></td><td><strong>Not necessarily</strong></td></tr>
+        <tr><td>Can create the resource?</td><td>Yes, if you allow it (client supplies the ID)</td><td>No — the resource must exist</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Why <code>PATCH</code> isn't automatically idempotent</div>
+    <p style="margin:0">It depends on the <em>operation</em> you express. A patch that says
+      <code>{ "email": "x" }</code> is idempotent — apply it twice, same result.
+      <br><br>
+      But JSON Patch allows relative operations:
+      <code>[{ "op": "add", "path": "/tags/-", "value": "vip" }]</code> appends. Apply that twice and you have
+      two <code>vip</code> tags.
+      <br><br>
+      So the spec can't promise idempotency for <code>PATCH</code> in general — even though most real-world
+      patches happen to be idempotent.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Implementing <code>PUT</code> as a partial update — ignoring fields the client didn't
+      send. It's convenient, and it breaks the contract: a client that legitimately wants to clear a field by
+      omitting it can't, and a client that expects replacement semantics gets surprised.
+      <br><br>
+      If you want partial updates, use <code>PATCH</code>. If you implement <code>PUT</code>, honour
+      replacement.</p>
+  </div>
+
+  <h2 id="status-codes">Status codes that matter <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Code</th><th>Means</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>200</strong> OK</td><td>Success, here's the result</td><td>Reads, and updates that return the new state</td></tr>
+        <tr><td><strong>201</strong> Created</td><td>Resource created</td><td>Successful <code>POST</code> — include a <code>Location</code> header</td></tr>
+        <tr><td><strong>202</strong> Accepted</td><td>Queued, not done yet</td><td>Async processing — include a status URL</td></tr>
+        <tr><td><strong>204</strong> No Content</td><td>Success, nothing to return</td><td><code>DELETE</code>, or an update with no response body</td></tr>
+        <tr><td><strong>304</strong> Not Modified</td><td>Your cached copy is current</td><td>Response to a conditional <code>GET</code></td></tr>
+        <tr><td><strong>400</strong> Bad Request</td><td>Malformed — couldn't parse it</td><td>Invalid JSON, wrong type, missing required field</td></tr>
+        <tr><td><strong>401</strong> Unauthorized</td><td><em>Unauthenticated</em></td><td>No or invalid credentials</td></tr>
+        <tr><td><strong>403</strong> Forbidden</td><td>Authenticated, not permitted</td><td>Known user, insufficient permission</td></tr>
+        <tr><td><strong>404</strong> Not Found</td><td>No such resource</td><td>Also for "exists but isn't yours"</td></tr>
+        <tr><td><strong>409</strong> Conflict</td><td>Conflicts with current state</td><td>Duplicate key, concurrency conflict, illegal state transition</td></tr>
+        <tr><td><strong>422</strong> Unprocessable</td><td>Parsed fine, semantically invalid</td><td>Business rule violation</td></tr>
+        <tr><td><strong>429</strong> Too Many Requests</td><td>Rate limited</td><td>Include <code>Retry-After</code></td></tr>
+        <tr><td><strong>500</strong> Internal Error</td><td><em>We</em> broke</td><td>Unexpected failure — never for user error</td></tr>
+        <tr><td><strong>503</strong> Unavailable</td><td>Temporarily down</td><td>Overloaded, or a dependency is down. <code>Retry-After</code> helps</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="400-vs-422">400 vs 422 vs 409 — the ones people argue about</h3>
+
+  <div class="simple">
+    <span class="sm-label">A rule that resolves most of it</span>
+    <p><strong>400</strong> — I couldn't <em>understand</em> the request.</p>
+    <p><strong>422</strong> — I understood it, but it's <em>not valid</em>.</p>
+    <p><strong>409</strong> — I understood it and it's valid, but it <em>clashes with the current state</em>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Situation</th><th>Code</th></tr></thead>
+      <tbody>
+        <tr><td>Malformed JSON</td><td>400</td></tr>
+        <tr><td><code>"quantity": "abc"</code> where a number was expected</td><td>400</td></tr>
+        <tr><td>Required field missing</td><td>400</td></tr>
+        <tr><td><code>"quantity": -5</code> — valid JSON, invalid value</td><td>400 or 422 (both defensible)</td></tr>
+        <tr><td>Email already registered</td><td>409</td></tr>
+        <tr><td>Cannot ship an unpaid order</td><td>409</td></tr>
+        <tr><td>Insufficient stock</td><td>409 (or 422)</td></tr>
+        <tr><td>Optimistic concurrency conflict</td><td>409</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The pragmatic answer</div>
+    <p style="margin:0">400 vs 422 is genuinely debated, and ASP.NET Core's built-in validation returns
+      <strong>400</strong>. Fighting that to return 422 is usually not worth it.
+      <br><br>
+      What matters far more is being <strong>consistent</strong> and giving a machine-readable error body.
+      A client can handle "always 400 with a typed error" easily; it can't handle "sometimes 400, sometimes
+      422, sometimes 200 with an error object".
+      <br><br>
+      In an interview, say that. Knowing the distinction and knowing it's low-stakes is the mature answer.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — 200 with an error body</div>
+    <p style="margin:0"><code>200 OK</code> with <code>{ "success": false, "error": "..." }</code> breaks
+      everything that isn't your own client code:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li>Monitoring reports a 100% success rate while every request fails.</li>
+      <li>Load balancers and proxies treat it as healthy.</li>
+      <li>Retry policies won't retry it.</li>
+      <li>Generated clients throw away the error because the call "succeeded".</li>
+    </ul>
+    <p style="margin:8px 0 0">The status code is how you talk to infrastructure. The body is how you talk to
+      the client. Use both.</p>
+  </div>
+
+  <h2 id="caching">Caching and conditional requests <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An <strong>ETag</strong> is a version marker for a resource — usually a hash or a row version.</p>
+    <p>The client sends it back, and if nothing changed you reply <strong>304</strong> with no body.</p>
+  </div>
+
+  <pre data-label="http — the round trip"><code class="language-http">GET /api/orders/42
+→ 200 OK
+  ETag: "a1b2c3"
+  Cache-Control: private, max-age=60
+  { ...order... }
+
+# Later, the client asks again but includes what it has:
+GET /api/orders/42
+If-None-Match: "a1b2c3"
+→ 304 Not Modified          # no body at all - just headers</code></pre>
+
+  <p>The win is bandwidth and serialization cost. The server still checks, but it doesn't send or serialize
+    the payload — which for a large response is most of the work.</p>
+
+  <h3 id="etag-concurrency">The same header solves optimistic concurrency <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <pre data-label="http — If-Match prevents the lost update"><code class="language-http">PUT /api/orders/42
+If-Match: "a1b2c3"
+{ ...changes... }
+
+→ 200 OK                    # still version a1b2c3, change applied
+→ 412 Precondition Failed   # someone else changed it first</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><code>If-None-Match</code> on a <code>GET</code> = <strong>caching</strong>. "Only send it if it
+      changed."</p>
+    <p><code>If-Match</code> on a <code>PUT</code> = <strong>concurrency</strong>. "Only apply this if it
+      hasn't changed."</p>
+  </div>
+
+  <p>That second form solves the lost update problem at the HTTP layer — the same problem EF Core solves with
+    a <code>RowVersion</code> token, and the reason the two pair naturally: use the row version as the ETag.
+    See <a href="../11-ef-core/transactions-concurrency.html">EF Core concurrency</a>.</p>
+
+  <h3 id="cache-control">Cache-Control, briefly</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Directive</th><th>Means</th></tr></thead>
+      <tbody>
+        <tr><td><code>public</code></td><td>Any cache may store it, including CDNs and proxies</td></tr>
+        <tr><td><code>private</code></td><td>Only the end client's cache. <strong>Use for anything user-specific</strong></td></tr>
+        <tr><td><code>no-store</code></td><td>Don't store it anywhere. For sensitive data</td></tr>
+        <tr><td><code>no-cache</code></td><td>May store, but must revalidate before use (badly named)</td></tr>
+        <tr><td><code>max-age=60</code></td><td>Fresh for 60 seconds</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — <code>public</code> on authenticated responses</div>
+    <p style="margin:0">Marking a user-specific response <code>public</code> lets a shared cache — a CDN, a
+      corporate proxy — store it and serve it to <strong>someone else</strong>.
+      <br><br>
+      That's a data leak caused by one header. Anything that varies by user is <code>private</code> at
+      minimum, and <code>no-store</code> if it's sensitive. And use <code>Vary</code> on
+      <code>Authorization</code> so caches key on the identity.</p>
+  </div>
+
+  <h2 id="versions">HTTP/1.1 vs 2 vs 3 <span class="lvl lvl-i">🟡 Intermediate</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr></thead>
+      <tbody>
+        <tr><td>Transport</td><td>TCP</td><td>TCP</td><td><strong>QUIC (UDP)</strong></td></tr>
+        <tr><td>Concurrent requests</td><td>One per connection (so browsers open ~6)</td><td>Multiplexed over one connection</td><td>Multiplexed over one connection</td></tr>
+        <tr><td>Head-of-line blocking</td><td>At the HTTP layer</td><td>Fixed at HTTP, <strong>remains at TCP</strong></td><td>Fixed — independent streams</td></tr>
+        <tr><td>Headers</td><td>Plain text, repeated</td><td>Binary, compressed (HPACK)</td><td>Compressed (QPACK)</td></tr>
+        <tr><td>Connection setup</td><td>TCP + TLS handshakes</td><td>TCP + TLS</td><td>Combined — faster, and 0-RTT resumption</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">The one thing to remember about each</span>
+    <p><strong>HTTP/2</strong> fixed head-of-line blocking at the HTTP layer — but TCP still delivers in
+      order, so one lost packet stalls every stream on that connection.</p>
+    <p><strong>HTTP/3</strong> moved to QUIC over UDP so streams are genuinely independent. A lost packet
+      only stalls its own stream — which is why it helps most on mobile and lossy networks.</p>
+  </div>
+
+  <p><strong>What it means practically:</strong> under HTTP/2 the old optimisations — domain sharding,
+    concatenating files, image sprites — become <em>counterproductive</em>, because many small requests over
+    one connection are now cheap. And gRPC requires HTTP/2, which is why it can't be called directly from a
+    browser without a proxy.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Safe ≠ idempotent. Idempotency is what makes retry-after-timeout safe.</li>
+      <li>Never change state with <code>GET</code> — prefetch, crawlers and caches will bite you.</li>
+      <li><code>PUT</code> replaces, <code>PATCH</code> modifies. Don't implement <code>PUT</code> as partial.</li>
+      <li>401 = unauthenticated, 403 = unauthorised. 409 = state conflict, 400/422 = invalid input.</li>
+      <li>Never return 200 with an error body — it lies to your monitoring and to proxies.</li>
+      <li>ETag + <code>If-None-Match</code> = caching. ETag + <code>If-Match</code> = optimistic concurrency.</li>
+      <li><code>Cache-Control: public</code> on a user-specific response is a data leak.</li>
+      <li>HTTP/2 multiplexes but keeps TCP head-of-line blocking; HTTP/3 fixes it via QUIC.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>State-changing <code>GET</code></strong> endpoints.</li>
+    <li><strong>200 with <code>{ success: false }</code></strong>, hiding failures from monitoring.</li>
+    <li><strong>500 for validation errors</strong>, causing pointless retries and false alerts.</li>
+    <li><strong><code>PUT</code> that ignores missing fields</strong>, so clients can't clear a value.</li>
+    <li><strong>403 for another tenant's record</strong>, confirming it exists.</li>
+    <li><strong>429 with no <code>Retry-After</code></strong>, so clients guess and retry too fast.</li>
+    <li><strong><code>Cache-Control: public</code></strong> on authenticated responses.</li>
+    <li><strong>201 with no <code>Location</code> header</strong>, so the client can't find what it created.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What's the difference between PUT and PATCH? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<code>PUT</code> is a full replacement — you're saying 'make the resource look exactly like this
+          payload'. <code>PATCH</code> is a partial update — 'apply this change and leave the rest alone'."</p>
+        <p>"The practical consequence is what happens to fields you <em>don't</em> send. With
+          <code>PUT</code>, omitting a field means it should be absent or reset. With <code>PATCH</code>,
+          omitting it means leave it as it is. So sending <code>{ "name": "Ada" }</code> as a
+          <code>PUT</code> could legitimately wipe the email address."</p>
+        <p>"The other difference is idempotency. <code>PUT</code> is idempotent by definition — send it five
+          times, same result. <code>PATCH</code> is <em>not guaranteed</em> to be, because the patch document
+          can express relative operations. A JSON Patch that appends to an array applied twice gives you two
+          entries."</p>
+        <p>"That matters for retries: a client that times out can safely retry a <code>PUT</code>, but can't
+          assume the same for <code>PATCH</code> unless the API documents it as idempotent."</p>
+        <p>"The mistake I'd watch for in review is implementing <code>PUT</code> as a partial update because
+          it's more convenient. It breaks the contract — a client can no longer clear a field by omitting it,
+          and anyone relying on replacement semantics gets surprised. If you want partial updates, use
+          <code>PATCH</code> and say so."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's about replacement vs modification, not just "update"?</li>
+        <li>Do you know <code>PATCH</code> isn't guaranteed idempotent, and why?</li>
+        <li>Do you connect it to retry safety?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Can <code>PUT</code> create a resource?</li>
+          <li>What's JSON Patch vs JSON Merge Patch?</li>
+          <li>How would you make a <code>POST</code> safe to retry?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What status code would you return for each of these, and why?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd frame it with a rule first: 400 means I couldn't understand the request, 422 means I
+          understood it but it isn't valid, and 409 means it's valid but it clashes with the current state."</p>
+        <p>"So — <strong>malformed JSON</strong> is 400. <strong>A missing required field</strong> is 400.
+          <strong>A negative quantity</strong> is arguably either 400 or 422; ASP.NET Core's built-in
+          validation gives 400 and I wouldn't fight that."</p>
+        <p>"<strong>Email already registered</strong> is 409 — the request is perfectly valid, it just
+          conflicts with existing state. Same for <strong>trying to ship an unpaid order</strong>: that's an
+          illegal state transition, so 409."</p>
+        <p>"<strong>An optimistic concurrency conflict</strong> is 409, or 412 specifically if the client sent
+          an <code>If-Match</code> header — 412 Precondition Failed is more precise there."</p>
+        <p>"<strong>Not authenticated</strong> is 401, <strong>authenticated but not permitted</strong> is
+          403. And for <strong>a record belonging to another tenant</strong> I'd return 404, not 403 —
+          because 403 confirms the record exists, which lets someone enumerate valid IDs."</p>
+        <p>"<strong>Rate limited</strong> is 429, and I'd always include <code>Retry-After</code>, otherwise
+          well-behaved clients guess and usually guess too aggressively."</p>
+        <p>"The thing I'd emphasise is that <strong>consistency beats precision</strong> here. 400 vs 422 is
+          genuinely debated and low-stakes. What actually breaks clients is inconsistency — sometimes 400,
+          sometimes 200 with an error object. I'd pick a convention, document it, and apply it everywhere,
+          with a machine-readable error type in the body so clients branch on that rather than on the
+          message."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have a rule, or are you guessing per case?</li>
+        <li>Do you know 409 for state conflicts?</li>
+        <li>Do you volunteer 404-over-403 for cross-tenant access?</li>
+        <li>Do you value consistency over purity?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> 500 for anything caused by user input.</li>
+        <li><span class="redflag">Red flag:</span> 200 with an error flag in the body.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What goes in the error response body?</li>
+          <li>What's the difference between 409 and 412?</li>
+          <li>Should a client retry a 409?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you use ETags? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"An ETag is a version identifier for a resource — typically a hash of the content, or a row version
+          from the database. It gives you two quite different things from one header, which is why it's worth
+          knowing well."</p>
+        <p>"The first is <strong>caching</strong>. I return an <code>ETag</code> with the response. The client
+          sends it back as <code>If-None-Match</code> on the next request, and if nothing changed I return
+          304 with no body. The server still does the lookup, but it skips serializing and sending the
+          payload — which for a large response is most of the cost."</p>
+        <p>"The second is <strong>optimistic concurrency</strong>. The client sends the ETag as
+          <code>If-Match</code> on a <code>PUT</code>. If the resource has changed since they read it, the tag
+          won't match and I return 412 Precondition Failed. That solves the lost update problem — where two
+          users load the same record, both edit, and the second save silently overwrites the first."</p>
+        <p>"So: <code>If-None-Match</code> on a read is caching, <code>If-Match</code> on a write is
+          concurrency. Same header, opposite intent."</p>
+        <p>"For implementation, the neat part is that if you already use a <code>RowVersion</code> column for
+          EF Core concurrency, that value <em>is</em> your ETag. You're exposing the concurrency token you
+          already have rather than computing a hash."</p>
+        <p>"One detail worth knowing: strong versus weak ETags. A strong tag means byte-identical; a weak one
+          (prefixed <code>W/</code>) means semantically equivalent. If your response includes a generated
+          timestamp, byte-identical is impossible, so a weak tag is more honest."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know both uses, and that they're different headers?</li>
+        <li>Do you connect it to the lost-update problem?</li>
+        <li>Bonus: the RowVersion-as-ETag link, and strong vs weak.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does this compare with a <code>Last-Modified</code> header?</li>
+          <li>What do you do when the ETag doesn't match — 409 or 412?</li>
+          <li>How does this interact with a CDN?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

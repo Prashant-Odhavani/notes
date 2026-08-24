@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indexing — PostgreSQL</title>
+<meta name="description" content="B-tree, GIN, GiST and BRIN; partial and expression indexes; index-only scans, the visibility map, and CREATE INDEX CONCURRENTLY.">
+<meta name="keywords" content="PostgreSQL index B-tree GIN GiST BRIN hash partial index expression index covering index INCLUDE index only scan visibility map bitmap heap scan CREATE INDEX CONCURRENTLY unique index exclusion constraint pg_trgm full text tsvector index bloat">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="12-postgresql/indexing.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Indexing</h1>
+    <p class="subtitle">Everything from the SQL indexing page still applies. What's new is that PostgreSQL has
+      several index <em>types</em>, and heap storage changes the mechanics.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Tables are heaps.</strong> There's no clustered index — every index is secondary and points
+        at a physical row location.</li>
+      <li><strong>B-tree</strong> for equality, ranges and sorting. The default and 90% of what you need.</li>
+      <li><strong>GIN</strong> for "contains" — arrays, <code>jsonb</code>, full-text, trigram search.</li>
+      <li><strong>BRIN</strong> for huge naturally-ordered tables. Tiny index, big win on time-series.</li>
+      <li><strong>Partial indexes</strong> (<code>WHERE</code>) are excellent and underused.</li>
+      <li><strong>Expression indexes</strong> make <code>lower(email)</code> and jsonb extraction fast.</li>
+      <li><strong>Index-only scans need the visibility map</strong> — so vacuum affects read performance.</li>
+      <li><strong>Always <code>CREATE INDEX CONCURRENTLY</code></strong> in production.</li>
+    </ul>
+  </div>
+
+  <h2 id="heap">No clustered index <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A SQL Server table <em>is</em> its clustered index — rows are physically stored in key order.</p>
+    <p>A PostgreSQL table is a <strong>heap</strong>: rows go wherever there's free space. Every index is
+      secondary, storing the key plus a <code>ctid</code> (physical page and offset).</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Consequence</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>No insert-position penalty</td><td><strong>Random UUID primary keys are fine</strong> — no page splits from out-of-order inserts</td></tr>
+        <tr><td>Every index lookup may need a heap fetch</td><td>Unless the index can answer alone — see index-only scans</td></tr>
+        <tr><td>No "clustering key in every index"</td><td>Indexes are narrower than the SQL Server equivalent</td></tr>
+        <tr><td>Physical order drifts</td><td><code>CLUSTER</code> reorders once, but doesn't maintain it</td></tr>
+        <tr><td>An <code>UPDATE</code> writes a new row version</td><td>Which usually means updating <em>every</em> index on the table</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — HOT updates</div>
+    <p style="margin:0">Because an update creates a new row version, it normally has to add a new entry to
+      every index — which is why tables with ten indexes have expensive updates.
+      <br><br>
+      PostgreSQL optimises this with <strong>HOT (Heap-Only Tuple) updates</strong>: if no
+      <em>indexed</em> column changed and there's room on the same page, the new version is chained on that
+      page and <strong>no index is touched at all</strong>.
+      <br><br>
+      Two practical consequences. Don't index columns you update frequently unless you need to — each one
+      disqualifies HOT. And leave some free space with a lower <code>fillfactor</code> on
+      update-heavy tables, because HOT needs room on the page.
+      <br><br>
+      This is a genuinely Postgres-specific answer and a strong signal in an interview.</p>
+  </div>
+
+  <h2 id="btree">B-tree <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — the same column-order rules as anywhere"><code class="language-sql">-- Equality columns first, then range, then sort
+CREATE INDEX ix_order_customer_status_created
+    ON "order" (customer_id, status, created_at DESC);
+
+-- Covering: include non-key columns at the leaf level (PG 11+)
+CREATE INDEX ix_order_lookup
+    ON "order" (customer_id, created_at DESC)
+    INCLUDE (total, status);</code></pre>
+
+  <p>Everything on the <a href="../10-sql/indexing.html#column-order">SQL indexing page</a> about composite
+    column order, prefixes, selectivity and SARGability applies unchanged. B-tree supports
+    <code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>BETWEEN</code>, <code>IN</code>,
+    <code>IS NULL</code>, <code>LIKE 'prefix%'</code>, and ordering.</p>
+
+  <div class="note warn">
+    <div class="note-title">The <code>LIKE 'prefix%'</code> collation catch</div>
+    <p style="margin:0">A standard B-tree index <strong>cannot</strong> support <code>LIKE 'abc%'</code> unless
+      the database uses the <code>C</code> locale — because in other collations, sort order doesn't match
+      byte-prefix order.
+      <br><br>
+      The fix is a <code>text_pattern_ops</code> index:
+      <br>
+      <code>CREATE INDEX ix_sku_prefix ON product (sku text_pattern_ops);</code>
+      <br><br>
+      That index serves <code>LIKE</code> and <code>~</code> prefix matching but <em>not</em> ordinary
+      <code>&lt;</code>/<code>&gt;</code> comparisons — so you may want both. This catches people who add an
+      index for a prefix search and see no improvement.</p>
+  </div>
+
+  <h2 id="index-types">The other index types <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Answers</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>B-tree</strong></td>
+          <td>Equality, ranges, sorting</td>
+          <td>The default. Almost everything</td>
+        </tr>
+        <tr>
+          <td><strong>GIN</strong></td>
+          <td>"Contains one of / all of"</td>
+          <td><code>jsonb</code>, arrays, full-text (<code>tsvector</code>), trigram search</td>
+        </tr>
+        <tr>
+          <td><strong>GiST</strong></td>
+          <td>Overlap, proximity, containment</td>
+          <td>Ranges, geometry/PostGIS, nearest-neighbour, exclusion constraints</td>
+        </tr>
+        <tr>
+          <td><strong>BRIN</strong></td>
+          <td>Very coarse range filtering</td>
+          <td>Huge append-only tables ordered by the indexed column</td>
+        </tr>
+        <tr>
+          <td><strong>Hash</strong></td>
+          <td>Equality only</td>
+          <td>Rarely — B-tree does equality nearly as well and much more</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to remember which</span>
+    <ul>
+      <li><strong>Is it one scalar value per row?</strong> → B-tree.</li>
+      <li><strong>Does one row contain <em>many</em> values you search within?</strong> → GIN. (Array of tags,
+        jsonb keys, words in a document.)</li>
+      <li><strong>Is it about overlap or distance?</strong> → GiST.</li>
+      <li><strong>Is the table enormous and physically ordered by this column?</strong> → BRIN.</li>
+    </ul>
+  </div>
+
+  <h3 id="gin">GIN</h3>
+
+  <pre data-label="sql — jsonb, arrays and text search"><code class="language-sql">-- jsonb containment
+CREATE INDEX ix_event_payload ON event USING gin (payload);
+SELECT * FROM event WHERE payload @&gt; '{"status":"shipped"}';
+
+-- Array overlap
+CREATE INDEX ix_article_tags ON article USING gin (tags);
+SELECT * FROM article WHERE tags &amp;&amp; ARRAY['sql','postgres'];
+
+-- Full-text search
+ALTER TABLE article ADD COLUMN search tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;
+CREATE INDEX ix_article_search ON article USING gin (search);
+SELECT * FROM article WHERE search @@ websearch_to_tsquery('english', 'postgres index');</code></pre>
+
+  <pre data-label="sql — substring search, which B-tree can never do" class="code-good"><code class="language-sql">CREATE EXTENSION pg_trgm;
+CREATE INDEX ix_product_name_trgm ON product USING gin (name gin_trgm_ops);
+
+-- Now a LEADING wildcard can use an index
+SELECT * FROM product WHERE name ILIKE '%widget%';</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Trigram indexes are a genuinely useful trick</div>
+    <p style="margin:0"><code>LIKE '%text%'</code> is the classic unindexable predicate — on SQL Server your
+      options are full-text search or a scan.
+      <br><br>
+      A <code>pg_trgm</code> GIN index makes it indexable, because it indexes overlapping three-character
+      sequences rather than the whole string. It also powers fuzzy matching with
+      <code>similarity()</code> and the <code>%</code> operator, which is how you build a decent typo-tolerant
+      search without a separate search engine.
+      <br><br>
+      Being able to answer "how would you make a substring search fast?" with something other than "you can't"
+      is a strong Postgres-specific signal.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">GIN write cost, and <code>fastupdate</code></div>
+    <p style="margin:0">GIN indexes are expensive to update — one row can produce many index entries.
+      Postgres mitigates this with a <strong>pending list</strong> (<code>fastupdate</code>, on by default):
+      new entries are appended cheaply and merged later.
+      <br><br>
+      The side effect is that a query may have to scan that unmerged pending list, so latency is inconsistent
+      until autovacuum merges it. On a write-heavy table with a large GIN index that's a real
+      cause of intermittent slow queries — and the answer is usually more aggressive vacuuming of that table
+      rather than dropping the index.</p>
+  </div>
+
+  <h3 id="brin">BRIN</h3>
+
+  <pre data-label="sql — a 500 GB time-series table"><code class="language-sql">CREATE INDEX ix_metric_time ON metric USING brin (recorded_at)
+    WITH (pages_per_range = 32);</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">How BRIN works, and why it's so small</span>
+    <p>It stores only the <strong>min and max value per block range</strong> — not per row.</p>
+    <p>A query filtering on a date range skips every block range whose min/max can't contain it. So a BRIN
+      index on a billion-row table might be a few megabytes, versus tens of gigabytes for a B-tree.</p>
+    <p>The catch: it only works if the data is <strong>physically ordered</strong> by that column. On
+      append-only, time-ordered inserts it is naturally. On randomly-updated data it's useless — every block
+      range spans the whole value range.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The BRIN answer interviewers like</div>
+    <p style="margin:0">"For a large append-only time-series table I'd consider BRIN on the timestamp instead
+      of a B-tree — it's orders of magnitude smaller, cheap to maintain, and for range scans over a naturally
+      time-ordered table it's usually enough."
+      <br><br>
+      Then the honest caveat: "it's much less precise, so it's wrong for point lookups, and it only works while
+      physical order tracks the column."</p>
+  </div>
+
+  <h2 id="partial">Partial indexes <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — index only the rows you query" class="code-good"><code class="language-sql">-- 500 million orders; 40,000 are pending
+CREATE INDEX ix_order_pending ON "order" (created_at)
+    WHERE status = 'pending';
+
+-- Only index active users
+CREATE UNIQUE INDEX ux_user_email_active ON users (lower(email))
+    WHERE deleted_at IS NULL;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Benefit</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td>Tiny</td><td>Fits in memory; far fewer pages to read</td></tr>
+        <tr><td>Cheap to maintain</td><td>Rows leave the index when they stop matching the predicate</td></tr>
+        <tr><td>Conditional uniqueness</td><td>Enforce "one active row per email" while allowing soft-deleted duplicates</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this is better than SQL Server's filtered index</div>
+    <p style="margin:0">SQL Server's filtered indexes have a
+      <a href="../10-sql/indexing.html#specialised">significant limitation</a>: a query using a
+      <em>parameter</em> generally can't use them, because the value isn't known at compile time.
+      <br><br>
+      PostgreSQL plans at execution with the actual parameter values available, so
+      <code>WHERE status = $1</code> <strong>can</strong> use a partial index when the planner can prove the
+      predicate holds. That makes partial indexes far more broadly useful here.
+      <br><br>
+      The conditional-unique pattern is also the standard Postgres answer to soft delete — and knowing that
+      SQL Server needs a computed column or a filtered unique index with different caveats shows you've used
+      both.</p>
+  </div>
+
+  <h2 id="expression">Expression indexes <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql" class="code-good"><code class="language-sql">-- Case-insensitive lookup
+CREATE INDEX ix_users_email_lower ON users (lower(email));
+SELECT * FROM users WHERE lower(email) = lower($1);   -- must match the expression
+
+-- Index one jsonb key
+CREATE INDEX ix_event_order ON event ((payload -&gt;&gt; 'orderId'));
+
+-- Index a computed value
+CREATE INDEX ix_order_month ON "order" (date_trunc('month', created_at));</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>On SQL Server, wrapping a column in a function <a href="../10-sql/indexing.html#sargable">kills the
+      seek</a> and your only option is to rewrite the query.</p>
+    <p>PostgreSQL lets you <strong>index the expression itself</strong>. So the function-on-column pattern
+      becomes viable — provided the query uses the <em>identical</em> expression.</p>
+    <p>That's a real capability difference, and a good thing to raise when asked about SARGability across both
+      databases.</p>
+  </div>
+
+  <h2 id="index-only">Index-only scans and the visibility map <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An index entry doesn't record whether its row version is visible to <em>your</em> transaction — that's
+      in the heap.</p>
+    <p>So normally, even a covering index still needs a heap fetch to check visibility. Which would defeat the
+      point.</p>
+    <p>PostgreSQL avoids that with the <strong>visibility map</strong>: a bitmap marking pages where
+      <em>every</em> row is visible to all transactions. If the index entry points at such a page, no heap
+      fetch is needed — an <strong>index-only scan</strong>.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Which means vacuum affects read performance</div>
+    <p style="margin:0">Only <strong><code>VACUUM</code> sets visibility-map bits</strong>. So a table that
+      hasn't been vacuumed recently has few all-visible pages, and index-only scans silently degrade into
+      index scans with heap fetches.
+      <br><br>
+      Symptom: a query that was fast gets slower after a bulk load or a burst of writes, with no plan change
+      that looks meaningful — but <code>EXPLAIN ANALYZE</code> shows a large <code>Heap Fetches</code> count on
+      an Index Only Scan node.
+      <br><br>
+      <strong>"Vacuum is a read-performance feature, not just cleanup"</strong> is a genuinely senior thing to
+      know, because everyone treats vacuum as garbage collection only.</p>
+  </div>
+
+  <h3 id="count">Why <code>COUNT(*)</code> is slower than you expect</h3>
+
+  <div class="simple">
+    <span class="sm-label">The reason</span>
+    <p>Same root cause. <code>COUNT(*)</code> must confirm each row is visible to your snapshot, and visibility
+      lives in the heap.</p>
+    <p>So an exact count is a full scan — index-only if the visibility map is well maintained, still a scan
+      either way. There's no stored row count to read.</p>
+  </div>
+
+  <pre data-label="sql — the pragmatic alternatives"><code class="language-sql">-- Good-enough estimate, instant, from the planner statistics
+SELECT reltuples::bigint FROM pg_class WHERE relname = 'order';
+
+-- "Are there more than 1000?" without counting them all
+SELECT count(*) FROM (SELECT 1 FROM "order" WHERE ... LIMIT 1001) t;</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The UI consequence</div>
+    <p style="margin:0">Showing "1,234,567 results" on a paginated screen over a big table means a full count on
+      every page load.
+      <br><br>
+      Options: an estimate from <code>reltuples</code>, a capped count ("1000+ results"), a maintained counter
+      table, or <a href="../10-sql/querying.html#pagination">keyset pagination</a> with no total at all — which
+      is what most large sites actually do, and for good reason.</p>
+  </div>
+
+  <h2 id="creating">Creating indexes safely <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — always CONCURRENTLY in production" class="code-good"><code class="language-sql">CREATE INDEX CONCURRENTLY ix_order_customer ON "order" (customer_id);
+DROP INDEX CONCURRENTLY ix_order_old;</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">A plain <code>CREATE INDEX</code> locks out writes</div>
+    <p style="margin:0">It takes a <code>SHARE</code> lock, which blocks every <code>INSERT</code>,
+      <code>UPDATE</code> and <code>DELETE</code> on the table until it finishes. On a large table that's an
+      outage.
+      <br><br>
+      <code>CONCURRENTLY</code> takes two passes and allows writes throughout. The costs:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li>Roughly twice as slow.</li>
+      <li><strong>Cannot run inside a transaction block</strong> — which matters for EF Core migrations, since
+        Postgres runs migrations transactionally by default. You need
+        <code>migrationBuilder.Sql("CREATE INDEX CONCURRENTLY ...", suppressTransaction: true)</code>.</li>
+      <li>On failure it leaves an <strong>invalid index</strong> that still costs writes but serves no reads.
+        Check <code>pg_index.indisvalid</code>, drop it, and retry — this is the part people don't know, and
+        an invisible invalid index can sit there for months.</li>
+    </ul>
+  </div>
+
+  <h2 id="maintenance">Finding unused and duplicate indexes <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="sql — never-used indexes"><code class="language-sql">SELECT s.relname AS table_name,
+       s.indexrelname AS index_name,
+       s.idx_scan,                                    -- times used
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS size
+FROM   pg_stat_user_indexes s
+JOIN   pg_index i ON i.indexrelid = s.indexrelid
+WHERE  s.idx_scan = 0
+  AND  NOT i.indisunique                              -- keep constraint indexes
+ORDER BY pg_relation_size(s.indexrelid) DESC;</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Two caveats before dropping anything</div>
+    <p style="margin:0"><code>idx_scan</code> is cumulative since the last statistics reset, so check
+      <code>pg_stat_get_db_stat_reset_time()</code> before concluding an index is unused — a recent reset makes
+      everything look unused.
+      <br><br>
+      And it's per-node: an index used only by a read replica shows zero scans on the primary. Check every
+      instance, and sample long enough to cover monthly reporting.
+      <br><br>
+      Also check <strong>index bloat</strong>. A B-tree that's been heavily updated accumulates dead entries;
+      <code>REINDEX CONCURRENTLY</code> (Postgres 12+) rebuilds it without blocking writes. That's often a
+      bigger win than adding anything.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Heap storage means no clustered index, so random UUID keys are fine.</li>
+      <li>HOT updates skip index maintenance when no indexed column changed — don't index volatile columns
+        needlessly.</li>
+      <li>B-tree for scalars; GIN for many-values-per-row; GiST for overlap; BRIN for huge ordered tables.</li>
+      <li><code>pg_trgm</code> GIN makes <code>LIKE '%x%'</code> indexable.</li>
+      <li><code>text_pattern_ops</code> is needed for prefix <code>LIKE</code> outside the C locale.</li>
+      <li>Partial indexes work with parameters here, unlike SQL Server filtered indexes.</li>
+      <li>Expression indexes make function-wrapped predicates viable.</li>
+      <li>Index-only scans depend on the visibility map, so vacuum affects read speed.</li>
+      <li><code>COUNT(*)</code> is a scan — visibility lives in the heap.</li>
+      <li><code>CREATE INDEX CONCURRENTLY</code> always in production; check for invalid indexes after a
+        failure.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Plain <code>CREATE INDEX</code> on a large production table</strong>, blocking all writes.</li>
+    <li><strong>Not noticing a failed <code>CONCURRENTLY</code> left an invalid index.</strong></li>
+    <li><strong>GIN on everything</strong>, paying heavy write costs for queries that need B-tree.</li>
+    <li><strong>BRIN on randomly-ordered data</strong>, where it does nothing.</li>
+    <li><strong>Expression index that doesn't match the query's expression exactly.</strong></li>
+    <li><strong>Expecting a plain B-tree to serve <code>LIKE 'abc%'</code></strong> outside the C locale.</li>
+    <li><strong>Assuming <code>COUNT(*)</code> is cheap.</strong></li>
+    <li><strong>Ignoring <code>Heap Fetches</code></strong> on an index-only scan.</li>
+    <li><strong>Indexing frequently-updated columns</strong> and disabling HOT updates.</li>
+    <li><strong>Dropping "unused" indexes</strong> based on stats since a recent reset.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>When would you use a GIN index instead of a B-tree? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The distinction I use: <strong>B-tree indexes one value per row; GIN indexes many values per
+          row</strong>."</p>
+        <p>"So if a column holds a single scalar — a customer ID, a date, a status — that's B-tree, and it
+          handles equality, ranges and sorting."</p>
+        <p>"GIN is for when one row contains a <em>collection</em> you want to search inside. An array of tags,
+          the keys and values in a <code>jsonb</code> document, the words in a <code>tsvector</code>. GIN
+          builds a reverse map from each individual element back to the rows containing it — essentially an
+          inverted index."</p>
+        <p>"Concretely I'd reach for GIN for: <code>jsonb</code> containment queries with
+          <code>@&gt;</code>, array overlap with <code>&amp;&amp;</code>, full-text search with
+          <code>@@</code>, and trigram search."</p>
+        <p>"That last one is worth highlighting because it solves a problem that has no good answer on SQL
+          Server. <code>LIKE '%widget%'</code> with a leading wildcard can't use a B-tree anywhere — but a
+          <code>pg_trgm</code> GIN index makes it indexable, because it indexes overlapping three-character
+          sequences rather than whole strings. That's also how you get fuzzy, typo-tolerant matching with
+          <code>similarity()</code> without adding a separate search engine."</p>
+        <p>"The cost is writes. One row can produce many index entries, so GIN is significantly more expensive
+          to maintain than B-tree. Postgres softens that with a pending list —
+          <code>fastupdate</code> — where new entries are appended cheaply and merged later. The side effect
+          is that queries may have to scan that unmerged list, so on a write-heavy table with a big GIN index
+          you get intermittently slower queries until autovacuum merges it. The fix there is usually more
+          aggressive vacuuming on that table rather than removing the index."</p>
+        <p>"I'd also mention GiST briefly, since it's the one people forget: it's for <em>overlap and
+          proximity</em> rather than containment — range types, geometry, nearest-neighbour searches, and it's
+          what backs exclusion constraints. So 'no two bookings for this room can overlap' is a GiST exclusion
+          constraint, which is a genuinely nice capability."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have a clear rule, or just a list of use cases?</li>
+        <li>Do you know about trigram indexes?</li>
+        <li>Do you know GIN's write cost and the pending list?</li>
+        <li>Bonus: do you know GiST and exclusion constraints?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you index a specific jsonb key rather than the whole document?</li>
+          <li>Write an exclusion constraint for overlapping bookings.</li>
+          <li>What's the trade-off with <code>fastupdate</code>?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>You need to add an index to a 400-million-row table in production. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<code>CREATE INDEX CONCURRENTLY</code>, and I'd plan around its specific failure modes rather than
+          just running it."</p>
+        <p>"The reason it's not optional: a plain <code>CREATE INDEX</code> takes a <code>SHARE</code> lock on
+          the table, which blocks every insert, update and delete until it completes. On 400 million rows
+          that's tens of minutes to hours — an outage, not a maintenance blip."</p>
+        <p>"<code>CONCURRENTLY</code> does two passes and lets writes continue throughout. It's roughly twice
+          as slow, which is entirely worth it."</p>
+        <p>"Four things I'd account for."</p>
+        <p>"<strong>It can't run inside a transaction block.</strong> That matters directly for EF Core,
+          because Npgsql runs migrations in a transaction by default. So it needs
+          <code>migrationBuilder.Sql("CREATE INDEX CONCURRENTLY ...", suppressTransaction: true)</code>. Get
+          that wrong and the migration fails with a confusing error."</p>
+        <p>"<strong>On failure it leaves an invalid index.</strong> This is the part people don't know. If it's
+          interrupted — a timeout, a deadlock, someone cancelling it — you're left with an index that
+          <em>still costs write overhead</em> but is never used for reads. I'd check
+          <code>pg_index.indisvalid</code> afterwards, drop any invalid index, and retry. An invisible invalid
+          index taxing every write can sit there for months."</p>
+        <p>"<strong>It needs a long-lived snapshot</strong>, so it can be blocked by, and will hold up, other
+          things. It waits for existing transactions to finish before starting, so a long-running transaction
+          or an idle-in-transaction session will stall it indefinitely. I'd check
+          <code>pg_stat_activity</code> first and kill idle transactions. It also means autovacuum can't clean
+          dead rows on that table while it runs, so a long build on a hot table causes bloat."</p>
+        <p>"<strong>It's I/O heavy.</strong> I'd run it off-peak, and I'd consider raising
+          <code>maintenance_work_mem</code> for the session — that has a large effect on build speed."</p>
+        <p>"Before running it at all, I'd ask whether a smaller index would do. On 400 million rows a
+          <strong>partial index</strong> is often dramatically better: if the query only ever looks at
+          <code>status = 'pending'</code> and that's 40,000 rows, indexing just those gives a tiny index that
+          fits in memory and is cheap to maintain. Unlike SQL Server's filtered indexes, Postgres can use a
+          partial index with parameterised queries, so this is broadly applicable."</p>
+        <p>"And if it's a time-series table queried by date range, <strong>BRIN</strong> might be the answer
+          instead — orders of magnitude smaller and far quicker to build, as long as the physical order tracks
+          the timestamp."</p>
+        <p>"Then I'd verify: confirm the index is valid, check with <code>EXPLAIN ANALYZE</code> that the query
+          actually uses it, and watch <code>pg_stat_user_indexes.idx_scan</code> to confirm it's being used in
+          production rather than just existing."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know a plain <code>CREATE INDEX</code> blocks writes?</li>
+        <li>Do you know about invalid indexes after a failed concurrent build?</li>
+        <li>Do you know the transaction-block restriction, and how that hits EF migrations?</li>
+        <li>Do you consider a smaller index instead?</li>
+        <li>Do you verify it's actually used?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> plain <code>CREATE INDEX</code> with no concern.</li>
+        <li><span class="redflag">Red flag:</span> knowing <code>CONCURRENTLY</code> but none of its
+          caveats.</li>
+        <li><span class="redflag">Red flag:</span> no consideration of whether the index is the right shape.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you find an invalid index?</li>
+          <li>Why does a long transaction block the build?</li>
+          <li>How would you do this on a table with a replica?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

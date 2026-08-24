@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Patterns — Overview</title>
+<meta name="description" content="How to think about design patterns for senior interviews: what they're for, which ones .NET already gives you, and how to avoid pattern-driven over-engineering.">
+<meta name="keywords" content="design patterns gof creational structural behavioral enterprise patterns csharp dotnet when not to use pattern overuse middleware linq">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="18-design-patterns/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Design Patterns</h1>
+    <p class="subtitle">Named solutions to problems that keep coming back. The value is the shared
+      vocabulary and the trade-offs — not the class diagrams.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>A pattern is a <strong>problem + solution + known consequences</strong>. Quoting the structure
+        without the problem is the classic weak answer.</li>
+      <li>Patterns are <em>recognised</em>, not chosen. You should spot one in code you already wrote.</li>
+      <li>Modern .NET already gives you several: DI containers do Factory and Singleton, LINQ does Iterator,
+        middleware is Chain of Responsibility, delegates make Strategy a one-liner.</li>
+      <li>The ones you'll genuinely use: Strategy, Decorator, Factory, Adapter, Repository, Mediator,
+        Builder, Chain of Responsibility.</li>
+      <li>Every pattern adds indirection. Ask: <em>what change does this make cheap, and what does it cost
+        me to read until then?</em></li>
+    </ul>
+  </div>
+
+  <h2 id="why-patterns">Why they matter — and why they get misused <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>The real value is <strong>communication</strong>. Saying "this is a decorator chain" conveys structure,
+    intent and consequences in three words.</p>
+
+  <p>The second value is that each pattern comes with documented downsides. You inherit other people's
+    experience of where it goes wrong.</p>
+
+  <p>The misuse is well documented too: <strong>pattern-driven design</strong>, where you pick a pattern and
+    then reshape the problem to fit it. The symptom is a codebase where a two-line operation passes through
+    a factory, a strategy, a decorator and a mediator — and no single file tells you what happens.</p>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Start with the <strong>forces</strong>, not the pattern: "what varies here, what must stay stable,
+      and what does the indirection cost?"</p>
+    <p>Candidates who start by drawing the class diagram are reciting. Candidates who start with what varies
+      are designing.</p>
+  </div>
+
+  <h2 id="categories">The categories</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Category</th><th>About</th><th>Most used in .NET</th></tr></thead>
+      <tbody>
+        <tr><td><a href="creational.html">Creational</a></td><td>How objects get created</td><td>Factory Method, Builder, Singleton (usually via DI)</td></tr>
+        <tr><td><a href="structural.html">Structural</a></td><td>How objects are composed</td><td>Adapter, Decorator, Facade, Proxy</td></tr>
+        <tr><td><a href="behavioral.html">Behavioral</a></td><td>How objects communicate</td><td>Strategy, Observer, Command, Chain of Responsibility, Mediator</td></tr>
+        <tr><td><a href="enterprise.html">Enterprise</a></td><td>Application-level structure (Fowler, not GoF)</td><td>Repository, Unit of Work, Specification, CQRS, Event Sourcing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="already-in-dotnet">Patterns you're already using <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>A strong answer to "which patterns have you used?" cites framework code, not a tutorial project.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pattern</th><th>Where it shows up in .NET</th></tr></thead>
+      <tbody>
+        <tr><td>Factory</td><td><code>IServiceProvider</code>, <code>IHttpClientFactory</code>, <code>ILoggerFactory</code></td></tr>
+        <tr><td>Singleton</td><td>DI singleton lifetime</td></tr>
+        <tr><td>Builder</td><td><code>WebApplicationBuilder</code>, <code>StringBuilder</code>, EF's <code>ModelBuilder</code></td></tr>
+        <tr><td>Adapter</td><td><code>ILogger</code> wrapping third-party sinks; <code>Stream</code> adapters</td></tr>
+        <tr><td>Decorator</td><td><code>DelegatingHandler</code> in <code>HttpClient</code>; <code>GZipStream</code></td></tr>
+        <tr><td>Proxy</td><td>EF Core lazy-loading proxies; gRPC clients</td></tr>
+        <tr><td>Chain of Responsibility</td><td>ASP.NET Core middleware</td></tr>
+        <tr><td>Iterator</td><td><code>IEnumerable&lt;T&gt;</code> and <code>yield return</code></td></tr>
+        <tr><td>Observer</td><td>Events; <code>IObservable&lt;T&gt;</code>; <code>IChangeToken</code></td></tr>
+        <tr><td>Strategy</td><td>Any injected interface with several implementations</td></tr>
+        <tr><td>Template Method</td><td><code>BackgroundService.ExecuteAsync</code></td></tr>
+        <tr><td>Mediator</td><td>MediatR-style in-process dispatch</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="language-features">When a language feature replaces a pattern <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>Several GoF patterns exist to work around limits of 1990s C++ and Java. In modern C# they collapse to
+    a few lines. Knowing that is a real seniority marker.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pattern</th><th>Classic form</th><th>Modern C#</th></tr></thead>
+      <tbody>
+        <tr><td>Strategy</td><td>Interface + a class per algorithm</td><td>Often just a <code>Func&lt;T, TResult&gt;</code> — until it needs dependencies</td></tr>
+        <tr><td>Command</td><td>Interface with <code>Execute()</code></td><td>A delegate, or a record + handler</td></tr>
+        <tr><td>Iterator</td><td>An explicit enumerator class</td><td><code>yield return</code>, <code>IAsyncEnumerable&lt;T&gt;</code></td></tr>
+        <tr><td>Observer</td><td>Subject with attach/detach lists</td><td><code>event</code>, <code>IObservable&lt;T&gt;</code>, <code>Channel&lt;T&gt;</code></td></tr>
+        <tr><td>Singleton</td><td>Static instance + double-checked locking</td><td>DI singleton registration, or <code>Lazy&lt;T&gt;</code></td></tr>
+        <tr><td>Visitor</td><td>Double dispatch across a hierarchy</td><td>Pattern matching over a sealed hierarchy</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="choosing">Pick the pattern from the problem</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>The problem is…</th><th>Look at</th></tr></thead>
+      <tbody>
+        <tr><td>An algorithm varies, chosen at runtime</td><td><a href="behavioral.html#strategy">Strategy</a></td></tr>
+        <tr><td>Add behaviour around something without changing it</td><td><a href="structural.html#decorator">Decorator</a>, <a href="structural.html#proxy">Proxy</a></td></tr>
+        <tr><td>An external API's shape doesn't match yours</td><td><a href="structural.html#adapter">Adapter</a></td></tr>
+        <tr><td>Construction is complex or depends on runtime data</td><td><a href="creational.html#factory-method">Factory</a>, <a href="creational.html#builder">Builder</a></td></tr>
+        <tr><td>Many handlers, one should deal with the request</td><td><a href="behavioral.html#chain">Chain of Responsibility</a></td></tr>
+        <tr><td>Things must react without being coupled to the source</td><td><a href="behavioral.html#observer">Observer</a>, domain events</td></tr>
+        <tr><td>Too many objects talking directly to each other</td><td><a href="behavioral.html#mediator">Mediator</a></td></tr>
+        <tr><td>Complex query rules reused in several places</td><td><a href="enterprise.html#specification">Specification</a></td></tr>
+        <tr><td>Reads and writes have different shapes and scaling needs</td><td><a href="enterprise.html#cqrs">CQRS</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card-grid" data-section-index></div>
+
+  <h2 id="interview-questions">Cross-cutting interview questions</h2>
+
+  <details class="qa">
+    <summary>Which design patterns do you actually use, and when do you avoid them?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The ones I reach for regularly are Strategy, Decorator, Factory and Adapter — and I'd describe
+          them by the problem, not the diagram."</p>
+        <p>"Strategy when behaviour varies by a runtime value and each variant has real logic — pricing
+          rules, export formats, payment providers. Decorator for cross-cutting concerns like caching,
+          retry and logging, because each concern stays in one class and I can compose them per
+          environment. Adapter whenever I integrate a third-party SDK, so its types don't leak into my
+          domain. Factory when construction depends on runtime data rather than a compile-time type."</p>
+        <p>"I also use several without naming them, because the framework does. Middleware is Chain of
+          Responsibility, <code>IEnumerable</code> with <code>yield</code> is Iterator, the DI container is
+          doing Factory and Singleton. That matters, because patterns describe structure — they're not
+          things you bolt on."</p>
+        <p>"Where I avoid them is anything speculative. One implementation and no concrete second case in
+          sight? I write the direct code. I also avoid patterns that hide control flow in a team that
+          isn't familiar with them — a mediator is genuinely useful at a certain size, but in a small
+          service it turns a readable call chain into handlers you have to find by naming convention."</p>
+        <p>"My trigger is usually the third occurrence. First time I write it directly, second time I notice
+          the duplication, third time I extract — because by then I can see what actually varies."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Is your pattern knowledge applied or recited?</li>
+        <li>Can you say no to a pattern? That's the more informative half.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> listing patterns with textbook definitions and no example from your own work.</li>
+        <li><span class="redflag">Red flag:</span> "I use singleton and factory a lot" with no mention that DI replaced most of that.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Show me how you'd build a decorator chain in ASP.NET Core DI.</li>
+          <li>Which pattern is ASP.NET Core middleware, and what are its consequences?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Can a codebase have too many patterns?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Yes — and in my experience it's a more common failure than having too few."</p>
+        <p>"Every pattern adds indirection, and indirection has a permanent readability cost paid by
+          everyone who reads the code. The benefit only shows up if the anticipated change actually
+          happens."</p>
+        <p>"The concrete symptom: you can't answer 'what happens when this endpoint is called?' without
+          following registrations through a container and jumping between six files, none of which contains
+          a complete thought. Stack traces stop being useful. New joiners take months instead of weeks. And
+          — the part people underestimate — changing behaviour gets <em>harder</em>, because the abstraction
+          was designed for a different axis of variation than the one that turned up."</p>
+        <p>"The way I keep it in check is requiring evidence before abstracting. Duplication is cheaper than
+          the wrong abstraction, because duplication is easy to see and easy to consolidate later. A wrong
+          abstraction gets built on and becomes load-bearing. So I duplicate twice and extract on the
+          third."</p>
+        <p>"I also try to keep indirection near the boundaries — I/O, external services, cross-cutting
+          concerns — rather than through the middle of business logic, so the domain code reads as a plain
+          description of the rules."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you treat readability as a first-class engineering concern?</li>
+        <li>Do you understand the wrong-abstraction cost asymmetry?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you unwind an over-abstracted area without a big-bang rewrite?</li>
+          <li>What's your rule for introducing an interface?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

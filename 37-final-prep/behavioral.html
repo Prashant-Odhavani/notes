@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Behavioural + Technical — Final Interview Prep</title>
+<meta name="description" content="Engineering judgement questions: how to structure a story, which four to prepare, and the questions worth asking them.">
+<meta name="keywords" content="behavioural interview engineering judgement STAR method technical stories disagreement mentoring incident ownership questions to ask interviewer influence without authority saying no">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="37-final-prep/behavioral.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Behavioural + Technical</h1>
+    <p class="subtitle">These aren't a soft round. At senior level they're where the actual hiring decision gets
+      made — and they're the part most engineers prepare least.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="note senior">
+    <div class="note-title">Why these matter more than the technical rounds at seven years</div>
+    <p style="margin:0">Everyone shortlisted for a senior role can write the code. What separates candidates is
+      whether they can be trusted with <strong>decisions, disagreements and other people</strong> — and that's what
+      these questions probe.
+      <br><br>
+      They're also where a strong technical candidate most often falls over, because they're improvised. Someone who
+      has prepared their architecture answers carefully will then ramble through "tell me about a conflict" and leave
+      an impression of vagueness.
+      <br><br>
+      The fix is straightforward: <strong>prepare four stories properly and know them well enough to tell in two
+      minutes.</strong> Not scripted, but structured — you should know the impact, the specific decision you made, and
+      what you'd do differently.
+      <br><br>
+      One habit that changes the quality of every answer: <strong>at senior level, talk about influence rather than
+      output.</strong> "I built X" is a mid-level answer. "I built X, and got two other teams to adopt it, which meant
+      Y" is a senior one — same work, and it demonstrates the thing they're actually assessing.</p>
+  </div>
+
+  <h2 id="structure">Structuring a story <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — the shape, weighted correctly"><code class="language-text">  SITUATION    ~15%   Just enough context. Two sentences.
+  TASK         ~10%   What YOU specifically owned.
+  ACTION       ~50%   What you DECIDED and why, including the alternatives
+                      you rejected. This is the substance.
+  RESULT       ~25%   The outcome, with a number if you have one, AND what
+                      you'd do differently.
+
+  The two failures:
+    - 80% situation, 20% everything else. Nobody needs the org chart.
+    - "we" throughout, so it is unclear what YOU did. Use "I" for your
+      decisions and "we" for team outcomes - deliberately.</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The action section is where the signal is</div>
+    <p style="margin:0">Most people over-invest in setup and under-invest in the decision. The interviewer doesn't need
+      the team structure or the project's history — they need to know <strong>what you decided, what you considered
+      instead, and why you chose as you did</strong>.
+      <br><br>
+      So the most valuable sentence in any of these answers is usually: <em>"the alternative was X, and I chose Y
+      because…"</em>. That single construction demonstrates judgement rather than activity, and it's what distinguishes
+      a story from an anecdote.
+      <br><br>
+      Two more things that lift an answer. <strong>A number in the result</strong>, even an approximate one — "deployment
+      went from a weekly two-hour ritual to on-demand" is much stronger than "it improved things". And
+      <strong>what you'd do differently</strong>, volunteered rather than extracted, because it shows you reflected
+      afterwards rather than moved on.
+      <br><br>
+      And be careful with pronouns. Systematic "we" makes it impossible to tell what you contributed, which is the most
+      common way a good story lands weakly. Use "I" for your decisions and "we" for the team's outcome — that's both
+      accurate and clearer.</p>
+  </div>
+
+  <h2 id="four-stories">The four stories to prepare <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Story</th><th>Answers questions about</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1. A hard technical decision</strong></td>
+          <td>Judgement, trade-offs, architecture, "a decision you regret"</td>
+        </tr>
+        <tr>
+          <td><strong>2. A production incident you handled</strong></td>
+          <td>Ownership, debugging, pressure, communication, prevention</td>
+        </tr>
+        <tr>
+          <td><strong>3. A disagreement with a colleague</strong></td>
+          <td>Conflict, influence, being wrong, disagree-and-commit</td>
+        </tr>
+        <tr>
+          <td><strong>4. Something you improved for other people</strong></td>
+          <td>Initiative, mentoring, influence without authority, impact</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Four stories cover almost every question asked</div>
+    <p style="margin:0">Behavioural questions are numerous and they map onto a small set of underlying assessments. So
+      four well-prepared stories, told from different angles, cover the ground — and preparing four properly is far more
+      effective than preparing twelve superficially.
+      <br><br>
+      "Tell me about a failure", "a decision you regret", "a time you had to choose between speed and quality" can all
+      draw on story 1. "Working under pressure", "a time you took ownership", "how you handle being on call" all draw
+      on story 2.
+      <br><br>
+      The trick is to know each story well enough to <strong>emphasise the part the question asked about</strong>
+          rather than telling it identically each time. Same events, different weighting.
+      <br><br>
+      Story 4 is the one people don't have, and it's the most senior-signalling of the four — because
+      <strong>improving things for other people is what the role actually is</strong>. It doesn't need to be
+      impressive: a test suite you made reliable, documentation that reduced repeated questions, a build you made
+      fast, a junior you brought up to speed. Impact on others is the point, not scale.</p>
+  </div>
+
+  <h2 id="questions">The questions, and what they're really asking <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>Tell me about a time you disagreed with a technical decision. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">What they're assessing, and how to answer</span>
+        <p>"They're checking three things: whether you can disagree <strong>without being difficult</strong>, whether you
+          can be <strong>wrong gracefully</strong>, and whether you can <strong>commit to a decision you lost</strong>.
+          The third is the one they care most about, and the one most answers skip."</p>
+        <p>"So the shape I'd use: what the disagreement was, how I tried to <em>resolve</em> it rather than win it, what
+          the outcome was, and what happened afterwards."</p>
+        <p>"The most useful thing to describe is <strong>how you found the real disagreement</strong>. Two people can
+          agree on every technical fact and differ on which risk matters, or on an unstated assumption about volume or
+          lifespan. Asking 'what would have to be true for your approach to be clearly right?' usually surfaces
+          it."</p>
+        <p>"Then: did you try to make it <strong>empirical rather than rhetorical</strong>? A prototype, a benchmark,
+          production data. Performance arguments especially are worth measuring rather than debating, because intuition
+          is unreliable there."</p>
+        <p>"And <strong>reversibility as a tie-breaker</strong> — if it can't be resolved, take the decision that's
+          easier to undo. That reframes it from 'who's right' to 'what's the cheapest way to find out', which is more
+          productive and demonstrably senior thinking."</p>
+        <p><strong>The strongest version of this story is one where you turned out to be wrong.</strong> It's
+          counterintuitive and it's true: describing how you changed your mind when shown a real problem answers all
+          three assessments at once, and it's much rarer than a story where you were right.
+          <br><br>
+          If you were right, the important part isn't the vindication — it's that you <em>committed properly</em> to the
+          alternative while it was being tried, rather than half-implementing it and waiting to be proven correct.</p>
+        <p><strong>What to avoid:</strong> a story where the other person was simply incompetent. It answers a
+          different question, unflatteringly — an interviewer hears how you'll talk about <em>their</em> team later.
+          Describe the other position as reasonable, because it usually was from where they stood.</p>
+      </div>
+      <h5>Red flags in the answer</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "I was right and they eventually realised."</li>
+        <li><span class="redflag">Red flag:</span> escalating immediately rather than trying to resolve it.</li>
+        <li><span class="redflag">Red flag:</span> no commitment after the decision went the other way.</li>
+        <li><span class="redflag">Red flag:</span> winning by seniority rather than by reasoning.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Tell me about a mistake you made. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">What they're assessing, and how to answer</span>
+        <p>"They want to know whether you can <strong>own something without either deflecting or over-apologising</strong>,
+          and whether you extracted something transferable."</p>
+        <p>"Pick a <strong>real</strong> mistake with real consequences. A fake-humble one — "I care too much about
+          quality" — is transparent and wastes the question. Equally, it doesn't need to be catastrophic: a
+          well-analysed medium-sized mistake beats a dramatic one told badly."</p>
+        <p>"The structure: what happened, the impact in concrete terms, what you did about it immediately, and the
+          <strong>systemic</strong> change that came out of it."</p>
+        <p>"That last part is what separates answers. <strong>"I'll be more careful" isn't a fix.</strong> The senior
+          version identifies why the mistake was <em>possible</em> and removes that possibility — a check in CI, a
+          guardrail, a required review, an alert. If your prevention relies on someone remembering, you've learned the
+          shallow lesson."</p>
+        <p>"For example: rather than "I deleted production data and now I double-check", the stronger version is "I
+          deleted production data, and it was possible because we all had write access to production — so we moved to
+          read-only access with a PIM-elevated break-glass path, and the class of mistake is now
+          structurally prevented"."</p>
+        <p>"<strong>Own it cleanly.</strong> "The requirements were unclear" is a deflection even when true — the senior
+          response is that clarifying them was part of your job. And don't over-flagellate either; excessive
+          self-criticism reads as poor calibration rather than as humility."</p>
+        <p>"One thing worth including if it applies: <strong>how you told people.</strong> Reporting your own mistake
+          promptly is a strong signal, and the instinct to hide it is common enough that the contrast lands.</p>
+      </div>
+      <h5>Red flags in the answer</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a fake mistake, or one with no consequence.</li>
+        <li><span class="redflag">Red flag:</span> blaming requirements, process, or someone else.</li>
+        <li><span class="redflag">Red flag:</span> "I'll be more careful" as the prevention.</li>
+        <li><span class="redflag">Red flag:</span> excessive self-criticism.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you handle competing priorities, or a deadline you can't meet? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">What they're assessing, and how to answer</span>
+        <p>"Whether you <strong>communicate early</strong>, whether you can <strong>say no constructively</strong>, and
+          whether you understand that prioritisation isn't yours to do alone."</p>
+        <p>"The core of a good answer: <strong>the moment you know a deadline is at risk, that's the moment to say
+          so</strong>. Not when it arrives. Early warning gives other people options — cutting scope, adding help,
+          moving the date, informing a customer. Late warning gives them none, and that's what makes it a failure of
+          communication rather than of estimation."</p>
+        <p>"Then: come with <strong>options rather than a problem</strong>. "We won't make it" is a report. "We can make
+          it with these two features cut, or make it complete two weeks later, or ship for one customer segment on
+          time — here's what I'd recommend" is a decision someone can actually take."</p>
+        <p>"On competing priorities, the senior move is to <strong>surface the conflict rather than absorb it</strong>.
+          If two stakeholders both need something first, quietly working extra hours to do both hides a real
+          prioritisation decision from the people whose job it is to make it — and it isn't sustainable, so it fails
+          later and more expensively."</p>
+        <p>"<strong>Saying no constructively</strong> is worth articulating: not "no", but "yes, and here's what moves"
+          or "not this sprint, and here's when". That keeps you a collaborator rather than an obstacle while still
+          protecting the commitment you've already made."</p>
+        <p>"And I'd mention what I'd protect under pressure: <strong>cutting scope rather than quality</strong>, and
+          specifically not compromising anything expensive to change later — the data model, a public contract — or
+          anything creating a security or data-integrity risk. Having a line and being able to name it is the
+          point."</p>
+      </div>
+      <h5>Red flags in the answer</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "I work longer hours" as the primary answer.</li>
+        <li><span class="redflag">Red flag:</span> raising the risk only when the deadline arrives.</li>
+        <li><span class="redflag">Red flag:</span> deciding priorities unilaterally.</li>
+        <li><span class="redflag">Red flag:</span> cutting quality silently to hit a date.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you approach mentoring, or code review? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">What they're assessing, and how to answer</span>
+        <p>"Whether you <strong>make other people better</strong>, which at senior level is a substantial part of the
+          job — and whether your review style would be pleasant to be on the receiving end of."</p>
+        <p>"On code review, the things worth saying:"</p>
+        <p>"<strong>Distinguish blocking from non-blocking comments.</strong> A reviewer who leaves twenty comments of
+          equal apparent weight is exhausting and the important one gets lost. Marking something as a preference rather
+          than a requirement is a small habit that changes the experience a lot."</p>
+        <p>"<strong>Explain <em>why</em>, not just what.</strong> "Use X instead" teaches nothing; "use X because Y
+          fails under concurrency" means they'll get it right next time without me."</p>
+        <p>"<strong>Ask rather than assert</strong> when you might be missing context. "What happens if this is called
+          twice?" is better than "this isn't idempotent" — partly because it's collaborative, and partly because
+          sometimes there's a reason you don't know about."</p>
+        <p>"<strong>Automate the mechanical.</strong> Formatting, naming conventions, analyzer rules — a human arguing
+          about brace placement is wasted review capacity. Humans should review design and correctness."</p>
+        <p>"<strong>And "split this up" is a legitimate comment.</strong> Review quality collapses with size — a
+          2,000-line change gets skimmed, so it receives <em>less</em> scrutiny than its risk warrants. People are
+          oddly reluctant to ask for smaller pull requests."</p>
+        <p>"On mentoring, the framing I'd offer: <strong>the goal is for them not to need you</strong>, which means
+          pairing on something hard rather than answering the question, and letting them make reversible mistakes
+          rather than preventing every one. Someone who has debugged something painful themselves has learned
+          something that can't be transferred by explanation."</p>
+        <p>"Worth mentioning the AI angle if it comes up: I'd be careful that <strong>fluent generated output doesn't
+          substitute for the struggle that builds judgement</strong>. Using it to explain and to check your work
+          accelerates learning; using it to produce code in an area you can't yet evaluate doesn't."</p>
+      </div>
+      <h5>Red flags in the answer</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> review as gatekeeping or fault-finding.</li>
+        <li><span class="redflag">Red flag:</span> arguing about style rather than automating it.</li>
+        <li><span class="redflag">Red flag:</span> mentoring described as telling people the answer.</li>
+        <li><span class="redflag">Red flag:</span> no interest in making others better.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why are you looking to leave? <span class="lvl lvl-i">🟡 Intermediate</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">What they're assessing, and how to answer</span>
+        <p>"This looks like small talk and it isn't. They're assessing <strong>how you'll talk about them
+          later</strong>, and whether what you want is something this role actually offers."</p>
+        <p>"So: <strong>frame it as moving toward something</strong>, not away. "I want to work on systems at a scale I
+          haven't yet" or "I want more architectural ownership" is forward-looking and specific."</p>
+        <p>"Being <em>honest but measured</em> about a negative is fine and often better than pretending everything is
+          perfect. "The product is mature and mostly maintenance now, and I want to build things again" is credible.
+          What doesn't work is criticising individuals, or describing the company in terms that make you sound
+          bitter — an interviewer hears that as a preview."</p>
+        <p>"The strongest version connects to <strong>this specific role</strong>. If you know something about their
+          domain, their scale or their technology, saying why that's what you're looking for makes the answer about fit
+          rather than about escape."</p>
+        <p>"And keep it brief. This isn't the question to spend four minutes on — a couple of sentences, forward-looking,
+          then move on."</p>
+      </div>
+      <h5>Red flags in the answer</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> criticising individuals by role or name.</li>
+        <li><span class="redflag">Red flag:</span> a list of grievances.</li>
+        <li><span class="redflag">Red flag:</span> "money", as the only reason.</li>
+        <li><span class="redflag">Red flag:</span> a reason this role also wouldn't fix.</li>
+      </ul>
+    </div>
+  </details>
+
+  <h2 id="your-questions">Questions worth asking them <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Ask</th><th>Because it tells you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>"How long does a change take to reach production?"</strong></td><td>Deployment maturity — and everything downstream of it</td></tr>
+        <tr><td><strong>"What happens when something breaks at 3am?"</strong></td><td>On-call reality, and whether blame culture exists</td></tr>
+        <tr><td><strong>"What's the most frustrating part of the codebase?"</strong></td><td>Honesty, and what you'd inherit</td></tr>
+        <tr><td><strong>"How are technical decisions made here?"</strong></td><td>Whether you'd have actual influence</td></tr>
+        <tr><td><strong>"What does the testing situation look like honestly?"</strong></td><td>Whether refactoring is possible</td></tr>
+        <tr><td><strong>"What would you want me to have achieved in six months?"</strong></td><td>Whether expectations are clear or vague</td></tr>
+        <tr><td>"Why is this role open?"</td><td>Growth, or churn</td></tr>
+        <tr><td>"How much technical debt work gets funded?"</td><td>Whether quality is actually valued</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — your questions are part of the assessment</div>
+    <p style="margin:0">Asking "what's the tech stack?" late in a process signals you haven't been paying attention.
+      Asking <strong>"how long does a change take to reach production?"</strong> signals you know that number predicts
+      almost everything else about how a team works.
+      <br><br>
+      The two most informative questions in my view are that one and <strong>"what happens when something breaks at
+      3am?"</strong> The first tells you about automation, testing and release confidence. The second tells you about
+      on-call load, whether incidents lead to blame or to fixes, and whether the team has the observability to diagnose
+      anything.
+      <br><br>
+      <strong>"What's the most frustrating part of the codebase?"</strong> is worth asking because the <em>manner</em>
+      of the answer matters as much as the content. A candid answer suggests a healthy culture; a defensive or evasive
+      one is itself information.
+      <br><br>
+      And genuinely listen to the answers — you're deciding too. A vague answer to "what would you want me to have
+      achieved in six months?" usually means nobody has thought about it, which tends to predict how the first six
+      months will actually go.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>At senior level these rounds carry the decision, and they're the least prepared.</li>
+      <li>Prepare four stories: hard decision, incident, disagreement, something you improved for others.</li>
+      <li>Weight the action section — the decision and the rejected alternative are the signal.</li>
+      <li>"The alternative was X, and I chose Y because…" is the most valuable sentence available.</li>
+      <li>Use "I" for your decisions and "we" for team outcomes, deliberately.</li>
+      <li>Include a number, and volunteer what you'd do differently.</li>
+      <li>Talk about influence, not just output.</li>
+      <li>The strongest disagreement story is one where you turned out to be wrong.</li>
+      <li>Never describe the other person as incompetent — it answers a different question.</li>
+      <li>A mistake's prevention must be structural; "I'll be more careful" is the shallow lesson.</li>
+      <li>Raise deadline risk the moment you know, and bring options rather than a problem.</li>
+      <li>Surface competing priorities rather than absorbing them.</li>
+      <li>Review: separate blocking from preference, explain why, automate the mechanical, ask for smaller PRs.</li>
+      <li>Mentoring aims at them not needing you.</li>
+      <li>Frame leaving as moving toward something, briefly.</li>
+      <li>Ask how long a change takes to reach production, and what happens at 3am.</li>
+    </ul>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

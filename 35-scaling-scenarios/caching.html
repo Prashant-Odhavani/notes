@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caching Failures — Scaling Scenarios</title>
+<meta name="description" content="Stampede, stale data, hot keys, a Redis outage taking the app with it, and caching that is quietly wrong — with the fix for each.">
+<meta name="keywords" content="cache stampede dogpile thundering herd cache invalidation stale data hot key Redis outage cache aside write through TTL jitter negative caching cache penetration correctness per tenant cache key single flight">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="35-scaling-scenarios/caching.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Caching Failures</h1>
+    <p class="subtitle">A cache turns a load problem into a correctness problem and an availability problem. Worth
+      it, and only if you know which failures you've bought.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Stampede:</strong> everything expires at once and the database gets every miss.</li>
+      <li><strong>Jitter every TTL.</strong> Identical TTLs synchronise expiry.</li>
+      <li><strong>A cache must be optional.</strong> If Redis down means app down, it's a dependency.</li>
+      <li><strong>Hot key:</strong> one key saturates one shard. Adding nodes doesn't help.</li>
+      <li><strong>Cache the absence</strong> too, or missing keys hit the database every time.</li>
+      <li><strong>Invalidate on write, don't just wait for the TTL.</strong></li>
+      <li><strong>Tenant id in every key</strong>, or you'll serve one customer another's data.</li>
+      <li><strong>Delete rather than update</strong> — two writers updating a cache can leave it wrong forever.</li>
+    </ul>
+  </div>
+
+  <h2 id="stampede">Scenario: the database is hammered every few minutes <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — how a stampede forms"><code class="language-text">  t=0     Deployment. All instances start cold. Every key cached with TTL=600s.
+
+  t=600   EVERY key expires in the same second.
+          1,000 concurrent requests all miss.
+          1,000 identical queries hit the database simultaneously.
+          Database saturates -> queries slow -> requests time out
+          -> nothing repopulates the cache -> the next wave misses too.
+
+  The cache made this WORSE than having no cache: without it the load
+  would have been steady rather than arriving in synchronised walls.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Fix</th><th>Mechanism</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>TTL jitter</strong></td><td>Randomise each TTL ±10–20% so expiry spreads</td><td><strong>None. Do this always</strong></td></tr>
+        <tr><td><strong>Single-flight / lock on miss</strong></td><td>One caller repopulates; others wait or serve stale</td><td>Complexity; a distributed lock</td></tr>
+        <tr><td><strong>Serve stale while refreshing</strong></td><td>Return the expired value, refresh in the background</td><td>Briefly stale data</td></tr>
+        <tr><td><strong>Refresh ahead of expiry</strong></td><td>Proactively renew at 80% of TTL</td><td>Refreshes things nobody wanted</td></tr>
+        <tr><td><strong>Warm the cache on startup</strong></td><td>Populate the known-hot keys before taking traffic</td><td>Slower start; needs a readiness gate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — jitter is free and it prevents the common case</div>
+    <p style="margin:0">Everything else on that list involves real complexity. <strong>Jitter is one line</strong> and
+      it removes the synchronisation that makes a stampede possible in the first place.
+      <br><br>
+      The reason it works: a stampede isn't really about cache misses, it's about <em>simultaneous</em> cache misses.
+      Spread the same number of misses over sixty seconds instead of one, and the database handles them
+      comfortably.
+      <br><br>
+      Where jitter isn't enough is a <strong>single very hot key</strong> — a homepage, a configuration blob, a
+      pricing table. There, one expiry means a thousand simultaneous misses regardless of jitter, because it's one
+      key. That's the case for <strong>single-flight</strong>: the first caller acquires a short lock and
+      repopulates, the others either wait briefly or serve the stale value.
+      <br><br>
+      <strong>Serving stale while refreshing in the background</strong> is usually the best user-facing behaviour, and
+      it's worth naming as a deliberate choice: you're trading a few seconds of staleness for never having a
+      user-visible miss. For most cached data that's obviously the right trade, and stating it that way shows you know
+      it's a trade.
+      <br><br>
+      The deployment case is worth calling out separately, because it's the most common trigger:
+      <strong>every instance starts cold at the same moment</strong>. A rolling deployment helps by spreading it; cache
+      warming plus a readiness gate helps more, because the instance doesn't take traffic until it's useful.</p>
+  </div>
+
+  <h2 id="redis-down">Scenario: Redis goes down and so does the app <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — a cache that degrades instead of failing" class="code-good"><code class="language-csharp">public async Task&lt;Product?&gt; GetAsync(int id, CancellationToken ct)
+{
+    var key = $"product:{_tenant.Id}:{id}";      // tenant in the key - always
+
+    // A cache failure must NEVER fail the request.
+    try
+    {
+        var cached = await _cache.GetStringAsync(key, ct);
+        if (cached is not null)
+            return cached == NullMarker ? null : Deserialize(cached);
+    }
+    catch (RedisException ex)
+    {
+        _log.CacheReadFailed(key, ex);           // log it, then carry on
+    }
+
+    var product = await _repository.GetAsync(id, ct);
+
+    try
+    {
+        // Cache the ABSENCE too, briefly - see cache penetration below
+        var value = product is null ? NullMarker : Serialize(product);
+        var ttl = product is null
+            ? TimeSpan.FromSeconds(30)
+            : Jitter(TimeSpan.FromMinutes(10));  // +/- 15%, so expiry spreads
+
+        await _cache.SetStringAsync(key, value,
+            new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = ttl }, ct);
+    }
+    catch (RedisException ex)
+    {
+        _log.CacheWriteFailed(key, ex);          // still not fatal
+    }
+
+    return product;
+}
+
+private static TimeSpan Jitter(TimeSpan baseTtl) =&gt;
+    baseTtl * (0.85 + Random.Shared.NextDouble() * 0.30);</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">If a cache outage is an app outage, it isn't a cache</div>
+    <p style="margin:0">A cache is an <em>optimisation</em>. Losing it should make the system slower, not broken. If
+      an unhandled <code>RedisException</code> propagates into a 500, you've added a hard dependency and
+      <strong>reduced</strong> your availability — the composite is now less reliable than the database alone.
+      <br><br>
+      So every cache access is wrapped, failures are logged and swallowed, and the request falls through to the
+      source. That's the baseline.
+      <br><br>
+      But there's a second-order problem that catches people, and it's the more interesting half:
+      <strong>can the source survive 100% of the traffic?</strong>
+      <br><br>
+      If the cache was absorbing 90% of reads, losing it means the database suddenly takes ten times its normal load
+      — and falls over. So the app degrades gracefully into a database outage, which is a total outage anyway.
+      <br><br>
+      Which means graceful degradation needs more than a try/catch:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>A short in-process fallback cache</strong> — <code>IMemoryCache</code> with a 30-second TTL. Not
+        shared, and it absorbs the repeated reads that would otherwise all reach the database.</li>
+      <li><strong>Load shedding</strong> when the cache is unavailable: serve fewer requests properly rather than all
+        of them badly.</li>
+      <li><strong>Circuit-break the cache itself</strong>, so you stop paying a connection timeout on every request
+        once it's clearly down.</li>
+      <li><strong>Know the numbers.</strong> If you can't say what the database does at 10× read load, you don't
+        know whether your degradation works — and a game day is how you find out.</li>
+    </ul>
+    <p style="margin:8px 0 0">That last point is what separates the textbook answer from the operational one:
+      <strong>"the cache is optional" is only true if the source can take the load.</strong></p>
+  </div>
+
+  <h2 id="hot-key">Scenario: one Redis node is saturated <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>One shard hot, others idle</strong></td><td>A single very hot key</td><td><strong>Local cache in front, or key replicas</strong></td></tr>
+        <tr><td>Uneven distribution across shards</td><td>Poor key distribution, or hash tags overused</td><td>Review key naming</td></tr>
+        <tr><td>Occasional very slow commands</td><td><code>KEYS</code>, <code>SMEMBERS</code> on a huge set, big values</td><td>Never <code>KEYS</code>; split large structures</td></tr>
+        <tr><td>Latency spikes with no obvious load</td><td>A blocking command, or eviction pressure</td><td>Check <code>SLOWLOG</code>, memory policy</td></tr>
+        <tr><td>Everything slow at once</td><td><strong>Redis is single-threaded per node</strong> — one slow command blocks all</td><td>Keep every command O(1)-ish</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two Redis facts that explain most of its incidents</div>
+    <p style="margin:0"><strong>Command execution is single-threaded per node.</strong> So one expensive command
+      blocks <em>every other client</em> on that node for its duration. A <code>KEYS *</code> on a large keyspace, a
+      <code>SMEMBERS</code> on a million-member set, or fetching a 50 MB value stops everything.
+      <br><br>
+      That's why "Redis got slow and we don't know why" is usually one bad command rather than capacity, and why
+      <code>SLOWLOG</code> is the first thing to look at. Use <code>SCAN</code> rather than <code>KEYS</code>, always,
+      and keep values small.
+      <br><br>
+      <strong>A hot key lives on exactly one shard.</strong> So adding nodes to a cluster doesn't help — the key still
+      hashes to one place. Same physics as every other hot-partition problem in this handbook.
+      <br><br>
+      The fixes are specific to caching though, and rather nice: <strong>put a short-lived in-process cache in
+      front</strong> of the hot key, so most reads never reach Redis at all. A two-second
+      <code>IMemoryCache</code> entry on a key read a thousand times a second removes 99.8% of the traffic, and
+      two seconds of staleness is almost always acceptable for something that hot.
+      <br><br>
+      Or <strong>replicate the key</strong> under several suffixes and have clients pick one at random, which spreads
+      it across shards at the cost of N writes on invalidation.
+      <br><br>
+      The in-process option is usually the right answer, and it's a good illustration of a general principle:
+      <strong>a two-tier cache handles hot keys that a single tier can't.</strong></p>
+  </div>
+
+  <h2 id="invalidation">Scenario: users see stale data <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>Staleness</th><th>Risk</th></tr></thead>
+      <tbody>
+        <tr><td><strong>TTL only</strong></td><td>Up to the TTL</td><td>Simple and predictable. Often enough</td></tr>
+        <tr><td><strong>Delete on write</strong></td><td>Near zero</td><td><strong>The recommended active approach</strong></td></tr>
+        <tr><td><strong>Update on write</strong></td><td>Near zero</td><td><strong>Two concurrent writers can leave it permanently wrong</strong></td></tr>
+        <tr><td><strong>Write-through</strong></td><td>Zero</td><td>Cache is on the write path, so its failures matter</td></tr>
+        <tr><td><strong>Event-driven invalidation</strong></td><td>Near zero, across services</td><td>Needs reliable eventing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — delete, don't update</div>
+    <p style="margin:0">This looks like a minor preference and it's a correctness argument.
+      <br><br>
+      <strong>Updating</strong> the cache after a write has an interleaving that leaves it wrong forever. Two writers:
+      A writes value 1 to the database, B writes value 2 to the database, B updates the cache to 2, A updates the
+      cache to 1. The database says 2; the cache says 1, and <strong>nothing will ever correct it</strong> until the
+      TTL expires. If the TTL is long or absent, that's a permanent inconsistency.
+      <br><br>
+      <strong>Deleting</strong> has no such interleaving. The worst outcome is a redundant delete, and the next read
+      repopulates from the source — which is authoritative. So the failure mode is a wasted database read rather than
+      wrong data.
+      <br><br>
+      The general rule: <strong>invalidate rather than synchronise.</strong> Keeping two copies in agreement is
+      genuinely hard; throwing one away is trivial. Same reasoning as preferring a rebuild over a patch.
+      <br><br>
+      Two related details worth having. <strong>Delete after the database commit</strong>, not before, or a concurrent
+      read can repopulate the cache with the old value in the window between. And a <strong>short TTL as a
+      backstop</strong> regardless of active invalidation, because an invalidation <em>will</em> be missed
+      eventually — a code path someone forgot, a failed event — and a TTL bounds how long that costs you.
+      <br><br>
+      Also: <strong>decide what staleness is acceptable per data type</strong>. A product description tolerating five
+      minutes is a completely different problem from a stock level or a permission check, and treating them the same
+      is how you end up either over-engineering or overselling inventory.</p>
+  </div>
+
+  <h2 id="penetration">Scenario: the cache isn't helping at all <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Tell</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Cache penetration</strong> — missing keys</td><td>Every request for a non-existent id hits the database</td></tr>
+        <tr><td><strong>Keys too specific</strong></td><td>Hit rate near zero; every request has a unique key</td></tr>
+        <tr><td><strong>TTL too short</strong></td><td>Entries expire before they're reused</td></tr>
+        <tr><td><strong>Eviction pressure</strong></td><td>Memory full; entries evicted before expiry</td></tr>
+        <tr><td><strong>Caching the wrong layer</strong></td><td>Caching cheap queries; the expensive ones aren't cached</td></tr>
+        <tr><td><strong>Serialisation cost exceeds the saving</strong></td><td>Large objects where the database was fast anyway</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Cache penetration is also an attack</div>
+    <p style="margin:0">If a key that doesn't exist isn't cached, then <strong>every request for a missing id reaches
+      the database</strong>. Normal traffic makes this a minor inefficiency.
+      <br><br>
+      Deliberate traffic makes it a denial of service: requesting <code>/api/products/999999991</code>,
+      <code>...992</code>, <code>...993</code> generates a database query per request with no cache protection at
+      all. The cache is completely bypassed by construction.
+      <br><br>
+      The fix is to <strong>cache the absence</strong> — a null marker with a short TTL, thirty seconds or so. Short,
+      because the entity may be created shortly and you don't want to serve "not found" for ten minutes after it
+      exists.
+      <br><br>
+      For very large keyspaces a <strong>Bloom filter</strong> is the scalable version: it answers "definitely not
+      present" cheaply without storing an entry per missing key, at the cost of occasional false positives that fall
+      through to the database.
+      <br><br>
+      And the diagnostic habit worth having: <strong>measure the hit rate.</strong> A cache with a 20% hit rate is
+      adding latency, memory cost and a failure mode for very little benefit — and nobody notices, because it's
+      "working". Hit rate per key prefix tells you which caches are earning their place.</p>
+  </div>
+
+  <h2 id="correctness">Scenario: the cache is quietly wrong <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Bug</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Tenant id missing from the key</strong></td><td><strong>One customer sees another's data.</strong> A breach</td></tr>
+        <tr><td><strong>User or role missing from the key</strong></td><td>Authorisation bypass via a cached response</td></tr>
+        <tr><td><strong>Culture or locale missing</strong></td><td>Wrong language or currency served</td></tr>
+        <tr><td><strong>Caching a personalised response at the CDN</strong></td><td>One user's page served to everyone</td></tr>
+        <tr><td><strong>Caching an authorisation decision too long</strong></td><td>Revoked access still works</td></tr>
+        <tr><td><strong>A shared cache across environments</strong></td><td>Test data served in production</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A cache key must include everything the value depends on</div>
+    <p style="margin:0">That's the whole rule, and it's the one that causes security incidents rather than
+      performance problems.
+      <br><br>
+      If the value differs by tenant, user, role, locale or API version, <strong>every one of those must be in the
+      key</strong>. Omit the tenant and you will eventually serve one customer another customer's data — which is a
+      reportable breach, not a bug.
+      <br><br>
+      It's an easy mistake because it works perfectly in development, where there's one tenant. And it's easy to
+      introduce later: a method gains a filter that varies by role, and the cache key isn't updated to match.
+      <br><br>
+      Structural defences, since review won't catch this reliably:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>A key-building helper</strong> that always includes tenant and user from the ambient context, so
+        constructing a key without them requires deliberately bypassing it.</li>
+      <li><strong>Separate Redis databases or key prefixes per environment</strong>, so a misconfiguration can't
+        cross environments.</li>
+      <li><strong>A test that populates the cache as tenant A and reads as tenant B</strong>, asserting isolation.
+        That's a five-line test for a whole class of breach.</li>
+      <li><strong>Never cache authorisation decisions</strong> for long, and prefer caching the <em>inputs</em> — roles,
+        permissions — over the decision, so revocation takes effect on the next evaluation.</li>
+    </ul>
+    <p style="margin:8px 0 0">And be very careful with <strong>CDN or response caching</strong> of anything
+      authenticated. A <code>Cache-Control: public</code> on a personalised response means a shared cache may serve
+      one user's data to another — the same bug, at a layer where the blast radius is much larger and the cache isn't
+      yours to purge.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>A stampede is about <em>simultaneous</em> misses — jitter every TTL, always.</li>
+      <li>Single-flight or serve-stale for a single very hot key.</li>
+      <li>Deployments create stampedes because every instance starts cold.</li>
+      <li>A cache failure must never fail the request.</li>
+      <li>"The cache is optional" is only true if the source survives 100% of the load.</li>
+      <li>An in-process fallback cache absorbs a Redis outage.</li>
+      <li>Redis is single-threaded per node — one slow command blocks everyone.</li>
+      <li>Never <code>KEYS</code>; check <code>SLOWLOG</code> first.</li>
+      <li>A hot key lives on one shard; put a local cache in front of it.</li>
+      <li>Delete on write, don't update — concurrent updates can leave it permanently wrong.</li>
+      <li>Delete after the commit, and keep a short TTL as a backstop.</li>
+      <li>Cache the absence, briefly, or missing keys bypass the cache entirely.</li>
+      <li>Measure hit rate — a 20% hit rate is cost without benefit.</li>
+      <li>The key must contain everything the value depends on, especially tenant.</li>
+      <li>Test cross-tenant isolation; never <code>Cache-Control: public</code> on personalised responses.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Identical TTLs</strong>, so everything expires together.</li>
+    <li><strong>An unhandled cache exception</strong> failing the request.</li>
+    <li><strong>Assuming the database can absorb a cache outage</strong> without checking.</li>
+    <li><strong>Updating the cache on write</strong> rather than deleting.</li>
+    <li><strong>Invalidating before the commit</strong>, so a read repopulates stale data.</li>
+    <li><strong>No TTL at all</strong> when relying on active invalidation.</li>
+    <li><strong>Not caching misses</strong>, leaving the database exposed to unknown ids.</li>
+    <li><strong>Never measuring hit rate.</strong></li>
+    <li><strong><code>KEYS</code> in production.</strong></li>
+    <li><strong>Adding Redis nodes for a hot key.</strong></li>
+    <li><strong>Tenant id missing from the cache key.</strong></li>
+    <li><strong>Caching authorisation decisions</strong> so revocation doesn't take effect.</li>
+    <li><strong>A shared cache across environments.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Every ten minutes the database spikes and requests time out. Diagnose it. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A regular ten-minute period is a very strong signal — that's almost certainly a
+          <strong>cache TTL</strong>, and I'd expect to find a ten-minute expiry in the code. It's a
+          <strong>cache stampede</strong>."</p>
+        <p>"The mechanism: all the entries were populated at roughly the same moment — usually at a deployment, when
+          every instance starts cold — and they were given <em>identical</em> TTLs. So they all expire in the same
+          second. Every concurrent request misses simultaneously, and a thousand identical queries hit the database at
+          once."</p>
+        <p>"Then it becomes self-sustaining: the database saturates, queries slow, requests time out before they can
+          repopulate the cache, so the next wave misses too. And the ten-minute rhythm persists because each
+          repopulation resets the clock in unison."</p>
+        <p>"The point I'd make is that <strong>the cache made this worse than having no cache</strong>. Without it the
+          database would see steady load; with it, the load arrives as synchronised walls."</p>
+        <p>"<strong>I'd confirm</strong> by correlating database load with cache miss rate — misses spiking at the same
+          instant as the database spike is conclusive. Redis <code>INFO</code> gives hits and misses, and any
+          reasonable cache wrapper should be emitting a hit-rate metric."</p>
+        <p>"<strong>Fixes, and the first one is nearly free.</strong>"</p>
+        <p>"<strong>TTL jitter</strong> — randomise each entry's TTL by ±15%. That's one line, and it's the whole fix
+          for the common case, because a stampede isn't about misses, it's about <em>simultaneous</em> misses. Spread
+          the same number of misses across ninety seconds and the database won't notice."</p>
+        <p>"<strong>If it's a single very hot key</strong> — a pricing table, a configuration blob — jitter doesn't help,
+          because it's one key expiring once. There I'd use <strong>single-flight</strong>: the first caller takes a
+          short distributed lock and repopulates while the others wait briefly or serve the stale value."</p>
+        <p>"<strong>Serve stale while refreshing</strong> is usually the best user-facing behaviour: return the expired
+          value immediately and refresh in the background, so no user ever waits for a miss. I'd state that as a
+          deliberate trade — a few seconds of staleness for eliminating user-visible misses — which for most cached
+          data is obviously worth it."</p>
+        <p>"<strong>Cache warming on startup</strong> for the deployment case, gated behind the readiness probe so an
+          instance doesn't take traffic until it's useful. Combined with a rolling deployment, that stops all instances
+          going cold in the same second."</p>
+        <p>"<strong>Two things I'd check while I'm there</strong>, because they're adjacent and commonly wrong."</p>
+        <p>"<strong>Is a cache failure fatal?</strong> If an unhandled <code>RedisException</code> becomes a 500,
+          we've made the cache a hard dependency and <em>reduced</em> availability below the database alone. Every
+          access should be wrapped and fall through to the source."</p>
+        <p>"<strong>Can the database survive losing the cache entirely?</strong> If the cache absorbs 90% of reads,
+          then losing it means 10× database load — so 'the cache is optional' is only true if the source can take the
+          traffic. That's worth knowing before it happens, and a short in-process fallback cache plus load shedding is
+          what makes the degradation real rather than theoretical."</p>
+        <p>"<strong>On prevention:</strong> alert on cache miss rate, not just database load, because the miss spike
+          precedes the symptom. And I'd treat 'identical TTL' as something to catch in review, since jitter costs
+          nothing and the failure mode is severe."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you recognise a periodic spike as a TTL?</li>
+        <li>Can you explain why it's self-sustaining?</li>
+        <li>Do you reach for jitter first?</li>
+        <li>Do you know jitter doesn't help a single hot key?</li>
+        <li>Do you check whether a cache failure is fatal?</li>
+        <li>Do you ask whether the database survives a cache outage?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> scaling the database.</li>
+        <li><span class="redflag">Red flag:</span> increasing the TTL as the only fix.</li>
+        <li><span class="redflag">Red flag:</span> not connecting the period to a cache expiry.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you implement single-flight across instances?</li>
+          <li>What happens when Redis fails entirely?</li>
+          <li>How do you warm the cache safely on startup?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A customer reports seeing another customer's data. Where do you look? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd treat this as a <strong>potential data breach from the first minute</strong>, not a bug — because that
+          changes what I do first and there may be notification obligations with a clock on them."</p>
+        <p>"<strong>Immediate actions.</strong> Preserve evidence: the exact request, timestamp, user, and the response
+          they saw. Then assess blast radius — is it one customer, or systemic? And notify whoever owns incident
+          response, because the disclosure decision is not mine to make alone and it has legal deadlines."</p>
+        <p>"If I can identify the affected path and it's a shared cache, <strong>flushing the relevant cache keys is a
+          fast containment step</strong> — it stops further wrong responses while I investigate."</p>
+        <p>"<strong>Then the candidates, and I'd start with caching</strong> because it's the most common cause of
+          exactly this symptom."</p>
+        <p>"<strong>A cache key missing the tenant id.</strong> The classic. <code>product:42</code> instead of
+          <code>product:tenant7:42</code> — so whichever tenant populates it first serves everyone. It passes every test
+          in development because there's one tenant, and it's easy to introduce later when a method gains a filter and
+          the key isn't updated."</p>
+        <p>"<strong>A key missing user or role</strong>, where the response varies by permission — so a cached admin
+          view is served to a standard user. Same bug, and it's an authorisation bypass rather than just a leak."</p>
+        <p>"<strong>Response or CDN caching of an authenticated response.</strong> If <code>Cache-Control:
+          public</code> is set on a personalised response, a shared cache serves one user's page to another. Worse
+          than the Redis case, because the cache isn't ours to purge and the blast radius is much larger."</p>
+        <p>"<strong>Then the non-cache causes.</strong>"</p>
+        <p>"<strong>A missing tenant filter in a query.</strong> If EF Core global query filters are in use, someone may
+          have called <code>IgnoreQueryFilters()</code>, or written raw SQL that bypasses them, or added a repository
+          method that doesn't apply the filter. This is the one that global filters exist to prevent, which is exactly
+          why bypassing them needs to be hard."</p>
+        <p>"<strong>Tenant context resolved incorrectly.</strong> If tenant id is held in something with the wrong
+          lifetime — a static, a singleton, or an <code>AsyncLocal</code> that leaks across an async boundary — then one
+          request can see another's context. That's a genuinely nasty one because it's intermittent and load-dependent,
+          and it presents exactly like a caching bug."</p>
+        <p>"<strong>A scoped service captured by a singleton</strong>, which is the DI version of the same problem."</p>
+        <p>"<strong>How I'd narrow it.</strong> Is it reproducible or intermittent? <strong>Reproducible points at a
+          key or a query</strong>; intermittent and load-dependent points at context or lifetime. Does it affect one
+          endpoint or several? One endpoint suggests a specific cache key or repository method; several suggests
+          tenant resolution, which is much more serious."</p>
+        <p>"And I'd check the telemetry for whether the tenant dimension on the request matches the data returned —
+          which is only possible if telemetry was
+          <a href="../24-azure/application-insights.html#opentelemetry">enriched with tenant id</a>, and is the
+          strongest argument for having done that."</p>
+        <p>"<strong>The fix has to be structural</strong>, because this class of bug is invisible in review and
+          catastrophic in production:"</p>
+        <p>"<strong>A key-building helper</strong> that always takes tenant and user from the ambient context, so
+          producing a key without them requires deliberately going around it. Then correctness is the default rather
+          than something each developer remembers."</p>
+        <p>"<strong>A test that writes as tenant A and reads as tenant B</strong>, asserting isolation. Five lines,
+          and it covers a whole class of breach. I'd want one per cached read path."</p>
+        <p>"<strong>An architecture test</strong> asserting no repository method returns an entity type without the
+          tenant filter, and that <code>IgnoreQueryFilters</code> appears nowhere outside a small allow-list."</p>
+        <p>"<strong>Never <code>Cache-Control: public</code> on an authenticated response</strong>, enforced by a
+          middleware that sets private-no-store by default for authenticated requests."</p>
+        <p>"The framing I'd land on: <strong>tenant isolation must be enforced by construction, not by
+          discipline.</strong> Every mechanism where a developer can forget the tenant is a latent breach, and the
+          number of places you have to remember should be as close to zero as the design allows."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you treat it as a breach with notification implications?</li>
+        <li>Do you preserve evidence and contain before diagnosing?</li>
+        <li>Do you check cache keys first, including CDN caching?</li>
+        <li>Do you know tenant-context lifetime bugs present identically?</li>
+        <li>Do you use reproducible-versus-intermittent to narrow it?</li>
+        <li>Is your fix structural rather than a code correction?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> fixing the one key and closing the ticket.</li>
+        <li><span class="redflag">Red flag:</span> no consideration of disclosure.</li>
+        <li><span class="redflag">Red flag:</span> only looking at the query, not the cache.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you prove no other tenant was affected?</li>
+          <li>How does an <code>AsyncLocal</code> leak across requests?</li>
+          <li>What would you enforce in CI?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture &amp; Data Types — Redis</title>
+<meta name="description" content="The single-threaded model and what follows from it, every data type and what it's genuinely for, key design, atomicity and Lua scripting.">
+<meta name="keywords" content="Redis single threaded event loop strings hashes lists sets sorted sets ZADD ZRANGE bitmaps HyperLogLog streams key naming TTL EXPIRE atomic INCR MULTI EXEC WATCH Lua EVAL pipelining O(N) commands KEYS SCAN">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="16-redis/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Architecture &amp; Data Types</h1>
+    <p class="subtitle">One design decision — single-threaded execution — explains most of Redis's behaviour,
+      including its worst failure mode.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Command execution is single-threaded.</strong> Every command is atomic, and one slow command
+        blocks everything.</li>
+      <li><strong>Never run <code>KEYS</code> in production.</strong> It's O(N) and blocks the server. Use
+        <code>SCAN</code>.</li>
+      <li><strong>Hashes</strong> for objects with independently-updated fields — not a serialized JSON blob.</li>
+      <li><strong>Sorted sets</strong> are the differentiating structure: ranked queries in O(log n).</li>
+      <li><strong><code>INCR</code> is atomic</strong>, which makes counters and rate limits trivial.</li>
+      <li><strong>Lua scripts run atomically</strong> — that's how you get multi-step atomicity.</li>
+      <li><strong>Pipelining</strong> removes round trips; it isn't a transaction.</li>
+    </ul>
+  </div>
+
+  <h2 id="single-threaded">The single-threaded model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Redis executes commands on <strong>one thread</strong>, one at a time, from a queue. There is no
+      concurrency between commands.</p>
+    <p>It's still extremely fast because everything is in memory and there's no lock contention, no context
+      switching, and no coordination overhead.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Consequence</th><th>What it means for you</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Every command is atomic</strong></td>
+          <td>No command can interleave with another. <code>INCR</code> can't lose an increment</td>
+        </tr>
+        <tr>
+          <td><strong>No locks needed</strong></td>
+          <td>Which is why it's fast despite being single-threaded</td>
+        </tr>
+        <tr>
+          <td><strong>One slow command blocks everything</strong></td>
+          <td><strong>The critical failure mode.</strong> An O(N) command on a large key stalls every other
+              client</td>
+        </tr>
+        <tr>
+          <td><strong>More cores don't help throughput</strong></td>
+          <td>Scale with more instances or cluster mode, not a bigger box</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Atomicity and the blocking failure mode are the same property.</strong></p>
+    <p>You get free atomicity because nothing runs concurrently. You get catastrophic latency spikes from one
+      expensive command for exactly the same reason.</p>
+    <p>That trade is the single most useful thing to understand about Redis, and it's the answer to a lot of
+      "why did Redis get slow?" questions.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The commands that will take down production</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Command</th><th>Cost</th><th>Instead</th></tr></thead>
+        <tbody>
+          <tr><td><code>KEYS pattern</code></td><td>O(N) over <strong>every key</strong></td><td><code>SCAN</code> — cursor-based, incremental</td></tr>
+          <tr><td><code>FLUSHALL</code> / <code>FLUSHDB</code></td><td>Blocks while freeing memory</td><td><code>FLUSHALL ASYNC</code></td></tr>
+          <tr><td><code>SMEMBERS</code> on a huge set</td><td>O(N)</td><td><code>SSCAN</code></td></tr>
+          <tr><td><code>HGETALL</code> on a huge hash</td><td>O(N)</td><td><code>HSCAN</code>, or <code>HMGET</code> for known fields</td></tr>
+          <tr><td><code>LRANGE list 0 -1</code></td><td>O(N)</td><td>A bounded range</td></tr>
+          <tr><td><code>DEL</code> on a multi-million-element key</td><td>Blocks while freeing</td><td><strong><code>UNLINK</code></strong> — frees on a background thread</td></tr>
+          <tr><td><code>ZRANGE key 0 -1</code></td><td>O(N)</td><td>A bounded range</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin:8px 0 0"><code>KEYS</code> is the classic. A developer runs
+      <code>KEYS user:*</code> to check something, the instance has ten million keys, and
+      <strong>every client times out</strong> for several seconds. It's not a slow query — it's an outage.
+      <br><br>
+      <code>UNLINK</code> instead of <code>DEL</code> is the less-known one and worth remembering: deleting a
+      large collection blocks the event loop while memory is freed, and <code>UNLINK</code> hands that to a
+      background thread.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">"Single-threaded" is now partly historical</div>
+    <p style="margin:0">Redis 6+ uses <strong>threaded I/O</strong> — reading from and writing to sockets happens
+      on multiple threads. Redis 7 added more background work, and lazy freeing moves deallocation off the main
+      thread.
+      <br><br>
+      But <strong>command execution is still a single thread</strong>, which is what preserves atomicity and the
+      blocking behaviour. So the mental model holds; the nuance is that network handling scales with cores while
+      command processing doesn't.
+      <br><br>
+      Worth saying precisely, because "Redis is single-threaded" gets challenged and the accurate version is
+      "command execution is single-threaded".</p>
+  </div>
+
+  <h2 id="data-types">The data types <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Is</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>String</strong></td><td>Bytes up to 512 MB</td><td>Cached values, counters, flags, locks</td></tr>
+        <tr><td><strong>Hash</strong></td><td>Field → value map</td><td>Objects whose fields are updated independently</td></tr>
+        <tr><td><strong>List</strong></td><td>Ordered, push/pop at both ends</td><td>Queues, recent-items feeds</td></tr>
+        <tr><td><strong>Set</strong></td><td>Unordered, unique</td><td>Tags, membership, unions and intersections</td></tr>
+        <tr><td><strong>Sorted set</strong></td><td>Unique members with scores</td><td><strong>Leaderboards, rate limiting, priority queues, time ranges</strong></td></tr>
+        <tr><td><strong>Bitmap</strong></td><td>Bit operations on a string</td><td>Daily active flags — extremely space-efficient</td></tr>
+        <tr><td><strong>HyperLogLog</strong></td><td>Approximate cardinality</td><td>Unique visitor counts in ~12 KB regardless of volume</td></tr>
+        <tr><td><strong>Stream</strong></td><td>Append-only log with consumer groups</td><td>Event streams needing acknowledgement</td></tr>
+        <tr><td><strong>Geospatial</strong></td><td>Sorted set with coordinates</td><td>"Within N km of here"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="strings">Strings and atomic counters</h3>
+
+  <pre data-label="csharp — atomicity you get for free" class="code-good"><code class="language-csharp">var db = multiplexer.GetDatabase();
+
+// Atomic increment - no read-modify-write, no race
+long views = await db.StringIncrementAsync("post:1041:views");
+
+// Set with expiry, only if absent - the lock and idempotency primitive
+bool acquired = await db.StringSetAsync(
+    "lock:order:1041", token, TimeSpan.FromSeconds(30), When.NotExists);</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why <code>INCR</code> matters more than it looks</div>
+    <p style="margin:0">In a relational database, incrementing a counter safely means either an
+      <a href="../10-sql/transactions.html#atomic-update">atomic <code>UPDATE ... SET x = x + 1</code></a> or
+      optimistic concurrency. Two application instances doing read-modify-write would
+      <a href="../10-sql/transactions.html#anomalies">lose an increment</a>.
+      <br><br>
+      In Redis it's one command, atomic by construction, because commands don't interleave. That's why counters,
+      rate limits and sequence numbers are trivial here and fiddly elsewhere.
+      <br><br>
+      <code>SET key value NX EX 30</code> is the same idea for locks — set-if-absent <em>with</em> expiry in one
+      atomic operation. Doing those as two commands is the classic
+      <a href="distributed-primitives.html#locks">broken lock</a>.</p>
+  </div>
+
+  <h3 id="hashes">Hashes vs serialized blobs <span class="lvl lvl-i">🟡 Intermediate</span></h3>
+
+  <pre data-label="csharp — a JSON blob: simple, and rewrites everything" class="code-bad"><code class="language-csharp">await db.StringSetAsync($"user:{id}", JsonSerializer.Serialize(user));
+
+// Updating one field: read all, deserialize, change, serialize, write all.
+// Two round trips, full payload twice, and a lost-update race between them.</code></pre>
+
+  <pre data-label="csharp — a hash: update one field atomically" class="code-good"><code class="language-csharp">await db.HashSetAsync($"user:{id}", new[]
+{
+    new HashEntry("name",  user.Name),
+    new HashEntry("email", user.Email),
+    new HashEntry("visits", user.Visits)
+});
+
+// One field, one round trip, no read, no race
+await db.HashSetAsync($"user:{id}", "email", newEmail);
+await db.HashIncrementAsync($"user:{id}", "visits");     // atomic
+var email = await db.HashGetAsync($"user:{id}", "email"); // partial read</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>JSON string</th><th>Hash</th></tr></thead>
+      <tbody>
+        <tr><td>Read one field</td><td>Fetches everything</td><td><strong><code>HGET</code></strong></td></tr>
+        <tr><td>Update one field</td><td>Read + write, with a race window</td><td><strong>One atomic <code>HSET</code></strong></td></tr>
+        <tr><td>Atomic increment</td><td>Not possible</td><td><strong><code>HINCRBY</code></strong></td></tr>
+        <tr><td>Memory</td><td>Larger</td><td>Smaller — small hashes use a compact encoding</td></tr>
+        <tr><td>TTL granularity</td><td>Whole key</td><td>Whole key (per-field TTL only in Redis 7.4+)</td></tr>
+        <tr><td>Simplicity</td><td><strong>Simpler</strong> — one object in, one out</td><td>More code</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to choose</span>
+    <p><strong>Hash</strong> when fields are read or written independently, or you need atomic field updates.</p>
+    <p><strong>JSON string</strong> when the object is always read and written whole — which is the common case
+      for a cached read model, and there's nothing wrong with it.</p>
+    <p>The mistake is using a JSON blob and then doing read-modify-write on one field, which is both slow and a
+      lost-update bug.</p>
+  </div>
+
+  <h3 id="sorted-sets">Sorted sets — the one to know <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <pre data-label="csharp — a leaderboard" class="code-good"><code class="language-csharp">// Add or update a score - O(log n)
+await db.SortedSetAddAsync("leaderboard", playerId, score);
+
+// Top 10, highest first - O(log n + 10)
+var top = await db.SortedSetRangeByRankWithScoresAsync(
+    "leaderboard", 0, 9, Order.Descending);
+
+// THIS is the hard part elsewhere: one player's rank, in O(log n)
+long? rank = await db.SortedSetRankAsync("leaderboard", playerId, Order.Descending);
+
+// Players scoring between 1000 and 2000
+var band = await db.SortedSetRangeByScoreAsync("leaderboard", 1000, 2000);</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why sorted sets are genuinely differentiating</div>
+    <p style="margin:0">"What is this user's rank?" is the query that's hard everywhere else. In SQL you need a
+      window function computed over the whole table on every call — so it gets slower as the table grows, and
+      you can't index your way out of it.
+      <br><br>
+      Redis maintains the ordering as a skip list, so rank lookup and range queries are both logarithmic.
+      That's a genuine algorithmic advantage, not just an in-memory speed advantage.
+      <br><br>
+      The same structure covers more than leaderboards, and recognising that is the useful part:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Sliding-window rate limiting</strong> — score = timestamp, remove old entries, count what
+        remains.</li>
+      <li><strong>Time-series with range queries</strong> — score = epoch, then query a time window.</li>
+      <li><strong>Priority queues</strong> — score = priority, pop the lowest.</li>
+      <li><strong>Delayed jobs</strong> — score = "run at" time, poll for scores below now.</li>
+    </ul>
+    <p style="margin:8px 0 0">Using a sorted set with a timestamp score is one of the most reusable techniques
+      in Redis.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Sorted sets grow forever unless you trim them</div>
+    <p style="margin:0">A leaderboard or a rate-limit window accumulates members indefinitely. There's no
+      per-member TTL — expiry applies to the whole key.
+      <br><br>
+      So you must trim explicitly: <code>ZREMRANGEBYRANK</code> to cap the size, or
+      <code>ZREMRANGEBYSCORE</code> to drop entries older than a cutoff. For a rate-limit window that removal is
+      part of the algorithm; for a leaderboard it's a maintenance job someone has to remember.
+      <br><br>
+      An untrimmed sorted set that reaches millions of members also makes any O(N) command on it a blocking
+      event — so this is a correctness <em>and</em> availability concern.</p>
+  </div>
+
+  <h3 id="specialised">Bitmaps, HyperLogLog and Streams <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <pre data-label="csharp — 50,000 daily-active users in about 6 KB"><code class="language-csharp">// One bit per user id
+await db.StringSetBitAsync($"active:{date:yyyyMMdd}", userId, true);
+
+long activeToday = await db.StringBitCountAsync($"active:{date:yyyyMMdd}");
+
+// Users active on BOTH days - a bitwise AND, server-side
+await db.StringBitOperationAsync(Bitwise.And, "active:both",
+    new RedisKey[] { "active:20240601", "active:20240602" });</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Structure</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Bitmap</strong></td>
+          <td><strong>Exact</strong> and tiny — but needs dense integer ids. Sparse ids waste space</td>
+        </tr>
+        <tr>
+          <td><strong>HyperLogLog</strong></td>
+          <td><strong>Approximate</strong> (~0.81% error) in a fixed ~12 KB, for <em>any</em> cardinality.
+              Counts unique items without storing them</td>
+        </tr>
+        <tr>
+          <td><strong>Stream</strong></td>
+          <td>Persistent log with consumer groups and acknowledgement — unlike pub/sub, which drops messages
+              with no subscriber</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">HyperLogLog is the right answer surprisingly often</div>
+    <p style="margin:0">"How many unique visitors today?" with a set means storing every visitor id —
+      potentially gigabytes.
+      <br><br>
+      HyperLogLog answers it in <strong>12 KB regardless of volume</strong>, with about 0.8% error. For an
+      analytics figure nobody acts on individually, that error is irrelevant and the memory saving is enormous.
+      <br><br>
+      The constraint: you cannot ask whether a <em>specific</em> item is in it, and you can't remove items. It
+      counts, and that's all. So it's right for metrics and wrong for membership — which is exactly the
+      distinction to draw if it comes up.</p>
+  </div>
+
+  <h2 id="keys">Key design <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Practice</th><th>Example</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Colon-separated namespaces</strong></td><td><code>user:1041:profile</code></td><td>Conventional; groups related keys for <code>SCAN</code></td></tr>
+        <tr><td><strong>Include a version</strong></td><td><code>v2:user:1041</code></td><td><strong>Deploy a schema change without stale-format reads</strong></td></tr>
+        <tr><td><strong>Include the tenant</strong></td><td><code>tenant:acme:user:1041</code></td><td>Prevents cross-tenant leakage through a shared cache</td></tr>
+        <tr><td><strong>Keep them short</strong></td><td><code>u:1041</code> at extreme scale</td><td>Keys are stored in memory too</td></tr>
+        <tr><td><strong>Always set a TTL</strong></td><td><code>EXPIRE</code> on write</td><td>An untracked key with no TTL lives forever</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — versioned keys solve the deployment problem</div>
+    <p style="margin:0">You change a cached DTO's shape and deploy. The cache holds entries in the
+      <em>old</em> format, and the new code deserializes them — either throwing, or worse, silently producing
+      objects with default values.
+      <br><br>
+      Options are flushing the cache on deploy (a stampede against a cold cache, at the worst moment) or
+      handling both formats (permanent complexity).
+      <br><br>
+      <strong>A version prefix in the key sidesteps it entirely.</strong> New code writes and reads
+      <code>v2:</code>, old entries under <code>v1:</code> are simply never read again and expire on their own
+      TTL. No flush, no dual-format code, and a rollback works because the old version still finds its own
+      keys.
+      <br><br>
+      That last property is what makes it a strong answer: it makes cache format changes
+      <strong>safely reversible</strong>, which flushing does not.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A missing TTL is a slow memory leak</div>
+    <p style="margin:0">Keys written without an expiry stay until explicitly deleted or evicted. So a cache
+      that's mostly TTL'd but has one code path that forgets grows steadily for months, then hits
+      <code>maxmemory</code> — at which point the <a href="operations.html#eviction">eviction policy</a> starts
+      discarding keys, possibly including ones you assumed were persistent.
+      <br><br>
+      The failure is delayed and unrelated to the code that caused it, which makes it hard to trace.
+      <br><br>
+      <strong>Set the TTL in the same call as the value</strong> — <code>SET key value EX 300</code>, not
+      <code>SET</code> then <code>EXPIRE</code>. A crash between two commands leaves an immortal key, and
+      wrapping every write in a helper that requires a TTL argument is a cheap structural fix.</p>
+  </div>
+
+  <h2 id="atomicity">Multi-step atomicity <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mechanism</th><th>Gives you</th><th>Doesn't</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Pipelining</strong></td>
+          <td>Many commands in one round trip</td>
+          <td><strong>Not atomic</strong> — other clients' commands can interleave</td>
+        </tr>
+        <tr>
+          <td><strong><code>MULTI</code>/<code>EXEC</code></strong></td>
+          <td>Commands execute consecutively with nothing between</td>
+          <td><strong>No rollback</strong>, and you can't read a value mid-transaction to branch on it</td>
+        </tr>
+        <tr>
+          <td><strong><code>WATCH</code></strong></td>
+          <td>Optimistic concurrency — aborts if a watched key changed</td>
+          <td>Needs retry logic</td>
+        </tr>
+        <tr>
+          <td><strong>Lua script</strong></td>
+          <td><strong>Atomic, with logic and branching</strong></td>
+          <td>Blocks the server while it runs — keep it short</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — Lua: read, decide, write, atomically" class="code-good"><code class="language-csharp">const string script = @"
+    local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+    local limit   = tonumber(ARGV[1])
+    if current &lt; limit then
+        redis.call('INCR', KEYS[1])
+        if current == 0 then
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
+        end
+        return 1
+    end
+    return 0";
+
+var allowed = (int)await db.ScriptEvaluateAsync(script,
+    new RedisKey[] { $"rate:{userId}" },
+    new RedisValue[] { 100, 60 }) == 1;</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong><code>MULTI</code>/<code>EXEC</code> is not a database transaction.</strong></p>
+    <p>Commands are queued and run consecutively, but there's <strong>no rollback</strong> — if one fails, the
+      others still applied. And you can't read a value inside the transaction and branch on it, because nothing
+      executes until <code>EXEC</code>.</p>
+    <p>So for anything conditional — "increment only if under the limit" — you need <strong>Lua</strong>, which
+      runs as a single atomic unit and can contain real logic.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Lua blocks the server, so keep scripts tiny</div>
+    <p style="margin:0">A script runs to completion on the single command thread. Nothing else executes
+      meanwhile.
+      <br><br>
+      So a script that loops over a large collection is exactly the blocking failure mode from the top of this
+      page — with the added problem that it can't be interrupted cleanly.
+      <br><br>
+      Rule of thumb: a handful of commands with simple branching, no unbounded loops, no
+      <code>KEYS</code>. Use <code>EVALSHA</code> with a cached script hash rather than sending the source every
+      time — StackExchange.Redis handles that automatically.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Pipelining is the easy performance win</div>
+    <p style="margin:0">100 sequential <code>GET</code>s at 1ms round-trip each is 100ms of pure waiting.
+      Pipelined, it's one round trip.
+      <br><br>
+      In StackExchange.Redis you get this by <strong>not awaiting immediately</strong> — collect the
+      <code>Task</code>s, then await them all. The multiplexer batches them automatically.
+      <br><br>
+      Or use <code>MGET</code>/<code>HMGET</code> for a genuine multi-key read. Either way, the fix for "Redis
+      is slow" is very often round trips rather than Redis.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Command execution is single-threaded: that's both the free atomicity and the blocking risk.</li>
+      <li>Never <code>KEYS</code> in production — <code>SCAN</code>. And <code>UNLINK</code> over
+        <code>DEL</code> for large keys.</li>
+      <li>Hashes for independently-updated fields; a JSON string when the object is read and written whole.</li>
+      <li>Sorted sets give O(log n) rank and range — the genuinely differentiating structure.</li>
+      <li>A timestamp-scored sorted set covers rate limiting, time series, delayed jobs and priority queues.</li>
+      <li>Sorted sets need explicit trimming; there's no per-member TTL.</li>
+      <li>HyperLogLog counts uniques in 12 KB but can't test membership.</li>
+      <li>Version your key prefixes so cache format changes are reversible.</li>
+      <li>Set the TTL in the same command as the value.</li>
+      <li><code>MULTI</code>/<code>EXEC</code> has no rollback and can't branch — use Lua for conditional
+        logic.</li>
+      <li>Pipeline to remove round trips; it isn't atomicity.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>KEYS</code> in production</strong>, blocking every client.</li>
+    <li><strong><code>DEL</code> on a huge collection</strong> instead of <code>UNLINK</code>.</li>
+    <li><strong>Read-modify-write on a JSON blob</strong> — slow and a lost-update race.</li>
+    <li><strong>Writing keys with no TTL</strong>, leaking memory until eviction starts.</li>
+    <li><strong><code>SET</code> then <code>EXPIRE</code></strong> as two commands.</li>
+    <li><strong>Expecting <code>MULTI</code>/<code>EXEC</code> to roll back.</strong></li>
+    <li><strong>Long-running Lua scripts</strong> blocking the event loop.</li>
+    <li><strong>Sequential awaits</strong> where pipelining would collapse the round trips.</li>
+    <li><strong>Unbounded sorted sets and lists.</strong></li>
+    <li><strong>No version prefix</strong>, so a DTO change breaks on deployment.</li>
+    <li><strong>Scaling up the instance</strong> to get more command throughput.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Redis is single-threaded. Why is it fast, and what's the risk? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It's fast because everything is in memory and, being single-threaded for command execution, there's
+          <strong>no lock contention, no context switching and no coordination overhead</strong>. A lot of a
+          multi-threaded database's work is synchronisation, and Redis simply doesn't do any."</p>
+        <p>"The important consequence is that <strong>every command is atomic for free</strong>. Commands can't
+          interleave, so <code>INCR</code> can't lose an increment and <code>SET NX</code> can't race. That's
+          why counters, rate limits and locks are trivial in Redis and fiddly in a relational database."</p>
+        <p>"And the risk is <strong>the same property</strong>: one slow command blocks everything. There's one
+          queue, so an O(N) command on a large key stalls every other client for its entire duration."</p>
+        <p>"The classic example is <code>KEYS</code>. Someone runs <code>KEYS user:*</code> to check something,
+          the instance has ten million keys, and every client times out for several seconds. That's not a slow
+          query, it's an outage — and it's usually caused by a person at a console rather than by application
+          code. <code>SCAN</code> is the cursor-based alternative that returns incrementally."</p>
+        <p>"Others in the same family: <code>HGETALL</code> or <code>SMEMBERS</code> on a huge collection,
+          <code>LRANGE 0 -1</code>, and a long-running Lua script — which is worse because it can't be
+          interrupted cleanly."</p>
+        <p>"One that's less well known and worth mentioning: <strong><code>DEL</code> on a key with millions of
+          elements blocks while the memory is freed.</strong> <code>UNLINK</code> does the same delete but hands
+          the deallocation to a background thread. So for large collections, <code>UNLINK</code> always."</p>
+        <p>"The other operational implication: <strong>more CPU cores don't increase command
+          throughput</strong>. So you scale with more instances or cluster mode, not a bigger machine — which
+          catches people who try to fix a throughput problem by resizing."</p>
+        <p>"I'd also be precise about the terminology, because it gets challenged: Redis 6 added
+          <strong>threaded I/O</strong>, so socket reads and writes use multiple threads, and Redis 7 moved more
+          background work off the main thread. But <em>command execution</em> is still single-threaded, which is
+          what preserves both the atomicity guarantee and the blocking behaviour. So the accurate statement is
+          'command execution is single-threaded', not 'Redis is single-threaded'."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you connect atomicity and the blocking risk as the same property?</li>
+        <li>Do you know the specific dangerous commands?</li>
+        <li>Do you know <code>UNLINK</code>?</li>
+        <li>Do you know the accurate version of "single-threaded"?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does <code>SCAN</code> work, and what are its guarantees?</li>
+          <li>How would you find a slow command in production?</li>
+          <li>How do you scale Redis throughput?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Design a leaderboard for 10 million players with live ranks. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A <strong>sorted set</strong>, and I'd explain why this is the case where Redis is genuinely the
+          right tool rather than just a fast one."</p>
+        <p>"<code>ZADD leaderboard score playerId</code> to write, which is O(log n). Then
+          <code>ZREVRANGE 0 9</code> for the top ten, and <code>ZREVRANK</code> for an individual player's
+          rank — also O(log n)."</p>
+        <p>"<strong>That rank query is the hard part.</strong> In SQL, 'what rank is this player?' needs a window
+          function computed across the whole table on every call. With 10 million rows that's expensive, it gets
+          worse as you grow, and you can't index your way out of it because the answer depends on every other
+          row. Redis maintains the ordering as a skip list, so it's logarithmic. That's an algorithmic
+          advantage, not just an in-memory speed advantage."</p>
+        <p>"On <strong>memory</strong>: roughly 10 million members at something like 60–90 bytes each is on the
+          order of a gigabyte. Worth calculating rather than assuming, and it's a reason to keep player ids
+          short — the member string is stored per entry."</p>
+        <p>"<strong>Ties</strong> are the detail people miss. Equal scores are ordered lexicographically by
+          member, so two players with the same score get arbitrary but stable relative ranks. If the product
+          wants 'earliest to reach the score ranks higher', I'd encode that into the score itself — a composite
+          like <code>score * 10^10 + (maxTimestamp - achievedAt)</code> — so the ordering is correct without a
+          second lookup. That's the standard trick and it needs care with float precision, since Redis scores
+          are doubles with 53 bits of integer precision."</p>
+        <p>"<strong>Trimming.</strong> A sorted set has no per-member TTL, so it grows forever. If only the top
+          N matter I'd <code>ZREMRANGEBYRANK</code> periodically. If it's seasonal, I'd use a separate key per
+          season — <code>leaderboard:2024-06</code> — with a TTL on the whole key, which is cleaner than trimming
+          and gives historical leaderboards for free."</p>
+        <p>"<strong>Scale and hot keys.</strong> One sorted set is one key, so it lives on <em>one</em> shard in
+          cluster mode. All leaderboard traffic hits that node, and no amount of sharding helps because you
+          can't split a single key. For 10 million players with heavy read traffic I'd expect that to be the
+          bottleneck."</p>
+        <p>"Two mitigations. <strong>Read replicas</strong> for the rank and range queries, accepting slight
+          staleness — which is fine for a leaderboard. And <strong>caching the top N separately</strong>, since
+          'top 100' is requested constantly and changes less often than individual ranks; that's a small string
+          key with a one-second TTL, which removes most of the read load."</p>
+        <p>"<strong>Durability.</strong> I'd treat Redis as the serving layer, not the source of truth. Scores
+          get written to a durable store as well, so the sorted set can be rebuilt — because with only RDB
+          snapshots you lose recent writes on failover, and a leaderboard that resets is a visible product
+          failure. Rebuilding 10 million members takes a while, so I'd want that path tested rather than
+          theoretical."</p>
+        <p>"One thing I'd push back on: <strong>live ranks for all 10 million players</strong> is rarely the real
+          requirement. Usually it's 'top 100' plus 'my rank and the few players around me' —
+          <code>ZREVRANGE rank-2 rank+2</code>. That's a much smaller problem, and worth confirming before
+          designing for the general case."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reach for a sorted set and know why rank is the hard query?</li>
+        <li>Do you handle ties deliberately?</li>
+        <li>Do you know a single key can't be sharded?</li>
+        <li>Do you consider memory, trimming and durability?</li>
+        <li>Do you question the requirement?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a SQL table with <code>ORDER BY score</code> and no
+          awareness of the rank cost.</li>
+        <li><span class="redflag">Red flag:</span> no mention of the hot-key problem.</li>
+        <li><span class="redflag">Red flag:</span> treating Redis as the source of truth with no rebuild
+          path.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you encode the tiebreaker without losing precision?</li>
+          <li>How would you rebuild after a total loss?</li>
+          <li>What if scores updated thousands of times per second?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Integration &amp; API Patterns — Architecture</title>
+<meta name="description" content="API gateway, backend-for-frontend, request/reply vs fire-and-forget, queue-based load levelling, competing consumers and claim check.">
+<meta name="keywords" content="api gateway backend for frontend bff request reply fire and forget queue based load levelling competing consumers claim check aggregator strangler fig service communication">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="19-architecture/integration-patterns.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Integration &amp; API Patterns</h1>
+    <p class="subtitle">How components find each other and exchange work — the layer between "we have
+      services" and "they actually cooperate".</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Request/reply</strong> — caller waits for an answer. Simple, but the caller's availability
+        is now tied to the callee's.</li>
+      <li><strong>Fire-and-forget</strong> — caller doesn't wait. Decoupled, but you need a way to find out
+        it failed.</li>
+      <li><strong>API gateway</strong> — one entry point handling auth, routing, rate limiting, TLS.</li>
+      <li><strong>BFF</strong> — a gateway per client type, so the mobile app isn't forced to use the web
+        app's payload shapes.</li>
+      <li><strong>Queue-based load levelling</strong> — put a queue in front of a component that can't
+        absorb spikes. Converts a spike into a longer queue instead of an outage.</li>
+      <li><strong>Claim check</strong> — don't put large payloads in messages. Store the blob, send the URL.</li>
+    </ul>
+  </div>
+
+  <h2 id="communication-styles">The four communication styles <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>Two independent choices: <em>do I wait for a response?</em> and <em>do I know who I'm talking to?</em></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Style</th><th>Shape</th><th>Good for</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Request / reply</strong></td>
+          <td>Sync HTTP, gRPC</td>
+          <td>You need the answer to continue — a price, a validation, a lookup</td>
+          <td>Temporal coupling: if they're down, you're down. Latency adds up across hops</td>
+        </tr>
+        <tr>
+          <td><strong>Fire and forget</strong></td>
+          <td>Send to a queue, don't wait</td>
+          <td>Work that can happen later — emails, indexing, reports</td>
+          <td>You won't know it failed unless you monitor for it</td>
+        </tr>
+        <tr>
+          <td><strong>Publish / subscribe</strong></td>
+          <td>Publish to a topic, N subscribers</td>
+          <td>Announcing facts; many independent reactions</td>
+          <td>No idea who's listening; ordering and duplicates</td>
+        </tr>
+        <tr>
+          <td><strong>Async request / reply</strong></td>
+          <td>Send, get a ticket, poll or get a callback</td>
+          <td>Long operations — video encoding, report generation</td>
+          <td>More moving parts: correlation, status storage, timeouts</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Synchronous calls create <strong>temporal coupling</strong> — both parties must be up at the same
+      moment.</p>
+    <p>Chain four synchronous services at 99.9% each and your effective availability is about 99.6%. The
+      maths gets worse fast.</p>
+  </div>
+
+  <h3 id="async-request-reply">Async request/reply, concretely</h3>
+
+  <pre data-label="http — the pattern for operations that take too long for one request"><code class="language-http">POST /api/reports
+202 Accepted
+Location: /api/reports/8f3c/status
+
+GET /api/reports/8f3c/status
+200 OK
+{ "status": "Running", "startedAt": "2025-08-19T10:00:00Z" }
+
+GET /api/reports/8f3c/status
+200 OK
+{ "status": "Completed", "resultUrl": "/api/reports/8f3c/download" }</code></pre>
+
+  <p>The important details: return <strong>202 Accepted</strong>, not 200 — the work isn't done. Give the
+    caller a URL to check. And keep the status record around long enough that a client which crashed can come
+    back and find out what happened.</p>
+
+  <h2 id="api-gateway">API gateway <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="oneline"><b>One line:</b> a single front door that handles the concerns every service would
+    otherwise implement itself.</div>
+
+  <pre data-label="what the gateway takes off each service's plate"><code class="language-text" data-nohl>           Internet
+              │
+        ┌─────▼──────────────────────────────┐
+        │          API Gateway               │
+        │  · TLS termination                 │
+        │  · Authentication (validate JWT)   │
+        │  · Rate limiting / quotas          │
+        │  · Routing to the right service    │
+        │  · Request/response logging        │
+        │  · Response caching                │
+        └───┬─────────────┬─────────────┬────┘
+            ▼             ▼             ▼
+       Orders svc    Catalog svc    Billing svc
+       (no auth      (no TLS        (no rate
+        code)         handling)      limiting)</code></pre>
+
+  <p><strong>What it genuinely buys you:</strong> those concerns get implemented once instead of per
+    service, clients see one hostname, and internal topology can change without clients noticing.</p>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — the gateway that ate the architecture</div>
+    <p style="margin:0">Gateways attract business logic. It starts reasonably — "just transform this
+      response" — and ends with orchestration, validation and data mapping living in the gateway.
+      <br><br>
+      Now it's a single point of failure that <em>every</em> team has to change, deployments are coordinated,
+      and you've rebuilt the ESB that microservices were supposed to escape.
+      <br><br>
+      <strong>Rule: the gateway does cross-cutting concerns. Never business rules.</strong></p>
+  </div>
+
+  <p>Note also that <strong>authorization</strong> can't fully live at the gateway. It can check that the
+    token is valid and the caller may reach the endpoint. It can't know that <em>this user</em> may see
+    <em>that specific order</em> — that's a data-level decision, and it belongs in the service. Skipping it
+    there is a common source of cross-tenant leaks; see
+    <a href="../23-multi-tenant-saas/tenant-context.html">tenant context</a>.</p>
+
+  <h2 id="bff">Backend-for-Frontend <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="oneline"><b>One line:</b> one gateway per client type, shaped for that client's needs.</div>
+
+  <p><strong>The problem it solves:</strong> a mobile app and a web app want very different things. Mobile
+    wants fewer, smaller round trips because the network is slow. Web can afford several calls and wants
+    richer payloads. One shared API ends up serving both badly — usually with a pile of
+    <code>?include=</code> and <code>?fields=</code> parameters.</p>
+
+  <pre data-label="one backend per client, each shaped for it"><code class="language-text" data-nohl>  Mobile app  ──▶  Mobile BFF   ──┐
+                  (one call,       │
+                   trimmed data)   │
+                                   ├──▶  Orders / Catalog / Pricing services
+  Web SPA     ──▶  Web BFF       ──┤
+                  (richer, more    │
+                   calls OK)       │
+                                   │
+  Partner API ──▶  Public API    ──┘
+                  (stable contract,
+                   versioned)</code></pre>
+
+  <p><strong>The trade-off:</strong> BFFs duplicate some logic across each one, and each needs owning and
+    deploying. That's worth it when clients genuinely differ and are owned by different teams. It's not worth
+    it for two clients that need almost the same thing.</p>
+
+  <div class="note tip">
+    <div class="note-title">Best practice</div>
+    <p style="margin:0">Have the <em>client team own its BFF</em>. That's the whole point — the mobile team
+      can change their payload shape without negotiating with a platform team. If a central team owns all the
+      BFFs, you've just built several gateways and kept the bottleneck.</p>
+  </div>
+
+  <h2 id="load-levelling">Queue-based load levelling <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Put a queue in front of anything that can't absorb a spike.</p>
+    <p>The spike becomes a <strong>longer queue</strong> instead of an outage. Latency degrades gracefully
+      instead of the system falling over.</p>
+  </div>
+
+  <pre data-label="csharp — accept fast, process at a sustainable rate" class="code-good"><code class="language-csharp">// API: accept and enqueue. Returns in milliseconds regardless of load.
+app.MapPost("/api/documents", async (UploadDocument cmd, IMessageSender sender, CancellationToken ct) =&gt;
+{
+    var jobId = Guid.NewGuid();
+    await sender.SendAsync(new ProcessDocument(jobId, cmd.BlobUrl), ct);
+    return Results.Accepted($"/api/documents/{jobId}");
+});
+
+// Worker: processes at whatever rate the database and CPU can sustain.
+// A traffic spike lengthens the queue - it does not overwhelm the database.</code></pre>
+
+  <p><strong>Where this is exactly right:</strong> a downstream system with a hard throughput limit — a
+    legacy API, a third party with strict rate limits, a database that can only take so many writes per
+    second.</p>
+
+  <div class="note warn">
+    <div class="note-title">What it doesn't fix</div>
+    <p style="margin:0">Levelling handles <strong>bursts</strong>, not a sustained overload. If arrival rate
+      exceeds processing rate on average, the queue grows forever and latency goes to infinity.
+      <br><br>
+      So always monitor <strong>queue age</strong> — the time the oldest unprocessed message has been waiting.
+      Queue <em>length</em> alone is meaningless without knowing throughput.</p>
+  </div>
+
+  <h2 id="competing-consumers">Competing consumers <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="oneline"><b>One line:</b> several instances read from the same queue; each message goes to
+    exactly one of them.</div>
+
+  <p>This is how you scale queue processing — add instances, throughput rises. Two things to get right:</p>
+
+  <ul>
+    <li><strong>Message locking.</strong> While one consumer holds a message, others can't see it. If the
+      consumer dies, the lock expires and the message reappears — which is exactly why you need idempotency.</li>
+    <li><strong>Ordering is lost.</strong> Three consumers process three messages concurrently, so they can
+      complete out of order. If you need ordering for related messages, you need
+      <strong>sessions</strong> (Service Bus) or a <strong>partition key</strong> (Kafka, Event Hubs) so
+      related messages go to the same consumer. See <a href="../22-kafka/delivery-ordering.html">delivery and
+      ordering</a>.</li>
+  </ul>
+
+  <h2 id="claim-check">Claim check <span class="lvl lvl-i">🟡 Intermediate</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="oneline"><b>One line:</b> put the big payload in storage and send a reference in the message.</div>
+
+  <pre data-label="csharp — the message stays small" class="code-good"><code class="language-csharp">// Bad: a 40 MB PDF in the message body. Most brokers reject it, and
+// even if they don't, it destroys throughput for everyone else.
+
+// Good: store it, send the pointer.
+var blobUrl = await _blobs.UploadAsync(stream, ct);
+await _sender.SendAsync(new DocumentUploaded(documentId, blobUrl, sizeBytes), ct);</code></pre>
+
+  <p>Brokers have message size limits (Service Bus standard is 256 KB, premium 100 MB — verify current
+    values before quoting). But even under the limit, large messages hurt: slower transfer, more memory per
+    consumer, and one big message can delay everything behind it.</p>
+
+  <p>Two things to remember with claim check: the consumer needs <strong>permission</strong> to read the blob
+    (use a short-lived SAS or managed identity), and you need a <strong>cleanup policy</strong> — otherwise
+    orphaned blobs accumulate forever when messages fail permanently.</p>
+
+  <h2 id="strangler">Strangler fig <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="oneline"><b>One line:</b> replace a legacy system gradually by routing traffic away from it,
+    piece by piece.</div>
+
+  <ol class="steps">
+    <li>Put a facade — usually a gateway or reverse proxy — in front of the legacy system. Everything still
+      routes through to it. <em>Nothing has changed functionally, and that's the point.</em></li>
+    <li>Build one new capability behind the facade. Route just that path to the new implementation.</li>
+    <li>Repeat, path by path, with each step independently shippable and revertible.</li>
+    <li>When nothing routes to the legacy system, delete it.</li>
+  </ol>
+
+  <p><strong>Why this beats a rewrite:</strong> every step delivers value and can be reverted. A big-bang
+    rewrite is a long period with no delivery, ending in one enormous risky cutover — and it has to catch up
+    with two years of changes made to the legacy system meanwhile.</p>
+
+  <div class="note warn">
+    <div class="note-title">The hard part nobody mentions</div>
+    <p style="margin:0">Shared data. While both systems run, they usually need the same data — so you're
+      either dual-writing, syncing, or letting the new system read the old database.
+      <br><br>
+      That's the part that determines whether the migration takes six months or three years, and it deserves
+      more design attention than the routing.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Sync calls chain availability multiplicatively. Four 99.9% services in series ≈ 99.6%.</li>
+      <li>Async request/reply returns 202 plus a status URL — don't fake it with a long-running request.</li>
+      <li>Gateways handle cross-cutting concerns. Business logic there rebuilds the ESB.</li>
+      <li>Data-level authorization can't live at the gateway.</li>
+      <li>Queue levelling absorbs bursts, not sustained overload. Monitor queue <em>age</em>.</li>
+      <li>Competing consumers scale throughput and destroy ordering. Use sessions or partition keys if order matters.</li>
+      <li>Claim check for anything large — and plan the cleanup.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Business logic in the API gateway</strong>, turning it into a coupled single point of failure.</li>
+    <li><strong>Relying on the gateway for data-level authorization</strong>, which it can't do — a common
+      cross-tenant leak.</li>
+    <li><strong>Long chains of synchronous calls</strong>, where latency and failure probability compound.</li>
+    <li><strong>Fire-and-forget with no monitoring</strong>, so failures are invisible until a customer
+      complains.</li>
+    <li><strong>Large payloads in messages</strong> instead of claim check.</li>
+    <li><strong>Alerting on queue length instead of queue age</strong>, which tells you nothing about impact.</li>
+    <li><strong>Assuming ordering with competing consumers</strong>, which is exactly what they give up.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>When would you use synchronous calls versus messaging between services?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The deciding question is whether the caller needs the answer to continue. If I'm checking a price
+          or validating something before I can respond to the user, that's request/reply — faking it with
+          messaging and a correlation timeout is more complex and no more reliable."</p>
+        <p>"If the work can happen afterwards — sending a confirmation email, updating a search index,
+          generating a report — messaging is better, because the caller returns immediately and a slow or
+          unavailable consumer doesn't affect the user."</p>
+        <p>"The thing I'd raise about synchronous chains is that they multiply availability. Four services at
+          99.9% in series gives you about 99.6%, and each hop adds latency. So a request path that touches
+          five services synchronously is fragile by construction — and the fix is usually to move some of
+          those calls off the request path entirely rather than to make each one faster."</p>
+        <p>"There's a middle option worth mentioning: async request/reply. Return 202 with a status URL and
+          let the client poll or receive a callback. That's the right shape for anything genuinely
+          long-running, like report generation or video processing, and it's much better than holding an HTTP
+          request open for two minutes."</p>
+        <p>"One practical caution on messaging: it isn't free decoupling. You take on idempotency, ordering
+          concerns, dead-letter monitoring and a harder debugging story. So I'd use it where it buys
+          something real — absorbing spikes, decoupling availability, fanning out to several consumers — not
+          just because it sounds more modern."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have a clear decision rule rather than a preference?</li>
+        <li>Do you know availability compounds across sync hops?</li>
+        <li>Do you know async request/reply as a third option?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>The user needs to see the result of a 30-second operation. How do you design it?</li>
+          <li>How do you stop a slow downstream service from exhausting your thread pool?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What's an API gateway, and what should it never do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It's a single entry point in front of your services that handles the concerns every service would
+          otherwise implement itself — TLS termination, authentication, rate limiting, routing, logging,
+          sometimes response caching."</p>
+        <p>"The value is that those get done once, consistently, and clients see one hostname while the
+          internal topology can change freely."</p>
+        <p>"What it should never do is <strong>business logic</strong>. That's the failure mode I've watched
+          happen: it starts as 'just transform this response', then it's aggregating three services, then
+          there's validation, then pricing rules. At that point the gateway is a single point of failure that
+          every team must change, deployments need coordinating, and you've rebuilt the ESB that
+          microservices were meant to avoid."</p>
+        <p>"The other thing it can't fully do is <strong>authorization</strong>. It can verify the token is
+          valid and that the caller is allowed to hit the endpoint. It cannot know that <em>this</em> user may
+          see <em>that</em> specific order — that's a data-level decision that needs the data. Teams that
+          assume the gateway handles authorization end up with cross-tenant leaks, because a valid token for
+          tenant A reaches an endpoint that returns tenant B's row."</p>
+        <p>"I'd also watch the deployment coupling. If every service change needs a gateway config change,
+          the gateway has become a bottleneck. Routing should be generic enough that adding an endpoint
+          doesn't require touching it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the boundary between cross-cutting and business concerns?</li>
+        <li>Do you know authorization can't be fully centralised?</li>
+        <li>Have you seen a gateway become a bottleneck?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where would you enforce tenant isolation, then?</li>
+          <li>What's the difference between a gateway and a BFF?</li>
+          <li>How do you stop the gateway being a single point of failure?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A downstream legacy API can only handle 50 requests/second, but you get bursts of 500. What do you do?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is queue-based load levelling. I'd put a queue between us and the legacy API, accept
+          requests fast, and have a worker consume at a rate the legacy system can sustain."</p>
+        <p>"So the API accepts the request, writes a message, and returns 202 with a status URL. The worker
+          processes at a controlled rate — I'd cap concurrency explicitly rather than relying on it happening
+          to be slow enough. A burst of 500 then becomes a longer queue and higher latency, not a downstream
+          outage."</p>
+        <p>"I'd add a few things around that. Idempotency, because at-least-once delivery means retries will
+          happen. A dead-letter queue with monitoring, so permanently failing messages surface instead of
+          disappearing. And a circuit breaker, so if the legacy system starts failing we stop hammering it
+          and give it room to recover."</p>
+        <p>"The important caveat is that levelling only fixes <strong>bursts</strong>. If sustained arrival
+          rate exceeds 50/second on average, the queue grows without bound and latency goes to infinity —
+          the queue just hides the problem for a while. So I'd monitor <em>queue age</em>, not queue length,
+          because age directly reflects how stale the work is, and alert if the oldest message exceeds our
+          acceptable latency."</p>
+        <p>"If the average genuinely exceeds capacity, then the answer is different: either the legacy system
+          has to scale, or we shed load deliberately — reject with 429 and a Retry-After — which is much
+          better than accepting work we can never complete."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the pattern by name and mechanism?</li>
+        <li>Do you understand it only fixes bursts, not sustained overload?</li>
+        <li>Do you monitor the right metric?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add retries" — that increases load on an overloaded system.</li>
+        <li><span class="redflag">Red flag:</span> "add a queue" with no mention of the sustained-rate limit.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you stop the queue growing unbounded?</li>
+          <li>The user needs to know when their request completed. How?</li>
+          <li>What if messages must be processed in order per customer?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

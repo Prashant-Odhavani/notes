@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object-Oriented Programming — Overview</title>
+<meta name="description" content="OOP for senior interviews: what the four pillars are really for, why interviewers still ask, and what they follow up with.">
+<meta name="keywords" content="oop object oriented programming encapsulation abstraction inheritance polymorphism csharp interview senior design invariants coupling">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="02-oop/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Object-Oriented Programming</h1>
+    <p class="subtitle">Everyone can name the four pillars. Interviews use them as a door into what you
+      actually understand about design.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>OOP exists to make change cheap. Data and the rules about it live together, so a change lands
+        in one place.</li>
+      <li><strong>Encapsulation</strong> = protect the rules, not just the fields.</li>
+      <li><strong>Abstraction</strong> = decide what to expose.</li>
+      <li><strong>Inheritance</strong> = "can be used instead of".</li>
+      <li><strong>Polymorphism</strong> = same call, different behaviour, picked at runtime.</li>
+      <li>Judge any design by one question: <em>what does this make easy to change, and what does it make
+        hard?</em></li>
+    </ul>
+  </div>
+
+  <h2 id="why-asked">Why interviewers still ask this <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>"What are the four pillars of OOP?" gets asked constantly. The recited answer is worth nothing —
+    everyone has it memorised.</p>
+
+  <p>The question is really a setup. What follows is where the signal is:</p>
+
+  <ul>
+    <li>"Show me encapsulation being broken in code you've seen."</li>
+    <li>"When would inheritance be the wrong choice?"</li>
+    <li>"How does polymorphism actually work at runtime?"</li>
+  </ul>
+
+  <p>So: know the definitions cold — they take thirty seconds — and spend your prep on the second layer.
+    Invariants, substitutability, coupling, and why designs rot.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Talk about <strong>invariants</strong> and <strong>dependency direction</strong>
+      instead of the four words. "Encapsulation means a caller can't put the object into an invalid state"
+      lands much better than "encapsulation means hiding data with private fields".</p>
+  </div>
+
+  <h2 id="the-four-pillars">The four pillars, and what they're actually for <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pillar</th><th>Textbook version</th><th>What it's really for</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Encapsulation</td>
+          <td>Bundle data with the methods that use it; restrict access</td>
+          <td>Make it impossible to observe or leave the object in an invalid state</td>
+        </tr>
+        <tr>
+          <td>Abstraction</td>
+          <td>Expose the essentials, hide the detail</td>
+          <td>Let callers depend on a stable idea instead of a changing implementation</td>
+        </tr>
+        <tr>
+          <td>Inheritance</td>
+          <td>Derive a type from another and gain its members</td>
+          <td>Express real substitutability so polymorphic code works — <em>not</em> code reuse</td>
+        </tr>
+        <tr>
+          <td>Polymorphism</td>
+          <td>One interface, many implementations</td>
+          <td>Add behaviour without touching existing callers</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>All four pillars are ways of controlling <strong>who depends on what</strong>.</p>
+    <p>That framing turns "define encapsulation" into a design conversation, which is where you want to be.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A well-designed kitchen. Encapsulation is the cupboard door — you get plates, not the mess.
+      Abstraction is the tap: hot and cold, no plumbing. Inheritance is that any kettle fits the same socket.
+      Polymorphism is that "boil water" works whether it's a kettle or a hob.</p>
+  </div>
+
+  <h2 id="how-this-section-works">What's in this section</h2>
+
+  <p><a href="fundamentals.html">Fundamentals</a> covers the pillars plus the C# details interviewers dig
+    into: <code>virtual</code>/<code>override</code>/<code>new</code>, abstract class vs interface,
+    overloading vs overriding, and how dispatch works.</p>
+
+  <p><a href="advanced.html">Advanced OOP</a> covers design quality: composition over inheritance,
+    coupling and cohesion, immutability, object lifetime, and Liskov in real code.</p>
+
+  <div class="note info">
+    <div class="note-title">Where this sits in the learning path</div>
+    <p style="margin:0">You've just done <a href="../01-csharp-fundamentals/index.html">C# fundamentals</a>,
+      so you know classes, interfaces and the type system. Next comes
+      <a href="../03-solid/index.html">SOLID</a> — five principles built directly on these four pillars —
+      and after that <a href="../18-design-patterns/index.html">design patterns</a>, which are named
+      solutions built on SOLID.</p>
+  </div>
+
+  <div class="card-grid" data-section-index></div>
+
+  <h2 id="interview-questions">Cross-cutting interview questions</h2>
+
+  <details class="qa">
+    <summary>Is OOP still the right default, given functional programming and modern C#?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I treat them as complementary. Modern C# clearly does too — records, pattern matching,
+          immutable collections and LINQ are functional ideas that landed in an OO language because they
+          solve things OOP handles badly."</p>
+        <p>"OOP earns its place when something has identity, a lifecycle and rules. An Order has a state
+          machine and things that must always be true about it. Putting that in a type that won't let
+          callers break it is genuinely valuable."</p>
+        <p>"Functional style wins for transformation and calculation — take data, apply rules, produce a
+          result, no hidden state. Easier to test, easy to parallelise, no temporal coupling."</p>
+        <p>"So a codebase I'd be happy with is mixed. Entities are encapsulated with behaviour. Values are
+          immutable records. Query and reporting paths are basically functional pipelines with no domain
+          objects at all — which is really the argument for CQRS. The mistake is dogma either way: forcing
+          a rich domain model onto a report, or turning entities into property bags with all the rules in
+          static helpers."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you hold a position with reasons, or an allegiance?</li>
+        <li>Do you know modern C# absorbed functional features, and why?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's an anaemic domain model? Is it always wrong?</li>
+          <li>When would you choose a record over a class?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>You're reviewing a class with 40 public members and 2,000 lines. What do you do?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I wouldn't start by splitting it. Splitting arbitrarily gives you several classes that all
+          depend on each other, which is worse than one honest big class."</p>
+        <p>"First I'd look for the seams: which methods use which fields. Classes like this almost always
+          have two or three clusters where a group of methods touches a group of fields and nothing else.
+          That clustering <em>is</em> the boundary — it's low cohesion showing itself."</p>
+        <p>"Then I'd ask what reasons this class has to change. If pricing rules, persistence and
+          notifications all live in it, those change for different reasons on different schedules, so
+          separating them is justified by more than taste. If it's genuinely one cohesive thing that
+          happens to be big — a complex tax calculation, say — I'd leave it. Splitting something cohesive
+          across files makes it harder to follow, not easier."</p>
+        <p>"And I'd do it incrementally behind tests. Characterisation tests first, extract one cluster at a
+          time, keep the original as a facade delegating to the new types so callers don't all change at
+          once. Every step stays reviewable and revertible."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you find real boundaries, or do you split by line count?</li>
+        <li>Do you know cohesion is the underlying concept?</li>
+        <li>Do you refactor safely and incrementally?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if it's a God object referenced from 200 places?</li>
+          <li>How do you decide when a class is "too big"?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

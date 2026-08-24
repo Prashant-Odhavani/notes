@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modern C# by Version — C# Fundamentals</title>
+<meta name="description" content="What arrived in C# 8 through 13, which features actually matter in production code, and how to talk about language versions in an interview.">
+<meta name="keywords" content="csharp 8 9 10 11 12 13 features nullable reference types records pattern matching primary constructors file scoped namespaces required members collection expressions">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="01-csharp-fundamentals/modern-csharp.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Modern C# by Version</h1>
+    <p class="subtitle">What changed, why it changed, and which features are worth adopting. Useful context
+      — and a quick way to show you write current C# rather than C# 5.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision — the ones that actually changed how we write C#</div>
+    <ul>
+      <li><strong>C# 8</strong> — nullable reference types. The biggest change to daily C# in a decade.</li>
+      <li><strong>C# 9</strong> — <code>record</code>. Value equality and immutable data without boilerplate.</li>
+      <li><strong>C# 10</strong> — file-scoped namespaces, global usings. Less noise in every file.</li>
+      <li><strong>C# 11</strong> — <code>required</code> members, raw string literals.</li>
+      <li><strong>C# 12</strong> — primary constructors on classes, collection expressions (<code>[1, 2, 3]</code>).</li>
+      <li><strong>C# 13</strong> — incremental: <code>params</code> collections, better <code>lock</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-care">Why this page exists <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>Nobody will quiz you on which version shipped <code>init</code> accessors. But two things do come up:</p>
+
+  <ol class="steps">
+    <li><strong>"What's new in C# that you like?"</strong> — a genuine question, and a weak answer signals
+      you stopped learning a few years ago.</li>
+    <li><strong>Your code samples date you.</strong> Writing <code>new List&lt;string&gt;()</code> where
+      <code>[]</code> works, or a 30-line DTO where a record does, reads as out of date.</li>
+    </ol>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>The last few C# versions have mostly been about <strong>writing less code to say the same
+      thing</strong>, plus <strong>letting the compiler catch null bugs</strong>.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Language version follows the target framework</div>
+    <p style="margin:0">You don't pick a C# version directly — it's implied by <code>TargetFramework</code>.
+      Roughly: .NET 6 → C# 10, .NET 7 → C# 11, .NET 8 → C# 12, .NET 9 → C# 13.
+      <br><br>
+      You <em>can</em> override it with <code>&lt;LangVersion&gt;</code>, but features that need runtime
+      support won't work on an older runtime. Verify against current docs before relying on a specific
+      pairing.</p>
+  </div>
+
+  <h2 id="csharp-8">C# 8 — nullable reference types <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>The headline feature, and the one with the most impact on real codebases.</p>
+
+  <pre data-label="csharp — the compiler starts helping"><code class="language-csharp">// With &lt;Nullable&gt;enable&lt;/Nullable&gt; in the csproj:
+string name  = null;      // warning: converting null to non-nullable
+string? maybe = null;     // fine, explicitly nullable
+
+Console.WriteLine(maybe.Length);          // warning: possible null dereference
+Console.WriteLine(maybe?.Length ?? 0);    // fine</code></pre>
+
+  <p>Covered in detail on <a href="type-system.html#nullable">the type system page</a> — including the
+    important caveat that it's <strong>compile-time only</strong>.</p>
+
+  <p>Also in C# 8, and genuinely useful:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Feature</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td>Switch expressions</td><td><code>var x = value switch { ... }</code> — an expression, not a statement</td></tr>
+        <tr><td><code>using</code> declarations</td><td><code>using var f = File.Open(...)</code> with no extra braces</td></tr>
+        <tr><td><code>IAsyncEnumerable&lt;T&gt;</code></td><td><code>await foreach</code> — streaming async data</td></tr>
+        <tr><td>Default interface methods</td><td>Add a member to an interface without breaking implementers</td></tr>
+        <tr><td>Ranges and indices</td><td><code>items[1..^1]</code>, <code>items[^1]</code> for the last item</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="csharp-9">C# 9 — records <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="vs-grid">
+    <div class="bad">
+      <span class="vs-label">Before — and this is the short version</span>
+      <p>A DTO with value equality meant writing a constructor, properties, <code>Equals</code>,
+        <code>GetHashCode</code>, <code>ToString</code> and a copy method. Around 40 lines for three
+        properties.</p>
+    </div>
+    <div class="good">
+      <span class="vs-label">After</span>
+      <p><code>public record Money(decimal Amount, string Currency);</code></p>
+    </div>
+  </div>
+
+  <p>Records are covered on <a href="type-system.html#records">the type system page</a>. Other C# 9 items:</p>
+
+  <ul>
+    <li><strong><code>init</code> accessors</strong> — settable during construction, read-only afterwards.</li>
+    <li><strong>Top-level statements</strong> — no <code>Program</code> class boilerplate.</li>
+    <li><strong>Target-typed <code>new</code></strong> — <code>List&lt;Order&gt; x = new();</code></li>
+    <li><strong>Pattern matching improvements</strong> — <code>is not null</code>, <code>and</code>,
+      <code>or</code>, relational patterns like <code>&gt; 100</code>.</li>
+  </ul>
+
+  <h2 id="csharp-10">C# 10 — less ceremony per file <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — file-scoped namespace: one less level of indentation everywhere" class="code-good"><code class="language-csharp">namespace MyApp.Orders;      // note the semicolon - no braces
+
+public sealed class Order
+{
+    // everything is one indent shallower than it used to be
+}</code></pre>
+
+  <pre data-label="csharp — global usings: declare once for the whole project"><code class="language-csharp">// In a single file, e.g. GlobalUsings.cs
+global using System.Collections.Generic;
+global using Microsoft.Extensions.Logging;
+
+// Or in the .csproj:
+// &lt;ImplicitUsings&gt;enable&lt;/ImplicitUsings&gt;</code></pre>
+
+  <p>Small changes, but they remove noise from every single file — which is why almost every new project
+    turns both on.</p>
+
+  <h2 id="csharp-11">C# 11 — <code>required</code> and raw strings <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — required: the compiler enforces initialisation"><code class="language-csharp">public class Order
+{
+    public required string CustomerId { get; init; }   // must be set
+    public string? Notes { get; init; }                 // optional
+}
+
+var a = new Order();                          // compile error - CustomerId not set
+var b = new Order { CustomerId = "acme" };    // fine</code></pre>
+
+  <p>This solves a real problem: object initialisers were convenient but let you forget a mandatory
+    property. Previously your only option was a constructor, which is awkward with many properties.</p>
+
+  <pre data-label="csharp — raw string literals: no more escaping"><code class="language-csharp">// Before: every quote escaped, unreadable
+var json = "{\"name\": \"Ada\", \"role\": \"engineer\"}";
+
+// After: three or more quotes, and the content is literal
+var json = """
+    { "name": "Ada", "role": "engineer" }
+    """;</code></pre>
+
+  <p>Especially good for embedded JSON, SQL and regex — the three places escaping used to hurt most. The
+    closing delimiter's indentation is stripped from every line, so it stays readable in context.</p>
+
+  <h2 id="csharp-12">C# 12 — primary constructors and collection expressions <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Primary constructors are the change you'll notice most in a DI-heavy codebase:</p>
+
+  <pre data-label="csharp — before" class="code-bad"><code class="language-csharp">public sealed class OrderService
+{
+    private readonly IOrderRepository _orders;
+    private readonly ILogger&lt;OrderService&gt; _log;
+
+    public OrderService(IOrderRepository orders, ILogger&lt;OrderService&gt; log)
+    {
+        _orders = orders;
+        _log = log;
+    }
+}</code></pre>
+
+  <pre data-label="csharp — after" class="code-good"><code class="language-csharp">public sealed class OrderService(IOrderRepository orders, ILogger&lt;OrderService&gt; log)
+{
+    // 'orders' and 'log' are usable directly in any member
+}</code></pre>
+
+  <p>Nine lines become one. This is why most examples in this handbook use that form.</p>
+
+  <div class="note warn">
+    <div class="note-title">One caveat worth knowing</div>
+    <p style="margin:0">Primary constructor parameters on a <strong>class</strong> are mutable within the
+      class — they aren't automatically <code>readonly</code> fields. If that matters, assign them to
+      explicit <code>readonly</code> fields. (On a <code>record</code>, they become public properties
+      instead, which is a different behaviour again.)</p>
+  </div>
+
+  <pre data-label="csharp — collection expressions"><code class="language-csharp">int[]        a = [1, 2, 3];
+List&lt;string&gt; b = ["x", "y"];
+Span&lt;int&gt;    c = [1, 2, 3];
+
+int[] combined = [..a, 4, 5];      // spread operator</code></pre>
+
+  <p>One syntax that works across arrays, lists and spans — and it's why you'll see <code>[]</code> instead
+    of <code>new List&lt;T&gt;()</code> throughout this handbook.</p>
+
+  <h2 id="csharp-13">C# 13 <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <p>An incremental release. The two most practical items:</p>
+
+  <ul>
+    <li><strong><code>params</code> collections</strong> — <code>params</code> now works with
+      <code>Span&lt;T&gt;</code>, <code>IEnumerable&lt;T&gt;</code> and others, not just arrays. That avoids
+      an array allocation on every call in hot paths.</li>
+    <li><strong><code>Lock</code> object</strong> — a dedicated <code>System.Threading.Lock</code> type that
+      <code>lock</code> recognises, which is faster than locking on a plain <code>object</code>.</li>
+  </ul>
+
+  <p>Also: <code>field</code> keyword work, implicit index access in initialisers, and more flexible
+    <code>ref struct</code> usage. Verify specifics against current docs — this is the area most likely to
+    have shifted since writing.</p>
+
+  <h2 id="adoption">Which of these to actually adopt <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Feature</th><th>Verdict</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Nullable reference types</td><td><strong>Always</strong>, on new projects</td><td>Catches a whole bug class at compile time. Highest value change available</td></tr>
+        <tr><td>Records for DTOs and values</td><td><strong>Always</strong></td><td>Correct equality and hashing for free — see the <code>GetHashCode</code> trap</td></tr>
+        <tr><td>File-scoped namespaces, global usings</td><td><strong>Always</strong></td><td>Pure noise reduction, zero risk</td></tr>
+        <tr><td>Primary constructors</td><td><strong>Yes</strong> for DI-heavy classes</td><td>Removes real boilerplate; watch the mutability caveat</td></tr>
+        <tr><td>Collection expressions</td><td><strong>Yes</strong></td><td>Shorter and works uniformly across collection types</td></tr>
+        <tr><td>Raw string literals</td><td><strong>Yes</strong>, where escaping hurt</td><td>Embedded JSON/SQL/regex become readable</td></tr>
+        <tr><td>Top-level statements</td><td><strong>Sparingly</strong></td><td>Great for samples and tiny tools; less clear in a large app's entry point</td></tr>
+        <tr><td>Default interface methods</td><td><strong>Only for interface evolution</strong></td><td>Not a substitute for a base class — no state, and subtle resolution rules</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Adopting a feature because it's new is as bad as refusing to. The strong position is
+      to name what a feature <em>buys</em> you: nullable reference types buy compile-time null safety,
+      records buy correct equality, primary constructors buy less boilerplate.
+      <br><br>
+      And be able to name one you'd use carefully. Default interface methods are a good example — they exist
+      for versioning a published interface, and using them as a general design tool leads to confusion about
+      where behaviour lives.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>C# version follows <code>TargetFramework</code>; you rarely set it directly.</li>
+      <li>C# 8's nullable reference types are the highest-value setting in a new project.</li>
+      <li>C# 9's records are the default choice for DTOs, events and value objects.</li>
+      <li>C# 12's primary constructors and collection expressions are the two changes most visible in
+        everyday code.</li>
+      <li>Judge features by what they buy you, not by how new they are.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What recent C# features do you like, and which do you avoid?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The one I'd turn on in every project is <strong>nullable reference types</strong>. It converts
+          a whole class of runtime null-reference bugs into compiler warnings. On a legacy codebase it's
+          noisy at first, so I'd enable it per-project and fix as I go rather than all at once."</p>
+        <p>"<strong>Records</strong> are my default for DTOs, events and value objects. Partly the brevity,
+          but mainly correctness: you get <code>Equals</code> and <code>GetHashCode</code> that agree with
+          each other, which is something people get wrong by hand — and getting it wrong makes objects
+          vanish from dictionaries."</p>
+        <p>"<strong>Primary constructors</strong> in C# 12 remove real boilerplate in DI-heavy classes —
+          nine lines down to one. The caveat is that on a class the parameters aren't automatically
+          readonly, so if immutability matters I still assign to explicit readonly fields."</p>
+        <p>"<strong>Raw string literals</strong> for anything with embedded JSON, SQL or regex. That was
+          genuinely painful before."</p>
+        <p>"What I'd use carefully: <strong>default interface methods</strong>. They exist so a library author
+          can add a member without breaking implementers, and that's a good reason. Using them as a general
+          design tool gets confusing, because there's still no state and the resolution rules are subtle.
+          I'd also use top-level statements sparingly — fine for tools and samples, less clear as the entry
+          point of a large application."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Are you still learning the language, or did you stop at C# 7?</li>
+        <li>Do you evaluate features on merit rather than novelty?</li>
+        <li>Can you name a caveat? That's the part that shows real use.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> not being able to name anything past C# 7 or 8.</li>
+        <li><span class="redflag">Red flag:</span> listing features with no reason why they help.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you introduce nullable reference types into a large legacy codebase?</li>
+          <li>When is a record the wrong choice?</li>
+          <li>What do default interface methods not give you that an abstract class does?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you enable nullable reference types on a 200,000-line legacy codebase?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Not all at once. Turning it on globally would produce thousands of warnings, everyone would
+          ignore them, and the feature would be worthless."</p>
+        <p>"I'd go project by project, starting with the ones where null bugs actually hurt — usually the
+          domain and application layers rather than the outer edges. Enable it in one project, fix that
+          project's warnings, treat them as errors from then on so they can't regress."</p>
+        <p>"For each project the work is mostly mechanical: mark things <code>?</code> that genuinely can be
+          null, and add guard clauses where they can't. The interesting part is that it forces you to
+          <em>decide</em> — and that's where you find the real bugs, in places where nobody had ever thought
+          about whether null was possible."</p>
+        <p>"I'd resist two shortcuts. The null-forgiving operator <code>!</code> silences the warning without
+          fixing anything, so I'd only use it where I can prove non-null and add a comment saying why.
+          And <code>#nullable disable</code> at the top of a file is a way of pretending you did the work."</p>
+        <p>"One thing I'd flag to the team: these are <strong>compile-time annotations only</strong>. A
+          non-nullable string can still be null at runtime — from deserialization, reflection, or a library
+          without annotations. So it doesn't remove the need to validate data at boundaries; it removes the
+          need to defensively null-check your own internal code."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know incremental adoption beats a big-bang change?</li>
+        <li>Do you know the annotations aren't enforced at runtime?</li>
+        <li>Do you recognise <code>!</code> as a smell rather than a solution?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does the <code>!</code> operator actually do?</li>
+          <li>How do you handle a third-party library with no annotations?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

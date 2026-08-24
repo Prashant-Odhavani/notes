@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Cloud — Overview</title>
+<meta name="description" content="How Azure questions are actually asked in .NET interviews, the decisions that matter, and how this section is organised.">
+<meta name="keywords" content="Azure overview for .NET developers compute options managed identity cost model well-architected framework service selection interview">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Azure Cloud</h1>
+    <p class="subtitle">Interviewers rarely test service trivia. They test whether you can choose between
+      services and explain what it costs you.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="how-asked">How Azure is actually assessed <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question shape</th><th>What they're checking</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>"Where would you host this?"</td>
+          <td><strong>Can you pick between App Service, Container Apps, AKS and Functions — and justify it?</strong></td>
+        </tr>
+        <tr>
+          <td>"Service Bus or Event Hubs or Event Grid?"</td>
+          <td>Do you know they solve different problems, not the same one at different scales</td>
+        </tr>
+        <tr>
+          <td>"How do you handle secrets?"</td>
+          <td><strong>Managed identity, or do you still put connection strings in config?</strong></td>
+        </tr>
+        <tr>
+          <td>"How would you debug this in production?"</td>
+          <td>Application Insights, KQL, distributed tracing</td>
+        </tr>
+        <tr>
+          <td>"The bill doubled. Why?"</td>
+          <td>Do you understand what each service actually charges for</td>
+        </tr>
+        <tr>
+          <td>"What happens when a region fails?"</td>
+          <td>Availability zones, paired regions, RPO and RTO</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The pattern in all of them</span>
+    <p><strong>Every answer is a trade-off, and naming the cost is what distinguishes a good one.</strong></p>
+    <p>"I'd use AKS" is weak. "I'd use Container Apps because we need scale-to-zero and Dapr but don't have a
+      platform team to run AKS — and we'd lose the fine-grained control if we later need custom scheduling" is
+      the shape they're listening for.</p>
+  </div>
+
+  <h2 id="compute">The compute decision <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th></th><th>App Service</th><th>Container Apps</th><th>AKS</th><th>Functions</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>You manage</td><td>Almost nothing</td><td>Very little</td><td><strong>The cluster</strong></td><td>Nothing</td></tr>
+        <tr><td>Scale to zero</td><td>No</td><td><strong>Yes</strong></td><td>No (node pools stay)</td><td><strong>Yes</strong></td></tr>
+        <tr><td>Containers</td><td>Optional</td><td>Required</td><td>Required</td><td>Optional</td></tr>
+        <tr><td>Control</td><td>Low</td><td>Moderate</td><td><strong>Total</strong></td><td>Lowest</td></tr>
+        <tr><td>Operational burden</td><td><strong>Lowest</strong></td><td>Low</td><td><strong>Highest</strong></td><td>Lowest</td></tr>
+        <tr><td>Best for</td><td>A web app or API</td><td><strong>Microservices without a platform team</strong></td><td>Complex orchestration, existing k8s skills</td><td>Event-driven, spiky, glue</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — Container Apps changed the default answer</div>
+    <p style="margin:0">The old choice was App Service for simple things and AKS for anything container-based, which
+      meant teams took on Kubernetes to get containers, service discovery and independent scaling.
+      <br><br>
+      <strong>Container Apps gives most of that without the cluster.</strong> It's Kubernetes underneath — KEDA for
+      event-driven scaling, Envoy for ingress, Dapr available — with none of it exposed. You get containers,
+      revisions, traffic splitting, scale-to-zero and managed certificates, and you never touch a node pool, a
+      cluster upgrade or a networking plugin.
+      <br><br>
+      So the honest position now: <strong>AKS needs justifying, not assuming.</strong> Reach for it when you
+      genuinely need custom scheduling, DaemonSets, operators, GPU workloads, a service mesh you control, or you
+      already have deep Kubernetes expertise and tooling.
+      <br><br>
+      "I'd use Container Apps unless we specifically need cluster-level control" is a stronger answer than
+      defaulting to AKS — because it recognises that running Kubernetes is a full-time commitment that many teams
+      take on without accounting for it.</p>
+  </div>
+
+  <h2 id="identity">Managed identity <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The single highest-value Azure practice</span>
+    <p>A managed identity is an Entra ID identity attached to your Azure resource. The platform issues and rotates
+      the tokens.</p>
+    <p>Which means <strong>there is no secret</strong> — nothing in configuration, nothing in Key Vault, nothing
+      to leak in a log or a screenshot or a repository.</p>
+  </div>
+
+  <pre data-label="csharp — no credentials anywhere" class="code-good"><code class="language-csharp">// One credential type works locally (your az login) and in Azure (managed identity)
+var credential = new DefaultAzureCredential();
+
+builder.Services.AddSingleton(new BlobServiceClient(
+    new Uri("https://myaccount.blob.core.windows.net"), credential));
+
+builder.Services.AddSingleton(new ServiceBusClient(
+    "mynamespace.servicebus.windows.net", credential));
+
+// Even SQL - no password in the connection string
+// "Server=tcp:my.database.windows.net;Database=app;Authentication=Active Directory Default;"</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>What can leak</th></tr></thead>
+      <tbody>
+        <tr><td>Connection string in <code>appsettings.json</code></td><td><strong>Everything</strong> — it's in source control</td></tr>
+        <tr><td>Connection string in app settings</td><td>Readable by anyone with portal access</td></tr>
+        <tr><td>Secret in Key Vault</td><td>The secret still exists, and needs rotating</td></tr>
+        <tr><td><strong>Managed identity</strong></td><td><strong>Nothing — there is no secret</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — Key Vault is an improvement, not the answer</div>
+    <p style="margin:0">"Put the secrets in Key Vault" is the common answer and it's a middle step. You've moved
+      the secret somewhere better and <strong>you still have a secret</strong> — to store, rotate, audit, and
+      grant access to.
+      <br><br>
+      Managed identity removes it entirely. There's no credential to rotate because there's no credential.
+      <br><br>
+      So the ordering is: <strong>managed identity wherever the service supports it</strong> — storage, Service
+      Bus, Key Vault, SQL, Cosmos, Event Hubs all do — and Key Vault only for secrets that genuinely can't be
+      replaced by an identity, typically third-party API keys.
+      <br><br>
+      And <code>DefaultAzureCredential</code> is what makes it practical: the same code authenticates via your
+      <code>az login</code> locally and via managed identity in Azure, so there's no
+      "works on my machine" divergence and no local secrets either.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr><td><a href="app-service.html">App Service</a></td><td>Plans and scaling, deployment slots, networking, the diagnostics that actually help</td></tr>
+        <tr><td><a href="functions.html">Azure Functions</a></td><td>Triggers and bindings, hosting plans, cold start, Durable Functions</td></tr>
+        <tr><td><a href="aks.html">AKS</a></td><td>Cluster architecture, node pools, identity, networking, upgrades — and when not to</td></tr>
+        <tr><td><a href="api-management.html">API Management</a></td><td>Policies, products, versioning, tiers, and the cost trap</td></tr>
+        <tr><td><a href="service-bus.html">Service Bus</a></td><td>Queues and topics, sessions, locks, dead-lettering, duplicate detection</td></tr>
+        <tr><td><a href="event-hubs.html">Event Hubs</a></td><td>Partitions, checkpointing, throughput units, Capture</td></tr>
+        <tr><td><a href="event-grid.html">Event Grid</a></td><td>Subscriptions, filtering, retries, CloudEvents</td></tr>
+        <tr><td><a href="storage.html">Storage Accounts</a></td><td>Blob tiers, redundancy, SAS tokens, lifecycle policies</td></tr>
+        <tr><td><a href="config-secrets.html">App Configuration &amp; Key Vault</a></td><td>Centralised config, feature flags, secret rotation</td></tr>
+        <tr><td><a href="application-insights.html">Application Insights</a></td><td>Telemetry model, sampling, KQL, tracing, and controlling cost</td></tr>
+        <tr><td><a href="comparisons.html">Service Comparisons</a></td><td><strong>The decision rules</strong> — messaging, compute, storage, config compared</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="cost">The cost model <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Service</th><th>What you're actually charged for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>App Service</strong></td><td>The <em>plan</em>, per hour, whether used or not</td></tr>
+        <tr><td><strong>Functions (Consumption)</strong></td><td>Executions and GB-seconds. Near zero when idle</td></tr>
+        <tr><td><strong>Container Apps</strong></td><td>vCPU-seconds and memory, with scale-to-zero</td></tr>
+        <tr><td><strong>AKS</strong></td><td>The <em>nodes</em>, always. The control plane is free</td></tr>
+        <tr><td><strong>Service Bus</strong></td><td>Operations (Standard) or messaging units (Premium)</td></tr>
+        <tr><td><strong>Event Hubs</strong></td><td>Throughput units plus ingress events</td></tr>
+        <tr><td><strong>Storage</strong></td><td>GB stored, <strong>plus transactions</strong>, plus egress</td></tr>
+        <tr><td><strong>Application Insights</strong></td><td><strong>GB of telemetry ingested</strong> — the surprise on most bills</td></tr>
+        <tr><td><strong>API Management</strong></td><td>The tier, per hour. Developer and Premium differ enormously</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The three costs that surprise teams</div>
+    <p style="margin:0"><strong>Application Insights ingestion.</strong> Billed per GB of telemetry. Verbose
+      logging on a high-traffic app can cost more than the compute running it. Sampling and log-level discipline
+      are cost controls, not just tidiness — covered on
+      <a href="application-insights.html#cost">the App Insights page</a>.
+      <br><br>
+      <strong>Storage transactions.</strong> Everyone budgets for GB stored; few budget for <em>operations</em>. A
+      chatty application doing millions of small blob reads can spend more on transactions than on storage — and
+      the cool and archive tiers have <em>higher</em> transaction costs, so moving data there to save money can
+      increase the bill if it's accessed often.
+      <br><br>
+      <strong>Cross-region egress.</strong> Data leaving a region is charged. A chatty service in one region
+      calling a database in another pays per byte, continuously, and it's invisible until you look at the
+      networking line.
+      <br><br>
+      All three share a shape: <strong>the obvious dimension is priced sensibly and a second dimension isn't
+      budgeted for.</strong> That's the thing to look for on any Azure bill.</p>
+  </div>
+
+  <details class="qa">
+    <summary>Where would you host a new .NET API on Azure? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd ask a few things first, because the answer genuinely depends: <strong>is it containerised, does it
+          need to scale to zero, how many services are we running, and do we have anyone to operate
+          Kubernetes?</strong>"</p>
+        <p>"For a <strong>single web API</strong> with steady traffic, <strong>App Service</strong>. It's the
+          lowest operational burden, deployment slots give zero-downtime releases and easy rollback, it has
+          built-in authentication, and there's essentially nothing to manage. Not fashionable, and frequently
+          correct."</p>
+        <p>"For <strong>several services</strong>, or anything containerised, my default is now <strong>Container
+          Apps</strong> rather than AKS. That's the answer that's changed in the last few years and it's worth
+          being explicit about."</p>
+        <p>"Container Apps is Kubernetes underneath — KEDA for event-driven scaling, Envoy for ingress, Dapr
+          available — with none of it exposed. So you get containers, revisions, traffic splitting for canary
+          releases, scale-to-zero, service discovery and managed certificates, and you never touch a node pool, a
+          cluster upgrade, or a CNI plugin."</p>
+        <p>"Which means <strong>AKS now needs justifying rather than assuming</strong>. I'd reach for it when
+          there's a genuine need for cluster-level control — custom scheduling, DaemonSets, operators, GPU
+          workloads, a service mesh we configure ourselves — or when the team already has deep Kubernetes
+          expertise and tooling, in which case the familiarity argument is real."</p>
+        <p>"Running AKS is a standing commitment: node image upgrades, Kubernetes version upgrades every few
+          months, networking, RBAC, cluster autoscaler tuning, and someone on call who understands it. Teams
+          routinely take that on to get containers, which Container Apps now provides without it."</p>
+        <p>"For <strong>event-driven or spiky work</strong> — a queue processor, a webhook handler, scheduled
+          jobs — <strong>Functions</strong> on the Consumption plan, because you pay almost nothing when idle and
+          it scales out automatically. The caveat is <strong>cold start</strong>, so I wouldn't put a
+          latency-sensitive user-facing API on Consumption; the Premium plan with pre-warmed instances fixes that
+          and costs like an App Service plan, at which point I'd ask what Functions is buying."</p>
+        <p>"Two things I'd decide regardless of the host."</p>
+        <p>"<strong>Managed identity, not connection strings.</strong> Storage, Service Bus, SQL, Cosmos and Key
+          Vault all support it, so there's no secret to store or rotate — and
+          <code>DefaultAzureCredential</code> means the same code works locally via
+          <code>az login</code>. 'Put the secrets in Key Vault' is a middle step; the better answer is not having
+          a secret."</p>
+        <p>"And <strong>Application Insights with OpenTelemetry</strong> from the start, because retrofitting
+          observability after the first production incident is much harder than having it — though I'd configure
+          sampling deliberately, since ingestion is billed per GB and verbose logging on a busy app can cost more
+          than the compute."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask about containers, scale-to-zero, service count and team capability?</li>
+        <li>Do you know Container Apps changed the default?</li>
+        <li>Will you say App Service when it's right?</li>
+        <li>Do you treat AKS as needing justification?</li>
+        <li>Do you know Functions' cold-start caveat?</li>
+        <li>Do you mention managed identity unprompted?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "AKS, because microservices."</li>
+        <li><span class="redflag">Red flag:</span> no mention of operational burden.</li>
+        <li><span class="redflag">Red flag:</span> connection strings in configuration.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do deployment slots actually work?</li>
+          <li>What causes a Functions cold start and how do you avoid it?</li>
+          <li>When would AKS genuinely be right?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Where this connects</div>
+    <p style="margin:0">Several Azure topics are already covered where they belong:
+      <a href="../10-sql/azure-sql.html">Azure SQL</a>,
+      <a href="../14-cosmos-db/index.html">Cosmos DB</a>, and
+      <a href="../16-redis/operations.html#monitoring">Azure Cache for Redis</a>. This section covers compute,
+      messaging, storage, configuration and observability — and
+      <a href="comparisons.html">the comparisons page</a> is the one to read if you only read one.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

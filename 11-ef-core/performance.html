@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EF Core Performance</title>
+<meta name="description" content="Diagnosing and fixing EF Core performance: query counting, projections, bulk operations, compiled queries, context pooling and connection resiliency.">
+<meta name="keywords" content="EF Core performance N+1 cartesian explosion AsNoTracking projection ExecuteUpdate ExecuteDelete bulk insert SqlBulkCopy compiled query DbContextPool connection pooling batching MaxBatchSize query cache tracking overhead measurement">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="11-ef-core/performance.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>EF Core Performance</h1>
+    <p class="subtitle">EF Core is fast. Most "EF is slow" problems are three or four specific mistakes, and
+      they're all measurable.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Count the queries first.</strong> That single number identifies most problems.</li>
+      <li><strong>Project into DTOs.</strong> Fewer columns, no tracking, covering-index eligible.</li>
+      <li><strong>Round trips dominate</strong> — 1,000 fast queries beat one slow query for total time.</li>
+      <li><strong><code>ExecuteUpdate</code>/<code>ExecuteDelete</code></strong> for set-based work. No
+        loading, no tracking.</li>
+      <li><strong><code>SqlBulkCopy</code></strong> for genuinely large inserts — orders of magnitude
+        faster.</li>
+      <li><strong>Compiled queries</strong> save query-plan compilation, not database time. Small, real win on
+        hot paths.</li>
+      <li><strong>Context pooling</strong> helps high-throughput APIs with simple contexts.</li>
+      <li><strong>Measure before and after.</strong> Most EF "optimisations" applied blind do nothing.</li>
+    </ul>
+  </div>
+
+  <h2 id="measure">Measure first <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — see the SQL and the query count" class="code-good"><code class="language-csharp">// Development configuration
+options.UseSqlServer(cs)
+       .LogTo(Console.WriteLine, new[] { DbLoggerCategory.Database.Command.Name },
+              LogLevel.Information)
+       .EnableSensitiveDataLogging()      // DEV ONLY - logs parameter values
+       .EnableDetailedErrors();</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>Tells you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>SQL logging</strong></td><td>Exactly what ran, and how many times. Start here</td></tr>
+        <tr><td><strong>MiniProfiler</strong></td><td>Query count and duration per request, in the browser</td></tr>
+        <tr><td><strong>OpenTelemetry / APM</strong></td><td>Database time as a share of request time, in production</td></tr>
+        <tr><td><strong><a href="../10-sql/performance.html#finding-queries">Query Store</a></strong></td><td>Which queries actually cost the most across the whole workload</td></tr>
+        <tr><td><strong>BenchmarkDotNet</strong></td><td>Comparing two approaches properly</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The counter worth adding permanently</div>
+    <pre data-label="csharp"><code class="language-csharp">public class QueryCountInterceptor : DbCommandInterceptor
+{
+    public static readonly AsyncLocal&lt;int&gt; Count = new();
+
+    public override InterceptionResult&lt;DbDataReader&gt; ReaderExecuting(
+        DbCommand command, CommandEventData e, InterceptionResult&lt;DbDataReader&gt; result)
+    {
+        Count.Value++;
+        return result;
+    }
+}
+// Log it per request in dev; assert on it in integration tests.</code></pre>
+    <p style="margin:0">An integration test asserting "this endpoint issues at most 4 queries" catches N+1
+      regressions permanently. Without it, someone adds a field to a response model in six months and the
+      endpoint quietly goes back to 400 queries.
+      <br><br>
+      This is the single most effective EF performance practice I know, because it turns a recurring problem
+      into a build failure.</p>
+  </div>
+
+  <h2 id="round-trips">Round trips are the dominant cost <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Fetching 100 items from a warehouse.</p>
+    <p>One trip with a trolley: a few minutes. A hundred separate trips, each one fast: an afternoon.</p>
+    <p>The walking is the cost, not the lifting.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pattern</th><th>Round trips</th><th>Typical cost</th></tr></thead>
+      <tbody>
+        <tr><td>1,000 lazy-loaded navigations</td><td><strong>1,001</strong></td><td>~1 second of pure latency</td></tr>
+        <tr><td><code>Include</code></td><td>1</td><td>~10ms</td></tr>
+        <tr><td>Projection</td><td>1, fewer columns</td><td>~5ms</td></tr>
+        <tr><td><code>SaveChanges</code> in a loop, 1,000 items</td><td>1,000 transactions</td><td>~10 seconds</td></tr>
+        <tr><td><code>AddRange</code> then one <code>SaveChanges</code></td><td>~25 batches</td><td>~300ms</td></tr>
+        <tr><td><code>SqlBulkCopy</code></td><td>1 stream</td><td>~50ms</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Latency multiplies; work adds.</strong></p>
+    <p>A cloud database at 1–2ms per round trip means 1,000 round trips is a second or two of doing nothing.
+      That's why query <em>count</em> matters more than query <em>speed</em>, and why it's the first thing to
+      look at.</p>
+  </div>
+
+  <h2 id="projection">Projection is the biggest single win <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — loads everything to show four fields" class="code-bad"><code class="language-csharp">var orders = await db.Orders
+    .Include(o =&gt; o.Customer)
+    .Include(o =&gt; o.Lines)
+    .Where(o =&gt; o.CustomerId == id)
+    .ToListAsync();
+
+// 40 Order columns + 25 Customer columns + every line, all tracked,
+// to render Id, date, customer name and a total.</code></pre>
+
+  <pre data-label="csharp — asks for exactly what's needed" class="code-good"><code class="language-csharp">var orders = await db.Orders
+    .Where(o =&gt; o.CustomerId == id)
+    .Select(o =&gt; new OrderListItem
+    {
+        Id           = o.Id,
+        CreatedUtc   = o.CreatedUtc,
+        CustomerName = o.Customer.Name,            // JOIN, one column
+        LineCount    = o.Lines.Count(),            // COUNT in SQL
+        Total        = o.Lines.Sum(l =&gt; l.Total)   // SUM in SQL
+    })
+    .ToListAsync();</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Projection gives you</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td>Fewer columns transferred</td><td>Only what's in the <code>Select</code></td></tr>
+        <tr><td>No change tracking</td><td>Non-entity results aren't tracked</td></tr>
+        <tr><td>No cartesian explosion</td><td>Collections become correlated subqueries</td></tr>
+        <tr><td>Aggregates computed in the database</td><td><code>COUNT</code>/<code>SUM</code> instead of loading rows to count</td></tr>
+        <tr><td><a href="../10-sql/indexing.html#covering">Covering index</a> eligibility</td><td>Narrow column set can be served entirely from an index</td></tr>
+        <tr><td>No over-posting risk</td><td>You can't accidentally serialise a field you didn't intend to</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — projection is a design decision, not a tweak</div>
+    <p style="margin:0">Loading entities to build a response is a category error: an entity models the
+      <em>write</em> side — invariants, behaviour, identity. A response models what a screen needs.
+      <br><br>
+      Once you separate them, the performance benefits follow automatically, and you stop leaking domain
+      structure into your API contract. That's the read-model idea from
+      <a href="../18-design-patterns/enterprise.html#cqrs">CQRS</a> applied at the smallest useful scale — no
+      separate database, no eventual consistency, just a different query.
+      <br><br>
+      Framing it that way is much stronger than "projection is faster", because it explains why it keeps being
+      the answer.</p>
+  </div>
+
+  <h2 id="bulk">Bulk operations <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <h3 id="bulk-update">Set-based update and delete</h3>
+
+  <pre data-label="csharp — loads 50,000 entities to change one column" class="code-bad"><code class="language-csharp">var stale = await db.Orders
+    .Where(o =&gt; o.CreatedUtc &lt; cutoff &amp;&amp; o.Status == OrderStatus.Pending)
+    .ToListAsync();                       // 50,000 entities materialised and tracked
+
+foreach (var o in stale) o.Status = OrderStatus.Expired;
+await db.SaveChangesAsync();              // 50,000 UPDATE statements, batched</code></pre>
+
+  <pre data-label="csharp — one statement (EF Core 7+)" class="code-good"><code class="language-csharp">var affected = await db.Orders
+    .Where(o =&gt; o.CreatedUtc &lt; cutoff &amp;&amp; o.Status == OrderStatus.Pending)
+    .ExecuteUpdateAsync(s =&gt; s.SetProperty(o =&gt; o.Status, OrderStatus.Expired));
+
+// UPDATE [Order] SET Status = @p WHERE CreatedUtc < @c AND Status = @s
+// Nothing loaded. Nothing tracked. One round trip.</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">What <code>ExecuteUpdate</code> and <code>ExecuteDelete</code> skip</div>
+    <p style="margin:0">They generate SQL directly, which means they bypass:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Change tracking</strong> — already-loaded entities keep stale values, and a later
+        <code>SaveChanges</code> can overwrite your update.</li>
+      <li><strong>Interceptors</strong> — audit stamps and soft-delete conversion don't run.</li>
+      <li><strong>The <code>SaveChanges</code> transaction</strong> — wrap both in an explicit transaction if
+        they must be atomic together.</li>
+      <li><strong>Cascade behaviour configured in EF</strong> — the database's FK actions still apply, but EF's
+        in-memory cascade doesn't.</li>
+    </ul>
+    <p style="margin:8px 0 0">Also worth knowing: a large <code>ExecuteDelete</code> is still one big
+      transaction, so it can escalate to a
+      <a href="../10-sql/transactions.html#escalation">table lock</a>. Batch it with
+      <code>.OrderBy(...).Take(5000)</code> in a loop for very large deletes.</p>
+  </div>
+
+  <h3 id="bulk-insert">Bulk insert</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rows</th><th>Approach</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Up to ~1,000</td><td><code>AddRange</code> + one <code>SaveChanges</code></td><td>Batching handles it fine</td></tr>
+        <tr><td>~1,000–50,000</td><td>Chunk it — 2,000 per context</td><td>Keeps the tracker and transaction bounded</td></tr>
+        <tr><td>50,000+</td><td><strong><code>SqlBulkCopy</code></strong>, or a bulk-extension library</td><td>Streams rows; minimal logging; 10–100× faster</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — chunked, with a fresh context per chunk" class="code-good"><code class="language-csharp">const int ChunkSize = 2_000;
+
+foreach (var chunk in items.Chunk(ChunkSize))
+{
+    await using var db = await factory.CreateDbContextAsync();
+    db.ChangeTracker.AutoDetectChangesEnabled = false;   // O(n^2) otherwise
+    db.Orders.AddRange(chunk);
+    await db.SaveChangesAsync();
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Why one context for 500,000 entities collapses</div>
+    <p style="margin:0"><strong>Change detection is O(n) per call and it runs on every
+      <code>Add</code></strong>, so adding n entities to one context is roughly O(n²).
+      <br><br>
+      At 500,000 entities that isn't "slow" — it effectively stops. Memory also holds every entity plus its
+      snapshot.
+      <br><br>
+      Two fixes: <code>AutoDetectChangesEnabled = false</code> while bulk-adding (call
+      <code>ChangeTracker.DetectChanges()</code> once before saving if needed), and a fresh context per chunk so
+      the tracker starts empty. Both matter; the fresh context matters more.</p>
+  </div>
+
+  <pre data-label="csharp — SqlBulkCopy for genuinely large loads"><code class="language-csharp">using var bulk = new SqlBulkCopy(connection)
+{
+    DestinationTableName = "dbo.[Order]",
+    BatchSize            = 10_000,
+    BulkCopyTimeout      = 0
+};
+bulk.ColumnMappings.Add(nameof(Order.CustomerId), "CustomerId");
+bulk.ColumnMappings.Add(nameof(Order.Total),      "Total");
+
+await bulk.WriteToServerAsync(dataReader);</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Knowing when to stop using the ORM is a senior signal</div>
+    <p style="margin:0">"I'd use <code>SqlBulkCopy</code> for a 2-million-row import" is a stronger answer than
+      any EF tuning, because it recognises that change tracking has no value when there's nothing to track.
+      <br><br>
+      The same reasoning applies to reporting queries: if there's no object graph to mutate, an ORM is doing
+      work you're paying for and not using.</p>
+  </div>
+
+  <h2 id="compiled">Compiled queries <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="csharp"><code class="language-csharp">private static readonly Func&lt;AppDbContext, int, Task&lt;Order?&gt;&gt; GetOrderById =
+    EF.CompileAsyncQuery((AppDbContext db, int id) =&gt;
+        db.Orders.FirstOrDefault(o =&gt; o.Id == id));
+
+// Usage
+var order = await GetOrderById(db, id);</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">What they actually save</span>
+    <p>EF caches query plans automatically, keyed on the expression-tree shape. But it still has to
+      <strong>walk and hash the expression tree</strong> on every call to find the cache entry.</p>
+    <p>A compiled query skips that. It saves CPU in your process, not database time.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Realistic expectations</div>
+    <p style="margin:0">Typically <strong>10–30% off the EF overhead</strong> — which on a query where the
+      database takes 20ms and EF takes 0.3ms is noise.
+      <br><br>
+      Worth it for a genuinely hot, simple, unchanging query executed thousands of times a second. Not worth
+      the loss of readability anywhere else, and it can't be built dynamically, so it doesn't work for queries
+      with optional filters.
+      <br><br>
+      If someone reaches for compiled queries before fixing an N+1, they're optimising the wrong order of
+      magnitude — and saying so is the better interview answer.</p>
+  </div>
+
+  <h2 id="pooling">Context pooling <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="csharp"><code class="language-csharp">builder.Services.AddDbContextPool&lt;AppDbContext&gt;(
+    o =&gt; o.UseSqlServer(cs), poolSize: 128);</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Instead of constructing a <code>DbContext</code> per request, instances are reused — reset and returned
+      to a pool at the end of the request.</p>
+    <p>It avoids the cost of building the internal service provider and model reference each time.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Works when</th><th>Breaks when</th></tr></thead>
+      <tbody>
+        <tr><td>The context has a parameterless-ish constructor taking only options</td><td>The context injects scoped services — a tenant provider, a user context</td></tr>
+        <tr><td>No per-request state on the context</td><td>You store <code>_tenantId</code> or similar as a field</td></tr>
+        <tr><td>Very high request throughput</td><td>Moderate traffic — the gain is unmeasurable</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The pooling bug that leaks data across tenants</div>
+    <p style="margin:0">If your context holds a <code>_tenantId</code> field — commonly used with a
+      <a href="querying.html#query-filters">global query filter</a> — pooling reuses the instance
+      <strong>with the previous request's value</strong> unless you explicitly reset it.
+      <br><br>
+      That's a cross-tenant data leak that appears only under concurrency, in production, intermittently.
+      <br><br>
+      Pooling is safe for a stateless context and dangerous for a stateful one. Given the gain is only
+      meaningful at very high throughput, <strong>I wouldn't enable it without a measured reason</strong> — the
+      risk/reward is poor otherwise.</p>
+  </div>
+
+  <h2 id="other">Smaller wins worth knowing <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>AsNoTracking()</code></td><td>10–30% on read queries returning entities. Free if you're not saving</td></tr>
+        <tr><td><code>AsNoTrackingWithIdentityResolution()</code></td><td>No tracking, but avoids duplicate object instances</td></tr>
+        <tr><td><code>AsSplitQuery()</code></td><td>Removes row multiplication from multiple collection includes</td></tr>
+        <tr><td><code>MaxBatchSize</code></td><td>Tune how many statements EF batches per round trip</td></tr>
+        <tr><td><code>CommandTimeout</code></td><td>Not a speed-up — stops a runaway query holding a connection</td></tr>
+        <tr><td><code>TagWith("...")</code></td><td>Adds a SQL comment so you can trace a slow query back to the C# that made it</td></tr>
+        <tr><td><code>AsAsyncEnumerable()</code></td><td>Streams results instead of buffering a huge list in memory</td></tr>
+        <tr><td>Async everywhere</td><td>Doesn't speed up one query; massively improves <a href="../05-csharp-advanced/async-await.html">thread-pool throughput</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title"><code>TagWith</code> is underrated</div>
+    <pre data-label="csharp"><code class="language-csharp">var orders = await db.Orders
+    .TagWith("OrderController.GetRecent")
+    .Where(o =&gt; o.CustomerId == id)
+    .ToListAsync();
+// SQL gets: -- OrderController.GetRecent</code></pre>
+    <p style="margin:0">When a DBA shows you a slow query from Query Store, that comment tells you exactly
+      which C# produced it. Without it, mapping generated SQL back to source is genuinely painful on a large
+      codebase.</p>
+  </div>
+
+  <h2 id="priority">Fix things in this order <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <ol class="steps">
+    <li><strong>Query count</strong> — eliminate N+1. Usually 10–100× wins.</li>
+    <li><strong>Row count</strong> — fix cartesian explosion and unbounded result sets. Often 10×.</li>
+    <li><strong>Column count</strong> — project instead of loading entities. Often 2–5×.</li>
+    <li><strong>Database indexes</strong> — the query is now sensible; make it fast. Sometimes 100×.</li>
+    <li><strong>Set-based operations</strong> — <code>ExecuteUpdate</code>, bulk copy. 10–100× on writes.</li>
+    <li><strong>Tracking</strong> — <code>AsNoTracking</code>. 10–30%.</li>
+    <li><strong>Micro-optimisation</strong> — compiled queries, pooling. Single-digit percentages.</li>
+  </ol>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Steps 1 to 4 are almost always where the time is.</strong> Steps 6 and 7 are where people start,
+      because they're the ones with names.</p>
+    <p>If someone proposes context pooling before checking the query count, they're chasing 3% while ignoring
+      a 50× problem.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Log the SQL and count queries. Assert on the count in integration tests.</li>
+      <li>Round trips dominate — latency multiplies while work adds.</li>
+      <li>Projection fixes columns, tracking, row bloat and aggregates in one change.</li>
+      <li><code>ExecuteUpdate</code>/<code>ExecuteDelete</code> for set-based writes — but they bypass
+        tracking, interceptors and the save transaction.</li>
+      <li>Chunk large inserts with a fresh context; disable auto-detect-changes.</li>
+      <li><code>SqlBulkCopy</code> past roughly 50,000 rows.</li>
+      <li>Compiled queries save EF overhead, not database time.</li>
+      <li>Context pooling is dangerous with a stateful context — cross-tenant leaks.</li>
+      <li><code>TagWith</code> to trace generated SQL back to source.</li>
+      <li>Fix query count, then rows, then columns, then indexes. Micro-optimise last.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Optimising without measuring</strong>, then not knowing what helped.</li>
+    <li><strong>Loading entities to build a response.</strong></li>
+    <li><strong>Loading a collection to <code>.Count()</code> it.</strong></li>
+    <li><strong><code>SaveChanges</code> inside a loop.</strong></li>
+    <li><strong>500,000 entities in one context</strong> — O(n²) change detection.</li>
+    <li><strong><code>ExecuteUpdate</code> on already-tracked entities</strong>, then saving stale values back.</li>
+    <li><strong>Compiled queries before fixing N+1.</strong></li>
+    <li><strong>Context pooling with a tenant field on the context.</strong></li>
+    <li><strong>Blaming EF for a missing database index.</strong></li>
+    <li><strong>Testing on 200 rows</strong> when production has 8 million.</li>
+    <li><strong><code>EnableSensitiveDataLogging</code> left on in production.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How would you update the status of 100,000 rows? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Not by loading them. The naive version — query them into a list, loop setting the property, call
+          <code>SaveChanges</code> — materialises 100,000 entities with snapshots, then issues 100,000
+          <code>UPDATE</code> statements. Batched, so it's not 100,000 round trips, but it's still a huge
+          amount of pointless work."</p>
+        <p>"Since EF Core 7 the right answer is <code>ExecuteUpdateAsync</code>:
+          <code>db.Orders.Where(...).ExecuteUpdateAsync(s =&gt; s.SetProperty(o =&gt; o.Status,
+          OrderStatus.Expired))</code>. That translates to a single <code>UPDATE ... WHERE ...</code>. Nothing
+          loaded, nothing tracked, one round trip. Before EF Core 7 this needed
+          <code>ExecuteSqlRaw</code>, which is why a lot of older code does it the slow way."</p>
+        <p>"Three things I'd be careful about."</p>
+        <p>"<strong>It bypasses the change tracker</strong>, so any of those entities already loaded in the
+          context keep their old values — and a subsequent <code>SaveChanges</code> could write them back over
+          my update. It also skips interceptors, so audit stamps and soft-delete conversion don't run. If audit
+          fields matter here I'd set them in the <code>SetProperty</code> calls explicitly."</p>
+        <p>"<strong>It's one transaction</strong>, so 100,000 rows can cross the lock escalation threshold and
+          take a table lock, blocking the application for the duration. At this size I'd batch it —
+          <code>.OrderBy(o =&gt; o.Id).Take(5000)</code> in a loop until zero rows are affected, with a short
+          delay between batches. Slower in wall clock, invisible to users, and resumable if it's
+          interrupted."</p>
+        <p>"<strong>It isn't in the <code>SaveChanges</code> transaction</strong>, so if it needs to be atomic
+          with other changes I'd wrap both in an explicit transaction."</p>
+        <p>"For the analogous <em>insert</em> case — 100,000 new rows — I'd use <code>SqlBulkCopy</code> rather
+          than EF at all. Change tracking has no value when there's nothing to track, and bulk copy streams the
+          rows with minimal logging, typically 10 to 100 times faster. Recognising when to stop using the ORM is
+          part of using it well."</p>
+        <p>"And I'd ask whether this should be an online operation at all. A 100,000-row status change is often
+          a maintenance job, in which case batching plus off-peak scheduling matters more than raw speed."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>ExecuteUpdate</code> exists?</li>
+        <li>Do you know what it bypasses?</li>
+        <li>Do you think about lock escalation and batching?</li>
+        <li>Do you know when to leave the ORM entirely?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> load-loop-save with no concern.</li>
+        <li><span class="redflag">Red flag:</span> <code>ExecuteUpdate</code> with no awareness of tracking or
+          locking implications.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you set audit fields with <code>ExecuteUpdate</code>?</li>
+          <li>Why does batching avoid the table lock?</li>
+          <li>How would you make the job resumable?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>The team says "EF Core is too slow, we should replace it with Dapper." How do you respond? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd want to see the measurements before agreeing to a rewrite, because in my experience 'EF is
+          slow' almost always turns out to be three or four specific mistakes rather than the framework — and
+          those mistakes are usually cheaper to fix than to migrate away from."</p>
+        <p>"The first thing I'd do is <strong>turn on SQL logging and count queries per request</strong>. That
+          one number usually identifies the problem in minutes."</p>
+        <p>"<strong>Hundreds of queries</strong> means N+1 — lazy loading, or a loop touching navigations. That's
+          not an EF speed problem, it's a usage problem, and Dapper wouldn't fix it either. Written badly,
+          Dapper produces exactly the same N+1 — you'd just be writing the SQL for it by hand."</p>
+        <p>"<strong>One enormous query</strong> means cartesian explosion from multiple collection includes.
+          Fixed with <code>AsSplitQuery</code> or a projection."</p>
+        <p>"<strong>A reasonable query that's slow</strong> means it's a database problem — missing index,
+          non-SARGable predicate, bad statistics. Rewriting the data layer changes nothing; the same SQL would
+          be equally slow from Dapper."</p>
+        <p>"The other thing I'd check is whether we're <strong>loading entities to build API responses</strong>.
+          That's extremely common and it's the biggest easy win — projecting into DTOs cuts columns, removes
+          tracking, avoids row multiplication and computes aggregates in SQL, all in one change."</p>
+        <p>"Now, EF does have real overhead: change tracking, expression-tree translation, entity
+          materialisation. Dapper is genuinely faster per query. But that overhead is typically a fraction of a
+          millisecond against a database call of 5 to 50 milliseconds. If we're 12 seconds slow, EF's overhead
+          is not where those 12 seconds are."</p>
+        <p>"So my counter-proposal wouldn't be 'keep EF, it's fine' — it'd be <strong>fix the actual problems,
+          then use both deliberately</strong>. EF Core for the write side and CRUD, where change tracking,
+          dependency-ordered inserts and migrations do real work I don't want to hand-write. Dapper for complex
+          reporting queries and any genuinely hot read path, where I want to control the SQL exactly. They share
+          a connection and transaction, so mixing them costs nothing architecturally."</p>
+        <p>"On the cost side: a full migration to Dapper means rewriting every query, losing migrations —
+          so schema management needs replacing too — losing dependency-ordered saves, and hand-writing all the
+          concurrency handling. That's months of work with a real regression risk, and afterwards the N+1 is
+          still there unless someone fixes it. Whereas the projection and <code>AsSplitQuery</code> changes are
+          days."</p>
+        <p>"I'd also want to know what's driving this. Sometimes 'EF is slow' really means 'we don't understand
+          what SQL it's generating', and the fix is turning on logging plus a query-count assertion in
+          integration tests. That gives the team visibility and stops the problem recurring — which a rewrite
+          wouldn't."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask for evidence before agreeing to a rewrite?</li>
+        <li>Do you know the real causes and that Dapper wouldn't fix them?</li>
+        <li>Are you honest that EF has genuine overhead, and about its scale?</li>
+        <li>Can you cost the alternative?</li>
+        <li>Do you propose using both rather than picking a side?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> agreeing immediately.</li>
+        <li><span class="redflag">Red flag:</span> defending EF with no acknowledgement of its overhead.</li>
+        <li><span class="redflag">Red flag:</span> no diagnostic plan.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Show me how you'd share a transaction between them.</li>
+          <li>What would you replace migrations with?</li>
+          <li>How do you stop N+1 coming back?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

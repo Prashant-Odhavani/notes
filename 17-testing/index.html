@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing — Overview</title>
+<meta name="description" content="What tests are actually for, why most suites fail at the thing they were meant to enable, and how this section is organised.">
+<meta name="keywords" content="testing overview why tests test strategy .NET brittle tests refactoring confidence coverage misuse test value">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="17-testing/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Testing</h1>
+    <p class="subtitle">The point of a test suite is that you can change the code with confidence. Most suites
+      fail at exactly that.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="what-for">What tests are actually for <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Tests exist so you can <strong>change the code without being afraid</strong>.</p>
+    <p>Everything else — catching bugs, documenting behaviour, driving design — follows from that or is a
+      secondary benefit. If a test suite makes change harder rather than easier, it has failed at its primary
+      job however green it is.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>A test earns its place if it</th><th>A test costs you if it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Fails when behaviour breaks</strong></td><td>Passes while behaviour is broken</td></tr>
+        <tr><td><strong>Passes through a refactor</strong></td><td><strong>Fails on every refactor</strong></td></tr>
+        <tr><td>Tells you what broke, quickly</td><td>Fails ambiguously, or intermittently</td></tr>
+        <tr><td>Documents an intended behaviour</td><td>Documents an implementation detail</td></tr>
+        <tr><td>Runs fast enough to run often</td><td>Is slow enough that people skip it</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The two failure modes, and the second is more common</div>
+    <p style="margin:0"><strong>False negatives</strong> — the test passes while the code is broken. Obvious, and
+      what everyone worries about.
+      <br><br>
+      <strong>False positives</strong> — the test fails when nothing is broken. This is the one that destroys
+      suites, and it's more common.
+      <br><br>
+      A test that fails every time you rename a private method, extract a class, or change how something is
+      implemented internally isn't protecting you. It's <strong>taxing every change</strong>. And the predictable
+      response is that people stop trusting failures, start re-running until green, and eventually delete or
+      disable the suite.
+      <br><br>
+      So "our tests break every time we refactor" isn't a minor annoyance — it's a diagnosis. It means the tests
+      are coupled to implementation rather than behaviour, and the suite is actively preventing the thing it was
+      written to enable.</p>
+  </div>
+
+  <h2 id="the-central-distinction">Behaviour, not implementation <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — coupled to implementation" class="code-bad"><code class="language-csharp">[Fact]
+public void PlaceOrder_calls_repository_then_publishes()
+{
+    _sut.PlaceOrder(order);
+
+    // Asserting HOW it works. Every one of these breaks on refactor.
+    _repository.Verify(r =&gt; r.Add(It.IsAny&lt;Order&gt;()), Times.Once);
+    _repository.Verify(r =&gt; r.SaveChanges(), Times.Once);
+    _publisher.Verify(p =&gt; p.Publish(It.IsAny&lt;OrderPlaced&gt;()), Times.Once);
+    _logger.Verify(l =&gt; l.LogInformation(It.IsAny&lt;string&gt;()), Times.Once);
+}</code></pre>
+
+  <pre data-label="csharp — asserts observable behaviour" class="code-good"><code class="language-csharp">[Fact]
+public async Task Placing_an_order_reserves_stock_and_confirms_it()
+{
+    var result = await _sut.PlaceOrderAsync(AnOrder.With(quantity: 2));
+
+    result.IsSuccess.Should().BeTrue();
+
+    var saved = await _db.Orders.SingleAsync();
+    saved.Status.Should().Be(OrderStatus.Confirmed);
+
+    (await _db.Inventory.SingleAsync()).Available.Should().Be(8);   // was 10
+}</code></pre>
+
+  <div class="remember">
+    <span class="r-label">The test to apply</span>
+    <p><strong>If I restructure the internals without changing what the system does, should this test
+      fail?</strong></p>
+    <p>If yes, the test is coupled to implementation and will cost you on every change.</p>
+    <p>Assert on <strong>return values, observable state, and messages that cross a boundary</strong>. Not on
+      which internal collaborators were called in what order.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — where the boundary sits determines everything</div>
+    <p style="margin:0">The reason most .NET test suites are brittle is that they treat <strong>every class</strong>
+      as a unit and mock every collaborator. So each test is welded to one class's exact dependencies, and
+      extracting a helper breaks a dozen tests.
+      <br><br>
+      A more useful notion of a unit is a <strong>behaviour</strong>, exercised through a stable entry point —
+      typically an application-service or handler method — with mocks only at genuine boundaries: the network, the
+      clock, the file system, a third-party API.
+      <br><br>
+      <strong>Internal collaborators are implementation detail and should be real.</strong> If a handler uses three
+      domain services, let it use them; the test asserts the outcome. Then extracting a fourth service breaks
+      nothing.
+      <br><br>
+      That single shift — mock at boundaries, not at class edges — is the difference between a suite that enables
+      refactoring and one that prevents it. It's covered in detail on
+      <a href="fundamentals.html#what-to-mock">the fundamentals page</a>.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">Fundamentals &amp; Test Doubles</a></td>
+          <td>The pyramid and its honest limits, arrange-act-assert, mocks vs stubs vs fakes, what to mock and
+              what not to, testing time and randomness</td>
+        </tr>
+        <tr>
+          <td><a href="dotnet-practice.html">Testing in .NET</a></td>
+          <td>xUnit mechanics, Moq and NSubstitute, async pitfalls,
+              <code>WebApplicationFactory</code>, Testcontainers, testing EF Core properly</td>
+        </tr>
+        <tr>
+          <td><a href="strategy.html">Strategy, Coverage &amp; CI</a></td>
+          <td>Which levels to invest in, coverage as a metric, mutation testing, flaky tests, and what belongs
+              in the pipeline</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="coverage-position">On coverage <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="note warn">
+    <div class="note-title">Coverage measures execution, not verification</div>
+    <p style="margin:0">A line is covered if a test <em>executed</em> it. Nothing about whether the test would
+      notice if that line were wrong.
+      <br><br>
+      Which means you can reach 90% coverage with tests that assert almost nothing — and this happens routinely
+      when coverage becomes a target. Auto-generated tests, tests that call a method and assert it doesn't throw,
+      tests over getters and setters.
+      <br><br>
+      Meanwhile the things that break in production — error paths, boundary conditions, concurrent access,
+      malformed input — are frequently the <em>uncovered</em> parts, because they're harder to write tests
+      for.
+      <br><br>
+      <strong>Coverage is useful as a diagnostic and harmful as a target.</strong> Low coverage in an important
+      area is a real signal worth investigating. A mandated percentage produces tests written to satisfy the
+      number.
+      <br><br>
+      If you want to know whether tests actually verify anything,
+      <a href="strategy.html#mutation">mutation testing</a> measures that directly — it changes the code and
+      checks whether a test notices.</p>
+  </div>
+
+  <details class="qa">
+    <summary>What makes a good test? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start from what tests are <em>for</em>: <strong>being able to change the code without being
+          afraid</strong>. So a good test is one that fails when behaviour breaks and survives a refactor."</p>
+        <p>"That second half is the part people underweight. Everyone worries about tests that pass while the code
+          is broken — false negatives. But <strong>false positives destroy suites</strong>: a test that fails every
+          time you rename a private method or extract a class isn't protecting you, it's taxing every change. And
+          the predictable outcome is that people stop trusting failures, re-run until green, and eventually
+          disable the suite."</p>
+        <p>"So the question I apply is: <strong>if I restructure the internals without changing what the system
+          does, should this test fail?</strong> If yes, it's coupled to implementation."</p>
+        <p>"Concretely that means asserting on <strong>return values, observable state, and messages crossing a
+          boundary</strong> — not on which internal collaborators were called in what order. A test with four
+          <code>Verify</code> calls checking that the repository was called then the publisher was called is
+          documenting the current implementation, and it will break the moment that implementation changes for
+          any reason, including a legitimate improvement."</p>
+        <p>"The related decision is <strong>where the boundary sits</strong>, and I think that's the root cause of
+          most brittle .NET suites. If you treat every class as a unit and mock every collaborator, each test is
+          welded to one class's exact dependencies — so extracting a helper breaks a dozen tests that were all
+          passing and all still correct."</p>
+        <p>"I'd rather define a unit as a <strong>behaviour</strong>, exercised through a stable entry point like
+          an application service or handler, with test doubles only at genuine boundaries: the network, the clock,
+          the file system, a third-party API. Internal collaborators are implementation detail and should be
+          real."</p>
+        <p>"Beyond that, the practical properties: <strong>fast enough that people run it</strong> — a suite taking
+          twenty minutes gets skipped; <strong>deterministic</strong>, because a flaky test is worse than no test
+          since it trains people to ignore failures; <strong>independent</strong>, so tests can run in any order
+          without shared state; and <strong>clear on failure</strong>, so the name and assertion tell you what
+          broke without opening the file."</p>
+        <p>"And I'd name what I <em>don't</em> use as a quality measure: <strong>coverage</strong>. It measures
+          whether a line was executed, not whether a test would notice if it were wrong. You can hit 90% with
+          tests that assert nothing, and that's exactly what happens when coverage becomes a target. It's a useful
+          diagnostic — low coverage somewhere important is worth investigating — and a harmful goal. If I wanted
+          to know whether tests genuinely verify behaviour, mutation testing measures that directly."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know false positives are the bigger problem?</li>
+        <li>Do you distinguish behaviour from implementation, with a usable test for it?</li>
+        <li>Do you have a view on where the unit boundary sits?</li>
+        <li>Are you sceptical of coverage as a target?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "high coverage and one assertion per test."</li>
+        <li><span class="redflag">Red flag:</span> mocking every dependency as a default.</li>
+        <li><span class="redflag">Red flag:</span> no acknowledgement that tests can make change harder.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>When would you mock something?</li>
+          <li>How do you handle a flaky test?</li>
+          <li>What's mutation testing?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Where this connects</div>
+    <p style="margin:0">Testing appears throughout the handbook rather than only here:
+      <a href="../31-angular/performance-testing.html#testing">Angular</a> and
+      <a href="../32-react/testing-security.html#testing">React</a> testing strategy,
+      <a href="../20-microservices/operations.html#testing">contract tests for microservices</a>, and
+      <a href="../29-sdlc/testing.html">testing within the delivery process</a>. This section is the
+      language-agnostic core plus the .NET specifics.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

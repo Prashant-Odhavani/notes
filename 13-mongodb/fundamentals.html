@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documents &amp; Schema Design — MongoDB</title>
+<meta name="description" content="BSON types, embedding vs referencing, the document design patterns and anti-patterns, schema validation and the 16 MB limit.">
+<meta name="keywords" content="MongoDB BSON document schema design embedding referencing unbounded array anti-pattern bucket pattern extended reference computed pattern subset pattern outlier polymorphic schema validation JSON Schema 16MB limit ObjectId denormalization">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="13-mongodb/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Documents &amp; Schema Design</h1>
+    <p class="subtitle">This is the page that matters. Almost every MongoDB production problem traces back to
+      a modelling decision.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Data read together should be stored together.</strong> The one rule everything follows
+        from.</li>
+      <li><strong>Embed</strong> for one-to-few, owned, read-as-a-unit data. <strong>Reference</strong> for
+        one-to-many, shared, or independently-queried data.</li>
+      <li><strong>Unbounded arrays are the number one anti-pattern.</strong> Any array that grows without limit
+        is a future outage.</li>
+      <li><strong>16 MB document limit</strong> — a hard ceiling, and if you're near it the model is wrong.</li>
+      <li><strong>Duplication is expected</strong>, but you must decide how it stays consistent.</li>
+      <li><strong>Turn on schema validation</strong> once the shape settles.</li>
+      <li><strong>Documents growing in place cause moves</strong> — size them realistically up front.</li>
+    </ul>
+  </div>
+
+  <h2 id="bson">BSON types worth knowing <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>BSON</th><th>.NET</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><code>ObjectId</code></td><td><code>ObjectId</code></td><td>12 bytes, starts with a timestamp — so it sorts roughly by creation time</td></tr>
+        <tr><td><code>String</code></td><td><code>string</code></td><td>UTF-8</td></tr>
+        <tr><td><code>Int32</code> / <code>Int64</code></td><td><code>int</code> / <code>long</code></td><td>Distinct types — a field can change type between documents</td></tr>
+        <tr><td><code>Double</code></td><td><code>double</code></td><td><strong>Not for money</strong></td></tr>
+        <tr><td><code>Decimal128</code></td><td><code>decimal</code></td><td><strong>Use this for money.</strong> Requires <code>[BsonRepresentation(BsonType.Decimal128)]</code></td></tr>
+        <tr><td><code>Date</code></td><td><code>DateTime</code></td><td><strong>Always UTC</strong>, millisecond precision</td></tr>
+        <tr><td><code>Boolean</code></td><td><code>bool</code></td><td></td></tr>
+        <tr><td><code>Array</code></td><td><code>List&lt;T&gt;</code></td><td>Indexable as multikey</td></tr>
+        <tr><td><code>Object</code></td><td>Nested class</td><td>Embedded document</td></tr>
+        <tr><td><code>Null</code> vs missing</td><td><code>null</code></td><td><strong>Different things</strong> — see below</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Two type traps that cause real bugs</div>
+    <p style="margin:0"><strong>1. <code>decimal</code> silently becomes a string or double.</strong> The C#
+      driver does not map <code>decimal</code> to <code>Decimal128</code> by default. Without
+      <code>[BsonRepresentation(BsonType.Decimal128)]</code> you get a string (unsortable, uncomparable in
+      queries) or a double (imprecise). For money that's a genuine correctness problem, and it's silent.
+      <br><br>
+      <strong>2. Missing is not null.</strong> <code>{ }</code> and <code>{ status: null }</code> are different
+      documents. A query for <code>status: null</code> matches <em>both</em>, which surprises people; to
+      distinguish, use <code>$exists</code>. It also means an index on a sparse field behaves differently from
+      what you'd expect — worth checking with <code>$exists: true</code> explicitly when it matters.</p>
+  </div>
+
+  <h2 id="embed-vs-reference">Embedding vs referencing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="json — embedded: one read gets everything"><code class="language-json">{
+  "_id": ObjectId("..."),
+  "orderNumber": "ORD-1041",
+  "createdAt": ISODate("2024-06-01T10:22:00Z"),
+  "customer": {                      // extended reference: id + the fields we display
+    "customerId": ObjectId("..."),
+    "name": "A. Patel",
+    "email": "a.patel@example.com"
+  },
+  "lines": [                          // bounded: an order has a few dozen lines at most
+    { "sku": "KB-01", "name": "Keyboard", "qty": 1, "unitPrice": NumberDecimal("49.99") },
+    { "sku": "MS-02", "name": "Mouse",    "qty": 2, "unitPrice": NumberDecimal("19.50") }
+  ],
+  "total": NumberDecimal("88.99")     // computed, stored
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Embed when</th><th>Reference when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Read together</strong> — you almost always want both</td><td>Read independently — you often want one without the other</td></tr>
+        <tr><td><strong>One-to-few</strong>, with a known bound</td><td><strong>One-to-many or many-to-many</strong>, unbounded</td></tr>
+        <tr><td>The child is <strong>owned</strong> — meaningless alone</td><td>The child is <strong>shared</strong> between parents</td></tr>
+        <tr><td>Updated together, atomically</td><td>Updated on very different schedules</td></tr>
+        <tr><td>The child doesn't need its own queries</td><td>You need to query or aggregate children directly</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The three-question test</span>
+    <ol>
+      <li><strong>Is it bounded?</strong> If the array can grow without limit — embed nothing, reference.</li>
+      <li><strong>Is it read together?</strong> If yes, embed. If you usually want one without the other,
+        reference.</li>
+      <li><strong>Is it shared?</strong> If several parents reference the same child and it changes, reference —
+        or embed only the fields that don't change.</li>
+    </ol>
+    <p>Boundedness comes first, because an unbounded array is the failure that can't be tuned away.</p>
+  </div>
+
+  <h2 id="unbounded">The unbounded array anti-pattern <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="json — this works fine for six months, then doesn't" class="code-bad"><code class="language-json">{
+  "_id": ObjectId("..."),
+  "name": "A. Patel",
+  "orders": [ /* every order this customer has ever placed */ ],
+  "loginEvents": [ /* every login, forever */ ]
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What goes wrong</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Hits the 16 MB limit</strong></td><td>Then writes simply fail. Nothing you can tune</td></tr>
+        <tr><td><strong>Every read loads everything</strong></td><td>Fetching a customer's name transfers megabytes</td></tr>
+        <tr><td><strong>Every write rewrites the document</strong></td><td>Appending one login rewrites the whole thing — no partial update at storage level</td></tr>
+        <tr><td><strong>Document moves</strong></td><td>Growing past its allocated space means relocating it, and updating every index entry</td></tr>
+        <tr><td><strong>Index bloat</strong></td><td>A multikey index has one entry per array element per document</td></tr>
+        <tr><td><strong>Working set blows up</strong></td><td>Huge documents evict everything else from cache</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Why this is the most damaging mistake</div>
+    <p style="margin:0">It's <strong>invisible in development and testing</strong>. Ten test customers with
+      three orders each works perfectly. The problem arrives eighteen months later with your most valuable
+      customer — the one with 40,000 orders — and by then fixing it means migrating live data and rewriting
+      every code path that touches the document.
+      <br><br>
+      <strong>The rule: if you cannot state an upper bound, don't embed it.</strong> Not "it's probably fine",
+      an actual number. "An order has at most a few hundred lines" is a bound. "Customers place a lot of orders"
+      is not.</p>
+  </div>
+
+  <h2 id="patterns">Design patterns <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <h3 id="extended-reference">Extended reference</h3>
+
+  <pre data-label="json — copy the fields you display, keep the id" class="code-good"><code class="language-json">// In the order document
+"customer": {
+  "customerId": ObjectId("..."),      // for fetching the full record
+  "name":       "A. Patel",           // duplicated: what we show on the order list
+  "email":      "a.patel@example.com"
+}</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">Why it's the most useful pattern</span>
+    <p>Rendering an order list needs the customer's name. A pure reference means a <code>$lookup</code> or a
+      second query per order — the <a href="../11-ef-core/querying.html">N+1 problem</a> in a different
+      database.</p>
+    <p>Copying the two or three fields you actually display makes the list a single read. Keep the ID so you can
+      fetch the authoritative record when you need everything.</p>
+    <p><strong>Only duplicate fields that rarely change.</strong> Name and email, yes. Loyalty tier that updates
+      nightly, no.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">You must decide how the copy stays current</div>
+    <p style="margin:0">A customer changes their name. Every order carrying the old copy is now stale.
+      <br><br>
+      Options, and you have to pick one deliberately: <strong>accept it</strong> (an order arguably <em>should</em>
+      show the name at time of purchase — that's a
+      <a href="../10-sql/fundamentals.html#denormalization">historical snapshot</a>, not stale data);
+      <strong>update on change</strong> with a bulk update or a change-stream handler; or
+      <strong>refresh on read</strong> for the current record only.
+      <br><br>
+      The failure is not deciding. That's how you get a system where nobody knows whether a displayed name is
+      current or historical.</p>
+  </div>
+
+  <h3 id="bucket">The bucket pattern</h3>
+
+  <pre data-label="json — time-series: one document per device per hour" class="code-good"><code class="language-json">{
+  "_id":      ObjectId("..."),
+  "deviceId": "sensor-42",
+  "hour":     ISODate("2024-06-01T10:00:00Z"),
+  "count":    60,
+  "sumValue": NumberDecimal("1284.5"),      // pre-computed
+  "minValue": NumberDecimal("18.2"),
+  "maxValue": NumberDecimal("24.9"),
+  "readings": [
+    { "t": ISODate("2024-06-01T10:00:00Z"), "v": 21.4 },
+    { "t": ISODate("2024-06-01T10:01:00Z"), "v": 21.6 }
+    /* ... up to 60 - BOUNDED by the hour */
+  ]
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Compared to one document per reading</th><th>Benefit</th></tr></thead>
+      <tbody>
+        <tr><td>60× fewer documents</td><td>Far less per-document overhead</td></tr>
+        <tr><td>60× fewer index entries</td><td>Index fits in memory</td></tr>
+        <tr><td>Pre-computed aggregates</td><td>Hourly stats need no aggregation at all</td></tr>
+        <tr><td><strong>Bounded array</strong></td><td>The time window is the bound — this is the key property</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>This is how you do time-series data without unbounded arrays. MongoDB 5.0+ also has native
+    <strong>time-series collections</strong>, which apply the same idea internally — prefer those for new
+    work, and understand bucketing because it's the same reasoning and still needed for non-metric data.</p>
+
+  <h3 id="other-patterns">The rest, briefly</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pattern</th><th>Problem it solves</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Computed</strong></td>
+          <td>Store the total, average or count rather than recomputing per read. Trades write work for read
+              speed</td>
+        </tr>
+        <tr>
+          <td><strong>Subset</strong></td>
+          <td>Embed the <em>most recent</em> 10 comments; keep the rest in another collection. Bounds the array
+              and covers the common read</td>
+        </tr>
+        <tr>
+          <td><strong>Outlier</strong></td>
+          <td>Most documents fit the normal shape; a rare few don't. Flag them and handle separately rather
+              than designing for the outlier</td>
+        </tr>
+        <tr>
+          <td><strong>Schema versioning</strong></td>
+          <td>A <code>schemaVersion</code> field so code can handle multiple shapes during migration — and you
+              can find un-migrated documents</td>
+        </tr>
+        <tr>
+          <td><strong>Polymorphic</strong></td>
+          <td>Different document shapes in one collection with a <code>type</code> discriminator. Fine when
+              they're read together</td>
+        </tr>
+        <tr>
+          <td><strong>Approximation</strong></td>
+          <td>Increment a view counter every 10th time by 10. Cuts write load where exactness doesn't
+              matter</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — subset plus extended reference together</div>
+    <p style="margin:0">The two patterns compose into the answer for most "one-to-many but I need some of it
+      inline" problems.
+      <br><br>
+      A blog post embeds its <strong>latest 10 comments</strong> (subset — bounded, covers the page view) with
+      each comment carrying the author's <strong>name and avatar URL</strong> (extended reference — no lookup
+      needed). Full comment history lives in a separate collection, queried only when someone clicks "show
+      all".
+      <br><br>
+      One read renders the page. Being able to combine patterns rather than reciting them individually is what
+      distinguishes someone who has designed a real schema.</p>
+  </div>
+
+  <h2 id="16mb">The 16 MB limit <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>16 MB is a hard limit, and it's not really the constraint.</strong></p>
+    <p>Long before you reach it, a large document is already causing problems: every read transfers it all,
+      every write rewrites it all, and it evicts other data from cache.</p>
+    <p><strong>If a document is approaching even 1 MB, the model is probably wrong.</strong> The limit exists to
+      stop you doing something you shouldn't be doing.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>If you're near the limit</th><th>Do this</th></tr></thead>
+      <tbody>
+        <tr><td>An unbounded array</td><td>Move it to its own collection with a reference</td></tr>
+        <tr><td>Time-series growth</td><td>Bucket by time window, or use a time-series collection</td></tr>
+        <tr><td>Large binary content</td><td>Object storage (S3, Blob Storage) and store the URL. Not GridFS unless you need file-like streaming</td></tr>
+        <tr><td>Genuinely huge single records</td><td>Split by access pattern — hot fields in one document, cold detail in another</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="validation">Schema validation <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="javascript — JSON Schema validation on a collection" class="code-good"><code class="language-javascript">db.createCollection("order", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["orderNumber", "customer", "lines", "total", "createdAt"],
+      properties: {
+        orderNumber: { bsonType: "string", pattern: "^ORD-[0-9]+$" },
+        total:       { bsonType: "decimal", minimum: 0 },
+        createdAt:   { bsonType: "date" },
+        customer: {
+          bsonType: "object",
+          required: ["customerId", "name"],
+          properties: { customerId: { bsonType: "objectId" } }
+        },
+        lines: {
+          bsonType: "array",
+          minItems: 1,
+          maxItems: 500,                       // enforce the bound explicitly
+          items: {
+            bsonType: "object",
+            required: ["sku", "qty", "unitPrice"],
+            properties: { qty: { bsonType: "int", minimum: 1 } }
+          }
+        }
+      }
+    }
+  },
+  validationLevel: "moderate",     // only validate inserts and valid existing docs
+  validationAction: "error"        // "warn" logs instead of rejecting
+});</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Setting</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>validationLevel: "strict"</code></td><td>All inserts and updates validated</td></tr>
+        <tr><td><code>validationLevel: "moderate"</code></td><td>Inserts, plus updates to documents that already conform. <strong>The migration-friendly option</strong></td></tr>
+        <tr><td><code>validationAction: "error"</code></td><td>Reject the write</td></tr>
+        <tr><td><code>validationAction: "warn"</code></td><td>Log it and allow. <strong>How you roll this out safely</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The rollout sequence</div>
+    <p style="margin:0">Add the validator with <code>validationAction: "warn"</code> first. Watch the logs for
+      a full business cycle. Fix whatever writes are violating it. <em>Then</em> switch to
+      <code>"error"</code>.
+      <br><br>
+      Going straight to <code>error</code> on an existing collection breaks whichever code path nobody
+      remembered — a nightly job, an admin tool, a partner integration.
+      <br><br>
+      And use <code>moderate</code> rather than <code>strict</code>, so updates to legacy documents that don't
+      conform aren't blocked before you've migrated them.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the timing argument</div>
+    <p style="margin:0">"Schema flexibility is valuable while you're still discovering the shape, and a
+      liability once you've found it."
+      <br><br>
+      So the recommendation is: no validation while prototyping, then add it as the model stabilises. That
+      captures the actual benefit of a document database without accepting the long-term cost of a collection
+      containing four different shapes.
+      <br><br>
+      That framing beats both "always validate" and "flexibility is the point", because it puts the decision on
+      a timeline.</p>
+  </div>
+
+  <h2 id="dotnet-mapping">Mapping in .NET <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp" class="code-good"><code class="language-csharp">public class Order
+{
+    [BsonId]
+    public ObjectId Id { get; set; }
+
+    [BsonElement("orderNumber")]
+    public string OrderNumber { get; set; } = null!;
+
+    [BsonRepresentation(BsonType.Decimal128)]      // REQUIRED for money
+    public decimal Total { get; set; }
+
+    [BsonRepresentation(BsonType.String)]          // not the ordinal
+    public OrderStatus Status { get; set; }
+
+    [BsonIgnoreIfNull]                              // omit rather than store null
+    public string? Notes { get; set; }
+
+    public List&lt;OrderLine&gt; Lines { get; set; } = [];
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Three mapping decisions with consequences</div>
+    <p style="margin:0"><strong><code>Decimal128</code> for money.</strong> Without the attribute you get a
+      string or a double. A string can't be compared or summed in a query; a double is imprecise. Both are
+      silent.
+      <br><br>
+      <strong>Enums as strings.</strong> Otherwise the stored value is an ordinal, and reordering the enum
+      changes what existing documents mean — the same
+      <a href="../11-ef-core/modeling-migrations.html#converters">trap as EF Core</a>, with no migration to
+      catch it.
+      <br><br>
+      <strong><code>IgnoreExtraElements</code>.</strong> Set it globally via a convention. Without it, reading a
+      document that has a field your class doesn't <strong>throws</strong> — which happens constantly during
+      schema evolution and during a rolling deploy, where old code reads documents written by new code.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Model the access pattern, not the data. Store together what's read together.</li>
+      <li>Embed for bounded, owned, read-together data; reference otherwise.</li>
+      <li>Boundedness is the first test — unbounded arrays are the failure you can't tune away.</li>
+      <li>Extended reference avoids lookups; decide how the copies stay current.</li>
+      <li>Bucket time-series data so arrays are bounded by the window.</li>
+      <li>Subset plus extended reference solves most "some of it inline" problems.</li>
+      <li>16 MB is a hard limit, but 1 MB already means the model is suspect.</li>
+      <li>Add schema validation as the model stabilises; roll out with <code>warn</code> then
+        <code>error</code>.</li>
+      <li><code>Decimal128</code> for money, enums as strings, <code>IgnoreExtraElements</code> globally.</li>
+      <li>Missing and null are different; a null query matches both.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Unbounded embedded arrays</strong> — the single most damaging modelling error.</li>
+    <li><strong>Normalising as you would in SQL</strong>, then needing a <code>$lookup</code> for every read.</li>
+    <li><strong>Designing the schema before knowing the queries.</strong></li>
+    <li><strong>Duplicating volatile fields</strong> in an extended reference.</li>
+    <li><strong>Duplicating without deciding</strong> how consistency is maintained.</li>
+    <li><strong>One document per sensor reading</strong> instead of bucketing.</li>
+    <li><strong>Binary blobs in documents</strong> instead of object storage.</li>
+    <li><strong><code>decimal</code> with no <code>Decimal128</code> representation.</strong></li>
+    <li><strong>Enums stored as ordinals.</strong></li>
+    <li><strong>No <code>IgnoreExtraElements</code></strong>, so deserialisation throws mid-deploy.</li>
+    <li><strong>No schema validation</strong> years after the model settled.</li>
+    <li><strong>Treating missing and null as the same thing.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How would you model a blog with posts, comments and authors? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by asking what the read patterns are, because in MongoDB the schema follows from that
+          rather than from the entities. I'd assume: a post page showing the post plus its comments, a homepage
+          listing recent posts, and an author page listing their posts."</p>
+        <p>"Given that, three collections: <code>post</code>, <code>comment</code> and
+          <code>author</code>."</p>
+        <p>"<strong>Author is referenced, not embedded</strong> — an author has many posts, so embedding would
+          duplicate their whole profile everywhere. But I'd use an <strong>extended reference</strong>: the post
+          stores <code>authorId</code> plus the author's <code>name</code> and <code>avatarUrl</code>. Those are
+          the only author fields the post page displays, and they change rarely. That makes rendering a post or
+          a post list a single read with no lookup — which is the N+1 problem in a different database if you get
+          it wrong."</p>
+        <p>"<strong>Comments are the interesting decision.</strong> Fully embedding them is the obvious move
+          and it's the classic mistake, because comments are <strong>unbounded</strong>. One popular post gets
+          50,000 comments, and then every read of that post transfers all of them, every new comment rewrites
+          the whole document, and eventually you hit the 16 MB limit and writes just fail. That failure is
+          invisible in testing — ten test posts with three comments each works perfectly."</p>
+        <p>"So I'd use the <strong>subset pattern</strong>: embed the most recent 10 or 20 comments in the post
+          for the initial page render, and keep the full set in a <code>comment</code> collection keyed by
+          <code>postId</code>. 'Show all comments' queries that collection with pagination. Each embedded
+          comment carries the commenter's name and avatar — extended reference again — so no lookup is
+          needed."</p>
+        <p>"That gives one read for the common case, a bounded array, and no ceiling on comment count."</p>
+        <p>"<strong>Computed fields on the post:</strong> <code>commentCount</code>, and if there's voting, a
+          score. Counting from another collection on every page view is wasteful when the number is displayed
+          every time."</p>
+        <p>"<strong>Consistency:</strong> when a comment is added I update both the subset array and the
+          comment collection, and increment the count. Ideally in a transaction; realistically the count can be
+          eventually consistent with a reconciliation job, because a slightly stale comment count is not a
+          business problem. I'd make that call explicitly rather than by accident."</p>
+        <p>"<strong>Indexes:</strong> <code>comment</code> on <code>{ postId: 1, createdAt: -1 }</code> for
+          paging, <code>post</code> on <code>{ authorId: 1, publishedAt: -1 }</code> for the author page and
+          <code>{ publishedAt: -1 }</code> for the homepage."</p>
+        <p>"The thing I'd flag: if the author's display name changes, every post carrying the copy is stale.
+          For a blog I'd probably just accept that and refresh it with a bulk update when a profile changes —
+          it's infrequent. But it's a decision to make, not something to leave undefined."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask about read patterns first?</li>
+        <li>Do you catch that comments are unbounded?</li>
+        <li>Do you know the subset and extended-reference patterns?</li>
+        <li>Do you address how duplicated data stays current?</li>
+        <li>Do you mention indexes?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> embedding all comments with no bound.</li>
+        <li><span class="redflag">Red flag:</span> three fully-normalised collections needing
+          <code>$lookup</code> on every page.</li>
+        <li><span class="redflag">Red flag:</span> not asking what the queries are.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you keep the embedded subset in sync?</li>
+          <li>How do you paginate 50,000 comments?</li>
+          <li>What if comments need threading?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>A collection has documents approaching 16 MB and writes are failing. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is almost always an unbounded array, so first I'd confirm that — find the largest documents
+          with <code>$bsonSize</code> in an aggregation, and see which field accounts for the size."</p>
+        <p>"Then I'd separate <strong>stopping the bleeding</strong> from <strong>fixing the model</strong>,
+          because writes failing is an active incident."</p>
+        <p>"<strong>Immediate:</strong> stop appending to the array. Depending on what it is, that might mean
+          writing new entries to a separate collection right away, even before the full migration, so the
+          affected documents stop growing. If the array is something like an event log where old entries aren't
+          needed, trimming with <code>$slice</code> buys time — though I'd only do that if I'm certain the data
+          being dropped isn't needed, and I'd copy it out first."</p>
+        <p>"<strong>The real fix</strong> depends on what the array is."</p>
+        <p>"<strong>If it's an unbounded child collection</strong> — orders on a customer, comments on a post —
+          it moves to its own collection with a reference back, and I'd apply the <strong>subset
+          pattern</strong>: keep the most recent N embedded for the common read, full history separate. That
+          preserves the single-read benefit for the normal case without the ceiling."</p>
+        <p>"<strong>If it's time-series data</strong> — readings, metrics, events — I'd use the
+          <strong>bucket pattern</strong>: one document per entity per hour or day, with the array bounded by
+          the time window, plus pre-computed count, sum, min and max on the bucket so range queries don't need
+          to aggregate the raw points. Or a native time-series collection on 5.0+, which does the same thing
+          internally."</p>
+        <p>"<strong>If it's binary content</strong> — images, attachments — that shouldn't be in the document
+          at all. Object storage with a URL in the document. GridFS only if I genuinely need file-like chunked
+          streaming."</p>
+        <p>"<strong>The migration itself</strong> is the part that needs care, because this is live data."</p>
+        <p>"I'd add a <code>schemaVersion</code> field, write the application to <strong>read both
+          shapes</strong>, deploy that first, then migrate documents in batches in the background, then remove
+          the old read path once nothing is left at the old version. That's expand/contract — same reasoning as
+          a <a href="../11-ef-core/modeling-migrations.html#zero-downtime">zero-downtime schema change</a>,
+          because old and new code run simultaneously during a rolling deploy."</p>
+        <p>"I'd batch the migration, not run one enormous update — it's resumable that way, and it doesn't
+          saturate the cluster. And the <code>schemaVersion</code> field is what lets me find the un-migrated
+          documents and confirm completion."</p>
+        <p>"<strong>Then prevention</strong>, because this recurs otherwise: schema validation with a
+          <code>maxItems</code> on the array, so the database refuses to let it grow unbounded again. Rolled
+          out as <code>warn</code> first to find violating code paths, then <code>error</code>."</p>
+        <p>"The lesson I'd articulate is that 16 MB wasn't the real problem — long before that, every read was
+          transferring megabytes and every append was rewriting the whole document. A document over about 1 MB
+          already indicates the model is wrong. The limit just makes it visible eventually, which is arguably a
+          feature."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you diagnose before acting?</li>
+        <li>Do you separate immediate mitigation from the real fix?</li>
+        <li>Do you know the subset and bucket patterns?</li>
+        <li>Do you plan a live migration that tolerates both shapes?</li>
+        <li>Do you prevent recurrence with validation?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "split the document" with no migration plan.</li>
+        <li><span class="redflag">Red flag:</span> a single bulk migration script on live data.</li>
+        <li><span class="redflag">Red flag:</span> no prevention, so it happens again.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you find the biggest documents?</li>
+          <li>How do you make the migration resumable?</li>
+          <li>What bucket size would you choose, and why?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LINQ In Depth</title>
+<meta name="description" content="LINQ explained simply: IEnumerable vs IQueryable, deferred execution, expression trees, the operators that matter, and the traps that cause real bugs.">
+<meta name="keywords" content="linq IEnumerable IQueryable deferred execution lazy evaluation expression tree Select Where SelectMany GroupBy Aggregate First Single Any All deferred execution csharp interview">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="04-linq/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>LINQ In Depth</h1>
+    <p class="subtitle">One query syntax over collections, databases and XML. The two things interviewers
+      actually probe are <em>when it runs</em> and <em>where it runs</em>.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>LINQ is just <a href="../01-csharp-fundamentals/language-features.html#extension-methods">extension
+        methods</a> that take <a href="../01-csharp-fundamentals/language-features.html#delegates">delegates</a>.
+        No magic.</li>
+      <li><strong>Deferred execution</strong> — building a query does nothing. It runs when you enumerate
+        it.</li>
+      <li><strong><code>IEnumerable</code> runs in memory. <code>IQueryable</code> is translated to
+        SQL.</strong> That one line is the most important thing on this page.</li>
+      <li><code>IQueryable</code> works by building an <strong>expression tree</strong> — data describing
+        your code — which a provider converts to SQL.</li>
+      <li><code>First</code> vs <code>Single</code> vs <code>FirstOrDefault</code>: know which throws and
+        when.</li>
+      <li>Casting <code>IQueryable</code> to <code>IEnumerable</code> too early is how you accidentally
+        load an entire table into memory.</li>
+    </ul>
+  </div>
+
+  <h2 id="what-is-linq">What LINQ actually is <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>LINQ gives you one way to write "filter, transform, group, sort" that works over
+      <strong>any</strong> source — a list, a database table, a JSON document.</p>
+    <p>It isn't a language feature. It's a set of extension methods plus some compiler sugar.</p>
+  </div>
+
+  <pre data-label="csharp — these two are identical"><code class="language-csharp">// Query syntax - looks like SQL
+var q1 = from o in orders
+         where o.Total &gt; 100
+         orderby o.CreatedUtc descending
+         select o.Id;
+
+// Method syntax - what the compiler turns the above into
+var q2 = orders.Where(o =&gt; o.Total &gt; 100)
+               .OrderByDescending(o =&gt; o.CreatedUtc)
+               .Select(o =&gt; o.Id);</code></pre>
+
+  <p>Query syntax is only sugar. It's occasionally clearer for joins and <code>let</code> clauses; method
+    syntax is more common and composes better. Use whichever reads better — they compile to the same thing.</p>
+
+  <h2 id="deferred">Deferred execution <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Writing a LINQ query <strong>doesn't run it</strong>. You've built a description of work to do.</p>
+    <p>It runs when something asks for the results.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A LINQ query is a <strong>recipe</strong>, not a meal. Writing down "chop onions, then fry" doesn't
+      cook anything.</p>
+    <p>The cooking starts when someone sits down to eat — and if you hand the same recipe to two people,
+      it gets cooked twice.</p>
+  </div>
+
+  <pre data-label="csharp — the surprising bit"><code class="language-csharp">var numbers = new List&lt;int&gt; { 1, 2, 3 };
+
+var query = numbers.Where(n =&gt; n &gt; 1);    // nothing has run yet
+
+numbers.Add(4);                            // change the source AFTER building the query
+
+Console.WriteLine(string.Join(",", query)); // 2,3,4  <- includes the new item!</code></pre>
+
+  <p>The query ran at the <code>string.Join</code>, by which time the list had four items. This catches
+    people out constantly.</p>
+
+  <h3 id="triggers">What forces execution</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Deferred (builds the query)</th><th>Immediate (runs it now)</th></tr></thead>
+      <tbody>
+        <tr><td><code>Where</code>, <code>Select</code>, <code>OrderBy</code></td><td><code>ToList</code>, <code>ToArray</code>, <code>ToDictionary</code></td></tr>
+        <tr><td><code>Skip</code>, <code>Take</code>, <code>Distinct</code></td><td><code>Count</code>, <code>Sum</code>, <code>Min</code>, <code>Max</code>, <code>Average</code></td></tr>
+        <tr><td><code>GroupBy</code>, <code>Join</code>, <code>SelectMany</code></td><td><code>First</code>, <code>Single</code>, <code>Last</code>, <code>ElementAt</code></td></tr>
+        <tr><td><code>Cast</code>, <code>OfType</code>, <code>Reverse</code></td><td><code>Any</code>, <code>All</code>, <code>Contains</code></td></tr>
+        <tr><td></td><td><code>foreach</code> over the query</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to remember which is which</span>
+    <p>If the method <strong>returns another <code>IEnumerable</code></strong>, it's deferred — there's
+      still more query to build.</p>
+    <p>If it returns a <strong>concrete value or collection</strong> (a number, an object, a
+      <code>List</code>), it had to run to produce it.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — enumerating twice</div>
+    <p style="margin:0">Because the query is a recipe, enumerating it twice <strong>executes it
+      twice</strong>:</p>
+    <pre data-label="csharp — two database round trips" class="code-bad"><code class="language-csharp">var expensive = db.Orders.Where(o =&gt; o.Total &gt; 1000);   // no query yet
+
+if (expensive.Any())                       // QUERY 1
+    foreach (var o in expensive) { }       // QUERY 2 - same data, fetched again</code></pre>
+    <pre data-label="csharp — materialise once" class="code-good"><code class="language-csharp">var expensive = await db.Orders.Where(o =&gt; o.Total &gt; 1000).ToListAsync();
+
+if (expensive.Count &gt; 0)                   // in-memory now
+    foreach (var o in expensive) { }       // no second query</code></pre>
+    <p style="margin:0">Note the second version also uses <code>.Count</code> rather than
+      <code>.Any()</code> — on a materialised list that's just reading a field.</p>
+  </div>
+
+  <h2 id="ienumerable-iqueryable">IEnumerable vs IQueryable <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>IEnumerable&lt;T&gt;</code> — the filtering happens <strong>in your process</strong>, in C#.</p>
+    <p><code>IQueryable&lt;T&gt;</code> — the filtering is <strong>translated into SQL</strong> and happens
+      in the database.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><code>IEnumerable</code> is ordering <strong>everything on the menu</strong> and then picking what
+      you want at the table. The kitchen did all the work; most of it goes in the bin.</p>
+    <p><code>IQueryable</code> is <strong>telling the kitchen what you want</strong>. Only that gets cooked
+      and carried out.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>IEnumerable&lt;T&gt;</code></th><th><code>IQueryable&lt;T&gt;</code></th></tr></thead>
+      <tbody>
+        <tr><td>Where the work happens</td><td>In your process, in memory</td><td>At the data source (usually the database)</td></tr>
+        <tr><td>What the lambda becomes</td><td>A compiled delegate (<code>Func&lt;T, bool&gt;</code>)</td><td>An <strong>expression tree</strong> (<code>Expression&lt;Func&lt;T, bool&gt;&gt;</code>)</td></tr>
+        <tr><td>Typical use</td><td>LINQ to Objects — lists, arrays</td><td>EF Core, any remote provider</td></tr>
+        <tr><td>What you pay for a mistake</td><td>CPU and memory in your app</td><td>Nothing — or a runtime translation error</td></tr>
+        <tr><td>Namespace</td><td><code>System.Linq.Enumerable</code></td><td><code>System.Linq.Queryable</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="the-expensive-mistake">The mistake that costs the most</h3>
+
+  <pre data-label="csharp — bad: loads the whole table, then filters in C#" class="code-bad"><code class="language-csharp">// AsEnumerable() switches from IQueryable to IEnumerable.
+// Everything after it happens in YOUR process.
+var recent = db.Orders
+    .AsEnumerable()                               // SELECT * FROM Orders  (all 10 million)
+    .Where(o =&gt; o.CreatedUtc &gt; cutoff)            // filtered in C#
+    .ToList();</code></pre>
+
+  <pre data-label="csharp — the filter becomes a WHERE clause" class="code-good"><code class="language-csharp">var recent = await db.Orders
+    .Where(o =&gt; o.CreatedUtc &gt; cutoff)            // SELECT ... WHERE CreatedUtc &gt; @cutoff
+    .ToListAsync();</code></pre>
+
+  <p>Same result, wildly different cost. The first version transfers every row over the network and
+    allocates an object for each one.</p>
+
+  <div class="note warn">
+    <div class="note-title">Where this sneaks in</div>
+    <p style="margin:0">You rarely write <code>AsEnumerable()</code> by accident. The realistic causes are:</p>
+    <ul style="margin:8px 0 0">
+      <li>A repository method returning <code>IEnumerable&lt;T&gt;</code> instead of
+        <code>IQueryable&lt;T&gt;</code>, so every caller's filtering happens in memory.</li>
+      <li>Calling <code>.ToList()</code> early "to make it concrete", then filtering the list.</li>
+      <li>A <code>Where</code> containing something EF can't translate — some providers then silently
+        evaluate it client-side (EF Core 3.0+ throws instead, which is much better).</li>
+    </ul>
+  </div>
+
+  <h3 id="expression-trees">Expression trees — why <code>IQueryable</code> can do this <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A delegate is <strong>compiled code</strong> — you can run it, but you can't look inside it.</p>
+    <p>An expression tree is <strong>data describing that code</strong> — you can inspect it, which means
+      you can translate it into something else, like SQL.</p>
+  </div>
+
+  <pre data-label="csharp — identical lambda, two different things"><code class="language-csharp">// Compiled to machine code. Runnable, opaque.
+Func&lt;Order, bool&gt; asDelegate = o =&gt; o.Total &gt; 100;
+
+// Compiled to an object graph. Inspectable.
+Expression&lt;Func&lt;Order, bool&gt;&gt; asExpression = o =&gt; o.Total &gt; 100;
+
+// You can walk the tree:
+var body = (BinaryExpression)asExpression.Body;
+Console.WriteLine(body.NodeType);    // GreaterThan
+Console.WriteLine(body.Left);        // o.Total
+Console.WriteLine(body.Right);       // 100</code></pre>
+
+  <p>That inspectability is the whole trick. EF Core walks the tree, sees "greater than", "member access on
+    Total", "constant 100", and emits <code>WHERE [Total] &gt; @p0</code>.</p>
+
+  <p>It's also why some C# doesn't work in an EF query: if EF can't map a construct to SQL, it can't
+    translate it. That's covered on the <a href="performance.html">LINQ performance page</a>.</p>
+
+  <h2 id="operators">The operators worth knowing well <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <h3 id="select-vs-selectmany"><code>Select</code> vs <code>SelectMany</code></h3>
+
+  <pre data-label="csharp — the difference in one example"><code class="language-csharp">var orders = new[]
+{
+    new Order { Lines = [ "a", "b" ] },
+    new Order { Lines = [ "c" ] }
+};
+
+// Select: one result per order -> a sequence OF SEQUENCES
+IEnumerable&lt;string[]&gt; nested = orders.Select(o =&gt; o.Lines);   // [["a","b"], ["c"]]
+
+// SelectMany: flattens them into one sequence
+IEnumerable&lt;string&gt; flat = orders.SelectMany(o =&gt; o.Lines);   // ["a","b","c"]</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><code>Select</code> = map. <code>SelectMany</code> = map <em>and flatten</em>.</p>
+    <p>If you find yourself writing <code>.Select(...).SelectMany(x =&gt; x)</code>, you wanted
+      <code>SelectMany</code> from the start.</p>
+  </div>
+
+  <h3 id="first-single">First, Single, and the OrDefault variants <span class="pill pill-must">🔥 Must know</span></h3>
+
+  <p>A frequent interview question because the difference is about <strong>intent</strong>, not just
+    behaviour.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>No match</th><th>One match</th><th>Many matches</th></tr></thead>
+      <tbody>
+        <tr><td><code>First()</code></td><td><strong>Throws</strong></td><td>Returns it</td><td>Returns the first</td></tr>
+        <tr><td><code>FirstOrDefault()</code></td><td>Returns <code>null</code>/default</td><td>Returns it</td><td>Returns the first</td></tr>
+        <tr><td><code>Single()</code></td><td><strong>Throws</strong></td><td>Returns it</td><td><strong>Throws</strong></td></tr>
+        <tr><td><code>SingleOrDefault()</code></td><td>Returns <code>null</code>/default</td><td>Returns it</td><td><strong>Throws</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms — how to choose</span>
+    <p>Use <code>Single</code> when more than one match would mean your <strong>data is corrupt</strong> —
+      looking up by primary key, for example. You <em>want</em> it to throw.</p>
+    <p>Use <code>First</code> when several matches are legitimate and you just want one — the newest order,
+      the highest bidder.</p>
+    <p>Add <code>OrDefault</code> when "not found" is a normal outcome you'll handle.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The performance difference <span class="pill pill-senior">⭐ Senior-level</span></div>
+    <p style="margin:0"><code>First</code> can stop as soon as it finds a match. <code>Single</code>
+      <strong>must keep looking</strong> to prove there isn't a second one.
+      <br><br>
+      Against a database, EF translates <code>Single</code> to <code>TOP 2</code> so it can detect a
+      duplicate — while <code>First</code> becomes <code>TOP 1</code>. A small difference, but it's a good
+      detail to know.</p>
+  </div>
+
+  <h3 id="grouping">GroupBy, and where it differs from SQL</h3>
+
+  <pre data-label="csharp — GroupBy gives you keys with nested collections"><code class="language-csharp">var byCustomer = orders
+    .GroupBy(o =&gt; o.CustomerId)
+    .Select(g =&gt; new
+    {
+        CustomerId = g.Key,       // the grouping value
+        Count      = g.Count(),   // g itself is IEnumerable&lt;Order&gt;
+        Total      = g.Sum(o =&gt; o.Total)
+    });</code></pre>
+
+  <p>The key difference from SQL: LINQ's <code>GroupBy</code> gives you the <strong>actual grouped
+    items</strong>, not just aggregates. In SQL you can only select the key and aggregate functions.</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake with EF Core</div>
+    <p style="margin:0">Because LINQ <code>GroupBy</code> can return whole objects and SQL can't, EF has to
+      either translate it to a <code>GROUP BY</code> (only if you just use the key and aggregates) or give
+      up and do the grouping in memory.
+      <br><br>
+      Older EF Core versions silently fetched everything and grouped client-side. Modern versions throw a
+      translation error instead. Either way: if you group in EF, <strong>only use the key and
+      aggregates</strong> in the projection.</p>
+  </div>
+
+  <h3 id="any-vs-count"><code>Any()</code> vs <code>Count() &gt; 0</code></h3>
+
+  <pre data-label="csharp — same answer, different work" class="code-bad"><code class="language-csharp">if (db.Orders.Count(o =&gt; o.CustomerId == id) &gt; 0)   // SELECT COUNT(*) - counts every row
+</code></pre>
+
+  <pre data-label="csharp — stops at the first match" class="code-good"><code class="language-csharp">if (await db.Orders.AnyAsync(o =&gt; o.CustomerId == id))   // SELECT EXISTS / TOP 1
+</code></pre>
+
+  <p><code>Count</code> has to examine every matching row. <code>Any</code> stops at the first one. For a
+    customer with 50,000 orders that's a real difference.</p>
+
+  <p><em>But</em> — on an already-materialised <code>List&lt;T&gt;</code>, use <code>.Count</code> (the
+    property). It's O(1); <code>Any()</code> sets up an enumerator.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>LINQ is extension methods taking delegates. Query syntax is sugar over method syntax.</li>
+      <li>Queries are recipes. They run when enumerated — and enumerating twice runs them twice.</li>
+      <li>Methods returning <code>IEnumerable</code> are deferred; methods returning a value are immediate.</li>
+      <li><code>IEnumerable</code> = in your process. <code>IQueryable</code> = translated to SQL.</li>
+      <li>Expression trees are what make translation possible — code as inspectable data.</li>
+      <li><code>Single</code> means "more than one is a bug". <code>First</code> means "give me one".</li>
+      <li><code>Any()</code> beats <code>Count() &gt; 0</code> against a database; <code>.Count</code>
+        wins on a list.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Enumerating the same query twice</strong> and doing two database round trips.</li>
+    <li><strong><code>.ToList()</code> too early</strong>, so filtering happens in memory instead of SQL.</li>
+    <li><strong>Returning <code>IEnumerable&lt;T&gt;</code> from a repository</strong> — callers lose the
+      ability to compose a translated query, and may enumerate after the connection closes.</li>
+    <li><strong><code>Count() &gt; 0</code> against a database</strong> instead of <code>Any()</code>.</li>
+    <li><strong>Using <code>Single</code> where duplicates are legitimate</strong> — it throws in production
+      on data that was always going to happen.</li>
+    <li><strong>Modifying a collection while enumerating it</strong> — throws
+      <code>InvalidOperationException</code>.</li>
+    <li><strong>Assuming <code>OrderBy</code> is stable across providers.</strong> In memory it is; in SQL,
+      row order without <code>ORDER BY</code> is undefined.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What's the difference between <code>IEnumerable</code> and <code>IQueryable</code>? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The short version: <code>IEnumerable</code> filtering happens in your process,
+          <code>IQueryable</code> filtering gets translated and happens at the data source."</p>
+        <p>"The mechanism is the difference between a delegate and an expression tree.
+          <code>IEnumerable.Where</code> takes a <code>Func&lt;T, bool&gt;</code> — compiled code that can
+          only be executed. <code>IQueryable.Where</code> takes an
+          <code>Expression&lt;Func&lt;T, bool&gt;&gt;</code> — an object graph describing the code, which a
+          provider like EF Core can walk and turn into a SQL <code>WHERE</code> clause."</p>
+        <p>"Why it matters in practice: if I have ten million orders and I call
+          <code>AsEnumerable()</code> before <code>Where</code>, I've just told the database to send me
+          every row so I can filter them in C#. Keep it as <code>IQueryable</code> and it becomes a
+          <code>WHERE</code> clause and I get back the handful I asked for."</p>
+        <p>"The way this actually bites in real code is a repository returning
+          <code>IEnumerable&lt;T&gt;</code>. It looks harmless, but it means every caller's filtering runs
+          in memory. There's a genuine trade-off there though — returning <code>IQueryable</code> leaks the
+          query capability out of the data layer, so the caller can write something that doesn't translate
+          or that keeps the connection open. I'd usually rather return a materialised result from a
+          purpose-built method than expose <code>IQueryable</code> broadly."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's delegates vs expression trees?</li>
+        <li>Can you name the concrete cost?</li>
+        <li>Bonus: do you see the repository design tension?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "<code>IQueryable</code> is for databases" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> "<code>IQueryable</code> is faster" — it isn't inherently;
+          it just moves the work.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What is an expression tree?</li>
+          <li>What happens if EF can't translate your <code>Where</code>?</li>
+          <li>Should a repository return <code>IQueryable</code>?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What is deferred execution, and when has it caused you a problem?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Deferred execution means building a LINQ query doesn't run it. You've created a description of
+          the work; it executes when something enumerates it — a <code>foreach</code>,
+          <code>ToList</code>, <code>Count</code>, <code>First</code>."</p>
+        <p>"The benefit is composition and efficiency. I can build a query in several steps, add a filter
+          conditionally, and nothing runs until the end — so only one query goes to the database, with all
+          the filters combined. And <code>Take(10)</code> genuinely stops early rather than materialising
+          everything first."</p>
+        <p>"Where it's bitten me is double enumeration. Code like
+          <code>if (query.Any()) foreach (var x in query)</code> looks completely reasonable and executes
+          the query twice. Against a database that's two round trips for the same data. The fix is to
+          materialise once with <code>ToList</code> and then work with the list."</p>
+        <p>"The subtler one is capturing a variable that changes. If I build a query that closes over a
+          loop variable and enumerate it later, I get the variable's <em>final</em> value, not the value
+          when I built the query — which is really the closure-capture issue showing up through LINQ."</p>
+        <p>"And there's a lifetime version of it: returning <code>IEnumerable</code> from a method that
+          opened a database connection in a <code>using</code>. By the time the caller enumerates, the
+          connection is disposed. That one produces a confusing exception a long way from the cause."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the benefit as well as the trap?</li>
+        <li>Have you actually hit double enumeration?</li>
+        <li>Bonus: the disposed-connection failure.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which LINQ methods force execution?</li>
+          <li>How would you build a query with optional filters?</li>
+          <li>What does <code>AsNoTracking</code> change?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary><code>First</code>, <code>FirstOrDefault</code>, <code>Single</code>,
+      <code>SingleOrDefault</code> — when do you use each?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They differ on what happens with zero matches and with many matches, and I choose based on
+          what would mean a bug."</p>
+        <p>"<code>Single</code> throws if there isn't exactly one. I use it when more than one match would
+          mean the data is corrupt — a lookup by primary key or a unique constraint. I <em>want</em> the
+          exception, because silently taking the first one would hide a real problem."</p>
+        <p>"<code>First</code> throws only if there are none. I use it when several matches are legitimate
+          and I genuinely want one of them — the most recent order, the highest bid — usually with an
+          <code>OrderBy</code> so 'first' is deterministic."</p>
+        <p>"The <code>OrDefault</code> variants return null instead of throwing when there's nothing. I use
+          those when 'not found' is a normal outcome I'm going to handle — a lookup that might legitimately
+          miss."</p>
+        <p>"The performance nuance is that <code>First</code> can stop at the first match, whereas
+          <code>Single</code> has to keep going to prove there isn't a second. Against a database EF
+          translates <code>Single</code> to <code>TOP 2</code> and <code>First</code> to
+          <code>TOP 1</code>."</p>
+        <p>"One thing I'd flag: <code>FirstOrDefault</code> on a value-type sequence returns <code>0</code>,
+          not null — so you can't distinguish 'not found' from 'found a zero'. There's an overload that
+          takes an explicit default, or use a nullable type."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you choose based on intent rather than habit?</li>
+        <li>Do you know <code>Single</code> throwing is often the <em>desired</em> behaviour?</li>
+        <li>Bonus: the value-type default trap.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "I always use <code>FirstOrDefault</code> because it doesn't throw."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which SQL does EF generate for each?</li>
+          <li>What does <code>First</code> without <code>OrderBy</code> return from a database?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

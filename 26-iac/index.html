@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IaC Principles — Infrastructure as Code</title>
+<meta name="description" content="Declarative versus imperative, state, drift, idempotency and immutability — the concepts that carry across every IaC tool.">
+<meta name="keywords" content="infrastructure as code principles declarative imperative state drift idempotency immutable infrastructure GitOps plan apply reconciliation snowflake servers environment parity">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="26-iac/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Infrastructure as Code</h1>
+    <p class="subtitle">The point isn't automation. It's that infrastructure becomes something you can review, test
+      and reason about — and that nobody can change it by clicking.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Declarative:</strong> describe the end state. The tool works out the steps.</li>
+      <li><strong>State</strong> is how the tool knows what it created and what changed.</li>
+      <li><strong>Drift</strong> is reality diverging from the declaration — usually a manual change.</li>
+      <li><strong>Idempotent:</strong> applying the same definition twice changes nothing the second time.</li>
+      <li><strong>Immutable:</strong> replace rather than modify in place.</li>
+      <li><strong>Plan before apply</strong>, always. The plan is the review artefact.</li>
+      <li><strong>The real value is review and reproducibility</strong>, not speed.</li>
+    </ul>
+  </div>
+
+  <h2 id="why">What problem this actually solves <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Without IaC</th><th>With IaC</th></tr></thead>
+      <tbody>
+        <tr><td>Nobody knows exactly what exists</td><td><strong>The repository is the inventory</strong></td></tr>
+        <tr><td>Environments differ in ways nobody documented</td><td>Same definition, different parameters</td></tr>
+        <tr><td>Changes made in the portal, unreviewed</td><td><strong>Changes go through pull request</strong></td></tr>
+        <tr><td>Rebuilding after a disaster is archaeology</td><td>Re-apply the definition</td></tr>
+        <tr><td>"Why is this setting like that?" — unanswerable</td><td><strong>Git blame answers it</strong></td></tr>
+        <tr><td>Onboarding means shadowing someone</td><td>Read the code</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the value is review, not automation</div>
+    <p style="margin:0">"It automates provisioning" is the usual answer and it's the weakest of the benefits. Most
+      teams provision infrastructure rarely, so the time saved is modest.
+      <br><br>
+      The properties that actually matter:
+      <br><br>
+      <strong>Infrastructure changes become reviewable.</strong> Opening a firewall port or removing a backup policy
+      arrives as a diff with an author and a reason, and someone else looks at it. That's a control you cannot
+      achieve with portal access, and it catches the changes that cause incidents.
+      <br><br>
+      <strong>It's reproducible.</strong> Standing up an identical environment stops being a project. Which makes
+      realistic testing possible, and makes disaster recovery a procedure rather than an improvisation.
+      <br><br>
+      <strong>It's the documentation, and it can't go stale</strong> — because it's what's actually deployed.
+      <br><br>
+      <strong>It eliminates snowflakes.</strong> The server nobody dares touch because someone configured something
+      by hand three years ago and left.
+      <br><br>
+      Framing it that way — <em>governance and reproducibility, with automation as a side effect</em> — is the more
+      senior read, and it's what makes the case to people who don't provision anything themselves.</p>
+  </div>
+
+  <h2 id="declarative">Declarative versus imperative <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Imperative</th><th>Declarative</th></tr></thead>
+      <tbody>
+        <tr><td>You write</td><td><strong>The steps</strong></td><td><strong>The desired end state</strong></td></tr>
+        <tr><td>Example</td><td><code>az webapp create ...</code></td><td>A Terraform or Bicep resource block</td></tr>
+        <tr><td>Run twice</td><td><strong>Fails or duplicates</strong></td><td>Second run is a no-op</td></tr>
+        <tr><td>Handles partial state</td><td>You write the checks</td><td><strong>The tool reconciles</strong></td></tr>
+        <tr><td>Deleting something</td><td>You must remember to script it</td><td><strong>Remove it from the definition</strong></td></tr>
+        <tr><td>Good for</td><td>One-off operations, glue</td><td><strong>Anything you'll maintain</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>Imperative</strong> is a recipe: heat the pan, add the oil, add the onions. Run it twice and you have
+      two pans of onions — or an error because the pan is already hot.</p>
+    <p><strong>Declarative</strong> is a photograph of the finished dish. The tool compares the photo to what's on
+      the counter and does whatever is needed to match. Compare again and there's nothing to do.</p>
+    <p>Which is why declarative scales to real infrastructure: <strong>you don't have to know the current
+      state</strong> to write a correct change.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The property that matters most: removal</div>
+    <p style="margin:0">The difference people underestimate is what happens when something should <em>stop</em>
+      existing.
+      <br><br>
+      With scripts, deleting a resource means writing a deletion script — and remembering that it exists at all. In
+      practice it doesn't happen, so orphaned resources accumulate: storage accounts nobody uses, public IPs still
+      billing, network rules nobody can justify keeping.
+      <br><br>
+      Declaratively, you <strong>delete the block</strong> and the tool removes the resource, because the definition
+      is the complete statement of what should exist. Anything not in it shouldn't be there.
+      <br><br>
+      That's also the property that makes IaC an audit tool: <strong>if it isn't in the repository, it shouldn't
+      exist</strong> — so anything unaccounted for is worth investigating. You can't say that with scripts.
+      <br><br>
+      It's also the property that makes IaC dangerous, which is why <code>plan</code> matters so much. The same
+      mechanism that cleans up orphans will happily delete a production database if you remove the wrong block.</p>
+  </div>
+
+  <h2 id="state">State <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why a tool needs it</span>
+    <p>To decide what to change, the tool must know <strong>what it created and how</strong>. That record is state.</p>
+    <p>Without it, the tool can't tell "this resource should be created" from "this resource exists and I made it"
+      from "this exists and someone else owns it."</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Where state lives</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Terraform</strong></td>
+          <td><strong>An explicit state file</strong> you must store and lock</td>
+          <td>Full lifecycle control, including deletion. <strong>The state file is critical infrastructure</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Bicep / ARM</strong></td>
+          <td><strong>Azure itself</strong> — the resource graph is the state</td>
+          <td>Nothing to manage or lose. Less control over deletion semantics</td>
+        </tr>
+        <tr>
+          <td>Kubernetes / GitOps</td>
+          <td>The cluster's etcd, reconciled continuously</td>
+          <td>Drift is corrected automatically, not just detected</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Terraform's state file is production infrastructure</div>
+    <p style="margin:0">This is the single biggest operational difference between Terraform and Bicep, and it's worth
+      being precise about.
+      <br><br>
+      <strong>Lose the state file</strong> and Terraform no longer knows anything it created. The next
+      <code>apply</code> tries to create everything again — and fails on name conflicts, or worse, creates duplicates
+      alongside the originals. Recovery means importing every resource by hand.
+      <br><br>
+      <strong>Two people applying at once</strong> without locking produces a corrupted state that doesn't match
+      reality, which is harder to fix than either individual change.
+      <br><br>
+      <strong>State contains secrets.</strong> Generated passwords, connection strings and keys are stored in
+      plaintext in the state file — so it needs the same protection as a credential store, not just a bucket.
+      <br><br>
+      So the non-negotiables: a <strong>remote backend</strong> (Azure Storage or Terraform Cloud) with
+      <strong>state locking</strong>, <strong>versioning and soft delete</strong> on the container, encryption at
+      rest, and access restricted to the pipeline identity rather than to every engineer.
+      <br><br>
+      <strong>Bicep avoids this entire category</strong> because Azure's own resource graph is the state. There's
+      nothing to store, lock, back up or leak. That's a genuine advantage, and the trade is that you get less control
+      over lifecycle — Bicep is weaker at knowing when to remove something.</p>
+  </div>
+
+  <h2 id="drift">Drift <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What it is</span>
+    <p><strong>Reality no longer matches the definition.</strong> Almost always because someone changed something
+      directly — in the portal, with the CLI, or via an automated process outside IaC.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Why drift happens</th><th>What to do about it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>An emergency fix during an incident</strong></td><td>Expected. <strong>Reconcile afterwards</strong>, don't pretend it won't happen</td></tr>
+        <tr><td>Someone has portal write access</td><td>Remove it — read-only for humans, write for the pipeline</td></tr>
+        <tr><td>Another tool or team manages part of it</td><td>Make ownership explicit; use data sources rather than resources</td></tr>
+        <tr><td>Azure adds or changes a default</td><td>Pin versions; expect occasional plan noise</td></tr>
+        <tr><td><strong>Nobody ever runs a plan</strong></td><td><strong>Scheduled drift detection</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the dangerous part of drift is silence</div>
+    <p style="margin:0">A single manual change is usually harmless in itself. The damage is what it does to
+      <em>trust</em>.
+      <br><br>
+      Once the definition doesn't match reality, the next <code>apply</code> will revert that change — possibly
+      during an unrelated deployment, weeks later, with no obvious connection. That's how an emergency firewall rule
+      quietly disappears and an outage returns.
+      <br><br>
+      Worse, people stop believing the repository. And once nobody trusts it, they stop using it, and you're back to
+      portal changes with extra ceremony.
+      <br><br>
+      So the practices that matter: <strong>scheduled drift detection</strong> — a nightly
+      <code>plan</code> that alerts on any diff, so drift is found in hours rather than at the worst moment.
+      <strong>Read-only portal access for humans</strong>, with the pipeline identity holding write permission, so
+      drift becomes difficult rather than merely discouraged. And an explicit <strong>break-glass path</strong>: a
+      documented way to make an emergency change with elevated access, logged, and a required follow-up to reconcile
+      the code.
+      <br><br>
+      That last one is the mature position. <strong>Pretending emergency changes won't happen guarantees they happen
+      undocumented.</strong> Planning for them keeps the repository trustworthy.</p>
+  </div>
+
+  <h2 id="immutability">Idempotency and immutability <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Means</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Idempotent</strong></td>
+          <td>Applying twice has the same effect as once</td>
+          <td><strong>A failed run can be retried safely</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Immutable</strong></td>
+          <td>Changes replace rather than modify in place</td>
+          <td>No accumulated state; the new thing is exactly as defined</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Immutable infrastructure, and where it stops</div>
+    <p style="margin:0">The immutable approach — build a new VM image or container image and replace the running
+      instance rather than patching it — removes configuration drift entirely at that layer. There's no long-lived
+      machine to accumulate hand-edits, and every instance is byte-identical.
+      <br><br>
+      That's why containers fit IaC so naturally: the image <em>is</em> the immutable artefact, and deployment
+      replaces rather than updates.
+      <br><br>
+      It doesn't apply everywhere. <strong>Stateful resources can't be replaced casually</strong> — a database holds
+      data, so "delete and recreate" is not available. That's the distinction worth carrying: immutable for compute,
+      careful in-place change for data.
+      <br><br>
+      Which is exactly where IaC needs the most care. A parameter change that Azure implements by
+      <strong>replacing</strong> a resource is fine for an App Service and catastrophic for a SQL database. The
+      <code>plan</code> output tells you which — <em>if</em> you read it, and reading it properly is the discipline
+      the whole workflow depends on.</p>
+  </div>
+
+  <h2 id="workflow">The workflow <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — the loop that makes this safe"><code class="language-text">  write / change definition
+        |
+        v
+  validate + lint        syntax, policy rules, security checks
+        |
+        v
+  PLAN                   what WOULD change - posted to the pull request
+        |
+        v
+  review                 a human reads the plan, not just the code diff
+        |
+        v
+  APPLY                  pipeline identity only, never a laptop
+        |
+        v
+  drift detection        scheduled plan; alert on any difference</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The plan is the review artefact, not the code</div>
+    <p style="margin:0">A code diff shows what someone <em>wrote</em>. The plan shows what will actually
+      <em>happen</em>, and they can differ dramatically.
+      <br><br>
+      A one-line change to a parameter can produce a plan containing
+      <strong><code>-/+ destroy and then create replacement</code></strong> on a database. Nothing in the diff hints
+      at that. You only see it in the plan.
+      <br><br>
+      So the practice is to <strong>post the plan into the pull request</strong> and require someone to read it —
+      specifically looking for destroy and replace operations. That's the single highest-value habit in IaC, and it's
+      what turns "we use Terraform" into "we use Terraform safely."
+      <br><br>
+      Two supports worth having. <strong>Policy checks in CI</strong> — Checkov, tfsec, Azure Policy — so
+      "public network access enabled" is caught mechanically rather than depending on a reviewer noticing. And
+      <strong>resource locks or <code>prevent_destroy</code></strong> on genuinely irreplaceable resources, so an
+      accidental deletion fails rather than succeeding.
+      <br><br>
+      <strong>Structural, not procedural</strong> — the same principle as everywhere else. A rule the tooling
+      enforces beats a rule people are asked to remember.</p>
+  </div>
+
+  <h2 id="in-this-section">In this section</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr><td><a href="terraform.html">Terraform</a></td><td>Providers, state and backends, modules, workspaces, plan/apply, imports</td></tr>
+        <tr><td><a href="bicep-arm.html">Bicep &amp; ARM</a></td><td>Resources, modules, scopes, parameters, deployment modes, what-if</td></tr>
+        <tr><td><a href="practices.html">IaC in Production</a></td><td>Pipelines, secrets, drift, environment strategy, and choosing between the tools</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The value is review, reproducibility and governance — automation is a side effect.</li>
+      <li>Declarative means you don't need to know the current state to write a correct change.</li>
+      <li>Removal is the property scripts don't give you: delete the block, the resource goes.</li>
+      <li>State is how a tool knows what it owns.</li>
+      <li>Terraform's state file is critical infrastructure and contains secrets.</li>
+      <li>Bicep avoids state entirely because Azure's resource graph is the state.</li>
+      <li>Drift's real cost is loss of trust in the repository.</li>
+      <li>Scheduled drift detection plus read-only portal access for humans.</li>
+      <li>Plan an explicit break-glass path — emergencies will happen.</li>
+      <li>Immutable for compute; careful in-place change for data.</li>
+      <li>Read the plan for destroy and replace operations — the code diff won't show them.</li>
+      <li>Policy checks and resource locks make safety structural.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Why use Infrastructure as Code rather than the portal? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd put automation last, because it's the weakest of the benefits — most teams provision infrastructure
+          rarely, so the time saved isn't the point."</p>
+        <p>"The strongest reason is <strong>reviewability</strong>. With IaC, opening a firewall port or removing a
+          backup policy arrives as a pull request with an author, a reason and a reviewer. In the portal it's a click
+          nobody sees. That's a genuine control, and it catches exactly the changes that cause incidents —
+          particularly security-relevant ones where the person making the change doesn't realise the
+          implication."</p>
+        <p>"Second, <strong>reproducibility</strong>. Standing up an identical environment stops being a project.
+          Which makes realistic testing practical, and turns disaster recovery from an improvisation into a procedure
+          you can rehearse."</p>
+        <p>"Third, <strong>it's documentation that can't go stale</strong>, because it's what's actually deployed.
+          The question 'why is this configured like that?' becomes answerable with git blame — usually the hardest
+          question to answer about inherited infrastructure."</p>
+        <p>"Fourth, <strong>no snowflakes</strong>. No server nobody dares touch because someone configured something
+          by hand years ago and left."</p>
+        <p>"There's a property worth calling out specifically: <strong>declarative IaC handles removal</strong>. With
+          scripts you have to remember to write a deletion script, so in practice orphaned resources accumulate —
+          storage accounts nobody uses, public IPs still billing. Declaratively you delete the block and the resource
+          goes, because the definition is the complete statement of what should exist. That's also what makes it an
+          audit tool: if it isn't in the repository, it shouldn't exist."</p>
+        <p>"I'd be honest about the costs, because they're real. <strong>There's a learning curve</strong>, and
+          simple changes take longer than a click. <strong>State management</strong> is a genuine operational concern
+          with Terraform. And <strong>drift</strong> becomes a new problem you have to manage — someone makes a
+          portal change during an incident, and now the code lies."</p>
+        <p>"On drift specifically, the mature position is that <strong>emergency manual changes will happen</strong>,
+          so I'd plan for them: a documented break-glass path with elevated access, logged, and a required follow-up
+          to reconcile the code. Pretending they won't happen just guarantees they happen undocumented."</p>
+        <p>"And I'd pair IaC with <strong>read-only portal access for humans</strong>, with write permission held by
+          the pipeline identity. Otherwise IaC is advisory — a convention people follow when convenient. That's the
+          difference between using it and relying on it, and it's the same structural-not-procedural principle that
+          applies to any control."</p>
+        <p>"Where I <em>wouldn't</em> insist on it: genuinely throwaway exploration. Clicking around to learn a
+          service is fine. The rule is that <strong>anything that lives becomes code</strong>, and anything
+          long-lived created by hand gets imported."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you lead with governance rather than automation?</li>
+        <li>Do you value reproducibility for testing and DR?</li>
+        <li>Do you know declarative handles removal?</li>
+        <li>Are you honest about the costs and about drift?</li>
+        <li>Do you restrict portal write access?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "it's faster" as the main argument.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of drift or state.</li>
+        <li><span class="redflag">Red flag:</span> claiming manual changes simply won't happen.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Someone changed a setting in the portal. What now?</li>
+          <li>How do you bring existing resources under IaC?</li>
+          <li>Who should be allowed to run apply?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

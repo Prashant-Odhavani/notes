@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Behavioural Patterns — Design Patterns</title>
+<meta name="description" content="Strategy, Observer, Command, Chain of Responsibility, Template Method, State and Mediator — with the naive code each replaces and honest trade-offs.">
+<meta name="keywords" content="strategy pattern C# open closed switch replacement observer domain events command pattern chain of responsibility middleware template method state machine transition table mediator MediatR pipeline behaviour CQRS handler">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="18-design-patterns/behavioral.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Behavioural Patterns</h1>
+    <p class="subtitle">Patterns about <em>how objects interact</em>. Strategy and Mediator are the two that
+      come up constantly — and Mediator is the one where having an opinion matters.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Strategy</strong> — one interface, a class per algorithm, chosen at runtime. Replaces a
+        growing <code>switch</code>.</li>
+      <li><strong>Observer</strong> — publishers notify subscribers without knowing them.</li>
+      <li><strong>Command</strong> — an action as an object, so it can be queued, logged or undone.</li>
+      <li><strong>Chain of Responsibility</strong> — ASP.NET Core middleware is exactly this.</li>
+      <li><strong>Template Method</strong> — a base class fixes the steps, subclasses fill them in.</li>
+      <li><strong>State</strong> — behaviour changes with state. Start with a transition table.</li>
+      <li><strong>Mediator</strong> — components talk through a hub. Real benefits, real costs.</li>
+    </ul>
+  </div>
+
+  <h2 id="strategy">Strategy <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>You have several ways of doing the same job, and which one applies depends on runtime data.</p>
+    <p>Strategy puts <strong>each variant in its own class behind one interface</strong>, so the caller picks
+      one instead of branching through all of them.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A navigation app. "Fastest route", "avoid motorways", "walking" are different algorithms producing the
+      same shape of answer.</p>
+    <p>The app doesn't contain one enormous routing function with modes bolted on. It has interchangeable
+      routing engines, and you select one.</p>
+  </div>
+
+  <h3 id="strategy-before">The problem it solves</h3>
+
+  <pre data-label="csharp — before: a switch that keeps growing" class="code-bad"><code class="language-csharp">public decimal CalculateDiscount(Order order, Customer customer)
+{
+    decimal discount = 0;
+
+    switch (customer.Tier)
+    {
+        case CustomerTier.Standard:
+            if (order.Subtotal &gt; 1000) discount = order.Subtotal * 0.05m;
+            break;
+
+        case CustomerTier.Gold:
+            discount = order.Subtotal * 0.10m;
+            if (order.Subtotal &gt; 5000) discount = order.Subtotal * 0.15m;
+            break;
+
+        case CustomerTier.Partner:
+            // Partner discounts come from a contract in the database...
+            var contract = _db.Contracts.FirstOrDefault(c =&gt; c.CustomerId == customer.Id);
+            discount = order.Subtotal * (contract?.Rate ?? 0.12m);
+            break;
+
+        // Six months later: Seasonal, Employee, Volume, FirstOrder...
+    }
+
+    return discount;
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What's wrong with it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Every new rule means editing this method</strong> — so every change risks the existing rules</td></tr>
+        <tr><td><strong>The method accumulates dependencies.</strong> Partner needs the database; the next one needs an HTTP call. Now this class depends on everything</td></tr>
+        <tr><td><strong>Testing one rule requires satisfying all of them.</strong> To test Gold you still construct the database dependency Partner needs</td></tr>
+        <tr><td><strong>It grows without limit.</strong> Discount logic is the classic example — it never stops accumulating cases</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="strategy-after">The pattern applied</h3>
+
+  <pre data-label="csharp — one interface, a class per rule" class="code-good"><code class="language-csharp">public interface IDiscountPolicy
+{
+    CustomerTier AppliesTo { get; }
+    Money Apply(Money subtotal, Customer customer);
+}
+
+public sealed class StandardDiscount : IDiscountPolicy
+{
+    public CustomerTier AppliesTo =&gt; CustomerTier.Standard;
+
+    public Money Apply(Money subtotal, Customer customer) =&gt;
+        subtotal.Amount &gt; 1000 ? subtotal * 0.95m : subtotal;
+}
+
+public sealed class GoldDiscount : IDiscountPolicy
+{
+    public CustomerTier AppliesTo =&gt; CustomerTier.Gold;
+
+    public Money Apply(Money subtotal, Customer customer) =&gt;
+        subtotal.Amount &gt; 5000 ? subtotal * 0.85m : subtotal * 0.90m;
+}
+
+// This one needs the database - and ONLY this one does
+public sealed class PartnerDiscount(IContractRepository contracts) : IDiscountPolicy
+{
+    public CustomerTier AppliesTo =&gt; CustomerTier.Partner;
+
+    public Money Apply(Money subtotal, Customer customer)
+    {
+        var rate = contracts.RateFor(customer.Id) ?? 0.12m;
+        return subtotal * (1 - rate);
+    }
+}</code></pre>
+
+  <pre data-label="csharp — the caller no longer branches" class="code-good"><code class="language-csharp">public sealed class PricingService(IEnumerable&lt;IDiscountPolicy&gt; policies)
+{
+    private readonly Dictionary&lt;CustomerTier, IDiscountPolicy&gt; _byTier =
+        policies.ToDictionary(p =&gt; p.AppliesTo);
+
+    public Money PriceFor(Order order, Customer customer) =&gt;
+        _byTier.TryGetValue(customer.Tier, out var policy)
+            ? policy.Apply(order.Subtotal, customer)
+            : order.Subtotal;          // no policy = no discount
+}</code></pre>
+
+  <pre data-label="csharp — registration: adding a rule is one line" class="code-good"><code class="language-csharp">services.AddScoped&lt;IDiscountPolicy, StandardDiscount&gt;();
+services.AddScoped&lt;IDiscountPolicy, GoldDiscount&gt;();
+services.AddScoped&lt;IDiscountPolicy, PartnerDiscount&gt;();
+services.AddScoped&lt;PricingService&gt;();
+
+// Or scan the assembly, so adding a class is genuinely zero configuration:
+// services.Scan(s => s.FromAssemblyOf&lt;IDiscountPolicy&gt;()
+//     .AddClasses(c => c.AssignableTo&lt;IDiscountPolicy&gt;()).AsImplementedInterfaces());</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What changed</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Each rule is its own class</td><td>A new rule is a <strong>new file</strong>, not an edit to working code</td></tr>
+        <tr><td>Each rule declares its own dependencies</td><td><code>PartnerDiscount</code> takes the repository; the others don't touch it</td></tr>
+        <tr><td>Each rule is independently testable</td><td>Test <code>GoldDiscount</code> with two lines and no mocks</td></tr>
+        <tr><td>The dictionary builds itself</td><td>No switch to forget to update</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — Strategy in .NET is usually just an injected interface</div>
+    <p style="margin:0">The GoF diagram has a <code>Context</code> class holding a strategy and a setter to swap
+      it. You almost never write that in .NET, because <strong>constructor injection <em>is</em> the strategy
+      pattern</strong> — the container supplies the implementation and the consumer never knows which one.
+      <br><br>
+      So if a class takes <code>IDiscountPolicy</code> in its constructor, you've already applied Strategy
+      without naming it. Saying that shows you recognise the pattern in idiomatic code rather than only in its
+      textbook shape.
+      <br><br>
+      And for a genuinely simple stateless algorithm, <strong>you may not need the interface at all</strong>. A
+      <code>Func&lt;Money, Customer, Money&gt;</code> or a dictionary of delegates is less ceremony:</p>
+    <pre data-label="csharp"><code class="language-csharp">private static readonly Dictionary&lt;CustomerTier, Func&lt;Money, Money&gt;&gt; Rules = new()
+{
+    [CustomerTier.Standard] = s =&gt; s.Amount &gt; 1000 ? s * 0.95m : s,
+    [CustomerTier.Gold]     = s =&gt; s * 0.90m
+};</code></pre>
+    <p style="margin:8px 0 0">Reach for the interface when a strategy needs <strong>its own dependencies</strong>
+      (like <code>PartnerDiscount</code>), needs a name for registration, or has more than one method.</p>
+  </div>
+
+  <div class="note compare">
+    <div class="note-title">The honest trade-off</div>
+    <p style="margin:0">Strategy exchanges a <strong>visible conditional</strong> for <strong>invisible
+      indirection</strong>.
+      <br><br>
+      With three simple cases, the <code>switch</code> is genuinely easier to read and debug — everything is on
+      one screen. Strategy scatters that logic across four files and a registration, and finding "what actually
+      runs for a Gold customer" now requires knowing the pattern.
+      <br><br>
+      It wins when the variants have <strong>real logic, their own dependencies, or the set keeps
+      growing</strong>. Discount rules, payment providers, export formats, notification channels — all yes. A
+      three-case switch over an enum that hasn't changed in two years — no.
+      <br><br>
+      <strong>Strategy vs Factory:</strong> a factory answers "which <em>object</em> do I need?" and hands it
+      back. Strategy answers "which <em>algorithm</em> should run?" and the caller just invokes it. They're often
+      used together — a factory selecting a strategy.</p>
+  </div>
+
+  <h2 id="observer">Observer <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Something happened, and an unknown number of interested parties should react — without the publisher
+      knowing who they are.</p>
+  </div>
+
+  <pre data-label="csharp — domain events, the common .NET shape" class="code-good"><code class="language-csharp">public sealed record OrderPlaced(Guid OrderId, Guid CustomerId, Money Total);
+
+// Several independent handlers, none known to the publisher
+public sealed class SendConfirmationEmail : INotificationHandler&lt;OrderPlaced&gt;
+{
+    public Task Handle(OrderPlaced e, CancellationToken ct) =&gt; /* ... */;
+}
+
+public sealed class UpdateSalesFigures : INotificationHandler&lt;OrderPlaced&gt;
+{
+    public Task Handle(OrderPlaced e, CancellationToken ct) =&gt; /* ... */;
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Two decisions people skip</div>
+    <p style="margin:0"><strong>1. Before or after commit?</strong> Handlers running <em>inside</em> the
+      transaction can roll it back — correct for maintaining an invariant, wrong for sending an email, because a
+      later failure has already sent it. Handlers running <em>after</em> commit can't affect the transaction but
+      may fail with the data already saved.
+      <br><br>
+      <strong>2. Anything with an external side effect belongs in an
+      <a href="../19-architecture/distributed-data.html#outbox">outbox</a>.</strong> Write the intent in the same
+      transaction, publish after commit. Otherwise you get the dual-write problem: the order saved and the email
+      didn't, or vice versa.
+      <br><br>
+      And with plain C# <code>event</code> handlers, <strong>a subscriber that never unsubscribes is a memory
+      leak</strong> — the publisher holds a reference to it indefinitely. Same shape as
+      <a href="../30-web-fundamentals/javascript.html#closures">unremoved DOM listeners</a>.</p>
+  </div>
+
+  <h2 id="command">Command <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Wrap "do this thing" in an object, so the action can be <strong>passed around, queued, logged, retried or
+      undone</strong> rather than being a method call that happens immediately.</p>
+  </div>
+
+  <pre data-label="csharp — the request as data"><code class="language-csharp">public sealed record CancelOrder(Guid OrderId, string Reason) : IRequest&lt;Result&gt;;
+
+public sealed class CancelOrderHandler(IOrderRepository orders)
+    : IRequestHandler&lt;CancelOrder, Result&gt;
+{
+    public async Task&lt;Result&gt; Handle(CancelOrder cmd, CancellationToken ct)
+    {
+        var order = await orders.GetAsync(cmd.OrderId, ct);
+        order.Cancel(cmd.Reason);
+        return Result.Ok();
+    }
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why turning an action into data is powerful</div>
+    <p style="margin:0">Once the request is an object, things become possible that a method call can't offer:
+      <strong>serialise it to a queue</strong> for later processing, <strong>log it</strong> as an audit record of
+      intent, <strong>validate it</strong> generically before any handler runs, <strong>retry it</strong> after a
+      failure, or <strong>store a sequence</strong> of them for undo.
+      <br><br>
+      That's why Command underpins <a href="enterprise.html#cqrs">CQRS</a>,
+      <a href="../21-messaging/index.html">message queues</a> and event sourcing — they all depend on the
+      operation being representable as data.
+      <br><br>
+      The cost is a class per operation, which is real ceremony for simple CRUD.</p>
+  </div>
+
+  <h2 id="chain">Chain of Responsibility <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">You already use this every day</span>
+    <p><strong>ASP.NET Core middleware is Chain of Responsibility.</strong> Each component gets the request,
+      decides whether to handle it or pass it on, and can act on the response coming back.</p>
+    <p>So is Angular's <code>HttpInterceptor</code>, and <code>DelegatingHandler</code> in
+      <code>HttpClient</code>.</p>
+  </div>
+
+  <pre data-label="csharp — the shape"><code class="language-csharp">app.UseExceptionHandler();     // outermost - catches everything below
+app.UseHttpsRedirection();
+app.UseAuthentication();       // must precede authorisation
+app.UseAuthorization();
+app.MapControllers();          // the endpoint - the end of the chain</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The pipeline is bidirectional, so order matters twice</div>
+    <p style="margin:0">Each middleware runs code <em>before</em> calling <code>next()</code> and can run more
+      <em>after</em> it returns. So the first registered component is the <strong>outermost</strong> — first to
+      see the request and last to see the response.
+      <br><br>
+      That's why exception handling goes first (it must wrap everything) and why authentication must precede
+      authorisation (you can't authorise an unidentified user).
+      <br><br>
+      Registering middleware in the wrong order produces failures that look inexplicable — authorisation
+      rejecting a valid user because authentication hasn't run yet. Covered in detail on the
+      <a href="../07-aspnet-core/pipeline-routing.html">ASP.NET Core pipeline page</a>.</p>
+  </div>
+
+  <h2 id="template-method">Template Method <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <pre data-label="csharp — the base class fixes the sequence"><code class="language-csharp">public abstract class ImportJob
+{
+    // The algorithm's shape is fixed here and cannot be reordered
+    public async Task&lt;ImportResult&gt; RunAsync(CancellationToken ct)
+    {
+        var raw = await FetchAsync(ct);           // subclass supplies
+        var valid = Validate(raw);                // subclass may override
+        await PersistAsync(valid, ct);            // subclass supplies
+        await NotifyAsync(valid.Count, ct);       // shared default
+        return new ImportResult(valid.Count);
+    }
+
+    protected abstract Task&lt;IReadOnlyList&lt;Row&gt;&gt; FetchAsync(CancellationToken ct);
+    protected abstract Task PersistAsync(IReadOnlyList&lt;Row&gt; rows, CancellationToken ct);
+    protected virtual IReadOnlyList&lt;Row&gt; Validate(IReadOnlyList&lt;Row&gt; rows) =&gt; rows;
+    protected virtual Task NotifyAsync(int count, CancellationToken ct) =&gt; Task.CompletedTask;
+}</code></pre>
+
+  <div class="note compare">
+    <div class="note-title">Prefer composition unless the sequence is genuinely fixed</div>
+    <p style="margin:0">Template Method uses inheritance, so it inherits inheritance's problems: a subclass is
+      coupled to the base's <code>protected</code> surface, and changing that base breaks every subclass at
+      once.
+      <br><br>
+      The composition alternative is to inject an <code>IFetcher</code> and an <code>IPersister</code> into one
+      concrete <code>ImportJob</code>. More flexible, more testable, and each part is substitutable
+      independently.
+      <br><br>
+      Template Method still earns its place when <strong>the ordering is the invariant you're protecting</strong>
+      — when it must be fetch, then validate, then persist, and a subclass getting that wrong would be a bug. The
+      base class makes the order unrepresentable-wrong, which composition doesn't.</p>
+  </div>
+
+  <h2 id="state">State <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — start with a transition table" class="code-good"><code class="language-csharp">private static readonly Dictionary&lt;(OrderStatus From, OrderTrigger On), OrderStatus&gt;
+    Transitions = new()
+{
+    [(OrderStatus.Draft,    OrderTrigger.Submit)]  = OrderStatus.Placed,
+    [(OrderStatus.Placed,   OrderTrigger.Pay)]     = OrderStatus.Paid,
+    [(OrderStatus.Placed,   OrderTrigger.Cancel)]  = OrderStatus.Cancelled,
+    [(OrderStatus.Paid,     OrderTrigger.Ship)]    = OrderStatus.Shipped,
+    [(OrderStatus.Shipped,  OrderTrigger.Deliver)] = OrderStatus.Delivered
+    // Anything absent is an invalid transition - by construction
+};
+
+public void Apply(OrderTrigger trigger)
+{
+    if (!Transitions.TryGetValue((Status, trigger), out var next))
+        throw new InvalidOperationException($"Cannot {trigger} an order that is {Status}.");
+    Status = next;
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why a table beats a class-per-state at first</div>
+    <p style="margin:0">The full State pattern gives each state its own class implementing the operations. That's
+      right when each state has substantial distinct behaviour.
+      <br><br>
+      But a <strong>transition table is exhaustively testable</strong> — you can assert every
+      state-trigger combination in a loop, and invalid transitions are simply absent from the table rather than
+      requiring a check in each state class. It's also readable as a specification: someone can see the whole
+      lifecycle in one place.
+      <br><br>
+      So start with the table. Move to class-per-state when the <em>behaviour</em> in each state diverges enough
+      that the table's value objects get complicated.
+      <br><br>
+      The alternative people reach for — a pile of <code>if (status == X &amp;&amp; ...)</code> checks scattered
+      across services — is what both approaches exist to prevent, because invalid transitions become possible
+      wherever someone forgets a check.</p>
+  </div>
+
+  <h2 id="mediator">Mediator <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Instead of components calling each other directly, they send messages to a <strong>hub</strong> which
+      routes them to whatever handles them.</p>
+    <p>In .NET this almost always means MediatR or a similar library: a controller sends a request object, and a
+      handler elsewhere processes it.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>An air traffic controller. Aircraft don't negotiate with each other directly — they all talk to the
+      tower.</p>
+    <p>That removes N-to-N coordination. It also means the tower is now essential, and you can't tell which
+      aircraft is talking to which by looking at the aircraft.</p>
+  </div>
+
+  <h3 id="mediator-before">The problem it solves</h3>
+
+  <pre data-label="csharp — before: a controller that knows everything" class="code-bad"><code class="language-csharp">public class OrdersController(
+    IOrderRepository orders,
+    IInventoryService inventory,
+    IPaymentGateway payments,
+    IEmailSender email,
+    IAuditLogger audit,
+    IValidator&lt;PlaceOrderDto&gt; validator,
+    IUnitOfWork uow,
+    ILogger&lt;OrdersController&gt; logger) : ControllerBase
+{
+    [HttpPost]
+    public async Task&lt;IActionResult&gt; Place(PlaceOrderDto dto)
+    {
+        // Validation, logging and transaction handling repeated in EVERY action
+        var result = await validator.ValidateAsync(dto);
+        if (!result.IsValid) return BadRequest(result.Errors);
+
+        logger.LogInformation("Placing order for {Customer}", dto.CustomerId);
+        using var tx = await uow.BeginAsync();
+        try
+        {
+            // ... orchestration ...
+            await tx.CommitAsync();
+            return Ok();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to place order");
+            throw;
+        }
+    }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What's wrong with it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Eight constructor dependencies</strong>, and the controller grows one per feature</td></tr>
+        <tr><td><strong>Validation, logging and transaction code repeated in every action</strong> — copy-paste that drifts</td></tr>
+        <tr><td><strong>Orchestration logic lives in the HTTP layer</strong>, so it can't be reused from a background job or a message consumer</td></tr>
+        <tr><td><strong>Hard to test</strong> — eight mocks to exercise one path</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="mediator-after">The pattern applied</h3>
+
+  <pre data-label="csharp — the controller does one thing" class="code-good"><code class="language-csharp">public class OrdersController(IMediator mediator) : ControllerBase
+{
+    [HttpPost]
+    public async Task&lt;IActionResult&gt; Place(PlaceOrder command, CancellationToken ct)
+    {
+        var result = await mediator.Send(command, ct);
+        return result.IsSuccess ? Ok(result.Value) : BadRequest(result.Error);
+    }
+}</code></pre>
+
+  <pre data-label="csharp — the handler owns the use case" class="code-good"><code class="language-csharp">public sealed record PlaceOrder(Guid CustomerId, OrderLine[] Lines) : IRequest&lt;Result&lt;Guid&gt;&gt;;
+
+public sealed class PlaceOrderHandler(
+    IOrderRepository orders,
+    IInventoryService inventory) : IRequestHandler&lt;PlaceOrder, Result&lt;Guid&gt;&gt;
+{
+    public async Task&lt;Result&lt;Guid&gt;&gt; Handle(PlaceOrder cmd, CancellationToken ct)
+    {
+        if (!await inventory.CanFulfilAsync(cmd.Lines, ct))
+            return Result.Fail&lt;Guid&gt;("Insufficient stock");
+
+        var order = Order.Place(cmd.CustomerId, cmd.Lines);
+        await orders.AddAsync(order, ct);
+        return Result.Ok(order.Id);
+    }
+}</code></pre>
+
+  <pre data-label="csharp — the real payoff: cross-cutting behaviour, written once" class="code-good"><code class="language-csharp">// Applies to EVERY request passing through the mediator
+public sealed class ValidationBehaviour&lt;TRequest, TResponse&gt;(
+    IEnumerable&lt;IValidator&lt;TRequest&gt;&gt; validators)
+    : IPipelineBehavior&lt;TRequest, TResponse&gt; where TRequest : notnull
+{
+    public async Task&lt;TResponse&gt; Handle(
+        TRequest request, RequestHandlerDelegate&lt;TResponse&gt; next, CancellationToken ct)
+    {
+        var failures = validators
+            .Select(v =&gt; v.Validate(request))
+            .SelectMany(r =&gt; r.Errors)
+            .Where(f =&gt; f is not null)
+            .ToList();
+
+        if (failures.Count &gt; 0) throw new ValidationException(failures);
+
+        return await next();
+    }
+}
+
+// One registration; every command is now validated, logged and transactional
+services.AddTransient(typeof(IPipelineBehavior&lt;,&gt;), typeof(ValidationBehaviour&lt;,&gt;));
+services.AddTransient(typeof(IPipelineBehavior&lt;,&gt;), typeof(LoggingBehaviour&lt;,&gt;));
+services.AddTransient(typeof(IPipelineBehavior&lt;,&gt;), typeof(TransactionBehaviour&lt;,&gt;));</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the pipeline is the actual reason to adopt Mediator</div>
+    <p style="margin:0">People justify MediatR with "it decouples the controller from the handler". That's true
+      and it's a weak benefit — the controller was already only calling one service.
+      <br><br>
+      <strong>The real value is <code>IPipelineBehavior</code>.</strong> Validation, logging, transaction
+      management, retry, caching and authorisation get written <em>once</em> and apply uniformly to every request.
+      Without it, each of those is copy-pasted into every handler and drifts — one endpoint forgets the
+      transaction, another logs differently.
+      <br><br>
+      It's the same mechanism as <a href="#chain">ASP.NET Core middleware</a>, applied at the application layer
+      instead of the HTTP layer — which matters because it also covers requests that <em>didn't</em> arrive over
+      HTTP, like a message consumer or a scheduled job.
+      <br><br>
+      Leading with the pipeline rather than the decoupling is what shows you've used it in anger.</p>
+  </div>
+
+  <div class="note compare">
+    <div class="note-title">The costs — have an opinion on these</div>
+    <p style="margin:0"><strong>Navigability suffers.</strong> "Go to definition" on
+      <code>mediator.Send(command)</code> takes you into the library, not the handler. You find handlers by
+      naming convention or by searching for the request type. On a large codebase that's a genuine daily friction,
+      and it's the complaint experienced teams raise most.
+      <br><br>
+      <strong>Weaker compile-time safety.</strong> A missing or duplicate handler is a runtime failure, not a
+      build error. Deleting a handler still compiles.
+      <br><br>
+      <strong>Indirection for its own sake in small services.</strong> In a three-endpoint API,
+      <code>mediator.Send</code> is an extra hop to reach a class the controller could have injected directly. You
+      get the ceremony and none of the benefit.
+      <br><br>
+      <strong>Debugging is harder.</strong> A stack trace through four pipeline behaviours and a dispatcher is
+      considerably less readable than a direct call.
+      <br><br>
+      <strong>My position:</strong> adopt it when you have enough use cases that uniform cross-cutting behaviour
+      is worth the indirection — and note you can get most of the benefit without the library by injecting
+      handlers directly and using decorators for the cross-cutting parts.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Strategy replaces a growing switch; each variant gets its own class and its own dependencies.</li>
+      <li>In .NET, constructor injection <em>is</em> Strategy — and a <code>Func&lt;&gt;</code> often suffices.</li>
+      <li>Strategy trades a visible conditional for invisible indirection. Three simple cases don't need
+        it.</li>
+      <li>Observer: decide before-commit vs after-commit deliberately, and use an outbox for external
+        effects.</li>
+      <li>C# <code>event</code> subscribers that never unsubscribe leak.</li>
+      <li>Command turns an action into data, which is what makes queueing, retry, audit and undo possible.</li>
+      <li>Middleware is Chain of Responsibility, and it's bidirectional — order matters twice.</li>
+      <li>For state machines, start with an exhaustively-testable transition table.</li>
+      <li>Mediator's real payoff is <code>IPipelineBehavior</code>, not controller decoupling.</li>
+      <li>Mediator costs navigability and compile-time safety. Don't adopt it reflexively in a small
+        service.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Strategy for a two-case switch</strong> — indirection with no benefit.</li>
+    <li><strong>A strategy interface where a <code>Func&lt;&gt;</code> would do.</strong></li>
+    <li><strong>One class accumulating every rule's dependencies</strong> because the switch stayed.</li>
+    <li><strong>Domain event handlers sending email inside the transaction.</strong></li>
+    <li><strong>Event subscribers never unsubscribed.</strong></li>
+    <li><strong>Middleware registered in the wrong order</strong> — authorisation before authentication.</li>
+    <li><strong>Status checks scattered across services</strong> instead of one transition table.</li>
+    <li><strong>Adopting MediatR for the decoupling</strong> without using pipeline behaviours.</li>
+    <li><strong>MediatR in a three-endpoint service.</strong></li>
+    <li><strong>Business logic in the controller</strong>, so it can't be reused by a job or consumer.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>You have a discount calculation with a growing switch on customer tier. How would you restructure it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That's Strategy, and I'd start by naming <em>why</em> the switch is a problem, because that determines
+          whether the pattern is worth it."</p>
+        <p>"Three specific problems. <strong>Every new rule means editing working code</strong>, so each change
+          risks the existing tiers. <strong>The method accumulates dependencies</strong> — the Partner tier needs
+          a contract from the database, the next one needs an HTTP call, and now this one class depends on
+          everything. And <strong>testing one rule requires satisfying all of them</strong>: to test the Gold
+          calculation I still have to construct whatever the Partner branch needs."</p>
+        <p>"So I'd extract an <code>IDiscountPolicy</code> interface with an <code>Apply</code> method, and one
+          class per tier. <code>PartnerDiscount</code> takes <code>IContractRepository</code> in its constructor;
+          the others take nothing. Each is testable in two lines with no mocks."</p>
+        <p>"For selection, rather than a factory with its own switch, I'd have each policy declare what it
+          applies to and inject <code>IEnumerable&lt;IDiscountPolicy&gt;</code> into the pricing service, building
+          a dictionary keyed by tier. That way <strong>adding a rule is one registration line</strong> — there's
+          no switch left to forget to update. With assembly scanning it's zero configuration."</p>
+        <p>"Now the honest part: <strong>Strategy trades a visible conditional for invisible
+          indirection.</strong> The switch had everything on one screen. After this, answering 'what runs for a
+          Gold customer?' means knowing the pattern and finding the right file."</p>
+        <p>"So I'd apply it here because discount logic is the classic never-stops-growing case and the rules
+          have genuinely different dependencies. I would <em>not</em> apply it to a three-case switch over a
+          stable enum — there the switch is easier to read and debug, and extracting it is
+          over-engineering."</p>
+        <p>"Two .NET-specific points. <strong>Constructor injection already is Strategy</strong> — if a class
+          takes <code>IDiscountPolicy</code>, the pattern is applied whether or not anyone called it that. And for
+          genuinely simple stateless rules, <strong>a dictionary of <code>Func&lt;&gt;</code> delegates</strong> is
+          less ceremony than an interface and four classes. I'd reach for the interface specifically because
+          <code>PartnerDiscount</code> needs its own dependency, which a lambda can't carry cleanly."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you name what's actually wrong with the switch?</li>
+        <li>Do you notice the dependency-accumulation problem?</li>
+        <li>Do you use self-selection rather than another switch in a factory?</li>
+        <li>Will you say when Strategy is <em>not</em> worth it?</li>
+        <li>Do you know DI already is Strategy?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> applying it with no cost analysis.</li>
+        <li><span class="redflag">Red flag:</span> replacing the switch with another switch in a factory and
+          calling it decoupled.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if two discounts can apply at once?</li>
+          <li>How would you test the selection logic?</li>
+          <li>When would a <code>Func&lt;&gt;</code> be enough?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Would you use MediatR in a new project? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It depends on size, and I'd be specific about what the benefit actually is — because the usual
+          justification is the weak one."</p>
+        <p>"People say it decouples the controller from the handler. That's true and it's not worth much: the
+          controller was already just calling one service, and swapping <code>IOrderService</code> for
+          <code>IMediator</code> hasn't bought much decoupling."</p>
+        <p>"<strong>The real value is <code>IPipelineBehavior</code>.</strong> Validation, logging, transaction
+          management, retry and authorisation get written once and apply to every request automatically. Without
+          it, each handler repeats that plumbing — and it drifts. One endpoint forgets to wrap in a transaction,
+          another logs a different shape, and you find out during an incident."</p>
+        <p>"It's the same mechanism as ASP.NET Core middleware, but at the <em>application</em> layer — which
+          matters because it also covers requests that didn't arrive over HTTP. A message consumer or a scheduled
+          job sending the same command gets the same validation and transaction handling for free. That's the
+          argument I'd lead with."</p>
+        <p>"It also gives you a natural unit of work per use case: one request type, one handler, one thing that
+          class does. That tends to keep handlers small in a way that service classes with fifteen methods
+          don't."</p>
+        <p>"Now the costs, which I think are understated."</p>
+        <p>"<strong>Navigability.</strong> 'Go to definition' on <code>mediator.Send(command)</code> takes you
+          into the library. You find handlers by convention or by searching the request type. On a large codebase
+          that's daily friction, and it's the thing teams who've lived with it complain about most."</p>
+        <p>"<strong>Weaker compile-time safety.</strong> A missing handler is a runtime failure. Deleting one
+          still compiles."</p>
+        <p>"<strong>Harder debugging.</strong> A stack trace through four behaviours and a dispatcher is much less
+          readable than a direct call."</p>
+        <p>"<strong>And in a small service it's pure overhead</strong> — an extra hop to reach a class you could
+          have injected."</p>
+        <p>"So: <strong>for a substantial application with many use cases, yes</strong>, because uniform
+          cross-cutting behaviour is worth the indirection. <strong>For a service with a handful of endpoints,
+          no</strong> — inject the handler directly."</p>
+        <p>"The middle option worth mentioning: you can get most of the benefit <strong>without the
+          library</strong>. Inject handler interfaces directly, and use <strong>decorators</strong> — which
+          Scrutor makes easy — for the cross-cutting concerns. You keep 'go to definition' working and
+          compile-time checking, and you lose the generic dispatch. For teams that find the indirection painful,
+          that's often the better trade."</p>
+        <p>"One thing I'd flag regardless: <strong>MediatR is now commercially licensed</strong> for larger
+          organisations. That doesn't change the design argument, but it's a real consideration for a new project
+          and worth raising rather than discovering later."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you identify pipeline behaviours as the real benefit?</li>
+        <li>Do you know it covers non-HTTP entry points?</li>
+        <li>Are you honest about navigability and debugging costs?</li>
+        <li>Do you scale the answer to project size?</li>
+        <li>Do you know the decorator alternative?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "yes, it's clean architecture" with no analysis.</li>
+        <li><span class="redflag">Red flag:</span> leading with controller decoupling.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of the navigability cost.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Write a transaction pipeline behaviour.</li>
+          <li>How would you handle a command that must not be transactional?</li>
+          <li>How do decorators compare?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

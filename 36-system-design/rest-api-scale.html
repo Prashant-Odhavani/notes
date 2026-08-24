@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Large-Scale REST API — System Design Exercises</title>
+<meta name="description" content="A worked design: versioning, pagination that survives scale, caching and ETags, rate limiting, bulk operations and evolving a public contract.">
+<meta name="keywords" content="REST API design at scale versioning URL header pagination keyset cursor offset caching ETag conditional requests rate limiting quotas idempotency bulk operations deprecation sunset header partial response filtering">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/rest-api-scale.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Large-Scale REST API</h1>
+    <p class="subtitle">A public API is a contract you cannot take back. Most of the design is about being able to
+      change it later without breaking anyone.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Assumed answer</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Who consumes it?</td><td><strong>External partners and our own SPA</strong></td><td>Partners change slowly — versioning matters</td></tr>
+        <tr><td>Can we ask consumers to change?</td><td><strong>No, not quickly</strong></td><td>Backward compatibility is a hard constraint</td></tr>
+        <tr><td>Volume?</td><td>10,000 reads/sec peak, 500 writes/sec</td><td><strong>Read-heavy — caching is load-bearing</strong></td></tr>
+        <tr><td>Largest collection?</td><td>Millions of rows for a big tenant</td><td>Rules out offset pagination</td></tr>
+        <tr><td>Latency target?</td><td>p95 under 200ms</td><td>Cache and index deliberately</td></tr>
+        <tr><td>Auth?</td><td>OAuth client credentials, per-partner subscriptions</td><td>Per-consumer quotas and revocation</td></tr>
+        <tr><td>Out of scope</td><td>The domain logic, the SPA, billing</td><td>Focus on the contract and its scaling</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — a public contract is the constraint that shapes everything</div>
+    <p style="margin:0">The read/write ratio tells you to cache. The collection size tells you how to paginate. But
+      the answer that shapes the <em>most</em> decisions is <strong>"we cannot ask consumers to change quickly."</strong>
+      <br><br>
+      That single constraint means: every response shape must be extensible, every field you add is permanent, every
+      field you remove is a breaking change requiring a version, and every default you choose is one you'll live with
+      for years.
+      <br><br>
+      Which reframes the design work. It isn't "what's the cleanest API for today's requirements" — it's
+      <strong>"what can I change later without a coordinated release across partners I don't control?"</strong>
+      <br><br>
+      The practical consequences run through every section below: return objects rather than arrays at the top level
+      so you can add metadata; make pagination opaque so you can change its implementation; put the version in a
+      predictable place; and know which consumers use which version, because you can never deprecate anything
+      otherwise.
+      <br><br>
+      An internal API consumed only by your own SPA is a completely different problem — you can change both sides
+      together, so most of this is unnecessary ceremony. Being able to say which situation you're in, and design
+      accordingly, is the signal.</p>
+  </div>
+
+  <h2 id="versioning">Versioning <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Example</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><strong>URL path</strong></td><td><code>/v1/orders</code></td><td><strong>Preferred for public APIs</strong> — visible, cacheable, obvious in logs</td></tr>
+        <tr><td>Custom header</td><td><code>X-Api-Version: 2</code></td><td>Cleaner URLs; invisible, harder to test in a browser</td></tr>
+        <tr><td>Media type</td><td><code>Accept: application/vnd.x.v2+json</code></td><td>Most "correct"; awkward for consumers</td></tr>
+        <tr><td>Query string</td><td><code>?api-version=2</code></td><td>Common in Azure; easy to omit by accident</td></tr>
+        <tr><td><strong>No versioning</strong></td><td>—</td><td>Fine internally; <strong>not for external consumers</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Version rarely, and additively by default</div>
+    <p style="margin:0">A new version is expensive: two code paths, two sets of tests, two documentation sets, and a
+      migration conversation with every consumer. So the goal is <strong>to need one as rarely as possible</strong>.
+      <br><br>
+      Most changes can be additive and therefore need no version at all. <strong>Adding a field</strong> is safe if
+      consumers ignore unknown properties. <strong>Adding an optional parameter</strong> is safe. <strong>Adding an
+      endpoint</strong> is safe. <strong>Adding an enum value</strong> is a grey area — safe if consumers handle
+      unknown values, breaking if they switch exhaustively, so it's worth documenting the expectation explicitly.
+      <br><br>
+      What genuinely breaks: removing or renaming a field, changing a type, making an optional parameter required,
+      changing a default, changing an error code's meaning, or tightening validation. Those need a version.
+      <br><br>
+      Two structural choices that reduce version pressure. <strong>Return an object at the top level, never a bare
+      array</strong> — <code>{ "data": [...], "pagination": {...} }</code> — because you can add sibling properties
+      later, and you cannot add anything to an array. And <strong>keep enums and status values extensible</strong>,
+      documenting that consumers must tolerate new values.
+      <br><br>
+      When you do version, <strong>version the whole API rather than individual endpoints</strong>. Per-endpoint
+      versions produce a matrix nobody can reason about — a consumer on v2 of orders and v1 of customers, with
+      undefined interactions.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Deprecation only works if you know who uses what</div>
+    <p style="margin:0">Publishing a v2 is the easy half. Retiring v1 is where APIs accumulate permanent maintenance
+      burden — and the blocker is almost always that <strong>nobody knows who's still calling it</strong>.
+      <br><br>
+      So instrument version usage <em>per consumer</em> from the start. Then "we'd like to retire v1" becomes a
+      specific list of partners to contact rather than an open-ended risk, and the conversation is possible at
+      all.
+      <br><br>
+      The process that works: announce with a date, emit the <strong><code>Deprecation</code> and
+      <code>Sunset</code> headers</strong> so automated clients and tooling can see it, contact the identified
+      consumers directly, then — usefully — run <strong>brownouts</strong>: short deliberate outages of the old
+      version. That converts "we didn't realise it affected us" into a discovery during a scheduled window rather
+      than at final shutdown.
+      <br><br>
+      And be realistic: <strong>some consumers never migrate.</strong> At some point the decision is commercial —
+      cut them off, or keep v1 alive for one partner. Having usage data makes that a decision rather than a
+      guess.</p>
+  </div>
+
+  <h2 id="pagination">Pagination <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — offset does not survive scale"><code class="language-text">  OFFSET / PAGE NUMBER
+    GET /v1/orders?page=5000&pageSize=50
+    -> SELECT ... ORDER BY CreatedAt OFFSET 250000 ROWS FETCH NEXT 50
+
+    The database walks 250,000 rows to discard them. Cost grows with depth.
+    AND: a row inserted between requests SHIFTS everything, so page 2
+         can repeat or skip items. Silent data loss in an export.
+
+  KEYSET / CURSOR
+    GET /v1/orders?limit=50&cursor=eyJjIjoiMjAyNS0wOC0yMSIsImkiOjQ0fQ
+    -> SELECT ... WHERE (CreatedAt, Id) < (@lastCreatedAt, @lastId)
+       ORDER BY CreatedAt DESC, Id DESC FETCH NEXT 50
+
+    Constant cost at any depth. Stable under concurrent inserts.
+    Cost: no random access to "page 500", no total count.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Offset</th><th>Keyset / cursor</th></tr></thead>
+      <tbody>
+        <tr><td>Cost at depth</td><td><strong>Grows linearly</strong></td><td><strong>Constant</strong></td></tr>
+        <tr><td>Stable under inserts</td><td><strong>No — items shift</strong></td><td>Yes</td></tr>
+        <tr><td>Jump to page N</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Total count</td><td>Easy (and expensive)</td><td>Not naturally available</td></tr>
+        <tr><td>Suits</td><td>Small collections, a UI with page numbers</td><td><strong>Large collections, APIs, exports</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Offset pagination loses data during exports, silently</div>
+    <p style="margin:0">The performance argument is well known. The correctness one is more serious and less
+      discussed.
+      <br><br>
+      A consumer exporting a collection page by page while rows are being inserted will <strong>skip items</strong>:
+      a new row at the top shifts everything down, so the item that was last on page 1 is now first on page 2 and is
+      never returned. Delete a row and items shift the other way, producing duplicates.
+      <br><br>
+      Nothing errors. The export completes and is quietly incomplete — which for a partner reconciling data is a
+      genuine problem, and one they'll blame on you and be right to.
+      <br><br>
+      <strong>Keyset pagination</strong> is stable because the cursor identifies a position in a sort order rather
+      than a count of rows. Inserts before or after don't move it.
+      <br><br>
+      Two implementation details. The sort must be on a <strong>unique, stable tuple</strong> — usually a timestamp
+      plus id as a tiebreaker — because a non-unique sort key means rows can be skipped at page boundaries.
+      <br><br>
+      And <strong>make the cursor opaque</strong> — base64 the internal state. Consumers must treat it as a token
+      rather than parsing it, which lets you change the implementation later. Expose <code>?after=2025-08-21</code>
+      and you've published your sort strategy as part of the contract.
+      <br><br>
+      On totals: an exact count is expensive on a large table, and consumers rarely need it. Offer
+      <code>hasMore</code>, and an approximate count only if genuinely required.</p>
+  </div>
+
+  <h2 id="caching">Caching <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="http — ETags do two jobs at once"><code class="language-http">GET /v1/orders/1042
+  -> 200 OK
+     ETag: "a7f3c9"
+     Cache-Control: private, max-age=60
+
+GET /v1/orders/1042
+   If-None-Match: "a7f3c9"
+  -> 304 Not Modified          no body. Bandwidth and serialisation saved.
+
+PUT /v1/orders/1042
+   If-Match: "a7f3c9"
+  -> 200 OK                    the version you edited is still current
+  -> 412 Precondition Failed   someone else changed it. OPTIMISTIC CONCURRENCY.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Layer</th><th>What it holds</th><th>Watch for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Client / <code>ETag</code></strong></td><td>Conditional requests, 304s</td><td>Must be <code>private</code> if personalised</td></tr>
+        <tr><td><strong>CDN</strong></td><td>Truly public, identical responses</td><td><strong>Never authenticated content</strong></td></tr>
+        <tr><td><strong>Gateway response cache</strong></td><td>Short-lived shared responses</td><td>Vary by everything that changes the body</td></tr>
+        <tr><td><strong>Redis</strong></td><td>Expensive computed results</td><td><strong>Tenant and user in the key</strong></td></tr>
+        <tr><td>In-process</td><td>Reference data, config</td><td>Bounded size; per-instance, so it can diverge</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — ETags give you concurrency control, not just caching</div>
+    <p style="margin:0">Most people know <code>ETag</code> as a caching mechanism. The more valuable use in a
+      write-capable API is <strong><code>If-Match</code> for optimistic concurrency</strong>.
+      <br><br>
+      Without it, two clients reading an order and both updating it means the second silently overwrites the first —
+      the classic lost update, and the client has no way to detect it happened.
+      <br><br>
+      With <code>If-Match</code>, the second update returns <strong>412 Precondition Failed</strong>, and the client
+      can re-read, re-apply and retry. That's a correctness feature delivered by the same header, and it costs almost
+      nothing to add if the entity already has a version or <code>rowversion</code> column.
+      <br><br>
+      Two related points worth making. <strong>Requiring <code>If-Match</code> on updates</strong> is a defensible
+      design choice for a public API — it forces consumers to handle concurrency rather than silently losing data, and
+      you can return 428 Precondition Required if they omit it.
+      <br><br>
+      And the caching hazard: <strong><code>Cache-Control: public</code> on an authenticated response is a data
+      leak.</strong> A shared cache or CDN may serve one user's data to another, and it's not your cache to purge.
+      Authenticated responses are <code>private</code> at minimum, and the safest default is a middleware that sets
+      that automatically for any authenticated request, so it can't be forgotten per endpoint.</p>
+  </div>
+
+  <h2 id="rate-limiting">Rate limiting and quotas <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Decision</th><th>Choice</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Key</strong></td><td><strong>The consumer's subscription or client id</strong>, from the token</td><td>A client-supplied header is forgeable</td></tr>
+        <tr><td><strong>Where</strong></td><td>Distributed store — Redis, or the gateway</td><td>Per-instance limits multiply on scale-out</td></tr>
+        <tr><td><strong>Short window</strong></td><td>Rate limit — requests per second/minute</td><td>Protects the backend from bursts</td></tr>
+        <tr><td><strong>Long window</strong></td><td>Quota — calls per month</td><td>Matches a commercial agreement</td></tr>
+        <tr><td><strong>Response</strong></td><td><strong>429 with <code>Retry-After</code></strong></td><td>A client that can see the limit will respect it</td></tr>
+        <tr><td>Cost weighting</td><td>Expensive endpoints consume more budget</td><td>One search shouldn't equal one point read</td></tr>
+        <tr><td>Headers</td><td><code>RateLimit-Limit</code>, <code>-Remaining</code>, <code>-Reset</code></td><td>Lets consumers self-throttle</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Three ways rate limiting is commonly wrong</div>
+    <p style="margin:0"><strong>A global limit rather than per-consumer.</strong> If the cap is 10,000 a minute and one
+      partner uses 9,500, everyone else shares 500 — so they're throttled because of someone else's behaviour. The
+      limit must be per consumer.
+      <br><br>
+      <strong>Per-instance counting.</strong> ASP.NET Core's built-in rate limiter is per-process, so a
+      1,000-per-minute limit becomes 5,000 across five instances. It has to be a distributed counter, or enforced at
+      the gateway.
+      <br><br>
+      <strong>Keying on something forgeable.</strong> Keying on a client-supplied header means the caller changes the
+      value and resets their limit, so the limit does nothing. Key on the subscription or a claim from a token you
+      validated — and validate the token <em>before</em> rate limiting on anything from it, or you're trusting an
+      unverified value.
+      <br><br>
+      Beyond correctness, the thing that makes limits usable is <strong>telling consumers where they stand</strong>.
+      <code>Retry-After</code> and the <code>RateLimit-*</code> headers let a well-behaved client back off smoothly.
+      Without them, a client that hits a limit retries immediately and makes it worse — so the headers protect
+      <em>you</em> as much as them.
+      <br><br>
+      One honesty point: distributed rate limits are <strong>approximate</strong> at scale, since counters aren't
+      perfectly synchronised. Fine for protection, not for billing.</p>
+  </div>
+
+  <h2 id="contract">Contract design details <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Errors</strong></td><td><strong>Problem Details (RFC 9457)</strong> — machine-readable, with a trace id</td></tr>
+        <tr><td><strong>Idempotency on writes</strong></td><td>Accept an <code>Idempotency-Key</code> header on POST</td></tr>
+        <tr><td><strong>Long operations</strong></td><td>202 Accepted with a status URL</td></tr>
+        <tr><td><strong>Bulk operations</strong></td><td>Explicit batch endpoint with per-item results</td></tr>
+        <tr><td>Filtering and sorting</td><td>An allow-list of fields, never arbitrary expressions</td></tr>
+        <tr><td>Partial responses</td><td><code>?fields=</code> if payloads are genuinely large</td></tr>
+        <tr><td>Correlation</td><td>Return a trace id in every response, including errors</td></tr>
+        <tr><td>Documentation</td><td>OpenAPI generated from code, so it can't drift</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Bulk endpoints need per-item results, not all-or-nothing</div>
+    <p style="margin:0">Partners will otherwise make 10,000 individual calls, which is slow for them and expensive for
+      you. So a batch endpoint is worth providing — and the design question is what happens when item 47 of 100 is
+      invalid.
+      <br><br>
+      <strong>All-or-nothing</strong> means one bad item rejects the whole batch. For a partner submitting a day's
+      data that's frustrating and encourages them to submit one at a time — defeating the purpose.
+      <br><br>
+      <strong>Per-item results</strong> — a <strong>207 Multi-Status</strong> style response with a result per item — is
+      usually right: the 99 valid items are processed, and the response says exactly which one failed and why.
+      <br><br>
+      Two things that must come with it. A <strong>maximum batch size</strong>, enforced, or someone submits 500,000
+      items in one request. And <strong>idempotency</strong>, because a batch that times out will be retried and must
+      not double-process the items that succeeded — which means per-item keys, not one key for the whole batch.
+      <br><br>
+      On <strong>filtering</strong>: an allow-list of filterable and sortable fields, never arbitrary expressions.
+      Exposing something OData-like or accepting raw predicates means consumers can construct queries that scan your
+      largest table, and you've made your database a public interface with no ability to add an index for every
+      combination.</p>
+  </div>
+
+  <h2 id="scaling">Making it fast <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lever</th><th>Effect</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Cache the hot reads</strong></td><td><strong>Usually the biggest single win</strong> at 20:1 read/write</td><td>Staleness; invalidation to design</td></tr>
+        <tr><td><strong>Read replicas</strong></td><td>Removes read load from the primary</td><td><strong>Breaks read-after-write</strong></td></tr>
+        <tr><td><strong>Projections for expensive reads</strong></td><td>Precomputed, cheap to serve</td><td>Eventual consistency; rebuild machinery</td></tr>
+        <tr><td>Indexes for actual access patterns</td><td>Turns scans into seeks</td><td>Every index costs on write</td></tr>
+        <tr><td>Async for anything slow</td><td>202 instead of a timeout</td><td>The contract changes</td></tr>
+        <tr><td>Response compression</td><td>Less bandwidth</td><td>CPU; careful with already-compressed payloads</td></tr>
+        <tr><td>Scale out the API tier</td><td>More request capacity</td><td><strong>More database connections</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — at 20:1 reads to writes, caching is the design, not an optimisation</div>
+    <p style="margin:0">10,000 reads a second against 500 writes is a 20:1 ratio. That number decides the
+      architecture: <strong>if 80% of reads can be served from cache, the database sees 2,000 reads a second instead
+      of 10,000</strong> — which is the difference between comfortable and needing to shard.
+      <br><br>
+      So caching isn't a later optimisation here; it's load-bearing, and the design has to say <em>what</em> is cached,
+      for how long, and how it's invalidated.
+      <br><br>
+      Which means being specific per data type rather than uniform. Reference data — currencies, categories, product
+      types — can cache for hours. An order can cache for a minute and be invalidated on write. A permission check
+      should barely cache at all, because stale authorisation is a security issue rather than a stale display.
+      <br><br>
+      The invalidation rule worth stating: <strong>delete on write, don't update</strong>. Two concurrent writers
+      updating a cache can interleave and leave it permanently wrong, whereas a delete's worst case is a redundant
+      database read.
+      <br><br>
+      And the counterintuitive scaling point: <strong>scaling out the API tier increases pressure on the
+      database</strong>, because each instance has its own connection pool. If the database is the constraint, more
+      API instances make it worse — so find what saturated first rather than adding instances by default.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>"Consumers can't change quickly" is the constraint that shapes everything.</li>
+      <li>Return an object at the top level, never a bare array.</li>
+      <li>Additive changes need no version; removals and type changes do.</li>
+      <li>Version the whole API, not individual endpoints.</li>
+      <li>Track version usage per consumer, or you can never deprecate.</li>
+      <li>Emit <code>Deprecation</code> and <code>Sunset</code> headers; consider brownouts.</li>
+      <li>Keyset pagination — offset is slow at depth <em>and</em> silently loses data during exports.</li>
+      <li>Sort on a unique tuple; make the cursor opaque.</li>
+      <li>ETags give conditional GETs and <code>If-Match</code> optimistic concurrency.</li>
+      <li>Never <code>Cache-Control: public</code> on authenticated responses.</li>
+      <li>Rate limit per consumer, distributed, keyed on a validated claim.</li>
+      <li>Return <code>Retry-After</code> and <code>RateLimit-*</code> headers.</li>
+      <li>Bulk endpoints with per-item results, a size cap and per-item idempotency.</li>
+      <li>Allow-list filters — never arbitrary query expressions.</li>
+      <li>At 20:1 reads, caching is the architecture; delete on write.</li>
+      <li>Scaling out the API tier adds database connections.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Design a public REST API for partners. 10,000 reads/sec, millions of rows per tenant. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The constraint that shapes most of this is that <strong>partners can't change quickly.</strong> So every
+          design question becomes 'what can I change later without a coordinated release across consumers I don't
+          control?' — not 'what's cleanest today'."</p>
+        <p>"<strong>Versioning:</strong> URL path — <code>/v1/orders</code> — for a public API. Visible, obvious in
+          logs, easy to test in a browser, and cacheable as a distinct resource."</p>
+        <p>"But the goal is <strong>needing new versions rarely</strong>, because each one is two code paths, two test
+          suites, two documentation sets and a migration conversation with every partner. So additive changes by
+          default: adding a field, an optional parameter or an endpoint is safe if consumers ignore unknown
+          properties."</p>
+        <p>"Two structural choices help. <strong>Return an object at the top level, never a bare array</strong>, so I
+          can add sibling properties like pagination metadata later — you can't add anything to an array. And document
+          that <strong>enums are extensible</strong>, so adding a status value isn't breaking."</p>
+        <p>"And I'd <strong>track version usage per consumer from day one</strong>, because otherwise you can never
+          deprecate anything — 'we'd like to retire v1' is unanswerable without knowing who calls it. With that data
+          it's a list of partners to contact. I'd emit <code>Deprecation</code> and <code>Sunset</code> headers, and
+          run brownouts before final shutdown so 'we didn't realise' happens in a scheduled window."</p>
+        <p>"<strong>Pagination: keyset, not offset</strong>, and I'd give both reasons because the second one matters
+          more."</p>
+        <p>"The performance argument is that <code>OFFSET 250000</code> makes the database walk 250,000 rows to
+          discard them, so cost grows with depth. The correctness argument is that <strong>offset pagination silently
+          loses data</strong>: a row inserted while a partner is exporting shifts everything down, so an item moves
+          from the end of page 1 to the start of page 2 and is never returned. The export completes and is quietly
+          incomplete — which for a partner reconciling data is a real problem."</p>
+        <p>"Keyset sorts on a unique tuple — timestamp plus id as a tiebreaker — so the cursor identifies a position
+          rather than a count. Constant cost, stable under inserts. And I'd make the cursor <strong>opaque</strong>,
+          base64-encoded, so consumers treat it as a token and I can change the implementation. Exposing
+          <code>?after=2025-08-21</code> publishes my sort strategy as part of the contract."</p>
+        <p>"The trade: no jumping to page 500, and no cheap total count. I'd offer <code>hasMore</code> instead, since
+          an exact count on a large table is expensive and partners rarely need it."</p>
+        <p>"<strong>Caching is load-bearing at a 20:1 read/write ratio</strong>, not an optimisation. If 80% of reads
+          come from cache, the database sees 2,000 a second rather than 10,000 — the difference between comfortable and
+          needing to shard."</p>
+        <p>"So I'd be specific per data type: reference data for hours, an order for a minute with invalidation on
+          write, permission checks barely at all because stale authorisation is a security issue rather than a stale
+          display. And <strong>delete on write rather than update</strong>, because two concurrent writers updating a
+          cache can interleave and leave it permanently wrong."</p>
+        <p>"<strong>ETags</strong> for two jobs. Conditional GETs returning 304, which saves bandwidth and
+          serialisation. And <code>If-Match</code> on updates for <strong>optimistic concurrency</strong> — without it,
+          two clients editing the same order means the second silently overwrites the first with no way to detect it.
+          With it they get a 412 and can re-read and retry."</p>
+        <p>"One hazard I'd flag: <strong>never <code>Cache-Control: public</code> on an authenticated
+          response.</strong> A shared cache or CDN may serve one partner's data to another, and it's not my cache to
+          purge. I'd have middleware setting <code>private</code> automatically for authenticated requests so it can't
+          be forgotten."</p>
+        <p>"<strong>Rate limiting per consumer</strong>, keyed on the subscription or a claim from the validated
+          token — never a client-supplied header, which they'd just change. Distributed, because a per-instance limiter
+          multiplies across five instances. A short-window rate limit to protect the backend and a long-window quota
+          matching the commercial agreement. And <code>Retry-After</code> plus <code>RateLimit-*</code> headers, so a
+          well-behaved client backs off rather than retrying immediately — which protects me as much as them."</p>
+        <p>"<strong>Two contract details</strong> I'd include. An <code>Idempotency-Key</code> header on POST, so a
+          partner's retry after a timeout doesn't create a duplicate — enforced with a unique index, not an application
+          check. And a <strong>bulk endpoint with per-item results</strong>, because otherwise partners make 10,000
+          individual calls; all-or-nothing means one bad item rejects the batch, so 207-style per-item results with a
+          size cap and per-item idempotency."</p>
+        <p>"And <strong>allow-listed filters and sorts</strong>, never arbitrary expressions — otherwise consumers can
+          construct queries that scan my largest table and I've made my database a public interface."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you treat backward compatibility as the shaping constraint?</li>
+        <li>Do you know offset pagination loses data, not just performance?</li>
+        <li>Do you make cursors opaque?</li>
+        <li>Do you know <code>If-Match</code> gives concurrency control?</li>
+        <li>Do you rate limit per consumer on a non-forgeable key?</li>
+        <li>Do you track version usage to enable deprecation?</li>
+        <li>Do you allow-list filters?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> page-number pagination for millions of rows.</li>
+        <li><span class="redflag">Red flag:</span> a global rate limit.</li>
+        <li><span class="redflag">Red flag:</span> no plan for retiring an old version.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>A partner needs a total count. What do you offer?</li>
+          <li>How do you add a required field without breaking anyone?</li>
+          <li>How do you stop one partner's traffic affecting the others?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

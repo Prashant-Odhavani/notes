@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transactions &amp; Concurrency — SQL</title>
+<meta name="description" content="ACID, isolation levels, locking, blocking, deadlocks and snapshot isolation — with the concurrency bugs each level actually allows.">
+<meta name="keywords" content="ACID isolation level read uncommitted read committed repeatable read serializable snapshot isolation RCSI dirty read non-repeatable read phantom read lost update deadlock NOLOCK UPDLOCK rowversion optimistic pessimistic concurrency tempdb version store">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/transactions.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Transactions &amp; Concurrency</h1>
+    <p class="subtitle">Where correctness bugs hide. These problems appear only under load, which is exactly
+      why interviewers ask about them.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>ACID:</strong> Atomicity, Consistency, Isolation, Durability. Isolation is the one with
+        dials.</li>
+      <li><strong>Higher isolation = more correctness, less concurrency.</strong> That's the whole trade-off.</li>
+      <li><strong>SQL Server defaults to <code>READ COMMITTED</code></strong> using locks — so readers block
+        writers.</li>
+      <li><strong><code>READ_COMMITTED_SNAPSHOT</code> (RCSI)</strong> gives the same isolation without
+        readers blocking. Usually the right setting.</li>
+      <li><strong><code>NOLOCK</code> is not "no locking, same data".</strong> It can return rows twice, miss
+        rows, and read uncommitted data.</li>
+      <li><strong>Deadlock ≠ blocking.</strong> Blocking resolves itself; a deadlock is a cycle the server has
+        to kill.</li>
+      <li><strong>Consistent access order</strong> prevents most deadlocks.</li>
+      <li><strong>Lost update</strong> is the bug read-modify-write causes, and no isolation level below
+        <code>REPEATABLE READ</code> prevents it.</li>
+    </ul>
+  </div>
+
+  <h2 id="acid">ACID <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Means</th><th>In practice</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Atomicity</strong></td>
+          <td>All or nothing</td>
+          <td>A crash mid-transaction rolls back on recovery. You never see half a transfer</td>
+        </tr>
+        <tr>
+          <td><strong>Consistency</strong></td>
+          <td>Constraints hold at commit</td>
+          <td>Foreign keys, checks and triggers are all satisfied — or the commit fails</td>
+        </tr>
+        <tr>
+          <td><strong>Isolation</strong></td>
+          <td>Concurrent transactions don't corrupt each other</td>
+          <td><strong>The configurable one.</strong> Everything below is about this</td>
+        </tr>
+        <tr>
+          <td><strong>Durability</strong></td>
+          <td>Committed means survives a crash</td>
+          <td>Write-ahead log flushed before commit acknowledges</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">The one that's often misunderstood</span>
+    <p>ACID's <strong>C</strong> is not "the data makes business sense". It means <em>declared database
+      constraints</em> hold.</p>
+    <p>If your business rule isn't expressed as a constraint, ACID doesn't protect it. That's a good reason to
+      express invariants as <a href="fundamentals.html#constraints">constraints</a> rather than only in code.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Durability has a dial too</div>
+    <p style="margin:0">SQL Server offers <strong>delayed durability</strong> — commit returns before the log
+      is flushed, batching writes.
+      <br><br>
+      Faster, and you can lose the last few committed transactions on a crash. Acceptable for
+      high-volume telemetry; not for payments. Worth knowing that "durable" is a choice, because it shows you
+      understand what the log flush costs.</p>
+  </div>
+
+  <h2 id="anomalies">The four concurrency problems <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Learn the problems first</span>
+    <p>Isolation levels are only meaningful as answers to these. If you know the problems, you can derive the
+      levels instead of memorising a grid.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Problem</th><th>What happens</th><th>Concrete example</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Dirty read</strong></td>
+          <td>You read data another transaction hasn't committed</td>
+          <td>You read a £1000 balance mid-transfer; that transfer rolls back. The value never existed</td>
+        </tr>
+        <tr>
+          <td><strong>Non-repeatable read</strong></td>
+          <td>You read the same <em>row</em> twice and get different values</td>
+          <td>A report reads a total, then re-reads it for a subtotal — they disagree, so the report doesn't add up</td>
+        </tr>
+        <tr>
+          <td><strong>Phantom read</strong></td>
+          <td>You re-run the same query and <em>new rows appear</em></td>
+          <td><code>COUNT(*)</code> returns 10, then 11, inside one transaction</td>
+        </tr>
+        <tr>
+          <td><strong>Lost update</strong></td>
+          <td>Two read-modify-writes; one silently overwrites the other</td>
+          <td>Two users each read stock 10, each decrement, each write 9. Two sold, one deducted</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Lost update is the one that matters most in application code</div>
+    <p style="margin:0">It's not in the classic ANSI list, and it's by far the most common real bug — because
+      <strong>read-modify-write is what ORMs do</strong>. Load an entity, change a property, save.
+      <br><br>
+      No isolation level below <code>REPEATABLE READ</code> prevents it, and raising isolation to fix it
+      destroys concurrency. The real fixes are:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Optimistic concurrency</strong> — a <code>rowversion</code> column, checked on update.</li>
+      <li><strong>Atomic update</strong> — <code>SET Stock = Stock - 1 WHERE Stock &gt;= 1</code>, no read at
+        all.</li>
+      <li><strong>Pessimistic lock</strong> — <code>UPDLOCK</code> on the read.</li>
+    </ul>
+  </div>
+
+  <h2 id="isolation-levels">Isolation levels <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Level</th><th>Dirty read</th><th>Non-repeatable</th><th>Phantom</th><th>Mechanism</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>READ UNCOMMITTED</code></td>
+          <td>❌ allowed</td><td>❌ allowed</td><td>❌ allowed</td>
+          <td>Takes no shared locks</td>
+        </tr>
+        <tr>
+          <td><code>READ COMMITTED</code> <em>(default)</em></td>
+          <td>✅ prevented</td><td>❌ allowed</td><td>❌ allowed</td>
+          <td>Shared locks released immediately after reading</td>
+        </tr>
+        <tr>
+          <td><code>REPEATABLE READ</code></td>
+          <td>✅</td><td>✅</td><td>❌ allowed</td>
+          <td>Shared locks held until commit</td>
+        </tr>
+        <tr>
+          <td><code>SERIALIZABLE</code></td>
+          <td>✅</td><td>✅</td><td>✅</td>
+          <td>Range locks — locks rows that <em>don't exist yet</em></td>
+        </tr>
+        <tr>
+          <td><code>SNAPSHOT</code></td>
+          <td>✅</td><td>✅</td><td>✅</td>
+          <td><strong>Row versions in tempdb — no read locks at all</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to remember the ladder</span>
+    <p>Each level up holds locks <strong>longer</strong> or over <strong>more</strong>:</p>
+    <ul>
+      <li><code>READ UNCOMMITTED</code> — no read locks.</li>
+      <li><code>READ COMMITTED</code> — locks during the read.</li>
+      <li><code>REPEATABLE READ</code> — locks until commit.</li>
+      <li><code>SERIALIZABLE</code> — locks the <em>range</em>, so no one can insert into it.</li>
+    </ul>
+    <p><code>SNAPSHOT</code> sits outside the ladder: it uses <strong>versioning instead of locking</strong>,
+      which is why it prevents everything without blocking.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Why <code>REPEATABLE READ</code> still allows phantoms</div>
+    <p style="margin:0">It locks the rows it <em>read</em>. It can't lock rows that don't exist yet.
+      <br><br>
+      So another transaction can still <code>INSERT</code> a matching row, and re-running the query returns
+      it. <code>SERIALIZABLE</code> fixes this with <strong>range locks</strong> — locking the key range
+      itself, blocking inserts into it.
+      <br><br>
+      That mechanism explains why <code>SERIALIZABLE</code> is so expensive: it blocks writes to rows that
+      don't exist.</p>
+  </div>
+
+  <h2 id="snapshot">Snapshot isolation and RCSI <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Instead of locking, SQL Server keeps <strong>old versions of rows in tempdb</strong>. A reader sees the
+      version that was committed when it started, and never waits for a writer.</p>
+    <p><strong>Readers don't block writers, writers don't block readers.</strong> That's the headline.</p>
+  </div>
+
+  <pre data-label="sql — two settings, often confused"><code class="language-sql">-- RCSI: makes the DEFAULT level non-blocking. Statement-level consistency.
+ALTER DATABASE MyDb SET READ_COMMITTED_SNAPSHOT ON;
+
+-- Enables the explicit SNAPSHOT level. Transaction-level consistency.
+ALTER DATABASE MyDb SET ALLOW_SNAPSHOT_ISOLATION ON;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>RCSI</th><th><code>SNAPSHOT</code></th></tr></thead>
+      <tbody>
+        <tr><td>Snapshot taken</td><td>At each <strong>statement</strong></td><td>At <strong>transaction</strong> start</td></tr>
+        <tr><td>Code changes needed</td><td><strong>None</strong> — replaces the default behaviour</td><td>Must request the level explicitly</td></tr>
+        <tr><td>Repeatable reads?</td><td>No — a later statement sees newer data</td><td>Yes, for the whole transaction</td></tr>
+        <tr><td>Update conflict errors</td><td>No</td><td><strong>Yes</strong> — error 3960, must be handled</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — recommend RCSI, and name the cost</div>
+    <p style="margin:0">For most OLTP applications RCSI is a large, cheap win: reporting reads stop blocking
+      writes, and it needs no application changes at all.
+      <br><br>
+      But name the costs, because that's what separates a recommendation from a slogan:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>tempdb load.</strong> The version store lives there. Size and monitor it.</li>
+      <li><strong>14 bytes per row</strong> added for versioning, which causes page splits on existing tables
+        the first time rows are updated.</li>
+      <li><strong>A long-running transaction pins versions</strong>, so the store grows until it commits. One
+        forgotten open transaction can fill tempdb.</li>
+      <li><strong>Enabling it needs exclusive database access</strong>, so it's a maintenance-window change.</li>
+    </ul>
+    <p style="margin:8px 0 0">This is also, notably, the model PostgreSQL uses by default — its MVCC keeps
+      versions in the table itself, which is why <code>VACUUM</code> exists there.</p>
+  </div>
+
+  <h3 id="snapshot-conflict">Snapshot update conflicts</h3>
+
+  <pre data-label="sql — error 3960"><code class="language-sql">-- Under SNAPSHOT isolation:
+-- If another transaction modified a row you're updating after your
+-- snapshot was taken, you get:
+--   Msg 3960: Snapshot isolation transaction aborted due to update conflict.
+-- The transaction is terminated. The application must retry.</code></pre>
+
+  <p>This is optimistic concurrency enforced by the engine. It's a feature — but it means
+    <code>SNAPSHOT</code> requires retry logic, whereas RCSI doesn't. That difference is usually why RCSI is
+    the pragmatic choice.</p>
+
+  <h2 id="nolock">Why <code>NOLOCK</code> is worse than people think <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The misconception</span>
+    <p>Most developers believe <code>NOLOCK</code> means "I might read slightly stale data, but it's fast".</p>
+    <p>That's wrong. <code>NOLOCK</code> (= <code>READ UNCOMMITTED</code>) can return results that were
+      <strong>never true at any point in time</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What can happen</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Dirty reads</strong></td><td>You see uncommitted data that then rolls back</td></tr>
+        <tr><td><strong>The same row twice</strong></td><td>A page split during your scan moves a row ahead of your position, so you read it again</td></tr>
+        <tr><td><strong>Missing rows entirely</strong></td><td>A row moves behind your scan position and is skipped — even though it was committed the whole time</td></tr>
+        <tr><td><strong>Corrupt values</strong></td><td>Reading a wide column mid-update can return a torn value</td></tr>
+        <tr><td><strong>Query failure</strong></td><td>Error 601: "could not continue scan with NOLOCK due to data movement"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The one that ends the argument</div>
+    <p style="margin:0"><code>SELECT COUNT(*) FROM Orders WITH (NOLOCK)</code> can return a count that is
+      <strong>wrong in either direction</strong> — not stale, wrong — because rows can be double-counted or
+      skipped due to page movement during the scan.
+      <br><br>
+      For a financial total, that's not "slightly out of date". It's a number that never existed.
+      <br><br>
+      <strong>If the goal is non-blocking reads, the correct answer is RCSI</strong> — same non-blocking
+      behaviour, actual consistency, and no code changes.</p>
+  </div>
+
+  <h2 id="locking">Locking basics <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lock</th><th>Taken by</th><th>Compatible with</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Shared (S)</strong></td><td>Reads</td><td>Other shared locks</td></tr>
+        <tr><td><strong>Exclusive (X)</strong></td><td>Writes</td><td><strong>Nothing</strong></td></tr>
+        <tr><td><strong>Update (U)</strong></td><td>The read phase of an update</td><td>Shared only — prevents conversion deadlocks</td></tr>
+        <tr><td><strong>Intent (IS/IX)</strong></td><td>Higher levels, signalling intent below</td><td>Lets the engine check conflicts without scanning every row</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">Why the Update lock exists</span>
+    <p>An <code>UPDATE</code> reads first, then writes. If it took a shared lock to read and then upgraded to
+      exclusive, two concurrent updates would both hold shared locks and both wait to upgrade — a guaranteed
+      deadlock.</p>
+    <p>The <code>U</code> lock is asymmetric: only one transaction can hold it, so the second waits instead of
+      deadlocking.</p>
+  </div>
+
+  <h3 id="escalation">Lock escalation <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <div class="note warn">
+    <div class="note-title">Why a big <code>DELETE</code> blocks everything</div>
+    <p style="margin:0">Around <strong>5,000 locks</strong> on one object, SQL Server escalates row locks to a
+      single <strong>table lock</strong> — because tracking millions of row locks costs more memory than it's
+      worth.
+      <br><br>
+      Consequence: <code>DELETE FROM Orders WHERE CreatedUtc &lt; '2020-01-01'</code> removing 2 million rows
+      takes a table lock and blocks the entire table for the duration.
+      <br><br>
+      <strong>Fix: batch it.</strong> Delete 2,000–5,000 rows at a time in a loop, each in its own
+      transaction. Stays below the escalation threshold, keeps the log small, and each batch releases locks
+      quickly.</p>
+  </div>
+
+  <pre data-label="sql — batched delete" class="code-good"><code class="language-sql">WHILE 1 = 1
+BEGIN
+    DELETE TOP (5000) FROM dbo.[Order]
+    WHERE CreatedUtc &lt; '2020-01-01';
+
+    IF @@ROWCOUNT &lt; 5000 BREAK;
+
+    WAITFOR DELAY '00:00:00.100';   -- let other work through
+END</code></pre>
+
+  <h2 id="deadlocks">Deadlocks <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">Blocking vs deadlock</span>
+    <p><strong>Blocking</strong> is a queue at a door. Annoying, but it clears — the person ahead will
+      finish.</p>
+    <p><strong>Deadlock</strong> is two people in a doorway, each refusing to move until the other does.
+      Nobody finishes. Something external has to intervene.</p>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A deadlock is a <strong>cycle</strong>: A holds a lock B wants, B holds a lock A wants.</p>
+    <p>SQL Server detects it (roughly every 5 seconds), picks a victim — usually the one with less log work
+      to undo — kills it with <strong>error 1205</strong>, and rolls it back.</p>
+  </div>
+
+  <pre data-label="sql — the classic cycle" class="code-bad"><code class="language-sql">-- Transaction A                    -- Transaction B
+BEGIN TRAN                          BEGIN TRAN
+UPDATE Account SET .. WHERE Id=1    UPDATE Account SET .. WHERE Id=2
+-- holds X on row 1                 -- holds X on row 2
+UPDATE Account SET .. WHERE Id=2    UPDATE Account SET .. WHERE Id=1
+-- waits for B                      -- waits for A     ← deadlock</code></pre>
+
+  <h3 id="deadlock-prevention">Preventing them</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>Why it works</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Consistent access order</strong></td>
+          <td>If everything touches accounts in ascending Id order, a cycle is impossible. <strong>The most
+              effective fix</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Shorter transactions</strong></td>
+          <td>Less time holding locks = smaller collision window</td>
+        </tr>
+        <tr>
+          <td><strong>Right indexes</strong></td>
+          <td>A scan locks far more rows than a seek. Many deadlocks are really missing-index problems</td>
+        </tr>
+        <tr>
+          <td><strong>RCSI</strong></td>
+          <td>Eliminates the entire read-versus-write deadlock category</td>
+        </tr>
+        <tr>
+          <td><strong>Lower isolation where safe</strong></td>
+          <td><code>SERIALIZABLE</code> range locks are a major source</td>
+        </tr>
+        <tr>
+          <td><strong><code>UPDLOCK</code> on the initial read</strong></td>
+          <td>Takes the update lock upfront rather than upgrading later</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Never-mentioned but important: deadlocks are normal</div>
+    <p style="margin:0">A busy system will have some. You cannot design them all away.
+      <br><br>
+      So <strong>retry logic isn't optional</strong> — error 1205 is explicitly retryable, because the victim
+      was rolled back cleanly and the conflicting transaction has now finished. Retry with a short random
+      delay (jitter) so both victims don't collide again immediately.
+      <br><br>
+      Retrying is only safe if the transaction is <a href="../08-http-web-apis/reliability.html#idempotency-keys">retry-safe</a>
+      — one atomic unit with no side effects outside the database. Sending an email inside the transaction
+      breaks that.</p>
+  </div>
+
+  <h2 id="patterns">Practical concurrency patterns <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <h3 id="atomic-update">1. Atomic update — no read at all</h3>
+
+  <pre data-label="sql — the best option when it applies" class="code-good"><code class="language-sql">UPDATE Inventory
+SET    Stock = Stock - @qty
+WHERE  Sku = @sku
+  AND  Stock &gt;= @qty;              -- the check is IN the update
+
+IF @@ROWCOUNT = 0
+    THROW 50001, 'Insufficient stock', 1;</code></pre>
+
+  <p>There's no read-modify-write, so there's no window for a lost update. The condition and the change are
+    one statement. If it applies to your problem, this is the simplest and fastest answer.</p>
+
+  <h3 id="optimistic">2. Optimistic concurrency with <code>rowversion</code></h3>
+
+  <pre data-label="csharp — EF Core" class="code-good"><code class="language-csharp">public class Product
+{
+    public int Id { get; set; }
+    public decimal Price { get; set; }
+
+    [Timestamp]                       // maps to SQL rowversion
+    public byte[] RowVersion { get; set; } = default!;
+}
+
+// EF adds "AND RowVersion = @original" to the UPDATE.
+// Zero rows affected -> someone else changed it first.
+try
+{
+    await db.SaveChangesAsync();
+}
+catch (DbUpdateConcurrencyException)
+{
+    // Reload, re-apply, or tell the user their view was stale
+}</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Optimistic</strong> = assume no conflict, detect it at write time, handle the failure.</p>
+    <p><strong>Pessimistic</strong> = lock upfront so a conflict can't happen.</p>
+    <p>Optimistic scales better and is the right default for web applications, because you can't hold a lock
+      across a user thinking about a form for two minutes.</p>
+  </div>
+
+  <h3 id="pessimistic">3. Pessimistic locking, when you must</h3>
+
+  <pre data-label="sql — read with intent to update"><code class="language-sql">BEGIN TRAN;
+
+SELECT Stock
+FROM   Inventory WITH (UPDLOCK, ROWLOCK)   -- lock now, not later
+WHERE  Sku = @sku;
+
+-- ... application logic ...
+
+UPDATE Inventory SET Stock = @newStock WHERE Sku = @sku;
+
+COMMIT;</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Keep it inside one round trip</div>
+    <p style="margin:0">A pessimistic lock held across application logic is holding a database lock while your
+      app does work — and if that work includes an HTTP call, you're holding a row lock for the duration of
+      someone else's network latency.
+      <br><br>
+      If you need <code>UPDLOCK</code>, do the whole thing in a stored procedure or a single short batch. Never
+      hold a lock across a user interaction.</p>
+  </div>
+
+  <h3 id="app-lock">4. Application locks for singleton work</h3>
+
+  <pre data-label="sql — only one worker runs this"><code class="language-sql">EXEC sp_getapplock @Resource = 'NightlyReconciliation',
+                   @LockMode = 'Exclusive',
+                   @LockOwner = 'Session',
+                   @LockTimeout = 0;          -- fail fast if held
+-- returns 0 acquired, -1 timeout
+-- ... work ...
+EXEC sp_releaseapplock @Resource = 'NightlyReconciliation', @LockOwner = 'Session';</code></pre>
+
+  <p>Useful when several instances of a background service must not run the same job simultaneously. Simpler
+    than a distributed lock if you already have SQL Server — though it's tied to a session, so a connection
+    drop releases it.</p>
+
+  <h2 id="transaction-scope">Transactions in .NET <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — explicit transaction with EF Core"><code class="language-csharp">await using var tx = await db.Database.BeginTransactionAsync();
+try
+{
+    db.Orders.Add(order);
+    await db.SaveChangesAsync();
+
+    inventory.Stock -= order.Quantity;
+    await db.SaveChangesAsync();
+
+    await tx.CommitAsync();
+}
+catch
+{
+    await tx.RollbackAsync();      // also happens on dispose
+    throw;
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Three .NET transaction traps</div>
+    <p style="margin:0"><strong>1. Side effects inside the transaction.</strong> Sending an email or calling an
+      API inside a transaction means a rollback can't undo it — and a retry does it twice. Use the
+      <a href="../19-architecture/distributed-data.html#outbox">outbox pattern</a>: write the intent to a
+      table in the same transaction, publish afterwards.
+      <br><br>
+      <strong>2. Long transactions.</strong> <code>SaveChanges</code> inside a loop over 10,000 items, all in
+      one transaction, holds locks for minutes and bloats the log. Batch it.
+      <br><br>
+      <strong>3. <code>TransactionScope</code> escalating to MSDTC.</strong> Touch two different connections
+      inside one scope and it promotes to a distributed transaction. That's slow, needs MSDTC configured, and
+      isn't supported at all on Linux — a nasty surprise during a
+      <a href="../09-dotnet-framework/index.html#migration">migration</a>.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Isolation is the configurable part of ACID; the rest you get for free.</li>
+      <li>Learn the four anomalies — the levels then make sense as answers to them.</li>
+      <li>Higher isolation holds locks longer or over more. <code>SERIALIZABLE</code> locks rows that don't
+        exist.</li>
+      <li><code>SNAPSHOT</code> uses versions, not locks — that's why it doesn't block.</li>
+      <li>RCSI is usually the best default: non-blocking reads, no code changes, tempdb cost.</li>
+      <li><code>NOLOCK</code> can return rows twice or skip them. Use RCSI instead.</li>
+      <li>Lock escalation at ~5,000 locks turns a big delete into a table lock. Batch it.</li>
+      <li>Deadlocks need consistent access order <em>and</em> retry logic. They're normal.</li>
+      <li>Lost update is the common real bug: prefer atomic updates, then <code>rowversion</code>.</li>
+      <li>Never put side effects or user think-time inside a transaction.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>NOLOCK</code> everywhere</strong> as a performance fix.</li>
+    <li><strong>Read-modify-write with no version check</strong> — silent lost updates.</li>
+    <li><strong>Large <code>DELETE</code>/<code>UPDATE</code> in one transaction</strong>, escalating to a
+      table lock.</li>
+    <li><strong>No retry on error 1205.</strong> Deadlocks are inevitable, not exceptional.</li>
+    <li><strong>Inconsistent access order</strong> across procedures, creating deadlock cycles.</li>
+    <li><strong>Emails or API calls inside a transaction.</strong></li>
+    <li><strong>Transactions spanning user interaction.</strong></li>
+    <li><strong>Enabling <code>SNAPSHOT</code> without handling error 3960.</strong></li>
+    <li><strong>Assuming <code>SERIALIZABLE</code> is just "safer"</strong>, then wondering about the
+      blocking.</li>
+    <li><strong>Not monitoring tempdb after enabling RCSI.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>Explain ACID. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>Atomicity</strong> — all or nothing. A transfer either debits and credits, or does
+          neither. If the server crashes halfway, recovery rolls it back from the log."</p>
+        <p>"<strong>Consistency</strong> — declared constraints hold at commit. Worth being precise here:
+          this doesn't mean the data makes business sense, it means foreign keys, checks and unique constraints
+          are satisfied. If a business rule isn't expressed as a constraint, ACID doesn't protect it — which
+          is a good argument for putting invariants in the schema rather than only in code."</p>
+        <p>"<strong>Isolation</strong> — concurrent transactions don't corrupt each other. This is the one
+          that's configurable, and it's where all the interesting trade-offs live."</p>
+        <p>"<strong>Durability</strong> — once committed, it survives a crash. Implemented with a write-ahead
+          log: the log is flushed to disk before the commit is acknowledged."</p>
+        <p>"Two things I'd add. First, isolation is the only one with dials, so in practice 'ACID' usually
+          means 'A, C and D are guaranteed, and I is whatever you configured'. Second, even durability has a
+          dial — SQL Server has delayed durability, where commit returns before the log flush. Faster, and you
+          can lose the last few committed transactions on a crash. Fine for telemetry, not for payments."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you go beyond the acronym?</li>
+        <li>Do you know Consistency means constraints, not business correctness?</li>
+        <li>Do you know isolation is the configurable one?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the default isolation level?</li>
+          <li>How does the write-ahead log give you both A and D?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Someone adds <code>NOLOCK</code> to every query to fix blocking. What do you say? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd push back, and I'd be specific about why — because the usual mental model of
+          <code>NOLOCK</code> is wrong."</p>
+        <p>"Most people think it means 'slightly stale data, but fast'. It doesn't.
+          <code>NOLOCK</code> is <code>READ UNCOMMITTED</code>, and it can return results that were
+          <strong>never true at any point in time</strong>."</p>
+        <p>"Concretely: it reads uncommitted data that may roll back, so you can report a value that never
+          existed. It can return <strong>the same row twice</strong>, and it can <strong>skip committed rows
+          entirely</strong> — because if a page split moves a row during your scan, the row can end up ahead of
+          or behind your scan position. It can return torn values on wide columns being updated. And it can
+          fail outright with error 601, 'could not continue scan due to data movement'."</p>
+        <p>"The example that usually ends the discussion: <code>SELECT COUNT(*) WITH (NOLOCK)</code> can be
+          wrong in <em>either direction</em>. Not stale — wrong. For a financial figure that's not a
+          performance optimisation, it's a correctness bug that only shows up under load."</p>
+        <p>"Then I'd give them what they actually want, because the underlying goal is reasonable — reads
+          shouldn't block writes. The answer is <strong>RCSI</strong>:
+          <code>ALTER DATABASE ... SET READ_COMMITTED_SNAPSHOT ON</code>. Readers get a consistent
+          point-in-time view from the version store instead of taking shared locks. Non-blocking reads, real
+          consistency, and <strong>no application changes at all</strong>."</p>
+        <p>"I'd name the costs so it's an honest recommendation: the version store lives in tempdb so that
+          needs sizing and monitoring, rows gain 14 bytes for versioning which causes some page splits the
+          first time they're updated, a long-running transaction pins versions and grows the store, and
+          enabling it needs exclusive database access so it's a maintenance-window change."</p>
+        <p>"And I'd look at <em>why</em> there's blocking in the first place. Usually it's missing indexes
+          causing scans that lock far more rows than necessary, or transactions held open too long. Fixing
+          that helps everything; <code>NOLOCK</code> just hides it."</p>
+        <p>"The one place I'd accept <code>NOLOCK</code>: an ad-hoc diagnostic query on a live system where I
+          need a rough number and must not add blocking. Never in application code."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>NOLOCK</code> does more than dirty reads?</li>
+        <li>Do you know RCSI, and that it needs no code changes?</li>
+        <li>Do you state the costs, and look for the root cause?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "it's fine for reporting" with no caveat.</li>
+        <li><span class="redflag">Red flag:</span> "never use it" with no explanation and no alternative.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Difference between RCSI and <code>SNAPSHOT</code>?</li>
+          <li>What's the tempdb impact?</li>
+          <li>How would you find the real cause of the blocking?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Two users buy the last item at the same time and you oversell. How do you fix it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That's a <strong>lost update</strong>. Both requests read stock as 1, both decided it was
+          available, both wrote 0. The read and the write weren't atomic, so there was a window between them."</p>
+        <p>"Worth being clear that no isolation level below <code>REPEATABLE READ</code> prevents this, and
+          raising isolation to fix it would hurt concurrency across the whole application. So the fix belongs
+          in how the operation is written."</p>
+        <p>"<strong>My first choice is an atomic conditional update</strong>:
+          <code>UPDATE Inventory SET Stock = Stock - @qty WHERE Sku = @sku AND Stock &gt;= @qty</code>, then
+          check <code>@@ROWCOUNT</code>. If it's zero, there wasn't enough stock and I fail the request."</p>
+        <p>"This works because there's no read-modify-write at all — the check and the decrement are one
+          statement, and the engine takes an exclusive lock on that row for the duration. There's no window.
+          It's also the fastest option, since there's no extra round trip and no retry."</p>
+        <p>"<strong>Second option: optimistic concurrency</strong> with a <code>rowversion</code> column. EF
+          Core adds <code>AND RowVersion = @original</code> to the update, so zero rows affected means someone
+          else got there first and I get a <code>DbUpdateConcurrencyException</code> to handle. I'd use this
+          when the update is more complex than one arithmetic change — when there's real domain logic between
+          the read and the write that I can't express in a single statement."</p>
+        <p>"<strong>Third: pessimistic</strong> — <code>SELECT ... WITH (UPDLOCK)</code> then update, in one
+          transaction. This serialises access to that row, so it costs throughput on hot items. I'd only reach
+          for it if the logic genuinely can't be expressed either of the other two ways, and I'd keep the whole
+          thing in one short batch or a stored procedure — never holding that lock across application logic or
+          an HTTP call."</p>
+        <p>"Two things I'd raise beyond the immediate fix."</p>
+        <p>"<strong>What the business actually wants.</strong> For a high-value or high-contention item,
+          serialising on one row is a throughput ceiling. An alternative is <em>reservations</em>: insert a
+          reservation row with a unique constraint and a TTL, so contention moves from an update on one hot row
+          to inserts, and expiry handles abandoned carts. That's also how you support a 'held for 10 minutes'
+          checkout, which the atomic decrement can't."</p>
+        <p>"<strong>Whether preventing it is even the right goal.</strong> Airlines deliberately oversell. The
+          question is whether the cost of a rare oversell is lower than the cost of the contention — and
+          whether there's a compensating process. Asking that is often more valuable than the locking
+          discussion, because it changes which solution is correct."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you name it as a lost update and explain the window?</li>
+        <li>Do you reach for the atomic update first, rather than locking?</li>
+        <li>Do you know optimistic vs pessimistic and when each fits?</li>
+        <li>Do you consider throughput and the business rule, not just correctness?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "use <code>SERIALIZABLE</code>" as the whole answer.</li>
+        <li><span class="redflag">Red flag:</span> a lock held across application logic or a user session.</li>
+        <li><span class="redflag">Red flag:</span> solving it only in application code, so a second writer
+          reintroduces the bug.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Now make it work across two services with separate databases.</li>
+          <li>How do you handle expiring reservations?</li>
+          <li>What if stock is cached in Redis?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>You're seeing frequent deadlocks in production. Walk me through it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd separate <strong>deadlocks from blocking</strong>, because they're often confused and the
+          fixes differ. Blocking is a queue — slow, but it resolves. A deadlock is a cycle that can't resolve,
+          so SQL Server kills one side with error 1205."</p>
+        <p>"Then I'd get the actual deadlock graphs. They're in the <code>system_health</code> extended events
+          session by default, so the data is already there without turning anything on. The graph tells me the
+          two statements, the resources, and the lock modes — which is nearly always enough to identify the
+          pattern."</p>
+        <p>"Most deadlocks I've seen fall into three shapes."</p>
+        <p>"<strong>Inconsistent access order.</strong> One procedure updates Account then Audit; another
+          updates Audit then Account. Fix: agree an order and apply it everywhere. This is the single most
+          effective change, and it's usually a small one."</p>
+        <p>"<strong>Missing index.</strong> This one surprises people. If a query scans instead of seeking, it
+          takes locks on far more rows than it needs — so the collision surface is much larger. Adding the
+          right index converts a scan to a seek and the deadlocks often disappear entirely, without touching
+          transaction logic. Always worth checking, because it's the cheapest fix."</p>
+        <p>"<strong>Lock escalation.</strong> A bulk operation crossing the ~5,000-lock threshold escalates to
+          a table lock and collides with everything. Fix: batch it — a few thousand rows per transaction in a
+          loop."</p>
+        <p>"Alongside that: are transactions longer than they need to be? Anything not part of the atomic unit
+          — reads that could happen before, API calls, logging — should be outside it."</p>
+        <p>"And I'd check whether <strong>RCSI</strong> is on. It eliminates the whole read-versus-write
+          deadlock category, since readers use the version store instead of taking shared locks. If those are
+          the deadlocks we're seeing, that's a one-setting fix."</p>
+        <p>"Then the part people leave out: <strong>retry logic is mandatory regardless</strong>. A busy system
+          will always have some deadlocks and you can't design them all away. Error 1205 is explicitly
+          retryable — the victim was rolled back cleanly and the other transaction has now completed. I'd retry
+          with a short randomised delay so the two victims don't collide again immediately."</p>
+        <p>"The caveat on retry: it's only safe if the transaction is genuinely retry-safe — one atomic unit
+          with no side effects outside the database. If it sends an email or calls an API, retrying does that
+          twice. So if I find non-retryable transactions, that's the first thing to fix, before adding
+          retries."</p>
+        <p>"Finally I'd add monitoring on the deadlock count so we know whether the fixes worked, rather than
+          waiting for the next complaint."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you distinguish deadlock from blocking?</li>
+        <li>Do you know deadlock graphs are already being captured?</li>
+        <li>Do you know missing indexes cause deadlocks?</li>
+        <li>Do you treat retry as mandatory, and know when it isn't safe?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add <code>NOLOCK</code>".</li>
+        <li><span class="redflag">Red flag:</span> trying to eliminate deadlocks entirely with no retry
+          logic.</li>
+        <li><span class="redflag">Red flag:</span> guessing without reading a deadlock graph.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does SQL Server choose the victim?</li>
+          <li>Why does an index change fix a deadlock?</li>
+          <li>How do you make a transaction retry-safe?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

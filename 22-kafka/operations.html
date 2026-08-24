@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operations &amp; Scaling — Kafka</title>
+<meta name="description" content="Consumer lag as the primary signal, rebalancing, retention and log compaction, partition sizing, and recovering from failure.">
+<meta name="keywords" content="Kafka consumer lag monitoring rebalance session timeout max poll interval retention log compaction tombstone partition sizing rack awareness reassignment throughput tuning batch linger compression">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="22-kafka/operations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Operations &amp; Scaling</h1>
+    <p class="subtitle">Consumer lag is the one number that tells you whether Kafka is healthy. Almost everything
+      operational reduces to keeping it low.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Consumer lag is the primary metric.</strong> Growing lag means you're falling behind
+        permanently.</li>
+      <li><strong>Slow processing causes rebalance loops</strong> via
+        <code>max.poll.interval.ms</code>.</li>
+      <li><strong>Retention is time or size based</strong> — and it deletes data regardless of whether it's been
+        read.</li>
+      <li><strong>Log compaction keeps the latest value per key</strong> forever. Different from retention.</li>
+      <li><strong>A tombstone is a null value</strong> — that's how you delete a key under compaction.</li>
+      <li><strong>Partition count is effectively permanent.</strong> Over-provision moderately.</li>
+      <li><strong>Batching and compression</strong> are the main producer throughput levers.</li>
+    </ul>
+  </div>
+
+  <h2 id="lag">Consumer lag <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Lag is <strong>the newest offset in a partition minus the consumer group's committed offset</strong> — how
+      many messages behind you are.</p>
+    <p>Some lag is normal and healthy. <strong>Growing</strong> lag means consumers can't keep up, and it will
+      never recover on its own.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lag pattern</th><th>Means</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Flat and low</strong></td><td>Healthy</td></tr>
+        <tr><td><strong>Spiky, returns to baseline</strong></td><td>Handling bursts fine</td></tr>
+        <tr><td><strong>Steadily growing</strong></td><td><strong>Under-provisioned.</strong> Will not self-correct</td></tr>
+        <tr><td><strong>Growing on one partition only</strong></td><td>A hot key, or a stuck consumer</td></tr>
+        <tr><td><strong>Sudden jump</strong></td><td>A consumer died, or a rebalance</td></tr>
+        <tr><td><strong>Flat but high</strong></td><td>Keeping pace but never catching up — a stalled consumer, or offsets reset</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Lag plus retention equals silent data loss</div>
+    <p style="margin:0">This is the failure that surprises people. Retention deletes data on a schedule
+      <strong>regardless of whether anyone has consumed it</strong>.
+      <br><br>
+      So if retention is 7 days and lag grows past 7 days' worth of messages, Kafka <strong>deletes messages the
+      consumer has never read</strong>. The consumer then jumps forward to the earliest available offset — and
+      the data is gone.
+      <br><br>
+      Depending on <code>auto.offset.reset</code>, the consumer either silently skips to the beginning of what's
+      retained (<code>earliest</code>) or to the newest message (<code>latest</code>), losing everything in
+      between. Either way there's no error — just a gap.
+      <br><br>
+      <strong>So lag must be alerted on before it approaches the retention window</strong>, not when it's already
+      there. And the alert should be in <em>time</em> terms, not message count, because "500,000 messages behind"
+      means nothing without knowing the rate.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Fixing growing lag</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Make the consumer faster</strong></td><td>Usually the best option — batch database writes, remove an N+1, cache a lookup</td></tr>
+        <tr><td><strong>Add consumers</strong></td><td>Only helps <strong>up to the partition count</strong></td></tr>
+        <tr><td><strong>Add partitions</strong></td><td>Raises the ceiling, and <strong>breaks key ordering</strong></td></tr>
+        <tr><td><strong>Increase <code>max.poll.records</code></strong></td><td>Fewer round trips per message</td></tr>
+        <tr><td><strong>Process concurrently within a partition</strong></td><td>Only if ordering allows, and offset tracking gets harder</td></tr>
+        <tr><td><strong>Reduce what's produced</strong></td><td>Sometimes the real answer — filter at the source</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="rebalancing">Rebalancing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Setting</th><th>Controls</th><th>Symptom if wrong</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>session.timeout.ms</code></td>
+          <td>How long without a heartbeat before the consumer is considered dead</td>
+          <td>Too low: spurious rebalances on GC pauses</td>
+        </tr>
+        <tr>
+          <td><strong><code>max.poll.interval.ms</code></strong></td>
+          <td><strong>Maximum time between <code>poll()</code> calls</strong></td>
+          <td><strong>Too low: rebalance loop when processing is slow</strong></td>
+        </tr>
+        <tr>
+          <td><code>heartbeat.interval.ms</code></td>
+          <td>Heartbeat frequency</td>
+          <td>Should be roughly a third of the session timeout</td>
+        </tr>
+        <tr>
+          <td><code>max.poll.records</code></td>
+          <td>Messages returned per poll</td>
+          <td>Too high with slow processing: exceeds the poll interval</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The rebalance loop — a classic and confusing failure</div>
+    <p style="margin:0">Heartbeats run on a <strong>background thread</strong>, so the consumer looks alive even
+      while your handler is busy. What actually detects a stuck consumer is
+      <code>max.poll.interval.ms</code> — the time between <code>poll()</code> calls.
+      <br><br>
+      So if <code>max.poll.records</code> is 500 and each message takes 100ms, one batch takes 50 seconds. With
+      the default 5-minute poll interval that's fine — but at 1,000 records and 500ms each, it's over 8 minutes,
+      the broker declares the consumer dead, and a rebalance starts.
+      <br><br>
+      Then the reassigned partition goes to another consumer which <strong>also</strong> takes too long, and
+      that one is evicted too. <strong>The group rebalances continuously and processes almost
+      nothing</strong> — while every consumer looks healthy and CPU looks fine.
+      <br><br>
+      Two fixes: <strong>reduce <code>max.poll.records</code></strong> so a batch completes well inside the
+      interval, or <strong>raise <code>max.poll.interval.ms</code></strong> to fit the realistic worst case. Reduce
+      the batch size first, because a long poll interval delays detection of genuinely dead consumers.
+      <br><br>
+      Recognising this pattern — continuous rebalancing with no progress and healthy-looking consumers — is one of
+      the most useful diagnostic signals in Kafka operations.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Cooperative and static membership reduce rebalance pain</div>
+    <p style="margin:0"><strong><code>CooperativeSticky</code> assignment</strong> only moves the partitions that
+      need to move, so consumers keep processing the rest. The older eager strategy stops the entire group and
+      reassigns everything — a stop-the-world pause on every deployment.
+      <br><br>
+      <strong>Static membership</strong> (<code>group.instance.id</code>) gives each consumer a stable identity, so
+      a restart within the session timeout <strong>doesn't trigger a rebalance at all</strong> — the same
+      partitions come back to it.
+      <br><br>
+      That's the setting that makes rolling deployments cheap. Without it, a rolling restart of ten consumers
+      causes ten rebalances; with it, none. Worth knowing because deployment-induced rebalancing is a common
+      source of latency spikes that nobody attributes to deployments.</p>
+  </div>
+
+  <h2 id="retention-compaction">Retention and compaction <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Retention (<code>delete</code>)</th><th>Compaction (<code>compact</code>)</th></tr></thead>
+      <tbody>
+        <tr><td>Deletes based on</td><td><strong>Age or size</strong></td><td><strong>Superseded keys</strong></td></tr>
+        <tr><td>Keeps</td><td>Everything within the window</td><td><strong>The latest value per key, forever</strong></td></tr>
+        <tr><td>Old values for a key</td><td>Kept until the window expires</td><td>Removed once superseded</td></tr>
+        <tr><td>Log size</td><td>Bounded by time or bytes</td><td>Bounded by <strong>distinct key count</strong></td></tr>
+        <tr><td>Use for</td><td><strong>Event streams</strong> — "what happened"</td><td><strong>State/snapshots</strong> — "what is it now"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">The distinction that matters</span>
+    <p><strong>Retention</strong> is a <em>time window</em> over events. Use it when you care about a stream of
+      things that happened, and old ones stop mattering.</p>
+    <p><strong>Compaction</strong> is a <em>key-value store in a log</em>. It keeps the most recent value for each
+      key indefinitely — so a new consumer can read the whole topic and reconstruct current state for every
+      key.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — compaction is what makes a topic a replayable state store</div>
+    <p style="margin:0">With retention, replaying gives you <em>recent</em> events. If retention is 7 days you
+      cannot rebuild state that depends on older data — the events are gone.
+      <br><br>
+      With <strong>compaction</strong>, the topic always contains at least the latest value for every key. So a
+      brand-new consumer can read from the beginning and end up with complete current state for every entity,
+      however old.
+      <br><br>
+      That's what makes compacted topics the foundation for <strong>materialised views, caches and lookup
+      tables</strong> — you can add a consumer at any time and it bootstraps itself. It's also how Kafka stores
+      its own consumer offsets, in the compacted <code>__consumer_offsets</code> topic.
+      <br><br>
+      To <strong>delete</strong> a key under compaction you publish a <strong>tombstone</strong> — a message with
+      that key and a <code>null</code> value. Compaction removes the key entirely after
+      <code>delete.retention.ms</code>, giving consumers time to observe the deletion.
+      <br><br>
+      Two caveats worth stating: compaction is asynchronous and best-effort, so duplicates for a key can exist
+      transiently; and it only ever compacts <em>inactive</em> segments, so the newest data is never compacted.
+      Consumers must therefore tolerate seeing several values for a key.</p>
+  </div>
+
+  <pre data-label="text — the same key, superseded"><code class="language-text">  Before compaction:
+    (user1, {name:"A"}) (user2, {name:"B"}) (user1, {name:"A2"}) (user2, null)
+
+  After compaction:
+    (user1, {name:"A2"})        <- only the latest value survives
+                                <- user2 removed by the tombstone</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Retention deletes unread data</div>
+    <p style="margin:0">Retention has <strong>no relationship to consumption</strong>. It is not "delete once
+      everyone has read it" — it's "delete after this long, regardless".
+      <br><br>
+      So a consumer offline longer than the retention window loses data permanently, with no error. That's the
+      lag-plus-retention trap from above, and it's why retention should be set from
+      <strong>recovery requirements</strong>: how long could a consumer plausibly be down — a long weekend, a
+      bank holiday, an extended incident — plus margin.
+      <br><br>
+      Seven days is a common default and it's a decision, not a given. If a consumer could be down over a
+      four-day break plus a day to notice and fix, seven days is uncomfortably tight.</p>
+  </div>
+
+  <h2 id="partition-sizing">Partition sizing <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The constraint that drives the decision</span>
+    <p><strong>You can add partitions but not remove them — and adding them breaks key ordering</strong>, because
+      partition assignment is <code>hash(key) % count</code>.</p>
+    <p>So this is effectively a design-time decision. Over-provision moderately, and don't plan to change it.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Too few</th><th>Too many</th></tr></thead>
+      <tbody>
+        <tr><td>Caps consumer parallelism</td><td>More file handles and open files per broker</td></tr>
+        <tr><td>Can't scale out to clear lag</td><td>More memory for producer batching per partition</td></tr>
+        <tr><td>Hot partitions more likely</td><td><strong>Slower rebalances</strong> and longer leader elections</td></tr>
+        <tr><td>Adding them later breaks ordering</td><td>Higher end-to-end latency from smaller batches</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">A sizing approach</div>
+    <p style="margin:0">Work from <strong>target throughput divided by per-consumer throughput</strong>. If you
+      need 100,000 messages a second and one consumer handles 5,000, that's 20 partitions minimum — then add
+      headroom for growth, so perhaps 30.
+      <br><br>
+      Sanity-check against <strong>key cardinality</strong>: partitions beyond the number of distinct keys are
+      guaranteed to sit empty. And against <strong>expected consumer count</strong>, since that's the ceiling
+      you're buying.
+      <br><br>
+      For most systems, tens of partitions is right. Hundreds is unusual and should be justified; thousands per
+      topic causes real operational problems.
+      <br><br>
+      A useful reframing: <strong>partition count is a capacity decision like sizing a thread pool</strong> — you
+      want enough for peak plus headroom, and over-provisioning has a real but modest cost while
+      under-provisioning is expensive to fix.</p>
+  </div>
+
+  <h2 id="throughput">Producer throughput tuning <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="csharp — the levers that matter" class="code-good"><code class="language-csharp">var config = new ProducerConfig
+{
+    BootstrapServers = brokers,
+    EnableIdempotence = true,
+    Acks = Acks.All,
+
+    // Wait briefly to fill a batch - the single biggest throughput lever
+    LingerMs = 10,
+    BatchSize = 64 * 1024,               // 64KB batches
+
+    // Compression applies per batch, so bigger batches compress better
+    CompressionType = CompressionType.Zstd,
+
+    MaxInFlight = 5                      // <= 5 required with idempotence
+};</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Setting</th><th>Effect</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>linger.ms</code></strong></td><td>Waits to fill a batch</td><td><strong>Latency for throughput.</strong> 0 means send immediately</td></tr>
+        <tr><td><strong><code>batch.size</code></strong></td><td>Maximum batch bytes</td><td>Memory per partition</td></tr>
+        <tr><td><strong><code>compression.type</code></strong></td><td>Compresses each batch</td><td>CPU for network and disk. <code>zstd</code> or <code>lz4</code></td></tr>
+        <tr><td><code>acks</code></td><td>Durability</td><td><code>all</code> costs latency and is correct</td></tr>
+        <tr><td><code>max.in.flight</code></td><td>Unacknowledged batches</td><td>Must be ≤ 5 with idempotence</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title"><code>linger.ms</code> is counter-intuitive and effective</div>
+    <p style="margin:0">The default of 0 sends each message as soon as possible, which sounds optimal and produces
+      many small requests.
+      <br><br>
+      Setting <code>linger.ms=10</code> waits up to 10 milliseconds to accumulate a batch. That adds at most 10ms
+      of latency and can <strong>multiply throughput several times over</strong>, because per-request overhead is
+      amortised across many messages — and larger batches compress far better, so network and disk usage drop
+      too.
+      <br><br>
+      For most event-streaming workloads 10ms is imperceptible and the gain is substantial. It's the highest
+      value-to-effort producer setting, and it's frequently left at the default.
+      <br><br>
+      Compression matters more than people expect because <strong>it applies per batch, not per message</strong> —
+      so JSON with repeated field names across a batch compresses very well. <code>zstd</code> generally beats
+      <code>gzip</code> on both ratio and CPU.</p>
+  </div>
+
+  <h2 id="failure">Failure and recovery <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Failure</th><th>What happens</th><th>What you should have done</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>A broker dies</strong></td>
+          <td>Leadership moves to an in-sync replica; producers and consumers reconnect</td>
+          <td><code>replication.factor ≥ 3</code>, <code>min.insync.replicas=2</code></td>
+        </tr>
+        <tr>
+          <td><strong>A consumer dies</strong></td>
+          <td>Rebalance; its partitions move; uncommitted work reprocesses</td>
+          <td>Idempotent consumers</td>
+        </tr>
+        <tr>
+          <td><strong>A whole AZ fails</strong></td>
+          <td>Depends on replica placement</td>
+          <td><strong>Rack awareness</strong>, so replicas span zones</td>
+        </tr>
+        <tr>
+          <td><strong>Disk fills</strong></td>
+          <td>Broker stops accepting writes</td>
+          <td>Retention sized to disk, plus alerting</td>
+        </tr>
+        <tr>
+          <td><strong>Consumer offsets lost</strong></td>
+          <td>Restarts per <code>auto.offset.reset</code> — reprocess everything or skip everything</td>
+          <td>Know which reset you've configured, and why</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title"><code>auto.offset.reset</code> has two bad outcomes, so choose deliberately</div>
+    <p style="margin:0">This applies when a consumer group has no committed offset — a brand-new group, or one
+      whose offsets expired or were deleted.
+      <br><br>
+      <strong><code>earliest</code></strong> reprocesses the entire retained topic. For a new analytics consumer
+      that's exactly right. For a consumer that <em>sends emails</em>, it means emailing everyone about every
+      order in the last seven days.
+      <br><br>
+      <strong><code>latest</code></strong> skips everything currently in the log. Safe against mass side effects,
+      and it silently loses any backlog — so a consumer that was down and lost its offsets never processes what
+      accumulated.
+      <br><br>
+      There is no safe default. The decision follows from what the consumer <em>does</em>: idempotent projections
+      and read models want <code>earliest</code>; anything with external side effects wants
+      <code>latest</code> plus a deliberate backfill if needed.
+      <br><br>
+      And this is a strong argument for <strong>idempotent consumers</strong> beyond duplicate handling — with
+      idempotency, an accidental <code>earliest</code> reprocess is wasteful rather than catastrophic.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Rack awareness is a one-line configuration with real value</div>
+    <p style="margin:0">Setting <code>broker.rack</code> makes Kafka distribute a partition's replicas across
+      different racks or availability zones.
+      <br><br>
+      Without it, all three replicas of a partition can land in the same zone — so a zone failure takes the
+      partition fully offline despite replication factor 3. You've paid for redundancy and got none against the
+      failure mode most likely to occur.
+      <br><br>
+      Managed services generally configure this. If you run your own brokers it's worth verifying rather than
+      assuming, because the symptom only appears during the incident you bought replication to survive.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Consumer lag is the primary health metric — alert in time terms, not message counts.</li>
+      <li>Retention deletes unread data, so lag exceeding the retention window loses messages silently.</li>
+      <li>Adding consumers only helps up to the partition count.</li>
+      <li><code>max.poll.interval.ms</code> plus slow processing causes continuous rebalancing with no
+        progress.</li>
+      <li>Reduce <code>max.poll.records</code> before raising the poll interval.</li>
+      <li>Cooperative assignment and static membership make deployments cheap.</li>
+      <li>Retention is a time window over events; compaction is a key-value store that keeps the latest value
+        forever.</li>
+      <li>Compacted topics let a new consumer bootstrap full current state.</li>
+      <li>A tombstone is a null value; compaction is asynchronous so consumers must tolerate duplicates.</li>
+      <li>Partition count is effectively permanent — size from throughput with headroom.</li>
+      <li><code>linger.ms</code> plus compression is the biggest producer throughput lever.</li>
+      <li><code>auto.offset.reset</code> has two bad outcomes; choose from what the consumer does.</li>
+      <li>Rack awareness, or replication factor 3 protects against nothing zone-wide.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Not monitoring consumer lag</strong>, or alerting on counts rather than time.</li>
+    <li><strong>Retention shorter than plausible consumer downtime.</strong></li>
+    <li><strong>Adding consumers beyond the partition count</strong> to fix lag.</li>
+    <li><strong><code>max.poll.records</code> too high</strong> for the processing time, causing rebalance
+      loops.</li>
+    <li><strong>Raising the poll interval</strong> instead of reducing the batch.</li>
+    <li><strong>Eager rebalancing</strong> and no static membership, so every deploy stalls the group.</li>
+    <li><strong>Using retention where compaction was needed</strong> for a state topic.</li>
+    <li><strong>Assuming compaction removes duplicates immediately.</strong></li>
+    <li><strong>Too many partitions</strong>, slowing rebalances for no gain.</li>
+    <li><strong><code>linger.ms=0</code></strong> and no compression on a high-volume producer.</li>
+    <li><strong><code>auto.offset.reset=earliest</code></strong> on a consumer with side effects.</li>
+    <li><strong>No rack awareness</strong>, so replicas share a failure domain.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Consumer lag is growing steadily. Walk me through it. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+    <div class="say-it">
+      <span class="s-label">How I'd answer</span>
+      <p>"Growing lag means consumers are slower than producers, and it <strong>will not recover on its own</strong>
+        — so this needs action rather than observation."</p>
+      <p>"The first thing I'd establish is <strong>how urgent it is relative to retention</strong>, because that
+        determines whether this is a performance problem or an imminent data-loss problem. Retention deletes data
+        on a schedule <em>regardless of whether it's been consumed</em>. So if retention is 7 days and lag reaches
+        7 days' worth, Kafka deletes messages the consumer has never read — and the consumer silently jumps
+        forward. No error, just a gap."</p>
+      <p>"So I'd convert lag into <strong>time</strong> rather than message count. '500,000 messages behind' is
+        meaningless; 'four hours behind, on seven-day retention' tells me I have room, and 'five days behind' means
+        I'm about to lose data."</p>
+      <p>"Then I'd check whether it's <strong>all partitions or one</strong>."</p>
+      <p>"<strong>One partition growing</strong> points at a hot key — a dominant entity sending most of the
+        traffic to one partition — or a stuck consumer on that partition. Adding consumers won't help a hot key,
+        because you can't split a single key across partitions."</p>
+      <p>"<strong>All partitions growing</strong> is genuine under-provisioning."</p>
+      <p>"Before scaling anything I'd check for a <strong>rebalance loop</strong>, because that presents as growing
+        lag with healthy-looking consumers and it's the most confusing cause. Heartbeats run on a background
+        thread, so a consumer looks alive while its handler is busy — what detects a stuck consumer is
+        <code>max.poll.interval.ms</code>. If a batch takes longer than that, the broker evicts the consumer, the
+        partition moves to another that also takes too long, and the group rebalances continuously while
+        processing almost nothing. I'd look at rebalance frequency in the consumer metrics to rule that in or
+        out."</p>
+      <p>"If that's the cause, the fix is to <strong>reduce <code>max.poll.records</code></strong> so a batch
+        completes well inside the interval — I'd do that before raising the poll interval, because a long interval
+        delays detection of genuinely dead consumers."</p>
+      <p>"For real under-provisioning, in order of preference:"</p>
+      <p>"<strong>Make the consumer faster.</strong> Usually the best option and often the easiest — batch the
+        database writes instead of one per message, remove an N+1, cache a lookup. A consumer doing a synchronous
+        HTTP call per message is the common culprit."</p>
+      <p>"<strong>Add consumers</strong> — but only up to the partition count. Beyond that they sit idle, which
+        catches teams mid-incident: they scale from 4 pods to 12, nothing improves, and rebalances get slower."</p>
+      <p>"<strong>Add partitions</strong> to raise the ceiling — and this <strong>breaks key ordering</strong>,
+        because assignment is <code>hash(key) % count</code>, so a key's old and new messages end up in different
+        partitions being processed concurrently. That's a correctness change made under pressure, which is exactly
+        when you don't want to make one."</p>
+      <p>"<strong>Or reduce what's produced</strong> — filtering at the source is sometimes the real answer, if a
+        lot of what's flowing through isn't needed."</p>
+      <p>"For immediate mitigation if retention is closing in, I'd consider <strong>temporarily extending
+        retention</strong> to buy time. That's a broker config change and it's much cheaper than losing
+        data."</p>
+      <p>"And afterwards: alert on lag in time terms with a threshold well below retention, so this is caught
+        while it's a capacity conversation rather than an incident."</p>
+    </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you connect lag to retention and potential data loss?</li>
+        <li>Do you express lag in time rather than count?</li>
+        <li>Do you check per-partition to spot hot keys?</li>
+        <li>Do you know about rebalance loops?</li>
+        <li>Do you know adding consumers is capped, and adding partitions breaks ordering?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add more consumers" as the whole answer.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that retention deletes unread data.</li>
+        <li><span class="redflag">Red flag:</span> adding partitions without mentioning the ordering
+          break.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you handle a hot key?</li>
+          <li>How do you process concurrently within a partition safely?</li>
+          <li>What would you set retention to, and why?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you use log compaction instead of retention? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They answer different questions, so the choice follows from what the topic represents."</p>
+        <p>"<strong>Retention</strong> is a time window over a stream of events. It suits topics where the topic
+          means 'these things happened' and old events stop mattering — order placed, payment received, page
+          viewed. Log size is bounded by time or bytes."</p>
+        <p>"<strong>Compaction</strong> keeps the <strong>latest value per key, indefinitely</strong>. So the topic
+          means 'this is the current state of each entity' rather than a history. Log size is bounded by the number
+          of distinct keys, not by time."</p>
+        <p>"The property that makes compaction powerful: <strong>a brand-new consumer can read the topic from the
+          beginning and end up with complete current state for every key</strong>, however old. With retention it
+          would only get whatever falls inside the window — so if retention is 7 days, you cannot rebuild state
+          for an entity that hasn't changed in a month, because its last event is gone."</p>
+        <p>"That's what makes compacted topics the foundation for <strong>materialised views, caches and lookup
+          tables</strong> — a consumer bootstraps itself with no separate seeding process. It's also how Kafka
+          stores its own consumer offsets, in the compacted <code>__consumer_offsets</code> topic."</p>
+        <p>"So concretely I'd use compaction for: a customer or product catalogue where I need current details per
+          id; configuration or feature flags; any read model I might need to rebuild; and anything where a new
+          consumer must be able to bootstrap full state."</p>
+        <p>"And retention for: event streams, audit trails, telemetry — anything where the sequence is the point
+          and old entries expire."</p>
+        <p>"To <strong>delete</strong> a key under compaction you publish a <strong>tombstone</strong> — a message
+          with that key and a <code>null</code> value. Compaction then removes the key entirely after
+          <code>delete.retention.ms</code>, which exists to give consumers time to observe the deletion rather than
+          it vanishing before they see it. That's also how you satisfy a GDPR erasure request against a compacted
+          topic, which is worth knowing because 'the log is immutable' otherwise sounds like a compliance
+          problem."</p>
+        <p>"Two caveats I'd state, because they cause bugs. Compaction is <strong>asynchronous and
+          best-effort</strong>, and it only ever compacts <em>inactive</em> segments — so the newest data is never
+          compacted. Which means <strong>a consumer can legitimately see several values for the same key</strong>
+          and must handle that; treating a compacted topic as guaranteeing one message per key is wrong."</p>
+        <p>"You can also combine them — <code>cleanup.policy=compact,delete</code> — to keep the latest value per
+          key <em>and</em> eventually expire keys that stop being updated. That's useful for something like session
+          state, where you want current values but don't want dead keys accumulating forever."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you frame it as events versus state?</li>
+        <li>Do you know a new consumer can bootstrap from a compacted topic?</li>
+        <li>Do you know about tombstones and <code>delete.retention.ms</code>?</li>
+        <li>Do you know compaction is asynchronous, so duplicates appear?</li>
+        <li>Bonus: do you know the combined policy?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does this relate to event sourcing?</li>
+          <li>How would you handle a GDPR deletion request?</li>
+          <li>What stops a compacted topic growing forever?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

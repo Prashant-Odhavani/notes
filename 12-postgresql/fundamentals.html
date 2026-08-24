@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fundamentals &amp; Data Types — PostgreSQL</title>
+<meta name="description" content="Types worth knowing, identifier folding and collation traps, arrays, jsonb, sequences, schemas and how they map to .NET.">
+<meta name="keywords" content="PostgreSQL data types text varchar numeric timestamptz uuid citext arrays jsonb json identifier folding case sensitivity collation sequences serial identity schemas search_path enum domain generated column upsert ON CONFLICT">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="12-postgresql/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Fundamentals &amp; Data Types</h1>
+    <p class="subtitle">The type system is richer than SQL Server's, and two defaults will catch you out on
+      day one.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Unquoted identifiers fold to lowercase.</strong> <code>Order</code> becomes
+        <code>order</code>; <code>"Order"</code> stays capitalised and must always be quoted.</li>
+      <li><strong>String comparison is case-sensitive</strong> by default. Unlike SQL Server.</li>
+      <li><strong>Use <code>text</code></strong> — there's no performance benefit to
+        <code>varchar(n)</code> here.</li>
+      <li><strong><code>timestamptz</code>, always.</strong> <code>timestamp</code> without a zone is a trap.</li>
+      <li><strong><code>numeric</code> for money</strong>, never <code>float</code>. There's also a
+        <code>money</code> type — don't use it.</li>
+      <li><strong><code>jsonb</code>, not <code>json</code></strong> — binary, indexable, deduplicated keys.</li>
+      <li><strong><code>ON CONFLICT</code></strong> is the upsert, and it's better than
+        <code>MERGE</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="identifiers">Identifier folding <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>PostgreSQL <strong>lowercases every unquoted identifier</strong>. Double-quoting makes it exact and
+      case-sensitive forever.</p>
+  </div>
+
+  <pre data-label="sql — the confusion this creates"><code class="language-sql">CREATE TABLE Orders (Id int);        -- actually creates "orders" with column "id"
+SELECT Id FROM Orders;               -- works: both folded to lowercase
+SELECT "Id" FROM "Orders";           -- ERROR: relation "Orders" does not exist
+
+CREATE TABLE "Orders" ("Id" int);    -- creates it capitalised
+SELECT Id FROM Orders;               -- ERROR: relation "orders" does not exist
+SELECT "Id" FROM "Orders";           -- works, and now quoting is mandatory forever</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Why this hits .NET developers specifically</div>
+    <p style="margin:0">EF Core names tables and columns after your C# classes and properties — so
+      <code>PascalCase</code>. The Npgsql provider therefore <strong>quotes everything</strong>, giving you a
+      database where every identifier requires quotes in hand-written SQL.
+      <br><br>
+      That works, and it's miserable for anyone writing queries in psql or a BI tool. Every statement needs
+      <code>SELECT "OrderNumber" FROM "Order"</code>.
+      <br><br>
+      <strong>The fix is <code>UseSnakeCaseNamingConvention()</code></strong> from the
+      <code>EFCore.NamingConventions</code> package. <code>OrderNumber</code> becomes
+      <code>order_number</code> — idiomatic Postgres, no quoting needed anywhere, and EF handles the mapping.
+      <br><br>
+      Decide this <em>before</em> the first migration. Changing it later renames every table and column in the
+      database.</p>
+  </div>
+
+  <h2 id="collation">Case-sensitive comparison <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — the login bug" class="code-bad"><code class="language-sql">-- Stored: 'bob@example.com'
+SELECT * FROM users WHERE email = 'Bob@Example.com';   -- 0 rows
+
+-- SQL Server's default collation WOULD have matched this.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>How</th><th>Assessment</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Normalise on write</strong></td>
+          <td>Lowercase before inserting</td>
+          <td><strong>Simplest and fastest.</strong> Indexes work normally. My default for emails and usernames</td>
+        </tr>
+        <tr>
+          <td><strong><code>citext</code> type</strong></td>
+          <td><code>CREATE EXTENSION citext;</code></td>
+          <td>Transparent — comparisons and unique constraints are case-insensitive</td>
+        </tr>
+        <tr>
+          <td><strong>Expression index</strong></td>
+          <td><code>CREATE INDEX ON users (lower(email));</code></td>
+          <td>Query must use <code>lower(email) = lower($1)</code> to match the index</td>
+        </tr>
+        <tr>
+          <td><strong>Non-deterministic collation</strong></td>
+          <td><code>CREATE COLLATION ... deterministic = false</code></td>
+          <td>Most correct for Unicode, but blocks some index optimisations and pattern matching</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Case-insensitive uniqueness is the real requirement</div>
+    <p style="margin:0">Matching on read is only half the problem. Without case-insensitive
+      <em>uniqueness</em>, <code>bob@x.com</code> and <code>Bob@x.com</code> are two accounts — which is an
+      account-takeover vector, not just untidy data.
+      <br><br>
+      Either <code>citext</code> with a normal unique constraint, or a unique index on
+      <code>lower(email)</code>. Normalising on write plus a plain unique constraint also works, provided
+      <em>every</em> write path normalises — which is why enforcing it in the database is safer.</p>
+  </div>
+
+  <h2 id="types">Types worth knowing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Use</th><th>Type</th><th>.NET</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td>Text</td><td><code>text</code></td><td><code>string</code></td><td><strong>No length penalty.</strong> Prefer over <code>varchar(n)</code></td></tr>
+        <tr><td>Money</td><td><code>numeric(19,4)</code></td><td><code>decimal</code></td><td>Exact. Never <code>float</code>, and never the <code>money</code> type</td></tr>
+        <tr><td>Timestamp</td><td><strong><code>timestamptz</code></strong></td><td><code>DateTime</code> (UTC)</td><td>Stores UTC, converts on read</td></tr>
+        <tr><td>Date only</td><td><code>date</code></td><td><code>DateOnly</code></td><td>Maps cleanly since .NET 6</td></tr>
+        <tr><td>Identity</td><td><code>uuid</code> or <code>bigint</code></td><td><code>Guid</code> / <code>long</code></td><td>Random UUIDs are fine here — heap storage</td></tr>
+        <tr><td>Flags</td><td><code>boolean</code></td><td><code>bool</code></td><td>A real boolean, not <code>bit</code></td></tr>
+        <tr><td>Document</td><td><strong><code>jsonb</code></strong></td><td><code>JsonDocument</code>, POCO</td><td>Indexable and queryable</td></tr>
+        <tr><td>List of scalars</td><td><code>text[]</code>, <code>int[]</code></td><td><code>string[]</code></td><td>Genuinely useful — no junction table needed</td></tr>
+        <tr><td>Range</td><td><code>tstzrange</code>, <code>daterange</code></td><td><code>NpgsqlRange&lt;T&gt;</code></td><td>Overlap operators plus exclusion constraints</td></tr>
+        <tr><td>IP / network</td><td><code>inet</code>, <code>cidr</code></td><td><code>IPAddress</code></td><td>Validated, and supports subnet operators</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title"><code>timestamp</code> vs <code>timestamptz</code> — get this right</div>
+    <p style="margin:0"><code>timestamptz</code> stores an absolute point in time (as UTC) and converts to the
+      session time zone on read. That's almost always what you want.
+      <br><br>
+      <code>timestamp</code> stores a wall-clock reading with <strong>no zone at all</strong>. Two rows can
+      both say 01:30 and refer to different instants — and during a daylight-saving fallback, that hour occurs
+      twice with no way to distinguish them. It's unfixable retroactively.
+      <br><br>
+      Npgsql 6+ enforces the distinction: <code>timestamptz</code> requires
+      <code>DateTimeKind.Utc</code>, and passing a <code>Local</code> or <code>Unspecified</code>
+      <code>DateTime</code> throws. That change annoyed people and it's correct — it stops you storing
+      ambiguous data. Use <code>DateTime.UtcNow</code>, or <code>DateTimeOffset</code>.</p>
+  </div>
+
+  <h2 id="jsonb">jsonb <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>json</code></th><th><code>jsonb</code></th></tr></thead>
+      <tbody>
+        <tr><td>Storage</td><td>Text, verbatim</td><td><strong>Parsed binary</strong></td></tr>
+        <tr><td>Write cost</td><td>Cheaper</td><td>Slight parse overhead</td></tr>
+        <tr><td>Read/query cost</td><td>Re-parsed every time</td><td><strong>Much faster</strong></td></tr>
+        <tr><td>Indexable</td><td>No</td><td><strong>Yes — GIN</strong></td></tr>
+        <tr><td>Duplicate keys</td><td>Preserved</td><td>Last one wins</td></tr>
+        <tr><td>Key order</td><td>Preserved</td><td>Not preserved</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Use <code>jsonb</code>.</strong> The only reason to choose <code>json</code> is if you must
+      reproduce the original document byte-for-byte, including key order — which is rare and usually a sign the
+      document should be stored as <code>text</code> instead.</p>
+  </div>
+
+  <pre data-label="sql — querying and indexing jsonb"><code class="language-sql">CREATE TABLE event (
+    id      bigserial PRIMARY KEY,
+    payload jsonb NOT NULL
+);
+
+-- Extract: ->  returns jsonb,  ->> returns text
+SELECT payload -&gt;&gt; 'orderId'                    AS order_id,
+       payload -&gt; 'customer' -&gt;&gt; 'country'      AS country
+FROM   event;
+
+-- Containment: does the document contain this shape?
+SELECT * FROM event WHERE payload @&gt; '{"status": "shipped"}';
+
+-- GIN index supporting containment and key-exists
+CREATE INDEX ix_event_payload ON event USING gin (payload);
+
+-- B-tree on one extracted field - cheaper if you only query that field
+CREATE INDEX ix_event_order ON event ((payload -&gt;&gt; 'orderId'));</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — when jsonb is right, and when it's an escape hatch</div>
+    <p style="margin:0"><strong>Good uses:</strong> genuinely schemaless data — webhook payloads you must
+      retain verbatim, per-tenant custom fields, feature flags, audit snapshots of a row as it was, sparse
+      attributes where 200 columns would be mostly null.
+      <br><br>
+      <strong>Bad use:</strong> avoiding schema design. If you're querying and filtering on the same five keys
+      in every request, those are columns. You've given up constraints, foreign keys, type checking and good
+      cardinality estimates in exchange for not writing a migration.
+      <br><br>
+      The test I'd apply: <em>does anything enforce what's in there?</em> If the answer is "the application, we
+      hope", and the data is business-critical, it should be columns.
+      <br><br>
+      Being able to argue both sides is the senior answer — a lot of Postgres codebases have a
+      <code>data jsonb</code> column that quietly became the actual schema, with no constraints on any of it.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two jsonb costs to know</div>
+    <p style="margin:0"><strong>Updates rewrite the whole document.</strong> Changing one key in a 200 KB
+      <code>jsonb</code> value writes a new 200 KB row version — MVCC has no partial update. A hot document
+      updated frequently causes serious bloat.
+      <br><br>
+      <strong>Large values go to TOAST.</strong> Anything over roughly 2 KB is compressed and moved to a side
+      table, so reading it is an extra fetch. That's fine for occasional reads and expensive if it's on your
+      hot path.</p>
+  </div>
+
+  <h2 id="arrays">Arrays <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="sql"><code class="language-sql">CREATE TABLE article (
+    id   bigserial PRIMARY KEY,
+    tags text[] NOT NULL DEFAULT '{}'
+);
+
+SELECT * FROM article WHERE 'postgres' = ANY(tags);   -- contains
+SELECT * FROM article WHERE tags @&gt; ARRAY['sql'];      -- contains all
+SELECT * FROM article WHERE tags &amp;&amp; ARRAY['sql','ef']; -- overlaps
+
+CREATE INDEX ix_article_tags ON article USING gin (tags);</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">When an array beats a junction table</div>
+    <p style="margin:0"><strong>Use an array</strong> for a small, unordered set of scalars with no attributes
+      of their own and no referential integrity requirement — tags, permission strings, ISO country codes.
+      <br><br>
+      <strong>Use a junction table</strong> the moment you need a foreign key, per-relationship data (who added
+      it, when), or you want to query "which articles have this tag" efficiently across a large table without
+      relying on a GIN index.
+      <br><br>
+      The array is genuinely simpler when it fits. The mistake is using one for something that turns out to be
+      an entity — you can't constrain it, and refactoring later means a data migration. Note EF Core maps
+      <code>string[]</code> to <code>text[]</code> natively with Npgsql, so this is ergonomic from .NET.</p>
+  </div>
+
+  <h2 id="sequences">Sequences and identity <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="sql — prefer the standard syntax"><code class="language-sql">-- Modern, SQL-standard, recommended
+CREATE TABLE customer (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    name text NOT NULL
+);
+
+-- Legacy shorthand, still everywhere
+CREATE TABLE customer (id bigserial PRIMARY KEY, name text NOT NULL);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>ALWAYS</code></th><th><code>BY DEFAULT</code></th></tr></thead>
+      <tbody>
+        <tr><td>Can insert an explicit value</td><td>No, without <code>OVERRIDING</code></td><td>Yes</td></tr>
+        <tr><td>Data imports / migrations</td><td>Awkward</td><td><strong>Easy</strong></td></tr>
+        <tr><td>EF Core default</td><td>—</td><td><strong>Yes</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Sequences aren't transactional</div>
+    <p style="margin:0">A rolled-back transaction <strong>does not return</strong> its sequence value. That's
+      deliberate — otherwise the sequence would be a contention point serialising all inserts.
+      <br><br>
+      So identity columns have gaps. That's normal and not a bug. It does mean an ID is not a count, and never
+      use "max ID" as a row count or an invoice number.
+      <br><br>
+      Also: after a bulk data load with explicit IDs, the sequence is left behind and the next insert collides.
+      Reset it with <code>setval</code> — a classic post-migration failure.</p>
+  </div>
+
+  <h2 id="upsert">Upsert with <code>ON CONFLICT</code> <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — insert or update" class="code-good"><code class="language-sql">INSERT INTO inventory (sku, stock, updated_at)
+VALUES ($1, $2, now())
+ON CONFLICT (sku) DO UPDATE
+    SET stock      = inventory.stock + EXCLUDED.stock,
+        updated_at = now();</code></pre>
+
+  <pre data-label="sql — idempotent insert: ignore duplicates" class="code-good"><code class="language-sql">INSERT INTO processed_message (message_id, processed_at)
+VALUES ($1, now())
+ON CONFLICT (message_id) DO NOTHING;
+-- 0 rows affected = already processed. The inbox pattern in one statement.</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Why this beats <code>MERGE</code></span>
+    <p><code>ON CONFLICT</code> is <strong>atomic and concurrency-safe by design</strong> — it relies on a
+      unique constraint, so two concurrent inserts can't both succeed.</p>
+    <p>SQL Server's <code>MERGE</code> needs <code>HOLDLOCK</code> to be safe and has a
+      <a href="../10-sql/querying.html#merge">history of correctness bugs</a>. This is one place Postgres is
+      simply better, and it's worth saying so.</p>
+    <p><code>EXCLUDED</code> is the row you tried to insert — that's the keyword people forget.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">This is the idempotency primitive</div>
+    <p style="margin:0"><code>ON CONFLICT DO NOTHING</code> plus checking the affected-row count is the whole
+      implementation of an <a href="../19-architecture/distributed-data.html#inbox">inbox</a>, or an
+      <a href="../08-http-web-apis/reliability.html#idempotency-keys">idempotency key</a>.
+      <br><br>
+      Insert wins → do the work. Zero rows → already handled, return the previous outcome. One statement, no
+      race window, no read-then-insert gap.</p>
+  </div>
+
+  <h2 id="schemas">Schemas and <code>search_path</code> <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A Postgres <strong>schema</strong> is a namespace inside a database — closest to a SQL Server schema, not
+      a SQL Server database.</p>
+    <p><code>search_path</code> decides which schemas unqualified names resolve against. Default:
+      <code>"$user", public</code>.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The <code>search_path</code> security issue</div>
+    <p style="margin:0">If a user can create objects in a schema that appears earlier in
+      <code>search_path</code>, they can shadow a legitimate function or table — and code calling it
+      unqualified silently gets theirs.
+      <br><br>
+      That's a real privilege-escalation path, especially inside <code>SECURITY DEFINER</code> functions.
+      <br><br>
+      Mitigations: <code>REVOKE CREATE ON SCHEMA public FROM PUBLIC</code> (the default since Postgres 15),
+      and set an explicit <code>search_path</code> on any <code>SECURITY DEFINER</code> function. Worth knowing
+      because it's a genuine Postgres-specific security question.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Schema-per-tenant</div>
+    <p style="margin:0">A common multi-tenant pattern: one schema per tenant, switching
+      <code>search_path</code> per connection. Good isolation and per-tenant backup within one database.
+      <br><br>
+      It scales to hundreds of tenants, not thousands — every schema multiplies the system catalogue, and
+      migrations must run N times. It also interacts badly with connection pooling, since
+      <code>search_path</code> is connection state that a pooled connection carries into the next request.
+      <br><br>
+      See <a href="../23-multi-tenant-saas/index.html">multi-tenant SaaS</a> for the trade-offs.</p>
+  </div>
+
+  <h2 id="generated">Generated columns and domains <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <pre data-label="sql — computed and stored"><code class="language-sql">CREATE TABLE order_line (
+    quantity   int NOT NULL,
+    unit_price numeric(19,4) NOT NULL,
+    total      numeric(19,4) GENERATED ALWAYS AS (quantity * unit_price) STORED
+);
+
+-- A reusable constrained type
+CREATE DOMAIN email AS citext
+    CHECK (VALUE ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$');</code></pre>
+
+  <p>Generated columns are always <code>STORED</code> in PostgreSQL — there's no virtual/computed-on-read
+    variant as in SQL Server. So they cost storage and are indexable, which is usually the trade you want.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Unquoted identifiers fold to lowercase. Use snake_case naming with EF Core, decided before the first
+        migration.</li>
+      <li>String comparison is case-sensitive. Fix uniqueness, not just matching.</li>
+      <li><code>text</code> over <code>varchar(n)</code> — no performance difference.</li>
+      <li><code>timestamptz</code> always; Npgsql enforces UTC for it.</li>
+      <li><code>numeric</code> for money; avoid the <code>money</code> type.</li>
+      <li><code>jsonb</code> over <code>json</code>. Great for genuinely schemaless data, bad as a substitute
+        for schema design.</li>
+      <li>jsonb updates rewrite the whole document; large values go to TOAST.</li>
+      <li>Arrays suit attribute-free scalar sets; junction tables once you need integrity.</li>
+      <li>Sequences aren't transactional — gaps are normal, and reset them after a bulk load.</li>
+      <li><code>ON CONFLICT</code> is a safe, atomic upsert and the natural idempotency primitive.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>PascalCase identifiers</strong>, so every hand-written query needs quotes.</li>
+    <li><strong>Assuming case-insensitive comparison</strong>, breaking login and creating duplicate
+      accounts.</li>
+    <li><strong><code>timestamp</code> instead of <code>timestamptz</code>.</strong></li>
+    <li><strong><code>varchar(50)</code> everywhere</strong> out of SQL Server habit.</li>
+    <li><strong>The <code>money</code> type</strong> — locale-dependent and fixed-scale.</li>
+    <li><strong><code>json</code> instead of <code>jsonb</code></strong>, so nothing is indexable.</li>
+    <li><strong><code>jsonb</code> as the whole schema</strong>, losing every constraint.</li>
+    <li><strong>Frequent small updates to large jsonb documents</strong> — bloat.</li>
+    <li><strong>Not resetting sequences</strong> after importing rows with explicit IDs.</li>
+    <li><strong>Read-then-insert</strong> where <code>ON CONFLICT</code> would be atomic.</li>
+    <li><strong>Leaving <code>CREATE</code> on <code>public</code></strong> granted to everyone.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>You're moving a .NET app from SQL Server to PostgreSQL. What breaks? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd split it into things that break loudly and things that break silently. The silent ones are the
+          dangerous list."</p>
+        <p>"<strong>Silent, and the first thing I'd check: case-sensitive string comparison.</strong> SQL
+          Server's default collation is case-insensitive; Postgres is case-sensitive. So
+          <code>WHERE email = 'Bob@x.com'</code> stops matching <code>bob@x.com</code> — logins fail, lookups
+          return nothing, and no error is raised anywhere."</p>
+        <p>"Worse than the matching problem is <strong>uniqueness</strong>. Without case-insensitive
+          uniqueness, <code>bob@x.com</code> and <code>Bob@x.com</code> become two accounts, which is an
+          account-takeover vector rather than untidy data. I'd fix that with <code>citext</code> or a unique
+          index on <code>lower(email)</code> — enforced in the database, not by hoping every write path
+          normalises."</p>
+        <p>"<strong>Silent: <code>timestamp</code> vs <code>timestamptz</code>.</strong> If the migration maps
+          to plain <code>timestamp</code>, you've stored wall-clock readings with no zone. Ambiguous across
+          daylight-saving transitions and unfixable retroactively. <code>timestamptz</code> throughout, and
+          Npgsql 6+ actually enforces this by rejecting non-UTC <code>DateTime</code> values for it —
+          irritating at first, and it's protecting you."</p>
+        <p>"<strong>Loud: identifier folding.</strong> Postgres lowercases unquoted identifiers, so EF Core's
+          PascalCase names all get quoted. It works, but you end up with a database where every hand-written
+          query needs <code>SELECT "OrderNumber" FROM "Order"</code>, which anyone using psql or a BI tool
+          will hate. I'd use <code>UseSnakeCaseNamingConvention()</code> — and decide that before the first
+          migration, because changing it later renames everything."</p>
+        <p>"<strong>Loud: T-SQL doesn't port.</strong> Stored procedures, functions and triggers need
+          rewriting in PL/pgSQL. Different syntax, different error handling, no <code>@@IDENTITY</code>,
+          <code>TOP</code> becomes <code>LIMIT</code>, no <code>NOLOCK</code> — and that last one isn't a loss,
+          since Postgres readers never block writers anyway."</p>
+        <p>"<strong>Feature mapping.</strong> <code>rowversion</code> for optimistic concurrency becomes
+          <code>UseXminAsConcurrencyToken()</code>. <code>MERGE</code> becomes <code>ON CONFLICT</code>, which
+          is genuinely better — atomic by design rather than needing <code>HOLDLOCK</code>. Full-text moves
+          from catalogues to <code>tsvector</code> plus a GIN index."</p>
+        <p>"<strong>Operational, and easy to overlook: connection pooling.</strong> Postgres uses a process per
+          connection, not a thread, so connections are much more expensive. A .NET service that scaled out
+          happily against SQL Server can exhaust <code>max_connections</code>. If there are several services or
+          it's serverless, PgBouncer goes in front."</p>
+        <p>"<strong>And <code>VACUUM</code>.</strong> Postgres keeps dead row versions in the table, so a
+          write-heavy workload needs autovacuum tuned or you get bloat and eventually a wraparound emergency.
+          That's a new operational responsibility that has no SQL Server equivalent."</p>
+        <p>"How I'd de-risk it: run both in parallel and diff results on a real dataset, because the
+          case-sensitivity and null-ordering differences won't show up in unit tests. Postgres also sorts
+          <code>NULL</code>s last by default rather than first, which quietly changes paginated results."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you lead with the silent failures?</li>
+        <li>Do you catch the uniqueness problem, not just matching?</li>
+        <li>Do you know the timestamptz and Npgsql behaviour?</li>
+        <li>Do you raise connection pooling and vacuum as new responsibilities?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "EF Core abstracts it, just change the provider."</li>
+        <li><span class="redflag">Red flag:</span> only listing syntax differences.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you make email lookups case-insensitive and fast?</li>
+          <li>What's <code>xmin</code>?</li>
+          <li>Why is a process-per-connection model a problem?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>A developer wants to store all tenant custom fields in a <code>jsonb</code> column. Do you agree? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"For genuinely tenant-defined custom fields, yes — that's one of the best uses of
+          <code>jsonb</code>. The alternative is either 200 mostly-null columns, or an entity-attribute-value
+          table, and EAV is worse: every query becomes a pile of self-joins and you still have no type safety."</p>
+        <p>"So if tenants really do define their own fields at runtime, <code>jsonb</code> is the right tool.
+          It's indexable with GIN, queryable with containment operators, and Npgsql maps it to a POCO or
+          <code>JsonDocument</code> cleanly."</p>
+        <p>"What I'd want to establish first is whether they're <strong>actually tenant-defined</strong>. The
+          question I'd ask is: <em>is the application code reading specific keys by name?</em> If there's code
+          doing <code>payload-&gt;&gt;'priority'</code> and filtering on it, that's not a custom field — that's a
+          column someone didn't want to write a migration for. Those should be columns, because as
+          <code>jsonb</code> you've given up not-null constraints, foreign keys, type checking and good
+          cardinality estimates."</p>
+        <p>"The planner point is worth being concrete about: Postgres has poor statistics on jsonb key
+          extraction, so a filter on an extracted key often estimates badly and you get the wrong join
+          strategy. That's a real performance consequence, not a purity argument."</p>
+        <p>"So my answer would be: <strong>both</strong>. Fields the product defines are columns. Genuinely
+          tenant-defined ones go in <code>jsonb</code>. That's a very common and defensible shape."</p>
+        <p>"Then I'd want three things in place."</p>
+        <p>"<strong>Some validation.</strong> Unconstrained <code>jsonb</code> becomes a landfill. Either a
+          <code>CHECK</code> constraint on structure, or a tenant-level field-definition table the application
+          validates against, so we know what should be in there. Without that, in two years nobody can tell you
+          what keys exist or what types they hold."</p>
+        <p>"<strong>The right index for the actual queries.</strong> A GIN index on the whole column supports
+          containment and key-exists. If they only ever filter on two specific keys, a B-tree expression index
+          on those extractions is much smaller and faster. Indexing the whole document by default is a common
+          waste."</p>
+        <p>"<strong>Awareness of the update cost.</strong> MVCC has no partial update, so changing one key
+          rewrites the entire document as a new row version. On a large document updated frequently, that's
+          significant bloat and vacuum pressure. And anything over about 2 KB goes to TOAST, so it's an extra
+          fetch on read. If the custom fields are hot and the document is large, I'd want to know that before
+          committing."</p>
+        <p>"The failure mode I'd name explicitly: I've seen a <code>data jsonb</code> column start as
+          'just a few custom fields' and quietly become the real schema, with the whole domain inside it and no
+          constraints on any of it. That's the outcome to design against, and the way to prevent it is being
+          strict now about which fields are product-defined."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you accept jsonb where it's appropriate rather than reflexively preferring columns?</li>
+        <li>Do you have a test for which is which?</li>
+        <li>Do you know the planner and statistics implication?</li>
+        <li>Do you know the update-rewrite and TOAST costs?</li>
+        <li>Do you insist on some validation?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "never use jsonb, normalise everything."</li>
+        <li><span class="redflag">Red flag:</span> "jsonb for everything, it's flexible."</li>
+        <li><span class="redflag">Red flag:</span> no mention of indexing or validation.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>GIN vs a B-tree expression index here?</li>
+          <li>How would you validate the structure?</li>
+          <li>How do you migrate a jsonb key into a real column later?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

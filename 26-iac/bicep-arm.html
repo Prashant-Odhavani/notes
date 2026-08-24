@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bicep &amp; ARM — Infrastructure as Code</title>
+<meta name="description" content="Resources, modules, deployment scopes, parameter files, incremental versus complete mode, what-if, and where Bicep beats Terraform on Azure.">
+<meta name="keywords" content="Bicep ARM templates modules deployment scopes subscription management group resource group parameters bicepparam incremental complete mode what-if existing keyword Key Vault reference deployment stacks Azure Verified Modules idempotent">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="26-iac/bicep-arm.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Bicep &amp; ARM</h1>
+    <p class="subtitle">Azure-native, no state file to manage, and day-one support for new services. The trade is
+      that it only does Azure.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Bicep compiles to ARM JSON.</strong> Same engine, far better language.</li>
+      <li><strong>No state file</strong> — Azure's resource graph is the state.</li>
+      <li><strong>Incremental mode is the default</strong>, and what you almost always want.</li>
+      <li><strong>Complete mode deletes anything not in the template.</strong> Be very careful.</li>
+      <li><strong><code>what-if</code></strong> is Bicep's equivalent of a plan.</li>
+      <li><strong>Four scopes:</strong> resource group, subscription, management group, tenant.</li>
+      <li><strong><code>existing</code></strong> references something you don't own.</li>
+      <li><strong>Deployment stacks</strong> give lifecycle management, closer to Terraform.</li>
+    </ul>
+  </div>
+
+  <h2 id="bicep-vs-arm">Bicep versus ARM JSON <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>ARM JSON</th><th>Bicep</th></tr></thead>
+      <tbody>
+        <tr><td>Readability</td><td>Verbose; expressions as strings</td><td><strong>Concise, typed, real syntax</strong></td></tr>
+        <tr><td>Dependencies</td><td>Manual <code>dependsOn</code></td><td><strong>Inferred from references</strong></td></tr>
+        <tr><td>Tooling</td><td>Limited</td><td><strong>IntelliSense, type checking, linting</strong></td></tr>
+        <tr><td>Modules</td><td>Nested/linked templates, awkward</td><td>First-class <code>module</code></td></tr>
+        <tr><td>Relationship</td><td>—</td><td><strong>Compiles to ARM JSON</strong>; identical runtime behaviour</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Bicep is a language, not a different engine</div>
+    <p style="margin:0">Bicep transpiles to ARM JSON and Azure Resource Manager executes it. So anything ARM can do,
+      Bicep can do, and the deployment semantics — modes, scopes, idempotency — are identical.
+      <br><br>
+      Which means <strong>you never need to write ARM JSON by hand</strong> for new work, and
+      <code>az bicep decompile</code> converts existing templates. Reading generated JSON is occasionally useful for
+      debugging an obscure error message that references the compiled output.
+      <br><br>
+      The most practically valuable difference is <strong>inferred dependencies</strong>. In ARM you write
+      <code>dependsOn</code> arrays by hand, and getting them wrong produces intermittent deployment failures that
+      depend on timing — the worst kind of bug. Bicep derives ordering from symbolic references, so referring to
+      <code>storageAccount.id</code> creates the dependency automatically.
+      <br><br>
+      You can still write <code>dependsOn</code> explicitly for an ordering that isn't expressed by a reference, and
+      needing to is usually a sign the template is fighting something.</p>
+  </div>
+
+  <h2 id="template">A Bicep template worth reading <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="bicep — main.bicep" class="code-good"><code class="language-bicep">targetScope = 'resourceGroup'
+
+@description('Environment name, used in resource naming')
+@allowed(['dev', 'test', 'prod'])
+param environment string
+
+@description('Deployment location')
+param location string = resourceGroup().location
+
+@minLength(3)
+@maxLength(11)
+param appName string
+
+@secure()                                  // never logged, never in deployment history output
+param sqlAdminPassword string
+
+// Computed values - not parameters, so callers cannot get them wrong
+var resourceSuffix = '${appName}-${environment}'
+var isProd = environment == 'prod'
+var tags = {
+  environment: environment
+  application: appName
+  managedBy: 'bicep'
+}
+
+resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
+  name: 'log-${resourceSuffix}'
+  location: location
+  tags: tags
+  properties: {
+    retentionInDays: isProd ? 90 : 30
+    sku: { name: 'PerGB2018' }
+  }
+}
+
+resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
+  name: 'plan-${resourceSuffix}'
+  location: location
+  tags: tags
+  sku: {
+    name: isProd ? 'P1v3' : 'B1'
+    capacity: isProd ? 3 : 1
+  }
+  properties: { reserved: true }           // Linux
+}
+
+resource app 'Microsoft.Web/sites@2023-12-01' = {
+  name: 'app-${resourceSuffix}'
+  location: location
+  tags: tags
+  identity: { type: 'SystemAssigned' }
+  properties: {
+    serverFarmId: plan.id                  // this reference creates the dependency
+    httpsOnly: true
+    siteConfig: {
+      linuxFxVersion: 'DOTNETCORE|9.0'
+      minTlsVersion: '1.2'
+      ftpsState: 'Disabled'
+      alwaysOn: isProd
+      healthCheckPath: '/health/ready'
+      appSettings: [
+        { name: 'ASPNETCORE_ENVIRONMENT', value: isProd ? 'Production' : 'Development' }
+        { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
+      ]
+    }
+  }
+}
+
+resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
+  name: 'appi-${resourceSuffix}'
+  location: location
+  tags: tags
+  kind: 'web'
+  properties: {
+    Application_Type: 'web'
+    WorkspaceResourceId: logAnalytics.id
+  }
+}
+
+// Diagnostics as a child of the app - an extension resource
+resource diagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  scope: app
+  name: 'send-to-log-analytics'
+  properties: {
+    workspaceId: logAnalytics.id
+    logs: [{ categoryGroup: 'allLogs', enabled: true }]
+    metrics: [{ category: 'AllMetrics', enabled: true }]
+  }
+}
+
+output appPrincipalId string = app.identity.principalId
+output appHostname string = app.properties.defaultHostName</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — <code>@secure()</code> and what it does and doesn't do</div>
+    <p style="margin:0"><code>@secure()</code> on a parameter means the value is <strong>excluded from deployment
+      history and logs</strong>. Without it, a password passed as a parameter is visible in the deployment record in
+      the portal, permanently, to anyone with read access to the resource group.
+      <br><br>
+      That's a real leak and an easy one to create — and unlike a Terraform state file, deployment history isn't
+      something people think to lock down.
+      <br><br>
+      What it doesn't do: protect the value in transit from wherever you got it, or stop it being echoed by a
+      pipeline that logs its own variables.
+      <br><br>
+      The better pattern is not to pass secrets at all. A parameter file can reference a
+      <strong>Key Vault secret</strong> directly, so the value goes from vault to ARM without appearing in a pipeline
+      variable or a parameter file. And where the resource supports it, use
+      <strong>managed identity</strong> so no secret exists — the app above has a system-assigned identity for exactly
+      that reason.
+      <br><br>
+      Same conclusion as everywhere: <strong>the best secret handling is not having a secret.</strong></p>
+  </div>
+
+  <h2 id="modules">Modules and scopes <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="bicep — modules, scopes and referencing what you don't own" class="code-good"><code class="language-bicep">targetScope = 'subscription'               // this template creates resource groups
+
+param environment string
+param location string = 'uksouth'
+
+resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
+  name: 'rg-orders-${environment}'
+  location: location
+}
+
+// A module is a separate deployment, scoped where you say
+module app './modules/web-app.bicep' = {
+  name: 'app-deployment'                   // the DEPLOYMENT name, not the resource name
+  scope: rg                                // deploy into the group created above
+  params: {
+    environment: environment
+    location: location
+    appName: 'orders'
+  }
+}
+
+// Reference something owned by another team - read only, never modified
+resource sharedVnet 'Microsoft.Network/virtualNetworks@2024-01-01' existing = {
+  name: 'vnet-shared-${environment}'
+  scope: resourceGroup('rg-platform-network')
+}
+
+// Deploy many similar things with a loop
+module regionalApps './modules/web-app.bicep' = [for region in ['uksouth', 'ukwest']: {
+  name: 'app-${region}'
+  scope: rg
+  params: {
+    environment: environment
+    location: region
+    appName: 'orders'
+  }
+}]
+
+output vnetId string = sharedVnet.id
+output appHostname string = app.outputs.appHostname</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Scope</th><th>Deploys</th></tr></thead>
+      <tbody>
+        <tr><td><code>resourceGroup</code></td><td>Resources into one group. <strong>The default</strong></td></tr>
+        <tr><td><code>subscription</code></td><td><strong>Resource groups themselves</strong>, policies, role assignments</td></tr>
+        <tr><td><code>managementGroup</code></td><td>Policies and RBAC across many subscriptions</td></tr>
+        <tr><td><code>tenant</code></td><td>Management groups themselves</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The <code>existing</code> keyword is the ownership boundary</div>
+    <p style="margin:0"><code>existing</code> declares a reference to a resource this template does
+      <strong>not</strong> manage. You get its properties and its id; you can't create, modify or delete it.
+      <br><br>
+      That's how you handle shared infrastructure cleanly. A platform team owns the virtual network and the Key
+      Vault; your template references them as <code>existing</code> and deploys into them.
+      <br><br>
+      It's the same distinction as Terraform's <code>data</code> versus <code>resource</code>, and the same hazard if
+      you get it wrong: two templates both declaring the same resource will each reset it to their own definition,
+      and it flaps between them on every deployment.
+      <br><br>
+      One thing to know: <code>existing</code> is resolved at deployment time, so <strong>if the resource doesn't
+      exist the deployment fails</strong> — which is usually the behaviour you want, since silently proceeding
+      without it would be worse.</p>
+  </div>
+
+  <h2 id="modes">Deployment modes <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mode</th><th>Behaviour</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Incremental</strong> (default)</td>
+          <td>Creates or updates what's in the template. <strong>Leaves everything else alone</strong></td>
+          <td><strong>Almost always this</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Complete</strong></td>
+          <td><strong>Deletes any resource in the group that isn't in the template</strong></td>
+          <td>Rarely, and only where the template is the sole owner of the group</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Complete mode is a loaded gun, and it's also the only way to get cleanup</div>
+    <p style="margin:0">Complete mode makes the resource group match the template exactly — which means
+      <strong>anything not in the template is deleted</strong>. Including things another team created, things added
+      during an incident, and things you forgot were there.
+      <br><br>
+      Run a partial template in complete mode against a shared resource group and you delete production
+      resources. It's the most destructive thing in this toolchain.
+      <br><br>
+      But there's a real tension here, because <strong>incremental mode never removes anything.</strong> Delete a
+      resource from your Bicep file and it stays in Azure, forever, unmanaged and still billing. That's the main
+      lifecycle weakness compared with Terraform, which deletes what you remove from the configuration.
+      <br><br>
+      So you get one of two uncomfortable positions: incremental and orphans accumulate, or complete and a mistake
+      is catastrophic.
+      <br><br>
+      <strong>Deployment stacks</strong> are the answer to that. A stack tracks the resources it manages, so removing
+      something from the template removes it from Azure — scoped to the stack rather than the whole resource group.
+      That's Terraform-like lifecycle management without a state file you have to look after, and it's what to reach
+      for when orphaned resources become a real problem.
+      <br><br>
+      Until then, the pragmatic position: <strong>incremental mode always, with periodic auditing for
+      orphans.</strong></p>
+  </div>
+
+  <h2 id="what-if">what-if, the plan equivalent <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="bash — deploy safely"><code class="language-bash"># Preview: what would change. Bicep's equivalent of terraform plan.
+az deployment group what-if \
+  --resource-group rg-orders-prod \
+  --template-file main.bicep \
+  --parameters main.prod.bicepparam
+
+# Deploy. Incremental is the default.
+az deployment group create \
+  --resource-group rg-orders-prod \
+  --template-file main.bicep \
+  --parameters main.prod.bicepparam \
+  --name "orders-$(git rev-parse --short HEAD)"    # traceable deployment name
+
+# Deployment stacks - manages lifecycle, so removals actually delete
+az stack group create \
+  --name orders \
+  --resource-group rg-orders-prod \
+  --template-file main.bicep \
+  --parameters main.prod.bicepparam \
+  --action-on-unmanage deleteResources \
+  --deny-settings-mode denyWriteAndDelete       # blocks portal changes to stack resources
+
+# Lint and build locally
+az bicep lint --file main.bicep
+az bicep build --file main.bicep</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">what-if is less precise than a Terraform plan, and you should know why</div>
+    <p style="margin:0"><code>what-if</code> compares your template against Azure's current state and reports
+      Create, Delete, Modify, Ignore or NoChange per resource. It's genuinely useful and worth running on every
+      pull request.
+      <br><br>
+      It's less exact than <code>terraform plan</code> for a structural reason: <strong>Terraform has a state file
+      recording what it last set</strong>, so it knows the difference between "I set this" and "Azure defaulted it".
+      Bicep has no such record and must infer from the live resource.
+      <br><br>
+      In practice that shows up as <strong>noisy output</strong> — properties reported as changing when they aren't
+      meaningfully, particularly on resources with many server-set defaults. Some resource providers implement the
+      what-if API better than others.
+      <br><br>
+      So it's a strong signal for <em>deletes and creates</em> — which are the operations you care most about — and
+      less reliable on the detail of modifications. That's fine as long as you know it, and it means the review focus
+      is the same as with Terraform: <strong>look for deletions first.</strong>
+      <br><br>
+      Two habits that help. Use a <strong>traceable deployment name</strong> — the git SHA — so the deployment history
+      maps to a commit. And note that deployment history is <em>capped at 800 per resource group</em>; exceeding it
+      causes deployment failures, so long-lived groups need history pruning.</p>
+  </div>
+
+  <h2 id="parameters">Parameter files <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="bicep — main.prod.bicepparam" class="code-good"><code class="language-bicep">using './main.bicep'                       // typed against the template - errors on mismatch
+
+param environment = 'prod'
+param appName = 'orders'
+param location = 'uksouth'
+
+// Pull the secret from Key Vault at deployment time.
+// The value never appears in this file, in a pipeline variable, or in logs.
+param sqlAdminPassword = getSecret(
+  '00000000-0000-0000-0000-000000000000',  // subscription
+  'rg-platform-secrets',                    // resource group
+  'kv-platform-prod',                       // vault
+  'sql-admin-password'                      // secret name
+)</code></pre>
+
+  <div class="note tip">
+    <div class="note-title"><code>.bicepparam</code> over JSON parameter files</div>
+    <p style="margin:0">The <code>.bicepparam</code> format is typed against the template through
+      <code>using</code>. So a misspelled parameter name, a missing required parameter or a wrong type is caught
+      <strong>before deployment</strong>, in the editor.
+      <br><br>
+      With JSON parameter files, those mistakes surface as a deployment failure — after you've triggered a pipeline
+      and waited.
+      <br><br>
+      The more valuable feature is <strong><code>getSecret</code></strong>, which references a Key Vault secret
+      directly. ARM retrieves it at deployment time, so the value never touches the parameter file, a pipeline
+      variable, or a log.
+      <br><br>
+      That's cleaner than the usual approach of storing the secret as a pipeline variable and passing it through,
+      which puts it in a second system and in the pipeline's own logs if anything echoes it. It does require the
+      deploying identity to have read access to the vault, which is the right place for that permission to live
+      anyway.</p>
+  </div>
+
+  <h2 id="vs-terraform">Where Bicep genuinely wins <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Bicep advantage</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>No state to manage</strong></td><td>Nothing to store, lock, back up, corrupt or leak</td></tr>
+        <tr><td><strong>Day-one support for new services</strong></td><td>It's the ARM API; no provider needs updating</td></tr>
+        <tr><td><strong>Preview and unusual features</strong></td><td>Available immediately, including undocumented properties</td></tr>
+        <tr><td><strong>Microsoft support</strong></td><td>Supported directly, and used by Azure's own documentation</td></tr>
+        <tr><td>Azure Verified Modules</td><td>Microsoft-maintained modules following the Cloud Adoption Framework</td></tr>
+        <tr><td>No extra credentials</td><td>Uses Azure RBAC directly, with no separate tool identity</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the provider-lag argument is the strongest one</div>
+    <p style="margin:0">Terraform reaches Azure through the <strong>azurerm provider</strong>, which is a layer that
+      has to be written. A new Azure service, a new property, or a preview feature isn't available until someone
+      implements and releases it — and that can be weeks or months.
+      <br><br>
+      When it isn't there, your options are unpleasant: wait, or use
+      <code>azapi</code>, or shell out to the CLI from a <code>null_resource</code>. All of which mean the thing
+      you're doing is no longer really Terraform.
+      <br><br>
+      <strong>Bicep is the ARM API</strong>, so if Azure supports it, Bicep supports it — today, including preview
+      features and properties that aren't in any provider yet.
+      <br><br>
+      That's the argument that carries weight for Azure-only work, alongside <strong>no state file</strong>, which
+      removes an entire operational concern: no backend to configure, no locking to get right, no plaintext secrets
+      in a storage container, and no possibility of the "we lost the state file" incident.
+      <br><br>
+      Terraform's counter-arguments are equally real and worth stating in the same breath:
+      <strong>multi-cloud</strong>, a <strong>far larger module and provider ecosystem</strong> (including Entra,
+      GitHub, Datadog and anything else in the estate), better <strong>lifecycle management</strong>, a more precise
+      plan, and <strong>portable skills</strong> — a Terraform engineer is useful anywhere.
+      <br><br>
+      The honest summary: <strong>Azure-only and want the least operational overhead → Bicep. Multi-cloud, or
+      already invested in Terraform → Terraform.</strong> Both are defensible; a candidate who insists one is simply
+      better usually hasn't run the other in production.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Bicep compiles to ARM JSON — same engine, better language, no hand-written JSON needed.</li>
+      <li>Dependencies are inferred from references, removing a class of ordering bug.</li>
+      <li><code>@secure()</code> keeps values out of deployment history — but prefer no secret at all.</li>
+      <li>Use <code>getSecret</code> in a <code>.bicepparam</code> so secrets never touch the pipeline.</li>
+      <li>Four scopes; subscription scope is what creates resource groups.</li>
+      <li><code>existing</code> is the ownership boundary — read, don't manage.</li>
+      <li>Incremental mode always; complete mode deletes anything absent.</li>
+      <li>Incremental never removes, so orphans accumulate.</li>
+      <li>Deployment stacks give real lifecycle management without a state file.</li>
+      <li><code>what-if</code> is noisier than a Terraform plan — trust it most on deletes.</li>
+      <li>Deployment history caps at 800 per resource group.</li>
+      <li>Bicep's strongest arguments: no state, and no provider lag.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Complete mode on a shared resource group</strong>, deleting other people's resources.</li>
+    <li><strong>Never auditing for orphans</strong> left behind by incremental mode.</li>
+    <li><strong>Secrets as plain parameters</strong> without <code>@secure()</code>, visible in history.</li>
+    <li><strong>Secrets in a parameter file</strong> instead of a Key Vault reference.</li>
+    <li><strong>Declaring a shared resource</strong> rather than referencing it with <code>existing</code>.</li>
+    <li><strong>Not running <code>what-if</code></strong> before deploying.</li>
+    <li><strong>Hand-written <code>dependsOn</code></strong> where a reference would do.</li>
+    <li><strong>Hardcoded locations and names</strong> instead of parameters and variables.</li>
+    <li><strong>Deployment history unpruned</strong>, eventually hitting the 800 limit.</li>
+    <li><strong>Generic deployment names</strong>, so history can't be traced to a commit.</li>
+    <li><strong>Writing ARM JSON by hand</strong> for new work.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Terraform or Bicep for a new Azure project? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Both are good, so I'd decide on three questions rather than a preference: <strong>is it Azure-only, what
+          does the team already know, and how much operational overhead do we want to own?</strong>"</p>
+        <p>"<strong>The case for Bicep</strong> — and the strongest single point is <strong>no state
+          file</strong>. That removes a whole operational category: no backend to configure, no locking to get right,
+          no plaintext secrets sitting in a storage container, and no possibility of the 'we lost the state file'
+          incident where Terraform no longer knows anything it created. Azure's resource graph <em>is</em> the
+          state."</p>
+        <p>"Second, <strong>no provider lag</strong>. Terraform reaches Azure through the azurerm provider, which is
+          a layer someone has to write. A new service or a preview property isn't available until it's implemented and
+          released — sometimes months. Then you're waiting, or using <code>azapi</code>, or shelling out to the CLI,
+          at which point it isn't really Terraform any more. Bicep <em>is</em> the ARM API, so if Azure supports it,
+          Bicep supports it today."</p>
+        <p>"Third, it's <strong>Microsoft-supported</strong>, Azure's own documentation uses it, and Azure Verified
+          Modules give you maintained modules aligned to the Cloud Adoption Framework."</p>
+        <p>"<strong>The case for Terraform</strong> — <strong>multi-cloud</strong>, obviously, but more practically a
+          much larger provider ecosystem. Real infrastructure isn't only Azure resources: it's Entra app
+          registrations, GitHub repositories and permissions, Datadog monitors, Cloudflare DNS. Terraform manages all
+          of that in one workflow; Bicep manages Azure and you need something else for the rest."</p>
+        <p>"Then <strong>better lifecycle management</strong>. This is Bicep's real weakness: incremental mode —
+          which is the default and what you should use — <em>never deletes anything</em>. Remove a resource from your
+          template and it stays in Azure, unmanaged and still billing. Terraform deletes what you remove from the
+          configuration. Complete mode exists in Bicep and it's dangerous, because it deletes everything in the
+          resource group that isn't in the template, including other teams' resources."</p>
+        <p>"Deployment stacks address that — they track what they manage, so removals actually delete, scoped to the
+          stack. That's a genuine improvement and it's newer, so it's worth checking maturity for the specific
+          resources involved."</p>
+        <p>"Also, <strong><code>terraform plan</code> is more precise than <code>what-if</code></strong>, and the
+          reason is structural: Terraform's state records what <em>it</em> last set, so it can distinguish 'I
+          configured this' from 'Azure defaulted it'. Bicep has to infer from the live resource, so what-if is noisier
+          on modifications. It's reliable on creates and deletes, which are what matter most in review."</p>
+        <p>"And <strong>portable skills</strong>. A Terraform engineer is useful in any cloud; Bicep knowledge is
+          Azure-specific."</p>
+        <p>"<strong>My recommendation</strong> would be: <strong>Azure-only, small team, want minimal operational
+          overhead → Bicep.</strong> The absence of state management is worth a lot, and the tooling is good.
+          <strong>Multi-cloud, or managing non-Azure resources, or the team already knows Terraform →
+          Terraform.</strong>"</p>
+        <p>"The one thing I'd push back on is using both. It happens — Terraform for the platform, Bicep for
+          applications — and it means two toolchains, two skill sets, and ambiguity about which owns what. If it has
+          to happen, the <strong>ownership boundary must be explicit</strong>, with each tool referencing the other's
+          resources read-only: <code>existing</code> in Bicep, <code>data</code> in Terraform. Two tools both
+          believing they own a resource is a genuinely nasty failure — each apply reverts the other and the resource
+          flaps."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you weigh trade-offs rather than declare a winner?</li>
+        <li>Do you know Bicep has no state, and why that matters?</li>
+        <li>Do you know provider lag is real?</li>
+        <li>Do you know incremental mode never deletes?</li>
+        <li>Do you consider non-Azure resources in the estate?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "Terraform, it's the industry standard" with no reasoning.</li>
+        <li><span class="redflag">Red flag:</span> unaware Bicep has no state file.</li>
+        <li><span class="redflag">Red flag:</span> not knowing removals don't delete in incremental mode.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you clean up resources Bicep left behind?</li>
+          <li>What are deployment stacks?</li>
+          <li>How would you manage Entra app registrations with Bicep?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

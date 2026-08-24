@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runtime, SDK &amp; Project System — .NET Platform</title>
+<meta name="description" content="How C# actually runs: IL, the CLR, JIT vs AOT, target frameworks, the SDK and CLI, NuGet and project files.">
+<meta name="keywords" content="CLR IL JIT tiered compilation ReadyToRun Native AOT target framework netstandard SDK CLI NuGet project file csproj assembly self-contained trimming">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="06-dotnet-platform/runtime-sdk.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Runtime, SDK &amp; Project System</h1>
+    <p class="subtitle">What happens between "I press F5" and "my code executes" — and the version concepts
+      that confuse everyone at least once.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>C# → <strong>IL</strong> (portable bytecode) → <strong>JIT</strong> → machine code, at runtime.</li>
+      <li><strong>Tiered compilation:</strong> the JIT compiles quickly first, then recompiles hot methods
+        with full optimisation.</li>
+      <li><strong>Native AOT</strong> compiles ahead of time — instant startup, tiny memory, but no
+        reflection-heavy code and no runtime code generation.</li>
+      <li><strong>SDK version ≠ runtime version.</strong> One SDK builds for many target frameworks.</li>
+      <li><code>net8.0</code> is a <strong>target framework</strong>. <code>netstandard2.0</code> is a
+        <strong>contract</strong> for sharing libraries — now largely legacy.</li>
+      <li><strong>Framework-dependent</strong> deployment needs the runtime installed;
+        <strong>self-contained</strong> ships it.</li>
+    </ul>
+  </div>
+
+  <h2 id="how-code-runs">How your code actually runs <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>C# isn't compiled to machine code when you build. It's compiled to <strong>IL</strong> — a portable
+      instruction set.</p>
+    <p>The CLR then compiles IL to real machine code <em>while the program runs</em>. That's the JIT.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>IL is a recipe written in a <strong>universal notation</strong>. It doesn't assume a particular
+      kitchen.</p>
+    <p>The JIT is the chef reading it in <em>your</em> kitchen and adapting to the equipment you actually
+      have — this CPU, these instruction sets.</p>
+  </div>
+
+  <ol class="steps">
+    <li><strong>Build.</strong> Roslyn compiles your C# to IL, packaged in an assembly (a
+      <code>.dll</code>).</li>
+    <li><strong>Load.</strong> The CLR loads the assembly and its dependencies.</li>
+    <li><strong>JIT.</strong> The first time a method is called, the JIT compiles that method to machine
+      code for your CPU.</li>
+    <li><strong>Execute.</strong> Subsequent calls run the compiled code directly.</li>
+  </ol>
+
+  <p>This is why the first request to a freshly started .NET app is slower — it's paying JIT costs. And it's
+    why .NET can take advantage of CPU features that didn't exist when your code was written: the JIT knows
+    what hardware it's on.</p>
+
+  <h3 id="tiered">Tiered compilation <span class="lvl lvl-i">🟡 Intermediate</span></h3>
+
+  <p>There's a tension: compiling well takes time, but you want to start fast. .NET resolves it by doing
+    both.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tier</th><th>When</th><th>Optimisation</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Tier 0</strong></td><td>First call to a method</td><td>Minimal — compile fast, run slower</td></tr>
+        <tr><td><strong>Tier 1</strong></td><td>After a method is called enough times</td><td>Full — recompiled with inlining and everything else</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>So a method that runs once stays cheaply compiled; a hot loop gets promoted and optimised properly. The
+    runtime also uses profile data gathered at tier 0 to make better decisions at tier 1 — including the
+    guarded devirtualization mentioned in <a href="../02-oop/fundamentals.html#dispatch">virtual
+    dispatch</a>.</p>
+
+  <div class="note info">
+    <div class="note-title">Why this matters for benchmarks</div>
+    <p style="margin:0">If you time a method's first few calls, you're measuring tier 0 plus JIT time, not
+      your code. That's the main reason a <code>Stopwatch</code> loop misleads and
+      <code>BenchmarkDotNet</code> warms up first — see
+      <a href="../05-csharp-advanced/performance.html#measuring">measuring properly</a>.</p>
+  </div>
+
+  <h3 id="aot">ReadyToRun and Native AOT <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>JIT (default)</th><th>ReadyToRun</th><th>Native AOT</th></tr></thead>
+      <tbody>
+        <tr><td>Compiled</td><td>At runtime</td><td>Ahead of time, JIT still available</td><td>Fully ahead of time</td></tr>
+        <tr><td>Startup</td><td>Slowest</td><td>Faster</td><td>Fastest — milliseconds</td></tr>
+        <tr><td>Peak throughput</td><td>Best (CPU-specific)</td><td>Good; hot paths still re-JIT</td><td>Slightly lower — can't adapt</td></tr>
+        <tr><td>Size</td><td>Smallest</td><td>Larger</td><td>Small binary, no runtime needed</td></tr>
+        <tr><td>Reflection</td><td>Full</td><td>Full</td><td><strong>Limited</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">When AOT is worth it</span>
+    <p>Serverless functions and CLI tools — anywhere <strong>startup time</strong> dominates and the process
+      is short-lived.</p>
+    <p>Not for a long-running web app: it starts once, then the JIT's CPU-specific optimisation wins.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">What AOT breaks</div>
+    <p style="margin:0">AOT requires the compiler to see all the code that will run, so anything resolved
+      dynamically is a problem: reflection over types the trimmer removed, runtime code generation
+      (<code>Expression.Compile</code>), and reflection-based serialization.
+      <br><br>
+      That's the reason source generators exist — see
+      <a href="../05-csharp-advanced/performance.html#source-generators">source generators</a>. If you're
+      targeting AOT, use the source-generated modes of <code>System.Text.Json</code> and friends.</p>
+  </div>
+
+  <h2 id="sdk-vs-runtime">SDK vs runtime vs target framework <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>Three version numbers that get confused constantly.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Thing</th><th>What it is</th><th>Where you see it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>SDK</strong></td><td>The build tools — compiler, CLI, templates</td><td><code>dotnet --version</code>, <code>global.json</code></td></tr>
+        <tr><td><strong>Runtime</strong></td><td>What executes your app on the target machine</td><td><code>dotnet --list-runtimes</code></td></tr>
+        <tr><td><strong>Target framework</strong></td><td>Which API surface you compile against</td><td><code>&lt;TargetFramework&gt;net8.0&lt;/TargetFramework&gt;</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">The relationship</span>
+    <p>One SDK can build for <strong>many</strong> target frameworks. The .NET 9 SDK happily builds a
+      <code>net6.0</code> project.</p>
+    <p>But the <em>runtime</em> on the machine must support the target framework you built for.</p>
+  </div>
+
+  <pre data-label="json — global.json pins the SDK for a repo"><code class="language-json">{
+  "sdk": {
+    "version": "8.0.400",
+    "rollForward": "latestFeature"
+  }
+}</code></pre>
+
+  <p>Worth having in a team repo: it stops "works on my machine" problems caused by two developers on
+    different SDK versions producing different build behaviour.</p>
+
+  <h3 id="netstandard">What about .NET Standard? <span class="pill pill-good">💡 Good to know</span></h3>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>netstandard</code> was a <strong>contract</strong>, not a runtime — a set of APIs that .NET
+      Framework, .NET Core, Xamarin and Mono all promised to provide.</p>
+    <p>It existed so one library could work everywhere. Since .NET 5 unified the platforms, it's mostly
+      unnecessary.</p>
+  </div>
+
+  <p><strong>When you'd still use it:</strong> a library that must be consumable from .NET Framework 4.x.
+    Target <code>netstandard2.0</code> for that. Otherwise target the .NET version you need.</p>
+
+  <h2 id="project-file">The project file <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <pre data-label="xml — a realistic csproj, and what each line buys you"><code class="language-xml">&lt;Project Sdk="Microsoft.NET.Sdk.Web"&gt;
+
+  &lt;PropertyGroup&gt;
+    &lt;TargetFramework&gt;net9.0&lt;/TargetFramework&gt;
+
+    &lt;!-- Turn null-reference bugs into compiler errors --&gt;
+    &lt;Nullable&gt;enable&lt;/Nullable&gt;
+    &lt;TreatWarningsAsErrors&gt;true&lt;/TreatWarningsAsErrors&gt;
+
+    &lt;!-- Common namespaces added automatically --&gt;
+    &lt;ImplicitUsings&gt;enable&lt;/ImplicitUsings&gt;
+
+    &lt;!-- Deterministic builds: same input, same binary --&gt;
+    &lt;Deterministic&gt;true&lt;/Deterministic&gt;
+  &lt;/PropertyGroup&gt;
+
+  &lt;ItemGroup&gt;
+    &lt;PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="9.0.0" /&gt;
+  &lt;/ItemGroup&gt;
+
+  &lt;ItemGroup&gt;
+    &lt;ProjectReference Include="..\MyApp.Application\MyApp.Application.csproj" /&gt;
+  &lt;/ItemGroup&gt;
+
+&lt;/Project&gt;</code></pre>
+
+  <p>Two properties worth arguing for on any new project:</p>
+
+  <ul>
+    <li><code>Nullable</code> + <code>TreatWarningsAsErrors</code> — the highest-value settings available.
+      Covered in <a href="../01-csharp-fundamentals/type-system.html#nullable">nullable reference types</a>.</li>
+    <li><code>ImplicitUsings</code> — removes a block of <code>using</code> lines from every file.</li>
+  </ul>
+
+  <div class="note tip">
+    <div class="note-title">Directory.Build.props</div>
+    <p style="margin:0">Repeating those properties in twelve project files means they'll drift. Put shared
+      settings in a single <code>Directory.Build.props</code> at the solution root — MSBuild applies it to
+      every project underneath automatically.
+      <br><br>
+      Same idea for package versions: <code>Directory.Packages.props</code> with
+      <code>ManagePackageVersionsCentrally</code> means you upgrade a package in one place instead of
+      fifteen.</p>
+  </div>
+
+  <h2 id="deployment">Deployment options <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Framework-dependent</th><th>Self-contained</th></tr></thead>
+      <tbody>
+        <tr><td>Includes the runtime?</td><td>No — must be installed</td><td>Yes</td></tr>
+        <tr><td>Size</td><td>Small (a few MB)</td><td>Large (~60 MB+, less with trimming)</td></tr>
+        <tr><td>Patching the runtime</td><td>Update the host, all apps benefit</td><td>Rebuild and redeploy every app</td></tr>
+        <tr><td>Good for</td><td>Containers with a runtime base image; servers you control</td><td>Machines you don't control; single-file tools</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The security implication people miss</div>
+    <p style="margin:0">Self-contained deployment means <strong>you</strong> own runtime patching. When a
+      .NET security fix ships, a framework-dependent app gets it by updating the base image or host. A
+      self-contained app keeps running the vulnerable runtime until someone rebuilds it.
+      <br><br>
+      That's a real operational trade-off, not just a size question — and it's the kind of detail that reads
+      as production experience.</p>
+  </div>
+
+  <h3 id="trimming">Trimming</h3>
+
+  <p><code>PublishTrimmed</code> removes unused code to shrink the output. It works well for
+    self-contained apps, but it's the same hazard as AOT: the trimmer can only remove what it can prove is
+    unused, and <strong>reflection defeats that proof</strong>. A type used only via reflection looks unused,
+    gets removed, and you get a runtime failure that didn't occur in a normal build.</p>
+
+  <p>Test a trimmed build properly before shipping one — the failures appear at runtime, not at build time.</p>
+
+  <h2 id="cli">The CLI commands worth knowing <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Command</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>dotnet build</code></td><td>Compile</td></tr>
+        <tr><td><code>dotnet run</code></td><td>Build and run</td></tr>
+        <tr><td><code>dotnet watch</code></td><td>Rebuild and restart on file change</td></tr>
+        <tr><td><code>dotnet test</code></td><td>Run tests</td></tr>
+        <tr><td><code>dotnet publish -c Release</code></td><td>Produce deployable output</td></tr>
+        <tr><td><code>dotnet list package --vulnerable</code></td><td>Report known-vulnerable dependencies</td></tr>
+        <tr><td><code>dotnet list package --outdated</code></td><td>Report available upgrades</td></tr>
+        <tr><td><code>dotnet format</code></td><td>Apply <code>.editorconfig</code> formatting</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Put two of these in CI</div>
+    <p style="margin:0"><code>dotnet list package --vulnerable</code> and <code>dotnet format --verify-no-changes</code>
+      belong in your pipeline. The first catches a supply-chain problem before it ships; the second ends
+      formatting debates in code review. Both are one line — see
+      <a href="../29-sdlc/development.html#automation">what to automate instead of reviewing</a>.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>C# → IL → JIT → machine code. The JIT can optimise for the actual CPU.</li>
+      <li>Tiered compilation trades startup speed for eventual peak performance — and it's why benchmarks
+        need warm-up.</li>
+      <li>Native AOT for short-lived processes; JIT for long-running services.</li>
+      <li>SDK, runtime and target framework are three different versions. One SDK builds many targets.</li>
+      <li><code>netstandard</code> is legacy — use it only to support .NET Framework consumers.</li>
+      <li>Put shared build settings in <code>Directory.Build.props</code>, not in every csproj.</li>
+      <li>Self-contained means you own runtime security patching.</li>
+      <li>Trimming and AOT both break reflection. Test those builds specifically.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Confusing SDK and runtime versions</strong> when diagnosing a build or deploy problem.</li>
+    <li><strong>Targeting <code>netstandard2.0</code> for a new project</strong> that has no .NET Framework
+      consumers — you lose access to modern APIs for nothing.</li>
+    <li><strong>Duplicating build properties</strong> across many csproj files so they drift.</li>
+    <li><strong>Shipping self-contained without a patching plan.</strong></li>
+    <li><strong>Enabling trimming or AOT without testing</strong> the published output.</li>
+    <li><strong>Benchmarking in Debug</strong>, or without warm-up, and drawing conclusions from tier 0.</li>
+    <li><strong>No <code>global.json</code></strong> on a team repo, so builds differ per machine.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What happens when you build and run a .NET application?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The C# compiler produces IL rather than machine code — a portable instruction set packaged into
+          an assembly. So the build output isn't native to any particular CPU."</p>
+        <p>"At runtime the CLR loads the assembly and its dependencies, and the JIT compiles each method to
+          machine code the first time it's called. That's why the first request to a freshly started app is
+          slower — you're paying JIT cost — and it's also why .NET can use CPU instructions that didn't
+          exist when the code was written, because the JIT knows what hardware it's actually on."</p>
+        <p>"There's a refinement called tiered compilation. Tier 0 compiles quickly with minimal
+          optimisation so startup is fast. Methods that get called a lot are recompiled at tier 1 with full
+          optimisation, using profile data gathered from tier 0. So you get fast startup and good steady-state
+          throughput rather than choosing between them."</p>
+        <p>"The alternatives are ReadyToRun, which pre-compiles ahead of time but keeps the JIT available, and
+          Native AOT, which compiles fully ahead of time. AOT gives you millisecond startup and a small
+          footprint, which is ideal for serverless or CLI tools — but it restricts reflection and runtime code
+          generation, because the compiler has to see everything statically."</p>
+        <p>"For a long-running web service I'd stay with the JIT. It starts once, and after that the
+          CPU-specific optimisation is worth more than the startup saving."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's IL and JIT, not direct native compilation?</li>
+        <li>Do you know tiered compilation, and can you explain why it exists?</li>
+        <li>Bonus: when AOT is and isn't appropriate.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does AOT break, and why?</li>
+          <li>How does this affect benchmarking?</li>
+          <li>What's the difference between the SDK and the runtime?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Framework-dependent or self-contained deployment — how do you choose?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It comes down to who controls the target machine and who owns runtime patching."</p>
+        <p>"Framework-dependent needs the matching runtime installed. The output is small — a few megabytes
+          — and when a .NET security patch ships, updating the host or the container base image fixes every
+          app at once. That's my default for anything I deploy to infrastructure I control, including
+          containers using a runtime base image."</p>
+        <p>"Self-contained bundles the runtime, so it runs anywhere without prerequisites. That's right for a
+          CLI tool users download, or a machine I don't control."</p>
+        <p>"The trade-off people underweight is <strong>patching responsibility</strong>. With self-contained,
+          a runtime CVE means I have to rebuild and redeploy every app to get the fix. Framework-dependent, I
+          update the base image. That's an operational commitment, not just a size difference."</p>
+        <p>"Size can be reduced with trimming, but that brings its own risk: the trimmer removes what it
+          can't see being used, and reflection defeats that analysis. So a trimmed build can fail at runtime
+          in a way the untrimmed build doesn't — which means you have to test the actual published artifact,
+          not just the debug build."</p>
+        <p>"For containers specifically I'd usually go framework-dependent on a runtime base image. You get
+          layer caching, small deltas per deploy, and centralised patching."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you think about patching, not just file size?</li>
+        <li>Do you know trimming's failure mode?</li>
+        <li>Have you thought about the container case specifically?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which base image would you choose for a container, and why?</li>
+          <li>How would you test that a trimmed build still works?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

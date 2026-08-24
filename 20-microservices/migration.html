@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Migration &amp; Modular Monolith — Microservices</title>
+<meta name="description" content="The strangler approach to extracting services, how to build a monolith you could split later, and when not to split at all.">
+<meta name="keywords" content="modular monolith strangler fig microservices migration extract service database decomposition architecture tests enforce boundaries when not to use microservices monolith first">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="20-microservices/migration.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Migration &amp; Modular Monolith</h1>
+    <p class="subtitle">The most useful page in this section, because the correct answer is usually "build a
+      modular monolith and extract only what proves it needs extracting".</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>A modular monolith gets you most of the benefit</strong> with none of the distribution
+        cost.</li>
+      <li><strong>Enforce module boundaries mechanically</strong> — an architecture test, not a convention.</li>
+      <li><strong>Never do a big-bang rewrite.</strong> Strangle it incrementally.</li>
+      <li><strong>Extract the boundary that's proven itself</strong>, not the one that's easiest.</li>
+      <li><strong>The database is the hard part</strong>, not the code.</li>
+      <li><strong>Extract code first, then data</strong> — in separate, shippable steps.</li>
+      <li><strong>Be willing to say "don't split this".</strong></li>
+    </ul>
+  </div>
+
+  <h2 id="modular-monolith">The modular monolith <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>One deployable, one database server, one process — but internally divided into modules with
+      <strong>enforced</strong> boundaries, each owning its own data and exposing an explicit interface.</p>
+    <p>You get separated concerns and independent reasoning. You keep transactions, refactoring, one stack trace
+      and one deployment.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>You keep from the monolith</th><th>You gain from the boundaries</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ACID transactions</strong> across modules</td><td>Clear ownership per module</td></tr>
+        <tr><td><strong>Refactoring across boundaries</strong> with compiler support</td><td>Independent reasoning — you can work in one module</td></tr>
+        <tr><td>One stack trace, one debugger</td><td>Explicit interfaces between modules</td></tr>
+        <tr><td>One deployment, one pipeline</td><td>A validated seam, if you later extract</td></tr>
+        <tr><td><code>F5</code> runs everything</td><td>Enforced dependency direction</td></tr>
+        <tr><td>No network latency between modules</td><td>Parallel work without merge chaos</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="text — the structure"><code class="language-text">  src/
+    Shop.Api/                   <- one deployable; references all modules
+    Shop.Modules.Ordering/
+      Domain/                   <- internal
+      Application/              <- internal
+      Infrastructure/           <- internal; owns its DB schema
+      Contracts/                <- PUBLIC: the only thing others may reference
+    Shop.Modules.Billing/
+      ...
+      Contracts/
+    Shop.Modules.Fulfilment/
+    Shop.SharedKernel/          <- primitives only: Money, ids, base types
+
+  Rule: a module may reference another module's Contracts, and nothing else.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — enforce boundaries mechanically or they erode</div>
+    <p style="margin:0">A documented convention that "Billing must not reference Ordering internals" survives
+      about three months. Someone needs one class, references it directly under deadline pressure, and nobody
+      notices in review.
+      <br><br>
+      So the boundary has to be <strong>checked by the build</strong>. Two ways:</p>
+    <pre data-label="csharp — an architecture test that fails the build" class="code-good"><code class="language-csharp">[Fact]
+public void Modules_may_only_depend_on_other_modules_Contracts()
+{
+    var result = Types.InAssembly(typeof(BillingModule).Assembly)
+        .Should()
+        .NotHaveDependencyOn("Shop.Modules.Ordering.Domain")
+        .And().NotHaveDependencyOn("Shop.Modules.Ordering.Infrastructure")
+        .GetResult();
+
+    result.IsSuccessful.Should().BeTrue(
+        because: string.Join(", ", result.FailingTypeNames ?? []));
+}</code></pre>
+    <p style="margin:8px 0 0">NetArchTest or ArchUnitNET for this. Or make it structural: separate projects
+      where only <code>Contracts</code> is referenced, so a violation is a <strong>compile error</strong> rather
+      than a test failure. That's stronger, because it can't be skipped.
+      <br><br>
+      <strong>This is the single most important practice in a modular monolith.</strong> Without enforcement you
+      have a normal monolith with folders — and the whole value proposition, including the cheap path to
+      extraction later, disappears.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Module data ownership, without separate databases</div>
+    <p style="margin:0">Each module owns its tables. Use <strong>schema separation</strong> —
+      <code>ordering.Orders</code>, <code>billing.Invoices</code> — with a
+      <code>DbContext</code> per module configured to its own schema.
+      <br><br>
+      Then the rule is: <strong>no module queries another module's tables.</strong> Cross-module data goes through
+      the <code>Contracts</code> interface, same as it would across a service boundary.
+      <br><br>
+      That's what makes later extraction tractable: the data boundary already exists and has been respected, so
+      splitting the database is a matter of moving schemas rather than untangling joins.
+      <br><br>
+      The pragmatic exception worth being honest about: you <em>can</em> still transact across schemas, and
+      sometimes you should. That's a genuine advantage over microservices — just be aware each cross-module
+      transaction is a coupling you'd have to replace with a saga if you extracted.</p>
+  </div>
+
+  <h2 id="when-not">When not to split <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Don't split when</th><th>Because</th></tr></thead>
+      <tbody>
+        <tr><td><strong>You have one or two teams</strong></td><td>There's no coordination problem to solve, and you'd pay all the costs</td></tr>
+        <tr><td><strong>The domain isn't understood yet</strong></td><td>Boundaries drawn from guesses are the expensive kind of wrong</td></tr>
+        <tr><td><strong>The motivation is "the code is messy"</strong></td><td>That's modularity — fixable in one deployable, far cheaper</td></tr>
+        <tr><td><strong>There's no operational maturity</strong></td><td>No CI/CD, no tracing, no on-call — microservices will be unrunnable</td></tr>
+        <tr><td><strong>The bottleneck is the database</strong></td><td>Splitting services that all hit one database changes nothing</td></tr>
+        <tr><td><strong>It's mostly CRUD</strong></td><td>The distribution cost buys nothing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Splitting before you understand the domain is the expensive mistake</div>
+    <p style="margin:0">Boundaries are the one decision that's genuinely hard to reverse. Inside a monolith,
+      moving a class between modules is a refactor. Between services it's a data migration, a contract change, a
+      coordinated deployment, and possibly a saga where a transaction used to be.
+      <br><br>
+      So splitting a domain you don't yet understand means <strong>committing to boundaries at the point of
+      minimum knowledge</strong> — and then discovering the seam was in the wrong place, when it's most expensive
+      to move.
+      <br><br>
+      That's the strongest argument for monolith-first: <strong>build it as modules, let the boundaries be
+      corrected cheaply while you learn</strong>, and extract only once a boundary has proven stable under real
+      change. Extracting a module that's already independent is mechanical. Extracting one that isn't is the
+      project that fails.</p>
+  </div>
+
+  <h2 id="extraction">Extracting a service <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <h3 id="which-first">Which one first</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Good first candidate</th><th>Bad first candidate</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Few dependencies</strong> in either direction</td><td>Deeply entangled with everything</td></tr>
+        <tr><td><strong>Clear data ownership</strong> already</td><td>Shares tables with three modules</td></tr>
+        <tr><td><strong>A genuinely different scaling or availability need</strong></td><td>Identical profile to the rest</td></tr>
+        <tr><td><strong>Owned by one team</strong> that wants it</td><td>Nobody's clear owner</td></tr>
+        <tr><td><strong>Tolerates eventual consistency</strong></td><td>Must be transactional with the core</td></tr>
+        <tr><td>Valuable but not the most critical path</td><td>The single most business-critical flow</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Pick for learning, not for value, the first time</div>
+    <p style="margin:0">The first extraction is where you build the machinery — pipelines, tracing, service
+      discovery, contract tests, deployment, on-call. All of that is new, and some of it will be wrong.
+      <br><br>
+      So the first candidate should be <strong>valuable enough to justify the work but not the most critical
+      path</strong>. Notifications, search indexing, reporting, file processing — things that are genuinely
+      separable, tolerate eventual consistency, and where a mistake during the learning phase is recoverable.
+      <br><br>
+      Extracting checkout first means learning distributed systems on the flow that generates revenue. Everything
+      you get wrong is an incident.</p>
+  </div>
+
+  <h3 id="how">The sequence</h3>
+
+  <ol class="steps">
+    <li><strong>Make it a clean module first.</strong> Enforce the boundary inside the monolith, with an
+      architecture test. If you can't do this, you're not ready to extract — the boundary doesn't exist yet.</li>
+    <li><strong>Separate its data.</strong> Move its tables to their own schema, remove cross-module joins and
+      foreign keys, and replace them with calls through the interface. <strong>This is the hard part.</strong></li>
+    <li><strong>Put a facade in front.</strong> All access goes through the module's interface. Still in-process,
+      still one deployment.</li>
+    <li><strong>Deploy it as a service, still calling the same code.</strong> Change the facade to make a network
+      call. Nothing else changes.</li>
+    <li><strong>Move the database.</strong> Its schema becomes its own database.</li>
+    <li><strong>Replace remaining synchronous calls with events</strong> where appropriate, to remove temporal
+      coupling.</li>
+  </ol>
+
+  <div class="remember">
+    <span class="r-label">The order matters</span>
+    <p><strong>Code first, then data.</strong> Each step is independently shippable and revertible.</p>
+    <p>Step 4 is the key insight: you can deploy something as a separate service while it still shares the
+      database. That proves the deployment, monitoring and network path work <em>before</em> you take on the data
+      migration — so if it goes wrong, you revert a routing change rather than a database split.</p>
+    <p>Doing both at once means a failure could be either, and reverting means undoing both.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Step 2 is where extractions actually fail</div>
+    <p style="margin:0">The code separation is usually straightforward — move classes, define an interface. The
+      <strong>data</strong> is where it gets hard, and teams consistently underestimate it.
+      <br><br>
+      <strong>Foreign keys across the boundary</strong> must go. That means giving up referential integrity the
+      database was enforcing, and replacing it with application-level checks plus a reconciliation job.
+      <br><br>
+      <strong>Joins across the boundary</strong> must be replaced — with a call, replicated data, or a
+      denormalised copy. Every one is a decision, and a report joining six tables across the seam may need a
+      separate reporting store.
+      <br><br>
+      <strong>Transactions spanning the boundary</strong> become sagas. That's the expensive one, and it's why
+      "things that must be atomic together belong in the same service" is worth checking <em>before</em>
+      committing to the split.
+      <br><br>
+      If step 2 reveals dozens of cross-boundary joins and transactions, that's not an obstacle to work
+      through — <strong>it's evidence the boundary is wrong.</strong> The right response is to stop and
+      reconsider, not to push on and build sagas.</p>
+  </div>
+
+  <h2 id="strangler">The strangler pattern <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="text — route incrementally, revert instantly"><code class="language-text">  Step 1:  Client ──► Proxy ──► Monolith                 (100% legacy)
+
+  Step 2:  Client ──► Proxy ──┬─► Monolith
+                              └─► New Service  (5% of traffic, shadow-compared)
+
+  Step 3:  Client ──► Proxy ──┬─► Monolith     (fallback)
+                              └─► New Service  (100%)
+
+  Step 4:  Client ──► Proxy ────► New Service  (monolith path deleted)</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Shadow traffic de-risks the cutover</div>
+    <p style="margin:0">Between steps 1 and 2, send requests to <strong>both</strong> the monolith and the new
+      service, serve the monolith's response, and <strong>compare</strong> them.
+      <br><br>
+      That validates the new implementation against real production traffic — including the edge cases nobody
+      thought to test — with zero user risk, because the monolith's answer is still what's returned.
+      <br><br>
+      Discrepancies are exactly the bugs you'd otherwise find after cutover. It's the single most effective
+      de-risking technique for an extraction, and it's underused because it requires the proxy to support it.
+      <br><br>
+      Caveat: only safe for <strong>reads</strong>, or writes you're confident are idempotent — otherwise you're
+      doubling side effects. For write paths, compare what the new service <em>would have</em> done rather than
+      letting it act.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Keep the old path until you're certain</div>
+    <p style="margin:0">Deleting the monolith's implementation as soon as the new service takes traffic removes
+      your rollback. Keeping it costs a little duplication and buys the ability to flip back in seconds.
+      <br><br>
+      Ideally the switch is a <strong>feature flag rather than a deployment</strong>, so reverting during an
+      incident is a configuration change.
+      <br><br>
+      Delete the old path once you've been at 100% for long enough to have covered the monthly and quarterly
+      jobs — those are what surface the paths nobody remembered.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>A modular monolith keeps transactions, refactoring and one deployment while giving you real
+        boundaries.</li>
+      <li>Enforce boundaries with an architecture test or project structure — conventions erode.</li>
+      <li>Modules own their schemas; no module queries another's tables.</li>
+      <li>Don't split with one or two teams, an unclear domain, or no operational maturity.</li>
+      <li>Splitting before understanding the domain commits you at minimum knowledge.</li>
+      <li>Extract for learning first — valuable but not the most critical path.</li>
+      <li>Make it a clean module before extracting; if you can't, the boundary doesn't exist.</li>
+      <li>Code first, then data. Deploy as a service while still sharing the database.</li>
+      <li>Data separation is where extractions fail — FKs, joins and transactions across the seam.</li>
+      <li>Many cross-boundary joins means the boundary is wrong, not that you need more sagas.</li>
+      <li>Shadow traffic validates against production reality at no user risk.</li>
+      <li>Keep the old path behind a flag until you're certain.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Big-bang rewrite</strong> — no delivery for a year, one risky cutover.</li>
+    <li><strong>Splitting before the domain is understood.</strong></li>
+    <li><strong>Boundaries by convention</strong>, with no mechanical enforcement.</li>
+    <li><strong>Extracting the most critical service first.</strong></li>
+    <li><strong>Moving code and data simultaneously</strong>, so a failure is ambiguous.</li>
+    <li><strong>Underestimating the data separation.</strong></li>
+    <li><strong>Pushing through dozens of cross-boundary joins</strong> instead of questioning the seam.</li>
+    <li><strong>Deleting the old path immediately</strong>, losing rollback.</li>
+    <li><strong>Extracting to fix code quality</strong> rather than a deployment problem.</li>
+    <li><strong>No tracing or CI/CD in place</strong> before the first service.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>You have a large monolith and leadership wants microservices. How do you approach it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd find out <strong>what problem they're trying to solve</strong>, because 'we want
+          microservices' is a solution looking for one — and the answer changes the whole approach."</p>
+        <p>"If it's <strong>'teams are blocked by coordinated releases'</strong>, that's the genuine case and
+          microservices are the right tool. If it's <strong>'the codebase is a mess'</strong>, that's a modularity
+          problem and distribution won't fix it — you'll get the same tangle with network calls between the
+          tangles, which is strictly harder. If it's <strong>'it doesn't scale'</strong>, I'd want measurements
+          first, because the bottleneck is frequently the database, and splitting services that all hit one
+          database changes nothing."</p>
+        <p>"I'd also check <strong>operational readiness</strong> honestly. If there's no mature CI/CD, no
+          distributed tracing, no centralised logging and no on-call rotation, microservices will be unrunnable —
+          and the first outage will be unexplainable. Those need to exist first, and building them is a
+          prerequisite rather than a parallel activity."</p>
+        <p>"What I'd propose is <strong>a modular monolith as the first phase</strong>, and I'd frame it as
+          progress toward microservices rather than a refusal — because it genuinely is."</p>
+        <p>"Concretely: identify module boundaries by business capability, move each into its own project, give
+          each its own database schema, and expose a <code>Contracts</code> project as the only thing other
+          modules may reference. Then <strong>enforce that with an architecture test that fails the
+          build</strong>, or structurally with project references so a violation is a compile error."</p>
+        <p>"That enforcement is the critical part. A documented convention survives about three months before
+          someone references an internal class under deadline pressure. Without mechanical enforcement you have a
+          normal monolith with folders, and the entire value — including the cheap path to extraction —
+          disappears."</p>
+        <p>"The reason this is the right first phase: it delivers most of what people actually want — separated
+          concerns, clear ownership, parallel work without merge chaos — while keeping transactions, refactoring
+          with compiler support, one stack trace and one deployment. And it's the <strong>cheapest possible path
+          to microservices later</strong>, because the boundaries already exist and have been validated by real
+          change. Extracting a module that's genuinely independent is mechanical work; extracting one from a
+          tangle is the project that fails."</p>
+        <p>"Then <strong>extract selectively</strong>, when a specific module proves it needs independent
+          deployment. For the first one I'd pick something valuable but not the most critical path —
+          notifications, search indexing, reporting — because the first extraction is where you build the
+          pipelines, tracing, contract tests and on-call, and some of that will be wrong. Learning distributed
+          systems on the checkout flow means every mistake is an incident."</p>
+        <p>"The sequence for an extraction: make it a clean module with the boundary enforced; separate its data
+          into its own schema, removing cross-boundary joins and foreign keys; put a facade in front; then
+          <strong>deploy it as a service while it still shares the database</strong>; then move the database
+          last."</p>
+        <p>"That step-4 ordering is the important one. It proves the deployment, monitoring and network path work
+          <em>before</em> taking on the data migration — so if something's wrong you revert a routing change
+          rather than a database split."</p>
+        <p>"And I'd set the expectation that <strong>step 2 is where this actually gets hard.</strong> Foreign keys
+          across the boundary have to go, which means giving up referential integrity and adding reconciliation.
+          Joins become calls or replicated data. Transactions become sagas. If separating the data reveals dozens
+          of cross-boundary joins and transactions, that's not an obstacle to grind through — it's evidence the
+          boundary is wrong, and the right response is to stop and reconsider."</p>
+        <p>"Throughout, I'd use a <strong>strangler</strong> approach with a proxy, ideally with shadow traffic —
+          send reads to both, serve the monolith's response, compare them. That validates the new service against
+          real production traffic including the edge cases nobody tested, at zero user risk. And I'd keep the old
+          path behind a feature flag so reverting during an incident is a config change rather than a
+          deployment."</p>
+        <p>"The message I'd give leadership: <strong>we'll get the benefits incrementally and reversibly, rather
+          than committing to an eighteen-month rewrite that delivers nothing until it's finished</strong> — and
+          we may well find that after phase one, only two modules genuinely need to be services."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you interrogate the motivation?</li>
+        <li>Do you check operational readiness as a prerequisite?</li>
+        <li>Do you propose a modular monolith, and insist on mechanical enforcement?</li>
+        <li>Do you extract code before data, and deploy before migrating?</li>
+        <li>Do you know data separation is the hard part?</li>
+        <li>Can you frame it politically as progress, not refusal?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a service-by-service rewrite plan with no questions asked.</li>
+        <li><span class="redflag">Red flag:</span> boundaries by convention only.</li>
+        <li><span class="redflag">Red flag:</span> no mention of the database.</li>
+        <li><span class="redflag">Red flag:</span> extracting the most critical service first.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle a report that joins across two modules?</li>
+          <li>What if leadership insists on a timeline for full migration?</li>
+          <li>How would you write the architecture test?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

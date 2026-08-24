@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distributed Failure Scenarios — Scaling Scenarios</title>
+<meta name="description" content="A dependency is down, messages arrive twice or out of order, consumer lag is growing, a multi-step operation failed halfway — and retry storms.">
+<meta name="keywords" content="distributed failure dependency down circuit breaker bulkhead duplicate messages idempotency out of order events consumer lag poison message partial failure saga compensation retry storm thundering herd exponential backoff jitter dead letter queue">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="35-scaling-scenarios/distributed.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Distributed Failure Scenarios</h1>
+    <p class="subtitle">Five failures that only exist once there's a network in the middle. Two of them are made
+      worse by the obvious fix.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Slow is worse than dead.</strong> A dead dependency fails fast; a slow one exhausts you.</li>
+      <li><strong>Timeouts first, then retries, then a circuit breaker.</strong> In that order of importance.</li>
+      <li><strong>Retries without backoff and jitter</strong> turn a blip into an outage.</li>
+      <li><strong>At-least-once is the norm.</strong> Duplicates are a design input, not a bug.</li>
+      <li><strong>Idempotent consumers</strong> give you an exactly-once <em>effect</em>.</li>
+      <li><strong>Ordering is per-partition at best</strong> — design for out-of-order instead.</li>
+      <li><strong>Lag trend matters, not depth.</strong> Growing is the problem; large but flat isn't.</li>
+      <li><strong>Compensation is not rollback.</strong> It's a new business action.</li>
+    </ul>
+  </div>
+
+  <h2 id="dependency-down">Scenario: a dependency is failing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Control</th><th>Does</th><th>Get this wrong and</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Timeout</strong></td><td><strong>Bounds how long you wait.</strong> The most important one</td><td>A slow dependency holds all your threads</td></tr>
+        <tr><td><strong>Retry with backoff + jitter</strong></td><td>Survives transient failure</td><td>Without jitter, synchronised retries hammer it</td></tr>
+        <tr><td><strong>Circuit breaker</strong></td><td>Stops calling a dependency that's clearly down</td><td>Without it, every request pays the timeout</td></tr>
+        <tr><td><strong>Bulkhead</strong></td><td>Caps concurrent calls to one dependency</td><td>One dependency consumes your whole capacity</td></tr>
+        <tr><td><strong>Fallback</strong></td><td>Degraded but useful response</td><td>Total failure for a non-essential feature</td></tr>
+        <tr><td><strong>Hedging</strong></td><td>A second request if the first is slow</td><td>Multiplied load if used carelessly</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Slow is worse than dead — and this is the most important idea here</div>
+    <p style="margin:0">A dependency that <strong>refuses connections</strong> fails in milliseconds. Your request
+      fails fast, the thread is released, you return an error, and the system stays healthy while one feature is
+      broken.
+      <br><br>
+      A dependency that <strong>accepts connections and responds in 30 seconds</strong> is far more damaging. Every
+      in-flight request holds a thread and a connection for 30 seconds. Requests accumulate. Your thread pool is
+      exhausted. Now <em>every</em> endpoint is slow, including ones that don't touch that dependency at all.
+      <br><br>
+      <strong>One slow dependency has taken down your entire service.</strong> That's the cascading failure, and it's
+      why a partial outage becomes a total one.
+      <br><br>
+      Which makes the ordering of controls clear. <strong>Timeouts matter most</strong>, because without one there's
+      no bound on the damage — and .NET's <code>HttpClient</code> default of 100 seconds is far too long for a
+      service-to-service call. Two seconds is often right.
+      <br><br>
+      <strong>Then a circuit breaker</strong>, so you stop paying the timeout on every request once it's clearly
+      down — fail immediately instead, and probe occasionally to see if it recovered.
+      <br><br>
+      <strong>Then a bulkhead</strong>, capping concurrent calls to that dependency, so even without a breaker it can
+      only ever consume a slice of your capacity rather than all of it.
+      <br><br>
+      The general principle: <strong>bound every wait.</strong> Anything unbounded is a queue that can grow until it
+      takes the process with it.</p>
+  </div>
+
+  <pre data-label="csharp — resilience with the standard stack" class="code-good"><code class="language-csharp">builder.Services.AddHttpClient&lt;IPricingClient, PricingClient&gt;(c =&gt;
+{
+    c.BaseAddress = new Uri(cfg["Pricing:BaseUrl"]!);
+    c.Timeout = TimeSpan.FromSeconds(5);        // overall ceiling, NOT the default 100s
+})
+.AddResilienceHandler("pricing", b =&gt; b
+    // Order matters: this pipeline runs outside-in
+    .AddConcurrencyLimiter(permitLimit: 20, queueLimit: 10)   // bulkhead
+    .AddRetry(new HttpRetryStrategyOptions
+    {
+        MaxRetryAttempts = 3,
+        BackoffType = DelayBackoffType.Exponential,
+        UseJitter = true,                        // ESSENTIAL - see below
+        ShouldHandle = new PredicateBuilder&lt;HttpResponseMessage&gt;()
+            .Handle&lt;HttpRequestModel&gt;()
+            .HandleResult(r =&gt; r.StatusCode &gt;= HttpStatusCode.InternalServerError
+                            || r.StatusCode == HttpStatusCode.RequestTimeout)
+            // Do NOT retry 4xx - the request is wrong, retrying cannot help
+    })
+    .AddCircuitBreaker(new HttpCircuitBreakerStrategyOptions
+    {
+        FailureRatio = 0.5,                      // half of requests failing
+        MinimumThroughput = 20,                  // over a meaningful sample
+        SamplingDuration = TimeSpan.FromSeconds(30),
+        BreakDuration = TimeSpan.FromSeconds(15)
+    })
+    .AddTimeout(TimeSpan.FromSeconds(2)));       // per attempt</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Jitter, and why retries make outages worse without it</div>
+    <p style="margin:0">Exponential backoff alone doesn't solve the problem it appears to. If a thousand clients all
+      fail at the same moment — because the dependency restarted — they all wait one second, then all retry
+      simultaneously. Then all wait two seconds and retry simultaneously.
+      <br><br>
+      You've replaced continuous load with <strong>synchronised spikes</strong>, which is often worse: the dependency
+      recovers, gets hit by a thousand simultaneous requests, falls over again, and the cycle repeats. That's a retry
+      storm, and it can keep a recovered service down indefinitely.
+      <br><br>
+      <strong>Jitter</strong> randomises each delay, so the retries spread out and the dependency sees a manageable
+      ramp instead of a wall. It's a single flag and it's the difference between a self-healing system and a
+      self-perpetuating outage.
+      <br><br>
+      Two related rules. <strong>Never retry a 4xx</strong> — the request is malformed or unauthorised, so retrying
+      cannot succeed and just adds load. And <strong>be careful retrying at multiple layers</strong>: three retries in
+      the client inside three at the gateway inside three in the caller is 27 requests for one logical call. Retry at
+      one level, deliberately chosen.</p>
+  </div>
+
+  <h2 id="duplicates">Scenario: messages are processed twice <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Why it happens</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>The lock expired mid-processing</strong></td><td>Service Bus redelivers; you were still working</td></tr>
+        <tr><td><strong>The consumer crashed after work, before commit</strong></td><td><strong>Unavoidable</strong> — the window always exists</td></tr>
+        <tr><td><strong>The producer retried a send</strong></td><td>The first send succeeded; the ack was lost</td></tr>
+        <tr><td><strong>Checkpointing on an interval</strong></td><td>Event Hubs and Kafka reprocess since the last checkpoint</td></tr>
+        <tr><td><strong>A rebalance</strong></td><td>Partition ownership moved mid-batch</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — exactly-once delivery doesn't exist; exactly-once effect does</div>
+    <p style="margin:0">The framing that matters: <strong>you cannot have exactly-once delivery across a
+      network</strong>, because the acknowledgement can always be lost. If the consumer processes a message and then
+      crashes before committing, the broker has no way to know the work was done — so it must either redeliver
+      (at-least-once) or risk losing it (at-most-once).
+      <br><br>
+      Every real system picks <strong>at-least-once</strong>, because losing messages is worse than repeating them.
+      Which means <strong>duplicates are a design input, not a defect</strong>.
+      <br><br>
+      So the goal isn't preventing duplicates — it's making them harmless. <strong>An idempotent consumer plus
+      at-least-once delivery gives an exactly-once effect</strong>, which is what anyone actually wanted.
+      <br><br>
+      Three ways to get there, in order of preference:
+      <br><br>
+      <strong>Make the operation naturally idempotent.</strong> "Set status to Shipped" is safe to repeat; "increment
+      the counter" is not. Where you can choose, choose the absolute form over the relative one — this is free and
+      needs no infrastructure.
+      <br><br>
+      <strong>Deduplicate on a message id.</strong> Record processed ids and skip repeats. The important detail:
+      <strong>the id record and the work must be in the same transaction</strong>, or you can do the work, fail to
+      record the id, and repeat it anyway. And the id must come from the producer, not be generated on
+      receipt.
+      <br><br>
+      <strong>Use a conditional write.</strong> <code>UPDATE ... WHERE Status = 'Pending'</code> — the second attempt
+      affects zero rows and is a no-op. This is the same atomic-conditional-write primitive that appears in every
+      store, and it's the most robust option because the database enforces it.</p>
+  </div>
+
+  <h2 id="ordering">Scenario: events arrive out of order <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Gives</th><th>Costs</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Partition by entity key</strong></td><td>Order within one entity</td><td>Parallelism limited by key distribution</td></tr>
+        <tr><td><strong>Service Bus sessions</strong></td><td>Ordered processing per session</td><td>One consumer per session at a time</td></tr>
+        <tr><td><strong>Version or sequence number</strong></td><td><strong>Discard anything older than applied</strong></td><td>Consumer must track versions</td></tr>
+        <tr><td><strong>Idempotent, commutative operations</strong></td><td>Order stops mattering</td><td>Constrains what events can express</td></tr>
+        <tr><td><strong>Buffer and reorder</strong></td><td>Strict ordering</td><td>Latency, memory, and a gap may never fill</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Version-based rejection beats enforcing order</div>
+    <p style="margin:0">Guaranteeing global ordering is expensive: it means a single partition, one consumer, no
+      parallelism, and a head-of-line blocking problem where one slow message stalls everything behind it.
+      <br><br>
+      The cheaper and more robust approach is to <strong>make out-of-order arrival detectable and harmless</strong>.
+      Every event carries a version or a timestamp from the source; the consumer stores the last version it applied
+      and <strong>discards anything older</strong>.
+      <br><br>
+      So an <code>OrderUpdated</code> at version 5 arriving after version 7 is simply dropped — correct final state,
+      no coordination required, full parallelism retained.
+      <br><br>
+      Two caveats worth knowing. This works for <em>state replacement</em> ("the order now looks like this") and not
+      for <em>deltas</em> ("add 5 to the total"), which need every event exactly once in order. That's a strong
+      argument for designing events as state rather than as increments.
+      <br><br>
+      And <strong>a create arriving after an update</strong> still needs handling — usually by upserting rather than
+      requiring the row to exist, so a late create doesn't overwrite newer data and an early update doesn't
+      crash.
+      <br><br>
+      The instinct to reach for is: <strong>can I make ordering not matter?</strong> That's almost always cheaper
+      than enforcing it.</p>
+  </div>
+
+  <h2 id="lag">Scenario: consumer lag is growing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — the questions, in order"><code class="language-text">1  Is lag GROWING or just LARGE?
+      Large and flat  -> a backlog draining. Fine, estimate the catch-up time.
+      Growing         -> arrival rate exceeds processing rate. Act.
+
+2  ALL partitions or ONE?
+      All  -> genuine capacity, or a shared dependency slowed down
+      ONE  -> skew, or a stalled/poisoned consumer on that partition
+
+3  Did the ARRIVAL rate change, or the PROCESSING rate?
+      Arrival up      -> a producer changed, a retry storm, a backfill
+      Processing down -> a slow dependency, a deployment, GC, throttling
+
+4  Can I add consumers?
+      Only up to the PARTITION COUNT. One reader per partition
+      per consumer group is a hard ceiling.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — one partition lagging is a completely different problem</div>
+    <p style="margin:0">Aggregate lag is the metric people watch and it hides the most common case. Lag on
+      <strong>one partition while the others are healthy</strong> rules out a capacity problem entirely — if the
+      consumer were simply too slow, every partition would lag.
+      <br><br>
+      So it's one of two things.
+      <br><br>
+      <strong>Skew.</strong> The partition key concentrates traffic — one large tenant, one misbehaving device. Same
+      hot-partition physics as everywhere else, and <strong>adding consumers cannot help</strong>, because there's a
+      hard limit of one reader per partition per consumer group. You can only reduce the events landing there or
+      speed up processing per event.
+      <br><br>
+      <strong>A stalled consumer.</strong> Usually a <strong>poison message</strong>: the handler throws on a specific
+      event, the code retries or rethrows, and that partition makes no progress while everything else continues. On
+      Event Hubs and Kafka there's <strong>no dead-letter queue</strong>, so a single bad message can hold up a
+      partition indefinitely. The fix is to record the failure elsewhere and move on.
+      <br><br>
+      A third, easily missed: <strong>ownership churn.</strong> If the processor is rebalancing repeatedly — instances
+      scaling up and down, or the checkpoint store being throttled — a partition spends its time re-establishing
+      ownership rather than processing. Worth checking the checkpoint storage account specifically, because it's a
+      different resource and nobody looks at it.
+      <br><br>
+      Which is why the metric to have is <strong>lag per partition</strong>, not aggregate. An average across 32
+      partitions hides exactly this.</p>
+  </div>
+
+  <h2 id="partial">Scenario: a multi-step operation failed halfway <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Response</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Retry the failed step</strong></td><td>It's transient and the step is idempotent. <strong>Prefer this</strong></td></tr>
+        <tr><td><strong>Compensate completed steps</strong></td><td>The operation cannot proceed and effects must be undone</td></tr>
+        <tr><td><strong>Leave it and alert</strong></td><td>Automatic resolution is riskier than a human deciding</td></tr>
+        <tr><td><strong>Complete it later</strong></td><td>Eventual completion is acceptable — persist and resume</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Compensation is not rollback</div>
+    <p style="margin:0">A database rollback makes it as though nothing happened. <strong>Compensation cannot do
+      that</strong> — the earlier steps really happened, and the world may have observed them.
+      <br><br>
+      So compensating a payment isn't "un-charging" it; it's <strong>issuing a refund</strong>, which is a separate
+      business event with its own record, its own fees, and its own appearance on the customer's statement. The
+      customer sees a charge and a refund, not nothing.
+      <br><br>
+      That has design consequences people miss:
+      <br><br>
+      <strong>Compensations can fail too</strong>, so they need retries, and eventually a human — an operation stuck
+      half-compensated is worse than either state.
+      <br><br>
+      <strong>Compensation must be idempotent</strong>, because the retry will happen.
+      <br><br>
+      <strong>Some steps cannot be compensated at all.</strong> An email has been sent; a webhook has fired. So order
+      the saga to put <strong>irreversible steps last</strong>, once everything reversible has succeeded.
+      <br><br>
+      And there's no isolation: another process can observe the intermediate state. If that's unacceptable, the
+      pattern is a <strong>pending status</strong> — the record exists but isn't treated as real until the saga
+      completes. That's the semantic version of a lock, and it's what makes eventual consistency tolerable to the rest
+      of the system.
+      <br><br>
+      Which is why the honest advice is: <strong>if the steps can live in one transaction, put them in one
+      transaction.</strong> A saga is what you use when they genuinely can't.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Slow is worse than dead — one slow dependency can exhaust the whole service.</li>
+      <li>Timeouts matter most; <code>HttpClient</code>'s 100s default is far too long.</li>
+      <li>Then a circuit breaker, then a bulkhead. Bound every wait.</li>
+      <li>Backoff without jitter creates synchronised retry spikes.</li>
+      <li>Never retry a 4xx; don't stack retries at multiple layers.</li>
+      <li>Exactly-once delivery is impossible; exactly-once effect is achievable.</li>
+      <li>Prefer naturally idempotent operations; dedupe in the same transaction as the work.</li>
+      <li>Conditional writes are the most robust deduplication.</li>
+      <li>Version-based rejection beats enforcing global order.</li>
+      <li>Design events as state, not deltas, so order stops mattering.</li>
+      <li>Lag trend matters, not depth; one partition lagging is skew or a stall.</li>
+      <li>Consumers cannot exceed the partition count.</li>
+      <li>Compensation is a new business action, must be idempotent, and can fail.</li>
+      <li>Put irreversible saga steps last; use a pending status for visibility.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No timeout</strong>, so a slow dependency exhausts the thread pool.</li>
+    <li><strong>Retries without jitter</strong>, producing synchronised storms.</li>
+    <li><strong>Retrying 4xx responses.</strong></li>
+    <li><strong>Retries at three layers</strong>, multiplying load 27×.</li>
+    <li><strong>Assuming exactly-once delivery.</strong></li>
+    <li><strong>Deduplication outside the transaction</strong> that does the work.</li>
+    <li><strong>Events as increments</strong>, so a duplicate corrupts state.</li>
+    <li><strong>Enforcing global ordering</strong> when version rejection would do.</li>
+    <li><strong>Alerting on queue depth</strong> rather than its trend.</li>
+    <li><strong>Adding consumers beyond the partition count</strong> and expecting throughput.</li>
+    <li><strong>Rethrowing on a poison message</strong>, stalling a partition.</li>
+    <li><strong>Treating compensation as rollback.</strong></li>
+    <li><strong>Irreversible steps early in a saga.</strong></li>
+    <li><strong>A circuit breaker with no fallback</strong>, so open means total failure.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A downstream service starts responding in 30 seconds instead of 200ms. What happens to you? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Without protection, <strong>my service goes down entirely</strong> — and the important part is that it
+          fails worse than if the dependency had simply died."</p>
+        <p>"The mechanism: every request calling that dependency holds a thread and a connection for 30 seconds.
+          Requests keep arriving, so in-flight work accumulates. The thread pool is exhausted, and now
+          <strong>every endpoint is slow — including ones that never touch that dependency</strong>. A partial outage
+          has become a total one."</p>
+        <p>"That's why <strong>slow is worse than dead</strong>. A dependency refusing connections fails in
+          milliseconds: the thread is released, I return an error, one feature is broken and the rest of the service
+          is fine. Failing fast is a feature."</p>
+        <p>"It gets worse if retries are involved. If each request retries three times with a 30-second timeout,
+          that's 90 seconds per request and <strong>triple the load on a dependency that's already struggling</strong>
+          — so my retries are helping to keep it down."</p>
+        <p>"<strong>What I'd want in place</strong>, in order of importance:"</p>
+        <p>"<strong>A timeout.</strong> The single most important control, because without one there's no bound on
+          the damage. And I'd specifically flag that <code>HttpClient</code>'s default is <strong>100
+          seconds</strong>, which is catastrophic for a service-to-service call — two seconds is often right. If the
+          dependency normally answers in 200ms, waiting 30 seconds serves nobody: the user has gone."</p>
+        <p>"<strong>A circuit breaker.</strong> Once a threshold of requests is failing, stop calling it and fail
+          immediately. Otherwise every request still pays the full timeout, so I'm slow rather than fast-failing —
+          and I'm still generating load. The breaker probes occasionally to detect recovery."</p>
+        <p>"<strong>A bulkhead</strong> — a concurrency limit on calls to that dependency. That's the one that
+          contains the blast radius structurally: even with no breaker, that dependency can only ever consume 20 of
+          my threads rather than all of them. Other endpoints stay healthy regardless."</p>
+        <p>"<strong>Retries with exponential backoff and jitter</strong>, and jitter matters more than people think.
+          Without it, a thousand clients that failed simultaneously all retry simultaneously — so the dependency
+          recovers, gets hit by a wall of requests, falls over again. Jitter spreads them into a ramp. It's one
+          flag and it's the difference between self-healing and a self-perpetuating outage."</p>
+        <p>"<strong>A fallback</strong> where the feature allows it — cached or stale data, a default, or a degraded
+          response. A circuit breaker with no fallback still means total failure for that feature; with one it means
+          degraded service, which is usually much better than an error page."</p>
+        <p>"<strong>Diagnosing it live</strong>, I'd look at dependency duration and failure rate in the telemetry to
+          confirm which dependency, and thread pool queue length to confirm the exhaustion. The signature is rising
+          latency across <em>unrelated</em> endpoints, which is what tells me it's cascading rather than local."</p>
+        <p>"<strong>Immediate mitigation</strong> if the protections aren't there: reduce the timeout — which can be
+          config rather than a deploy — or disable the feature by flag, or trip the breaker manually. Getting off
+          that dependency restores everything else."</p>
+        <p>"<strong>The architectural question</strong> I'd raise afterwards: does this call need to be synchronous at
+          all? If the result isn't needed to answer the request, publishing to a queue and processing asynchronously
+          removes this failure mode completely — the dependency being slow becomes a growing queue rather than an
+          outage. That's the structural fix rather than better handling of a bad situation."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know slow is worse than dead, and why?</li>
+        <li>Do you know the <code>HttpClient</code> default timeout?</li>
+        <li>Do you order timeout, breaker, bulkhead correctly?</li>
+        <li>Can you explain why jitter matters?</li>
+        <li>Do you notice retries add load to a struggling dependency?</li>
+        <li>Do you question whether the call should be synchronous?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add retries" as the main answer.</li>
+        <li><span class="redflag">Red flag:</span> no mention of timeouts.</li>
+        <li><span class="redflag">Red flag:</span> assuming only the dependent feature breaks.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What timeout would you pick, and how?</li>
+          <li>How do you choose circuit breaker thresholds?</li>
+          <li>What if the call genuinely must be synchronous?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Customers report being charged twice. Diagnose and fix. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is a correctness incident affecting money, so I'd handle it in a specific order:
+          <strong>stop it getting worse, quantify who's affected, fix them, then fix the cause.</strong> Not
+          root-cause first."</p>
+        <p>"<strong>First, stop the bleeding.</strong> If it's ongoing and I can identify the path, disable it by
+          feature flag or take that route out of service. A payment path producing duplicates should not keep running
+          while I investigate — the cost of downtime is much lower than the cost of more double charges."</p>
+        <p>"<strong>Second, quantify.</strong> Query for multiple successful charges against the same order or the
+          same customer within a short window. I need the exact list, because refunding is a customer-communication
+          exercise and 'we think about fifty people' isn't good enough."</p>
+        <p>"<strong>Third, remediate.</strong> Refund the duplicates and contact those customers before they contact
+          us. That matters commercially — a proactive refund is a very different experience from a disputed charge, and
+          a chargeback costs more than the refund."</p>
+        <p>"<strong>Then the cause</strong>, and there are four candidates I'd distinguish."</p>
+        <p>"<strong>A user double-click or double-submit.</strong> Two requests, both processed. The fix is a
+          client-generated idempotency key sent with the request, so the second is recognised as the same logical
+          operation. Disabling the button is a UX nicety, not a fix — the request can always arrive twice."</p>
+        <p>"<strong>A client or gateway retry.</strong> The charge succeeded but the response was lost — a timeout, a
+          dropped connection — so the client retried. This is the common one, and it's important because
+          <strong>nothing was broken</strong>: the payment provider behaved correctly, we behaved correctly, and the
+          outcome is still wrong. That's why idempotency is a design requirement rather than a bug fix."</p>
+        <p>"<strong>Message redelivery.</strong> If the charge happens in a message handler, the lock expired
+          mid-processing, or the consumer crashed after charging and before completing the message. The broker
+          redelivers because it has no way to know the work was done — that's at-least-once, working as designed."</p>
+        <p>"<strong>Concurrent requests racing.</strong> Two requests both check 'has this been charged?', both see
+          no, both charge. A check-then-act race, and it's the one that survives every naive fix because the window is
+          small enough to look impossible."</p>
+        <p>"<strong>The fix, and I'd want it at multiple levels.</strong>"</p>
+        <p>"<strong>Idempotency keys.</strong> The client generates a key per logical payment attempt and sends it.
+          We store it with the result. A repeat with the same key returns the <em>original</em> result rather than
+          charging again."</p>
+        <p>"The critical detail: <strong>a unique constraint on the key in the database, not an application-level
+          check.</strong> A check-then-insert is exactly the race above. Insert first and let the second attempt fail
+          on the constraint — then the database enforces it atomically, and no amount of concurrency defeats it. Same
+          reasoning as a conditional write in any store: <strong>make the database the arbiter, not your code.</strong>"</p>
+        <p>"<strong>Pass the key to the payment provider.</strong> Stripe and most others support idempotency keys
+          natively, so even if our logic fails, the provider deduplicates. That's defence in depth, and it's free."</p>
+        <p>"<strong>A conditional state transition.</strong> <code>UPDATE Payments SET Status='Charging' WHERE
+          Id=@id AND Status='Pending'</code> — if it affects zero rows, someone else is already handling it. That's an
+          atomic claim, and it's the pattern I'd reach for generally."</p>
+        <p>"<strong>Prevention beyond the fix.</strong> A test that asserts submitting the same payment twice
+          concurrently charges once — because that's the case nobody tests, and it's the one that fails. An alert on
+          multiple charges per order per hour, so the next occurrence is detected in minutes rather than by customers.
+          And I'd audit for the same check-then-act shape elsewhere, because if it's here it's probably in
+          registration, in invitations, and anywhere else a uniqueness rule is enforced in code."</p>
+        <p>"The general lesson I'd state: <strong>at-least-once delivery is normal, so any operation with a
+          real-world side effect needs an idempotency mechanism enforced by the database.</strong> Preventing
+          duplicates from arriving is not achievable; making them harmless is."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you stop the bleeding and remediate customers before root-causing?</li>
+        <li>Do you distinguish double-submit, retry, redelivery and a race?</li>
+        <li>Do you know a check-then-insert is itself a race?</li>
+        <li>Do you enforce idempotency with a database constraint?</li>
+        <li>Do you pass the key to the provider as well?</li>
+        <li>Do you look for the same pattern elsewhere?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> disabling the button as the fix.</li>
+        <li><span class="redflag">Red flag:</span> an application-level "already charged?" check.</li>
+        <li><span class="redflag">Red flag:</span> debugging first, leaving the path live.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where does the idempotency key come from?</li>
+          <li>How long do you retain keys, and what expires them?</li>
+          <li>What if the provider charged but our write failed?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

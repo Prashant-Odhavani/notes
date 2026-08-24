@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Domain-Driven Design — Architecture</title>
+<meta name="description" content="DDD explained simply: bounded contexts, aggregates, entities vs value objects, domain events, ubiquitous language, and when DDD is not worth it.">
+<meta name="keywords" content="domain driven design bounded context aggregate root entity value object domain event ubiquitous language anti corruption layer context map repository invariant consistency boundary">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="19-architecture/ddd.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Domain-Driven Design</h1>
+    <p class="subtitle">A way of finding boundaries in complex business software — and the vocabulary
+      interviewers expect you to use precisely.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Bounded context</strong> — a boundary inside which a word means exactly one thing. This is
+        the most valuable idea in DDD.</li>
+      <li><strong>Aggregate</strong> — a cluster of objects treated as one unit for changes. Its root is the
+        only way in.</li>
+      <li>An aggregate is a <strong>consistency boundary</strong>, not a "group of related things". That's
+        the distinction most people get wrong.</li>
+      <li><strong>Entity</strong> = has identity that persists through change. <strong>Value object</strong>
+        = defined entirely by its values, immutable.</li>
+      <li><strong>Domain event</strong> = something meaningful happened, stated in past tense.</li>
+      <li>DDD is for <strong>complex domains</strong>. On CRUD it's pure cost, and saying so is a senior
+        signal.</li>
+    </ul>
+  </div>
+
+  <h2 id="what-ddd-is-for">What DDD is actually for <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>DDD's core claim: in complex business software, the hard part isn't the technology — it's
+      <strong>understanding and modelling the business accurately</strong>.</p>
+    <p>So the code should be structured around the business, and use the business's own words.</p>
+  </div>
+
+  <p>It's usually split into two halves, and they have very different value:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>What it covers</th><th>Honest value</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Strategic DDD</strong></td>
+          <td>Bounded contexts, context maps, ubiquitous language, anti-corruption layers</td>
+          <td><strong>High.</strong> Useful even on a monolith, even on a small team. This is where the real
+              payoff is</td>
+        </tr>
+        <tr>
+          <td><strong>Tactical DDD</strong></td>
+          <td>Aggregates, entities, value objects, repositories, domain services, domain events</td>
+          <td><strong>Depends.</strong> Excellent for complex invariants. Ceremony for CRUD</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Most teams adopt the tactical patterns and skip the strategic thinking, which is backwards — the
+    patterns are the cheap part.</p>
+
+  <h2 id="ubiquitous-language">Ubiquitous language <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="oneline"><b>One line:</b> developers and domain experts use the same words for the same
+    things, and the code uses those words too.</div>
+
+  <p>This sounds soft. It isn't. Here's what it prevents:</p>
+
+  <div class="vs-grid">
+    <div class="bad">
+      <span class="vs-label">Without it</span>
+      <p>Sales says "account" meaning the company.<br>
+         Support says "account" meaning the login.<br>
+         Finance says "account" meaning the billing record.<br><br>
+         You build one <code>Account</code> table with 47 columns, and every query needs a comment
+         explaining which kind of account it means.</p>
+    </div>
+    <div class="good">
+      <span class="vs-label">With it</span>
+      <p><code>Organisation</code>, <code>UserAccount</code> and <code>BillingAccount</code> — three
+        concepts, three names, three tables.<br><br>
+        Nobody has to ask which one a method means.</p>
+    </div>
+  </div>
+
+  <p>The practical version: <strong>write a glossary early</strong>, argue about the words, and then name
+    your classes exactly that. If the business calls it a "policy renewal", don't name the class
+    <code>ContractUpdateProcessor</code>.</p>
+
+  <h2 id="bounded-context">Bounded context <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>A bounded context is a boundary inside which each term has <strong>exactly one meaning</strong>.</p>
+    <p>The same real-world thing can appear in several contexts with different shapes — and that's correct,
+      not duplication to eliminate.</p>
+  </div>
+
+  <p>Example. "Customer" in three contexts:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Context</th><th>What "Customer" means there</th><th>Fields it cares about</th></tr></thead>
+      <tbody>
+        <tr><td>Sales</td><td>A prospect or account being sold to</td><td>Lead source, pipeline stage, assigned rep</td></tr>
+        <tr><td>Billing</td><td>A party that owes money</td><td>Payment method, tax ID, credit limit, invoices</td></tr>
+        <tr><td>Support</td><td>A person raising tickets</td><td>Contact details, entitlement tier, ticket history</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The instinct is to build one shared <code>Customer</code> class. That's the mistake. It produces a class
+    that serves nobody well, changes for three different reasons, and forces three teams to coordinate on
+    every change.</p>
+
+  <p>Three separate models, each small and fit for its purpose, linked by a shared <strong>customer
+    ID</strong>, is the right answer.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Being comfortable with the <em>same concept modelled differently in different
+      places</em>. Junior instinct is "don't repeat yourself — one Customer class". Senior instinct is that
+      DRY applies to <em>knowledge</em>, not to shapes that merely look similar.
+      <br><br>
+      Bounded contexts are also the best available guide to <a href="../20-microservices/boundaries.html">service
+      boundaries</a> — a service per context is a far better starting point than a service per entity.</p>
+  </div>
+
+  <h3 id="context-relationships">How contexts relate</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Relationship</th><th>Means</th></tr></thead>
+      <tbody>
+        <tr><td>Shared kernel</td><td>Two contexts share a small common model. Powerful but couples them — change needs both teams</td></tr>
+        <tr><td>Customer/Supplier</td><td>Downstream context's needs influence upstream's roadmap</td></tr>
+        <tr><td>Conformist</td><td>Downstream just accepts upstream's model as-is (common with third parties)</td></tr>
+        <tr><td><strong>Anti-corruption layer</strong></td><td>Downstream translates the upstream model into its own. The safest option</td></tr>
+        <tr><td>Published language</td><td>A shared, versioned contract both sides agree on — e.g. integration events</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The <strong>anti-corruption layer</strong> is the one to remember. It's the strategic version of the
+    <a href="../18-design-patterns/structural.html#adapter">Adapter pattern</a>: when you integrate with a
+    legacy system or a vendor, you translate their model into yours at the boundary, so their concepts don't
+    spread through your codebase.</p>
+
+  <h2 id="entities-value-objects">Entities vs value objects <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Entity</th><th>Value object</th></tr></thead>
+      <tbody>
+        <tr><td>Identity</td><td>Has an ID that persists through change</td><td>No ID — it <em>is</em> its values</td></tr>
+        <tr><td>Equality</td><td>Same ID = same thing</td><td>Same values = same thing</td></tr>
+        <tr><td>Mutability</td><td>Usually mutable (through methods)</td><td>Always immutable</td></tr>
+        <tr><td>Example</td><td><code>Order</code>, <code>Customer</code>, <code>Invoice</code></td><td><code>Money</code>, <code>Address</code>, <code>DateRange</code>, <code>Email</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The test: <em>if two of these had identical values, would they be the same thing?</em></p>
+
+  <ul>
+    <li>Two £10 notes with the same value — interchangeable. <strong>Value object.</strong></li>
+    <li>Two customers named "John Smith" at the same address — still two different people.
+      <strong>Entity.</strong></li>
+  </ul>
+
+  <pre data-label="csharp — value objects catch bugs the type system can help with" class="code-good"><code class="language-csharp">public readonly record struct Email
+{
+    public string Value { get; }
+
+    public Email(string value)
+    {
+        if (!value.Contains('@')) throw new ArgumentException("Invalid email", nameof(value));
+        Value = value.ToLowerInvariant();     // normalised once, here
+    }
+}
+
+// Now this is impossible to get wrong:
+public void Register(Email email, CustomerId id) { ... }
+
+// instead of this, where the arguments can be swapped silently:
+public void Register(string email, string id) { ... }</code></pre>
+
+  <p>Two things this buys you. Validation happens <strong>once</strong>, in the constructor — so an invalid
+    <code>Email</code> can't exist anywhere in the program. And the compiler stops you passing arguments in
+    the wrong order, which is a real bug class when everything is <code>string</code>.</p>
+
+  <h2 id="aggregates">Aggregates <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>An aggregate is a <strong>consistency boundary</strong> — the set of objects that must be updated
+      together, in one transaction, to keep a rule true.</p>
+    <p>It is <em>not</em> "a group of related objects". That's the mistake that produces huge aggregates.</p>
+  </div>
+
+  <pre data-label="csharp — the aggregate root is the only way in"><code class="language-csharp">public sealed class Order          // aggregate root
+{
+    private readonly List&lt;OrderLine&gt; _lines = [];
+
+    public OrderId Id { get; }
+    public OrderStatus Status { get; private set; }
+    public IReadOnlyList&lt;OrderLine&gt; Lines =&gt; _lines;   // read-only outside
+
+    // The invariant lives here, where it cannot be bypassed:
+    // "an order may never exceed 50 lines and must have at least one to be placed"
+    public void AddLine(Sku sku, int quantity, Money unitPrice)
+    {
+        if (Status != OrderStatus.Draft)
+            throw new InvalidOperationException("Cannot modify a placed order.");
+        if (_lines.Count &gt;= 50)
+            throw new InvalidOperationException("An order may not exceed 50 lines.");
+
+        _lines.Add(new OrderLine(sku, quantity, unitPrice));
+    }
+}</code></pre>
+
+  <p>Nothing outside the aggregate may hold a reference to an <code>OrderLine</code> or modify it directly.
+    If it could, the "max 50 lines" rule would be unenforceable.</p>
+
+  <h3 id="aggregate-rules">The four rules that make aggregates work</h3>
+
+  <ol class="steps">
+    <li><strong>One transaction, one aggregate.</strong> If you're saving two aggregates in one transaction,
+      your boundaries are probably wrong — or you actually need eventual consistency between them.</li>
+    <li><strong>Reference other aggregates by ID, not by object.</strong> <code>Order</code> holds a
+      <code>CustomerId</code>, not a <code>Customer</code>. This keeps aggregates small and prevents
+      accidental loading of half the database.</li>
+    <li><strong>Keep them small.</strong> A big aggregate means more contention (everyone locks it) and
+      slower loads. If a rule doesn't need two things updated together, they're separate aggregates.</li>
+    <li><strong>The root enforces all invariants.</strong> That's the point of having a root.</li>
+  </ol>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake — the aggregate that ate the domain</div>
+    <p style="margin:0">Modelling <code>Customer</code> as an aggregate containing all their orders, which
+      contain all their lines, which reference all their products.
+      <br><br>
+      Loading a customer now loads thousands of rows. Two users editing unrelated orders for the same
+      customer collide on the same optimistic concurrency token. Nothing scales.
+      <br><br>
+      <strong>Ask: what rule requires these to change together?</strong> If there isn't one, they're separate
+      aggregates linked by ID.</p>
+  </div>
+
+  <h3 id="cross-aggregate">When a rule spans two aggregates</h3>
+
+  <p>This comes up constantly, and it's a good interview follow-up. Say the rule is "a customer may not have
+    more than 5 open orders".</p>
+
+  <p>Three honest options:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>How</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td>Merge the aggregates</td><td>Customer owns Orders</td><td>Usually far too big. Rarely right</td></tr>
+        <tr><td>Check in the application service</td><td>Query the count before creating the order</td><td>A race window between check and write — needs a unique constraint or lock to be safe</td></tr>
+        <tr><td>Accept eventual consistency</td><td>Create the order, then a handler detects the violation and compensates</td><td>The rule can be briefly violated. Often fine for business rules that aren't safety-critical</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The senior answer is to ask <em>how strictly the rule must hold</em>. Many "rules" turn out to tolerate
+    a few seconds of violation, which makes the design far simpler. Ones that don't — financial limits,
+    seat allocation — need a real lock or a database constraint.</p>
+
+  <h2 id="domain-events">Domain events <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="oneline"><b>One line:</b> a record that something meaningful happened, named in the past
+    tense.</div>
+
+  <pre data-label="csharp — the aggregate announces, it doesn't command"><code class="language-csharp">public sealed record OrderPlaced(OrderId OrderId, CustomerId CustomerId, Money Total)
+    : IDomainEvent;
+
+public sealed class Order
+{
+    public void Place()
+    {
+        if (_lines.Count == 0) throw new InvalidOperationException("Cannot place an empty order.");
+        Status = OrderStatus.Placed;
+        Raise(new OrderPlaced(Id, CustomerId, Total));   // Order doesn't know who cares
+    }
+}</code></pre>
+
+  <p><strong>Why this matters:</strong> without events, <code>Order.Place()</code> would have to call the
+    email service, the inventory service and the analytics service — coupling the domain to all of them. With
+    events, the order just states what happened.</p>
+
+  <h3 id="domain-vs-integration">Domain events vs integration events <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <p>A distinction interviewers like, and people confuse:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Domain event</th><th>Integration event</th></tr></thead>
+      <tbody>
+        <tr><td>Scope</td><td>Inside one bounded context</td><td>Crosses contexts / services</td></tr>
+        <tr><td>Transport</td><td>In-process dispatch</td><td>Message broker</td></tr>
+        <tr><td>Contents</td><td>Can carry domain objects</td><td>Primitives only — it's serialized and versioned</td></tr>
+        <tr><td>Coupling</td><td>Internal; change it freely</td><td>A public contract; changing it breaks consumers</td></tr>
+        <tr><td>Delivery</td><td>Same process, same transaction (or just after)</td><td>At-least-once, via an <a href="distributed-data.html#outbox">outbox</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The usual pattern: a domain event fires internally, a handler decides whether it's externally
+    interesting, and if so publishes an integration event. That keeps your internal model free to change
+    without breaking other services.</p>
+
+  <div class="note danger">
+    <div class="note-title">Production trap</div>
+    <p style="margin:0">Publishing an integration event <em>before</em> the transaction commits. If the
+      commit then fails, other services have reacted to something that never happened — and you can't unsend
+      a message.
+      <br><br>
+      Publish after commit, and use the <a href="distributed-data.html#outbox">outbox pattern</a> so the
+      event and the state change are committed atomically.</p>
+  </div>
+
+  <h2 id="when-not-ddd">When not to use DDD <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>Being able to say this clearly is worth more in an interview than reciting the patterns.</p>
+
+  <ul>
+    <li><strong>The domain is genuinely simple.</strong> If the logic is "validate, save, return", a rich
+      model adds files without adding safety.</li>
+    <li><strong>It's a reporting or data pipeline.</strong> Those want a functional, data-oriented approach —
+      not aggregates.</li>
+    <li><strong>Nobody has access to a domain expert.</strong> DDD's engine is the conversation with people
+      who know the business. Without that, you're inventing a model and dressing it up in DDD vocabulary.</li>
+    <li><strong>The team doesn't know it.</strong> Half-applied DDD — anaemic entities in a folder called
+      "Domain" — gets you the ceremony and none of the benefit.</li>
+  </ul>
+
+  <p>Note the asymmetry, though: even when tactical DDD isn't worth it,
+    <strong>bounded contexts and ubiquitous language usually still are</strong>. Those cost almost nothing.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Strategic DDD (contexts, language) is high value and cheap. Tactical DDD (aggregates) depends on complexity.</li>
+      <li>A bounded context is where a word has one meaning. Different contexts modelling the same thing differently is correct.</li>
+      <li>An aggregate is a consistency boundary. Ask "what rule forces these to change together?"</li>
+      <li>One transaction per aggregate; reference other aggregates by ID.</li>
+      <li>Entity = identity survives change. Value object = it <em>is</em> its values, and it's immutable.</li>
+      <li>Domain events are internal; integration events are a public contract sent via an outbox.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Huge aggregates</strong> containing everything related, causing contention and slow loads.</li>
+    <li><strong>Aggregates referencing each other by object</strong>, so loading one loads half the database.</li>
+    <li><strong>Anaemic "domain" entities</strong> — properties only, all rules in services. That's a folder
+      name, not DDD.</li>
+    <li><strong>One shared model across contexts</strong>, producing a class with 47 columns that serves
+      nobody.</li>
+    <li><strong>Value objects that are mutable</strong>, which reintroduces every aliasing bug they existed
+      to prevent.</li>
+    <li><strong>Domain events published before commit</strong>, so handlers react to rolled-back changes.</li>
+    <li><strong>DDD vocabulary applied to CRUD</strong> — repositories, aggregates and domain services around
+      a five-table app.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What is an aggregate, and how do you decide its boundaries? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"An aggregate is a consistency boundary — the group of objects that has to be updated together, in
+          one transaction, to keep some rule true. The root is the only entry point, so the rule can't be
+          bypassed."</p>
+        <p>"The key thing is that it's <em>not</em> 'a group of related objects'. That's the mistake that
+          produces enormous aggregates. The question I ask is: <strong>what invariant requires these to
+          change together?</strong> If I can't name one, they're separate aggregates."</p>
+        <p>"So an Order and its Lines are one aggregate, because rules like 'total must equal the sum of the
+          lines' and 'max 50 lines' need them consistent at every moment. But Order and Customer are
+          separate, even though they're obviously related — there's no rule requiring them to change in the
+          same transaction. Order holds a <code>CustomerId</code>, not a <code>Customer</code>."</p>
+        <p>"That ID-reference rule matters practically. If aggregates reference each other by object, loading
+          one drags in a graph, and your ORM either lazy-loads unpredictably or you fetch far too much."</p>
+        <p>"Size matters too, for reasons that show up in production. A big aggregate is a contention point —
+          everyone editing anything about a customer collides on the same concurrency token. Smaller
+          aggregates mean less locking and faster loads."</p>
+        <p>"And when a rule genuinely spans two aggregates — 'a customer may not have more than 5 open
+          orders' — I'd first ask how strictly it must hold. Many business rules tolerate a few seconds of
+          violation, and then eventual consistency with a compensating action is much simpler. If it must be
+          exact, I'd enforce it with a database constraint or an explicit lock rather than pretending the
+          aggregate boundary handles it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's a consistency boundary, not a containment hierarchy?</li>
+        <li>Do you know the ID-reference rule and why it exists?</li>
+        <li>Can you handle the cross-aggregate rule question without hand-waving?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "an aggregate groups related entities" — true but misses the point.</li>
+        <li><span class="redflag">Red flag:</span> making Customer an aggregate containing all their orders.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you enforce a rule that needs data from another aggregate?</li>
+          <li>How does aggregate design affect optimistic concurrency?</li>
+          <li>Where do repositories fit — one per aggregate, or per entity?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What's a bounded context, and how does it relate to microservices?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A bounded context is a boundary inside which every term has exactly one meaning. Outside it, the
+          same word can mean something different — and that's fine."</p>
+        <p>"The example I'd give is 'customer'. In Sales it's a prospect with a pipeline stage and an
+          assigned rep. In Billing it's a party that owes money, with a payment method and a credit limit. In
+          Support it's a person raising tickets. Same real-world person, three genuinely different models."</p>
+        <p>"The instinct is to build one shared Customer class. That produces something with fifty columns
+          that serves nobody well, changes for three different reasons, and forces three teams to coordinate
+          on every change. Three small models linked by a customer ID is better — and that's not duplication,
+          because they encode different knowledge."</p>
+        <p>"On microservices: bounded contexts are the best available guide to service boundaries. A service
+          per context tends to work, because a context is already a place where the language and the rules
+          are coherent — which usually means the data and the team are too."</p>
+        <p>"But I'd be careful about the reverse claim. Identifying a context doesn't mean you should
+          <em>deploy</em> it separately. Contexts are a modelling boundary; services are a deployment
+          boundary. You can have five bounded contexts in one modular monolith, which is often exactly the
+          right answer — you get the modelling clarity without distributed cost."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand contexts as a language boundary, not just a module?</li>
+        <li>Are you comfortable with the same concept modelled differently?</li>
+        <li>Do you separate modelling boundaries from deployment boundaries?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do two contexts share data without coupling?</li>
+          <li>What's an anti-corruption layer and when have you used one?</li>
+          <li>What if a single business process spans four contexts?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you NOT use DDD?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd split the answer, because the two halves of DDD have very different costs."</p>
+        <p>"The tactical patterns — aggregates, value objects, domain services, repositories — I'd skip when
+          the domain is genuinely simple. If the logic is validate-save-return, a rich domain model adds files
+          without adding safety. Same for reporting and data pipelines, which want a functional data-oriented
+          approach, not aggregates."</p>
+        <p>"I'd also skip it if there's no access to a domain expert. The engine of DDD is the conversation
+          with people who actually know the business. Without that you're inventing a model and dressing it
+          in DDD vocabulary, which is the worst of both."</p>
+        <p>"And I'd be wary if the team doesn't know it. Half-applied DDD — anaemic entities in a folder
+          called Domain, repositories that are just DbSet wrappers — gets you the ceremony and none of the
+          benefit, and it's harder to unwind than plain code."</p>
+        <p>"But the strategic side is different. Bounded contexts and ubiquitous language cost almost nothing
+          and pay off even on a small CRUD app. Agreeing that 'account' means three different things, and
+          naming them accordingly, is just good engineering. So my honest position is: use the strategic
+          thinking almost always, and use the tactical patterns where the invariants justify them."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you criticise a methodology you also know well?</li>
+        <li>Do you distinguish the strategic and tactical halves?</li>
+        <li>Do you recognise half-applied DDD as a real failure mode?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "DDD is always better" — dogma.</li>
+        <li><span class="redflag">Red flag:</span> equating DDD with "having a Domain folder".</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>You join a team with a "Domain" project full of property bags. What do you do?</li>
+          <li>How do you introduce ubiquitous language without a big process change?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

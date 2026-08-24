@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Messaging Patterns In Depth</title>
+<meta name="description" content="Queue versus topic semantics, delivery guarantees, retries and dead-letter queues, ordering, poison messages and idempotent consumers.">
+<meta name="keywords" content="message queue topic pub sub competing consumers fan out at least once delivery dead letter queue DLQ poison message ordering session partition key idempotent consumer Azure Service Bus RabbitMQ MassTransit outbox claim check">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="21-messaging/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Messaging Patterns In Depth</h1>
+    <p class="subtitle">Queues look simple until you meet ordering, duplicates and poison messages. All three
+      arrive in production, not in testing.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Queue = one consumer gets each message</strong> (competing consumers).
+        <strong>Topic = every subscriber gets a copy</strong> (fan-out).</li>
+      <li><strong>Delivery is at-least-once.</strong> Duplicates are guaranteed, not exceptional.</li>
+      <li><strong>A dead-letter queue is mandatory</strong> — and so is monitoring it.</li>
+      <li><strong>Ordering costs throughput</strong>, because it forces serial processing per group.</li>
+      <li><strong>Scaling consumers breaks global ordering.</strong> You can only order within a partition.</li>
+      <li><strong>A poison message blocks its partition</strong> unless you handle it.</li>
+      <li><strong>Publish via an outbox</strong>, or you'll lose messages on commit failures.</li>
+    </ul>
+  </div>
+
+  <h2 id="queue-vs-topic">Queue or topic <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The distinction</span>
+    <p>A <strong>queue</strong> delivers each message to exactly one consumer. Add consumers and you process
+      faster — they compete for messages. That's for <em>work</em>.</p>
+    <p>A <strong>topic</strong> delivers a copy to every subscription. Add a subscriber and it gets everything.
+      That's for <em>notification</em>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Queue</th><th>Topic / pub-sub</th></tr></thead>
+      <tbody>
+        <tr><td>Each message goes to</td><td><strong>One consumer</strong></td><td><strong>Every subscription</strong></td></tr>
+        <tr><td>More consumers means</td><td>Higher throughput</td><td>More copies delivered</td></tr>
+        <tr><td>Producer knows consumers</td><td>Implicitly one logical consumer</td><td>No — it just publishes</td></tr>
+        <tr><td>Adding a new reaction</td><td>Change the consumer</td><td><strong>Add a subscription; touch nothing</strong></td></tr>
+        <tr><td>Natural message name</td><td><strong>A command</strong> — <code>SendInvoice</code></td><td><strong>An event</strong> — <code>OrderPlaced</code></td></tr>
+        <tr><td>Use for</td><td>Work distribution</td><td>Notifying interested parties</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Command or event — the naming tells you which to use</span>
+    <p>A <strong>command</strong> is an instruction to one recipient: <code>SendInvoice</code>,
+      <code>ChargeCard</code>. Imperative, one handler, <strong>queue</strong>.</p>
+    <p>An <strong>event</strong> is a statement of fact: <code>OrderPlaced</code>,
+      <code>PaymentReceived</code>. Past tense, any number of interested parties, <strong>topic</strong>.</p>
+    <p>If you find yourself publishing <code>SendEmailEvent</code> to a topic, the name is telling you the
+      design is confused — that's a command wearing an event's clothes, and the publisher has taken on knowledge
+      of what should happen.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — events invert the dependency</div>
+    <p style="margin:0">With commands, the sender decides what happens. Adding "also award loyalty points when an
+      order is placed" means <strong>changing the order service</strong> to send another command.
+      <br><br>
+      With events, the order service publishes <code>OrderPlaced</code> and is finished. Loyalty subscribes.
+      Adding a fifth reaction touches nothing in the publisher — so the dependency points from the reactor to the
+      event, not from the publisher to every reactor.
+      <br><br>
+      That's genuine decoupling and it's the strongest argument for event-driven design. The cost is that
+      <strong>nobody knows the full set of consequences</strong> of placing an order — which is a real
+      operational problem when debugging, and why an event catalogue matters.
+      <br><br>
+      The nuance: events should describe <em>what happened in the domain</em>, not what should happen next. If
+      your event is <code>OrderPlacedSoSendEmail</code>, you've coupled the publisher to the consumer's purpose
+      and lost the benefit.</p>
+  </div>
+
+  <h2 id="delivery">Delivery guarantees <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Guarantee</th><th>Means</th><th>Reality</th></tr></thead>
+      <tbody>
+        <tr><td><strong>At-most-once</strong></td><td>Never duplicated, may be lost</td><td>Fire-and-forget. Acceptable for metrics</td></tr>
+        <tr><td><strong>At-least-once</strong></td><td>Never lost, may be duplicated</td><td><strong>What you actually get</strong></td></tr>
+        <tr><td><strong>Exactly-once</strong></td><td>Never lost, never duplicated</td><td><strong>Not achievable at the transport level</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Why exactly-once delivery is impossible</div>
+    <p style="margin:0">A consumer processes a message and crashes before its acknowledgement reaches the broker.
+      <br><br>
+      The broker now cannot distinguish "processed but unacknowledged" from "never processed". It has two
+      choices: <strong>redeliver</strong> (risking a duplicate) or <strong>don't</strong> (risking loss). There is
+      no third option — the information needed to decide doesn't exist anywhere.
+      <br><br>
+      Brokers choose redelivery, because losing messages is worse. So <strong>at-least-once is the honest
+      guarantee</strong>, and any product advertising exactly-once is doing deduplication somewhere and calling it
+      delivery.
+      <br><br>
+      What you can achieve is <strong>at-least-once delivery plus idempotent processing</strong>, which produces
+      an exactly-once <em>effect</em>. That's what exactly-once always means in practice, and being precise about
+      it is a strong signal — it's the same
+      <a href="../08-http-web-apis/reliability.html#the-ambiguous-timeout">ambiguous timeout</a> problem as
+      HTTP.</p>
+  </div>
+
+  <pre data-label="csharp — the inbox pattern: dedupe and work in ONE transaction" class="code-good"><code class="language-csharp">public async Task ConsumeAsync(OrderPlaced msg, CancellationToken ct)
+{
+    await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+    // Unique constraint on MessageId is what makes this correct
+    _db.ProcessedMessages.Add(new ProcessedMessage(msg.MessageId, DateTime.UtcNow));
+
+    try
+    {
+        await _db.SaveChangesAsync(ct);
+    }
+    catch (DbUpdateException) when (IsUniqueViolation)
+    {
+        return;                     // already processed - acknowledge and move on
+    }
+
+    await DoTheWorkAsync(msg, ct);  // the work
+    await _db.SaveChangesAsync(ct);
+    await tx.CommitAsync(ct);       // dedupe record and work commit TOGETHER
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The detail that makes it correct</div>
+    <p style="margin:0">The dedupe record and the work must commit in the <strong>same transaction</strong>.
+      <br><br>
+      If you record the message id and commit, then do the work separately, a crash between them leaves the
+      message marked processed but the work never done. You've converted duplicate delivery into
+      <strong>lost work</strong>, which is strictly worse — and it's silent.
+      <br><br>
+      Also: prune the dedupe table. It grows forever otherwise. A TTL slightly longer than the broker's maximum
+      redelivery window is sufficient.</p>
+  </div>
+
+  <h2 id="retries-dlq">Retries and dead-letter queues <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Two kinds of failure, two responses</span>
+    <p><strong>Transient</strong> — a network blip, a timeout, a throttled dependency. Retrying works.</p>
+    <p><strong>Permanent</strong> — malformed payload, a referenced entity that doesn't exist, a business rule
+      violation. Retrying will <em>never</em> work.</p>
+    <p>Treating the second as the first is how you get a message retried ten thousand times.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Layer</th><th>Purpose</th><th>Typical</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Immediate retry</strong></td><td>Momentary blips</td><td>3 attempts, milliseconds apart</td></tr>
+        <tr><td><strong>Delayed retry</strong></td><td>A dependency that needs time</td><td>Exponential backoff with jitter, minutes</td></tr>
+        <tr><td><strong>Dead-letter queue</strong></td><td>Give up; preserve the message</td><td>After retries are exhausted</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — distinguishing the two in a consumer" class="code-good"><code class="language-csharp">public async Task ConsumeAsync(ConsumeContext&lt;ChargeCard&gt; ctx)
+{
+    try
+    {
+        await _payments.ChargeAsync(ctx.Message, ctx.CancellationToken);
+    }
+    catch (HttpRequestException)          // transient - let the retry policy work
+    {
+        throw;
+    }
+    catch (CardDeclinedException ex)      // PERMANENT - retrying is pointless
+    {
+        _logger.LogWarning(ex, "Card declined for {OrderId}", ctx.Message.OrderId);
+        await ctx.Publish(new PaymentFailed(ctx.Message.OrderId, ex.Reason));
+        return;                           // acknowledge - do NOT retry or dead-letter
+    }
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — a DLQ nobody monitors is a silent data-loss mechanism</div>
+    <p style="margin:0">Every guide says "use a dead-letter queue". Far fewer mention that <strong>an
+      unmonitored DLQ is worse than no DLQ</strong>.
+      <br><br>
+      Messages arrive there, nobody notices, and the business consequence surfaces weeks later — orders never
+      fulfilled, invoices never sent. The system reported no errors, because dead-lettering <em>is</em> the
+      designed error path.
+      <br><br>
+      So a DLQ needs three things: <strong>an alert on depth greater than zero</strong> — not a threshold, because
+      any dead letter is by definition unhandled; <strong>enough context to diagnose</strong>, meaning the
+      original message plus the exception and the trace id; and <strong>a documented replay path</strong>, because
+      the whole point is that these messages can be reprocessed after a fix.
+      <br><br>
+      The replay path is the one that's usually missing. Teams dead-letter diligently for a year, then discover
+      they have no tooling to resubmit and have to write it during an incident.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Poison messages block their partition</div>
+    <p style="margin:0">In an <strong>ordered</strong> stream — a Service Bus session, a Kafka partition — the
+      consumer cannot skip a message without breaking ordering. So a message that always fails
+      <strong>blocks everything behind it</strong>, indefinitely.
+      <br><br>
+      One malformed order stalls every subsequent order for that customer. The queue depth grows and nothing
+      progresses.
+      <br><br>
+      Options, and each is a real trade-off: <strong>dead-letter it and continue</strong>, accepting an ordering
+      gap; <strong>park the whole partition</strong> and alert, preserving order at the cost of availability; or
+      <strong>fail the consumer</strong> and force intervention.
+      <br><br>
+      Most systems choose dead-letter-and-continue, which means <strong>you've chosen availability over strict
+      ordering</strong> — and that should be a deliberate decision, since it can leave the downstream state
+      inconsistent in a way that needs reconciliation.
+      <br><br>
+      Knowing that ordering and poison-message handling are in direct tension is a strong signal.</p>
+  </div>
+
+  <h2 id="ordering">Ordering <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The fundamental tension</span>
+    <p><strong>Ordering requires serial processing. Throughput requires parallel processing.</strong></p>
+    <p>You cannot have both globally. What you can have is <strong>ordering within a partition, parallelism
+      across partitions</strong>.</p>
+    <p>So the design question is: <em>what is the smallest scope that genuinely needs ordering?</em> Usually one
+      entity — one order, one account, one device.</p>
+  </div>
+
+  <pre data-label="csharp — partition by the entity that needs ordering" class="code-good"><code class="language-csharp">// Azure Service Bus: SessionId groups messages for ordered, single-consumer processing
+await sender.SendMessageAsync(new ServiceBusMessage(payload)
+{
+    SessionId = order.Id.ToString(),      // all messages for this order, in order
+    MessageId = eventId.ToString()        // for deduplication
+});
+
+// Kafka: the partition key does the same job
+await producer.ProduceAsync("orders", new Message&lt;string, string&gt;
+{
+    Key = order.Id.ToString(),            // same key -> same partition -> ordered
+    Value = payload
+});</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Ordering scope</th><th>Throughput</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Global</strong> — every message in order</td><td>One consumer, ever</td><td>Almost never a real requirement</td></tr>
+        <tr><td><strong>Per entity</strong> — per order, per account</td><td><strong>Parallel across entities</strong></td><td><strong>Usually the right answer</strong></td></tr>
+        <tr><td><strong>None</strong></td><td>Maximum</td><td>Fine if handlers are commutative</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — design so ordering doesn't matter</div>
+    <p style="margin:0">Ordering is expensive: it caps parallelism, and it creates the poison-message blocking
+      problem. So the better question is often whether you need it at all.
+      <br><br>
+      Techniques that remove the requirement: <strong>include a version or sequence number</strong> and have the
+      consumer ignore anything older than what it has already applied — so out-of-order arrival is handled rather
+      than prevented. Make handlers <strong>commutative</strong>, so order genuinely doesn't affect the outcome.
+      Or send <strong>state rather than deltas</strong> — "the order is now Shipped" is order-independent, where
+      "increment the status" isn't.
+      <br><br>
+      That last one is the most useful reframing. <code>SetQuantity(5)</code> is idempotent and
+      order-independent; <code>AddQuantity(2)</code> is neither. Choosing state-based messages over delta-based
+      ones eliminates a whole category of problem.
+      <br><br>
+      "I'd try to make ordering unnecessary before paying for it" is a stronger answer than describing how to
+      configure sessions.</p>
+  </div>
+
+  <h2 id="outbox">Publishing reliably <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the dual-write problem" class="code-bad"><code class="language-csharp">await _db.SaveChangesAsync(ct);                    // database committed
+await _bus.Publish(new OrderPlaced(order.Id), ct); // if THIS fails...
+
+// The order exists and nothing downstream knows. No email, no fulfilment,
+// no inventory update. And no error the user sees.
+//
+// Reversing the order is no better: publish then save means consumers can
+// react to an order that was never persisted.</code></pre>
+
+  <pre data-label="csharp — the outbox: one transaction, then relay" class="code-good"><code class="language-csharp">// Both the entity and the message go into the SAME transaction
+_db.Orders.Add(order);
+_db.OutboxMessages.Add(OutboxMessage.For(new OrderPlaced(order.Id)));
+await _db.SaveChangesAsync(ct);      // atomic - both or neither
+
+// A background relay reads unsent outbox rows, publishes them,
+// and marks them sent. At-least-once, which is why consumers dedupe.</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The outbox is the answer to "how do you not lose messages?"</div>
+    <p style="margin:0">There is no way to make a database commit and a broker publish atomic — they're separate
+      systems, and 2PC is the option nobody wants.
+      <br><br>
+      The outbox sidesteps it: the message becomes <strong>part of the database transaction</strong>, so it can't
+      be lost if the commit succeeds. A relay publishes it afterwards, retrying until the broker accepts.
+      <br><br>
+      The consequence is at-least-once publishing — the relay might publish and crash before marking it sent — so
+      consumers must be idempotent. Which they had to be anyway.
+      <br><br>
+      In .NET, MassTransit has a transactional outbox that handles the relay, the retries and the deduplication.
+      Hand-rolling it is straightforward but the details — ordering of relay dispatch, cleanup, and avoiding
+      double-publish under concurrent relays — are easy to get subtly wrong.
+      <br><br>
+      Covered in more depth on the <a href="../19-architecture/distributed-data.html#outbox">distributed data
+      page</a>.</p>
+  </div>
+
+  <h2 id="practical">Practical details <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Guidance</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Message size</strong></td>
+          <td>Keep messages small. For large payloads use the <strong>claim check</strong> pattern — store the
+              blob, send a reference</td>
+        </tr>
+        <tr>
+          <td><strong>Schema evolution</strong></td>
+          <td>Additive only. New optional fields; never change a field's meaning. Consumers must tolerate
+              unknown fields</td>
+        </tr>
+        <tr>
+          <td><strong>Versioning</strong></td>
+          <td>A new message <em>type</em> (<code>OrderPlacedV2</code>) rather than changing V1, with both
+              published during transition</td>
+        </tr>
+        <tr>
+          <td><strong>Trace propagation</strong></td>
+          <td>Put <code>traceparent</code> in the message headers, or the trace stops at the publish</td>
+        </tr>
+        <tr>
+          <td><strong>Scheduled messages</strong></td>
+          <td>Broker-level scheduling beats a polling table for delayed work</td>
+        </tr>
+        <tr>
+          <td><strong>Competing consumers</strong></td>
+          <td>Scale out on a queue for throughput; watch the ordering implication</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The claim-check pattern, and why message size matters</div>
+    <p style="margin:0">Brokers have hard limits — Service Bus is 256KB on standard tiers, 1MB on premium; Kafka
+      defaults to 1MB.
+      <br><br>
+      More importantly, large messages are <strong>slow to move and expensive to retry</strong>. A 5MB message
+      retried three times is 15MB of traffic for one logical operation, and it occupies broker storage.
+      <br><br>
+      <strong>Claim check:</strong> write the payload to blob storage, put the <em>reference</em> in the message.
+      The message stays small, the payload is fetched only if needed, and retries cost almost nothing.
+      <br><br>
+      The trade-off is a second failure mode — the blob might be missing or expired — so lifecycle needs
+      thought: the blob must outlive the maximum redelivery window plus the DLQ retention period, or a replayed
+      message will find nothing.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Trace context does not cross the broker automatically</div>
+    <p style="margin:0">This is the observability gap that catches people. HTTP calls propagate
+      <code>traceparent</code> automatically; a message publish does not, unless the library adds it.
+      <br><br>
+      So without it, the trace ends at "published a message" and the consumer's work appears as an unrelated
+      root trace. Correlating them means matching timestamps and guessing — precisely where the hard bugs live,
+      because asynchronous flows are the ones you can't reason about by reading code.
+      <br><br>
+      MassTransit and the Azure SDKs handle this now, but it's worth <strong>verifying</strong> on a real trace
+      rather than assuming. Publish a message, consume it, and confirm both spans appear under one trace
+      id.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Queue for work (one consumer), topic for notification (all subscribers).</li>
+      <li>Commands go to queues, events to topics — the naming reveals the design.</li>
+      <li>Events invert the dependency; the cost is nobody knowing all the consequences.</li>
+      <li>At-least-once is the real guarantee. Exactly-once is at-least-once plus idempotency.</li>
+      <li>Dedupe record and work must commit in one transaction, or duplicates become lost work.</li>
+      <li>Separate transient from permanent failures — retrying a declined card never helps.</li>
+      <li>An unmonitored DLQ is silent data loss. Alert on depth &gt; 0 and build the replay path.</li>
+      <li>A poison message blocks its partition; ordering and availability are in tension.</li>
+      <li>Order within a partition, parallelise across them. Global ordering is rarely a real
+        requirement.</li>
+      <li>Better still: send state not deltas, so ordering stops mattering.</li>
+      <li>Publish via an outbox — a database commit and a broker publish can't be atomic.</li>
+      <li>Claim check for large payloads; verify trace context crosses the broker.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>A topic where a queue was needed</strong>, so work is done N times.</li>
+    <li><strong>Command-shaped events</strong> — <code>SendEmailEvent</code> — coupling publisher to
+      consumer.</li>
+    <li><strong>Non-idempotent consumers</strong>, so redelivery duplicates side effects.</li>
+    <li><strong>Dedupe key committed separately</strong> from the work.</li>
+    <li><strong>Retrying permanent failures</strong> until the retry limit.</li>
+    <li><strong>No dead-letter queue</strong>, so failures vanish.</li>
+    <li><strong>A DLQ nobody monitors.</strong></li>
+    <li><strong>No replay tooling</strong> for dead-lettered messages.</li>
+    <li><strong>Global ordering</strong> when per-entity would do, capping throughput.</li>
+    <li><strong>Scaling consumers</strong> without realising ordering is lost.</li>
+    <li><strong>Dual writes</strong> instead of an outbox.</li>
+    <li><strong>Large payloads inline</strong> rather than a claim check.</li>
+    <li><strong>Trace context not propagated</strong> through the broker.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How do you handle a message that keeps failing? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The first thing is to <strong>distinguish transient from permanent failure</strong>, because they need
+          opposite responses and conflating them is the usual bug."</p>
+        <p>"<strong>Transient</strong> — a network blip, a timeout, a throttled dependency. Retrying works, so I'd
+          use immediate retries for momentary problems and delayed retries with exponential backoff and jitter for
+          a dependency that needs time to recover."</p>
+        <p>"<strong>Permanent</strong> — a malformed payload, a referenced entity that doesn't exist, a declined
+          card. Retrying will <em>never</em> succeed. So retrying a declined card ten times just wastes ten
+          attempts and delays telling anyone. The correct handling is to acknowledge the message and publish a
+          failure event so the saga or the user can respond."</p>
+        <p>"That's the distinction I'd write into the consumer explicitly — catch the permanent exceptions, handle
+          them, and let everything else propagate to the retry policy."</p>
+        <p>"For genuine exhaustion, the message goes to a <strong>dead-letter queue</strong> — it's preserved
+          rather than lost, and can be reprocessed after a fix."</p>
+        <p>"But the point I'd emphasise is that <strong>an unmonitored DLQ is worse than no DLQ</strong>. Messages
+          arrive, nobody notices, and the business impact surfaces weeks later — orders never fulfilled, invoices
+          never sent. And there's no error anywhere, because dead-lettering <em>is</em> the designed error
+          path."</p>
+        <p>"So a DLQ needs three things. An <strong>alert on depth greater than zero</strong> — not a threshold,
+          because any dead letter is by definition unhandled. <strong>Enough context to diagnose</strong>: the
+          original message, the exception, and the trace id so I can find the full distributed trace. And a
+          <strong>documented replay path</strong>, which is the one usually missing — teams dead-letter diligently
+          for a year, then discover during an incident that they have no tooling to resubmit."</p>
+        <p>"The harder case is a <strong>poison message in an ordered stream</strong> — a Service Bus session or a
+          Kafka partition. There the consumer can't skip it without breaking ordering, so a message that always
+          fails <strong>blocks everything behind it indefinitely</strong>. One malformed order stalls every
+          subsequent order for that customer."</p>
+        <p>"There's no free answer. Dead-letter it and continue, accepting an ordering gap. Park the whole
+          partition and alert, preserving order at the cost of availability. Or fail the consumer and force
+          intervention. Most systems choose dead-letter-and-continue — which means <strong>choosing availability
+          over strict ordering</strong>, and that should be a deliberate decision, because it can leave downstream
+          state inconsistent in a way needing reconciliation."</p>
+        <p>"And the preventative point: <strong>validate at the boundary</strong>. A message that can't be
+          deserialised or fails schema validation should be dead-lettered on the first attempt rather than
+          retried — it's permanently broken, and retrying it three times just delays the inevitable while
+          blocking the partition."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you separate transient from permanent?</li>
+        <li>Do you know retrying a business failure is pointless?</li>
+        <li>Do you insist on DLQ monitoring and a replay path?</li>
+        <li>Do you know a poison message blocks an ordered partition?</li>
+        <li>Do you recognise the ordering/availability trade-off?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "retry until it works".</li>
+        <li><span class="redflag">Red flag:</span> a DLQ with no monitoring.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of partition blocking.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you build the replay tooling?</li>
+          <li>How do you avoid re-dead-lettering on replay?</li>
+          <li>What if the poison message is one of a million per hour?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>You need messages processed in order, but you also need throughput. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"These are in direct tension: <strong>ordering requires serial processing, throughput requires
+          parallel processing.</strong> You can't have both globally, so the design work is finding the smallest
+          scope that genuinely needs ordering."</p>
+        <p>"My first question would be <strong>what actually needs to be ordered</strong>, because 'we need
+          ordering' is almost always narrower than it sounds. Global ordering across all messages is very rarely a
+          real requirement — usually it's per entity: messages for <em>one</em> order, <em>one</em> account,
+          <em>one</em> device."</p>
+        <p>"If it's per entity, the answer is <strong>partition by that entity</strong>. In Service Bus that's a
+          <code>SessionId</code>; in Kafka it's the partition key. Same key means same partition means ordered
+          delivery to a single consumer — and different keys process in parallel."</p>
+        <p>"So with a thousand orders you get ordering within each order and a thousand-way parallelism across
+          them. That's the answer that satisfies both requirements, and it scales with entity count rather than
+          being capped."</p>
+        <p>"Two constraints to be honest about. <strong>Throughput is bounded by partition count</strong>, and in
+          Kafka you can't easily reduce partitions later, so that's a capacity decision made upfront. And
+          <strong>a hot key still serialises</strong> — if one account generates most of the traffic, that
+          partition is your bottleneck and adding consumers won't help, because you can't split a single key."</p>
+        <p>"The bigger point I'd make though: <strong>I'd first try to make ordering unnecessary</strong>, because
+          it's expensive beyond the throughput cost — it also creates the poison-message blocking problem, where
+          one permanently-failing message stalls everything behind it."</p>
+        <p>"Three ways to remove the requirement."</p>
+        <p>"<strong>Send state rather than deltas.</strong> This is the most useful reframing.
+          <code>SetQuantity(5)</code> is order-independent and idempotent — applying it twice or out of sequence
+          gives the same result. <code>AddQuantity(2)</code> is neither. So designing messages as facts about
+          current state rather than increments eliminates the whole category of problem."</p>
+        <p>"<strong>Include a version or sequence number</strong> and have the consumer ignore anything older than
+          what it has already applied. That <em>handles</em> out-of-order arrival rather than preventing it, so
+          you keep full parallelism."</p>
+        <p>"<strong>Make handlers commutative</strong> where the domain allows it, so order genuinely doesn't
+          affect the outcome."</p>
+        <p>"So my order of preference: design so ordering doesn't matter; if it does, partition by the entity that
+          needs it; and only consider global ordering if there's a genuine domain requirement — at which point
+          I'd want to understand it properly, because it means one consumer forever and that's a hard
+          ceiling."</p>
+        <p>"One practical detail: <strong>scaling consumers on a plain queue silently breaks ordering</strong>.
+          If a team adds instances to clear a backlog without realising the queue wasn't partitioned, they've
+          introduced a subtle correctness bug to fix a throughput problem — and it won't be obvious until
+          something processes out of sequence."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know ordering and throughput are fundamentally in tension?</li>
+        <li>Do you narrow the ordering scope to the entity?</li>
+        <li>Do you know about session ids and partition keys?</li>
+        <li>Do you try to eliminate the requirement first?</li>
+        <li>Do you know state-vs-delta messages matter?</li>
+        <li>Do you know hot keys still serialise?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "use one consumer" with no partitioning idea.</li>
+        <li><span class="redflag">Red flag:</span> claiming you can have both globally.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that scaling consumers breaks ordering.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if one entity produces 80% of the traffic?</li>
+          <li>How do you choose the partition count?</li>
+          <li>What happens to ordering when a consumer restarts?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

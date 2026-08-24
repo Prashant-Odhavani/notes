@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing &amp; Quality — SDLC</title>
+<meta name="description" content="Testing as a delivery concern: shift-left, quality gates that aren't theatre, environments, test data and non-functional testing.">
+<meta name="keywords" content="shift left testing quality gates test environments test data management regression UAT smoke test non-functional testing load soak spike test flaky tests QA role">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="29-sdlc/testing.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Testing &amp; Quality</h1>
+    <p class="subtitle">Testing as part of delivery rather than a phase — what runs where, who owns it, and
+      how quality gates stop being theatre.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="note info">
+    <div class="note-title">Scope of this page</div>
+    <p style="margin:0">This is testing as a <em>lifecycle</em> concern. The mechanics — test doubles,
+      xUnit, mocking, integration setup, coverage, flaky tests — are in
+      <a href="../17-testing/index.html">section 31</a>.</p>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>Shift-left = move each check as early as it can meaningfully run. That includes types, analysers
+        and contract tests — not just "write more unit tests".</li>
+      <li>A quality gate only counts if failing it actually blocks and someone acts. Gates people override
+        train the team to ignore signals.</li>
+      <li>Test <strong>strategy</strong> is the senior artefact: what's verified where, what's deliberately
+        not tested, and how fast the suite must stay.</li>
+      <li>Environment fidelity beats environment count.</li>
+      <li>Flaky tests are the most corrosive quality problem there is. Quarantine them the same day.</li>
+      <li>The team owns quality. QA owns testing <em>expertise</em>.</li>
+    </ul>
+  </div>
+
+  <h2 id="shift-left">Shift-left, properly understood <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>The mental model worth carrying is a ladder from cheapest feedback to most expensive:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>When</th><th>Mechanism</th><th>Feedback in</th><th>Catches</th></tr></thead>
+      <tbody>
+        <tr><td>While typing</td><td>Compiler, nullable reference types, analysers</td><td>Seconds</td><td>Type errors, null risk, API misuse, resource leaks</td></tr>
+        <tr><td>Before commit</td><td>Unit tests, format check</td><td>Seconds–minutes</td><td>Logic errors in isolated behaviour</td></tr>
+        <tr><td>On PR</td><td>Integration tests, contract tests, security scan</td><td>Minutes</td><td>Wiring errors, broken contracts, vulnerable dependencies</td></tr>
+        <tr><td>On merge</td><td>Full regression, migration dry-run, perf smoke</td><td>Tens of minutes</td><td>Cross-feature regressions, slow queries, migration failures</td></tr>
+        <tr><td>Pre-release</td><td>Exploratory testing, UAT, load test</td><td>Hours–days</td><td>Usability problems, capacity limits, unclear requirements</td></tr>
+        <tr><td>In production</td><td>Canary, flags, synthetics, real telemetry</td><td>Minutes–days</td><td>Everything earlier stages can't simulate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the row candidates forget</div>
+    <p style="margin:0">Some defects <strong>cannot</strong> be found before production at any reasonable
+      cost: real traffic shapes, real data skew, real third-party behaviour, real cache hit ratios.
+      <br><br>
+      Mature teams accept that and invest in making production failures <strong>small, detectable and
+      reversible</strong> — rather than pretending a staging environment eliminates them. Saying that reads
+      as experience, as long as you pair it with the controls that make it responsible: flags, canaries, and
+      a rollback trigger defined in advance.</p>
+  </div>
+
+  <h2 id="strategy">Owning a test strategy <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>It's usually half a page, and its main value is the explicit decisions about what <em>not</em> to test.
+    Four questions:</p>
+
+  <ol class="steps">
+    <li><strong>What must never break?</strong> Rank flows by cost of failure — money movement, data loss,
+      auth. Those get redundant coverage: unit + integration + a production synthetic check.</li>
+    <li><strong>Where is each behaviour verified?</strong> Domain rules at unit level. Persistence,
+      transactions and query correctness at integration level against a real database engine. A small number
+      of end-to-end journeys. Verifying the same rule at three levels is waste that also slows everyone down.</li>
+    <li><strong>What are we deliberately not testing?</strong> Third-party library internals, framework
+      behaviour, trivial getters, generated code, UI layout that changes weekly. Writing this down prevents
+      coverage-driven busywork.</li>
+    <li><strong>What's the time budget?</strong> PR feedback under about 10 minutes. Past that, people batch
+      changes and review less carefully.</li>
+  </ol>
+
+  <h2 id="gates">Quality gates that aren't theatre <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Gate</th><th>Works when</th><th>Becomes theatre when</th></tr></thead>
+      <tbody>
+        <tr><td>Tests must pass</td><td>The suite is trustworthy and fast</td><td>Flaky tests are re-run until green — this actively destroys trust</td></tr>
+        <tr><td>Coverage threshold</td><td>Applied as a delta on changed lines</td><td>A global percentage — people write assertion-free tests to hit it</td></tr>
+        <tr><td>Security scan</td><td>Findings are triaged and fixed</td><td>Thousands of unreviewed findings; everyone waives it</td></tr>
+        <tr><td>Manual sign-off</td><td>The signer has real information and authority</td><td>A rubber stamp for audit purposes</td></tr>
+        <tr><td>Performance check</td><td>A specific budget on a specific endpoint</td><td>"Performance test passed" with no baseline or threshold</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — flaky tests</div>
+    <p style="margin:0">This is the most corrosive quality problem a team can have, because it turns a red
+      build from <em>information</em> into <em>noise</em>. Once "just re-run it" is normal, genuine failures
+      get re-run too.
+      <br><br>
+      The only strategy that works: <strong>quarantine the flaky test out of the blocking suite
+      immediately</strong>, raise a ticket with an owner, fix or delete it within a fixed window. A deleted
+      flaky test is strictly better than a tolerated one.</p>
+  </div>
+
+  <h2 id="environments">Environments and test data <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p>The typical dysfunction: four environments, none matching production, all shared, all with stale data,
+    and a queue to use them.</p>
+
+  <ul>
+    <li><strong>Prefer ephemeral to shared.</strong> A database container per test run (Testcontainers)
+      removes the whole class of "someone else's test data broke mine" failures and lets tests run in
+      parallel.</li>
+    <li><strong>Fidelity where it matters.</strong> Run integration tests against the same database
+      <em>engine and version</em> as production. An in-memory provider will accept queries the real engine
+      rejects, and won't reproduce transaction, collation or index behaviour — so it gives false confidence
+      exactly where you needed real confidence.</li>
+    <li><strong>Never copy production data unmasked.</strong> It's a data-protection incident waiting to
+      happen. Use generated data plus a small, masked, curated set of real edge cases.</li>
+    <li><strong>Make setup explicit and local to the test.</strong> Shared fixtures produce tests that pass
+      or fail depending on execution order, and nobody can read a test to learn what it needs.</li>
+  </ul>
+
+  <h3 id="nfr-testing">Non-functional testing</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Question it answers</th><th>Practical note</th></tr></thead>
+      <tbody>
+        <tr><td>Load test</td><td>Does it hit its latency target at expected load?</td><td>Use realistic data volume and cache state. An empty database proves nothing</td></tr>
+        <tr><td>Stress test</td><td>Where does it break, and how?</td><td>You want graceful degradation (429s, shed load), not collapse</td></tr>
+        <tr><td>Soak test</td><td>Does it survive hours of sustained load?</td><td>Finds leaks, connection exhaustion, unbounded growth — invisible in short runs</td></tr>
+        <tr><td>Spike test</td><td>What happens on a sudden 10× burst?</td><td>Exercises autoscale reaction time and queue behaviour</td></tr>
+        <tr><td>Failure injection</td><td>What happens when a dependency dies?</td><td>Verify timeouts and circuit breakers actually fire</td></tr>
+        <tr><td>Security testing</td><td>Are the common vulnerability classes present?</td><td>Dependency scanning and SAST in CI; pen test before major releases</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Load testing a scaled-down environment and extrapolating linearly. Systems don't
+      degrade linearly — thread pools, connection pools, lock contention and cache hit ratios all have knees
+      in the curve. A test at 20% of production capacity mostly proves the code compiles.
+      <br><br>
+      If you can't test at scale, at least identify <em>which resource saturates first</em> and reason about
+      it explicitly.</p>
+  </div>
+
+  <h2 id="ownership">Who owns quality</h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>The team owns quality. QA specialists own testing <strong>expertise</strong>.</p>
+  </div>
+
+  <p>A dedicated QA function is valuable for exploratory testing, designing test strategy, adversarial
+    thinking developers are bad at on their own code, and representing the user's real workflow.</p>
+
+  <p>It's <em>not</em> valuable as a downstream gate that receives "finished" work and finds bugs a week
+    later. That guarantees long feedback loops and diffuses responsibility.</p>
+
+  <p><strong>The practical test:</strong> when a defect reaches production, is the reaction "QA missed it" or
+    "our process let it through — where would we have caught it earliest?" The first answer indicates the
+    broken model.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Move each check as early as it can meaningfully run — and accept that some can only run in production.</li>
+      <li>Write down what you deliberately don't test.</li>
+      <li>Keep PR feedback under ten minutes or the whole strategy degrades.</li>
+      <li>Integration tests need the real database engine, not an in-memory substitute.</li>
+      <li>Quarantine flaky tests the same day. They destroy trust in every other test.</li>
+      <li>Load-test with realistic data volume, or don't bother.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Coverage as a goal</strong>, producing tests with no assertions and false confidence.</li>
+    <li><strong>An E2E-heavy suite</strong>: slow, flaky, and it fails without telling you where the defect is.</li>
+    <li><strong>Mocking everything</strong>, so tests verify the mock configuration rather than the system.</li>
+    <li><strong>Testing implementation details</strong>, so every refactor breaks tests and the team learns
+      to distrust them.</li>
+    <li><strong>No test for the failure path</strong> — which is where the actual production defects live.</li>
+    <li><strong>Treating a passing pipeline as proof of correctness</strong> rather than absence of known
+      regressions.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What's your testing strategy for a new service?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I start from risk, not from the pyramid diagram. Which flows would be most expensive if they
+          broke — usually anything touching money, permissions or data integrity? Those get redundant
+          verification: unit tests for the rules, integration tests against a real database for persistence
+          and transactions, and a synthetic check running against production so we hear about a failure
+          before customers do."</p>
+        <p>"For the bulk of the code I want fast unit tests around domain logic with no infrastructure, and
+          integration tests for anything crossing a boundary — repositories, message handlers, HTTP
+          endpoints — using a real database in a container."</p>
+        <p>"I'd specifically avoid the in-memory provider. It doesn't enforce constraints or reproduce
+          transaction behaviour, so it passes tests that production would fail. That's worse than no test,
+          because it's confidence you haven't earned."</p>
+        <p>"Then a deliberately small number of end-to-end journeys — maybe five, critical paths only. They're
+          the slowest and flakiest thing in the suite and their cost grows faster than their value."</p>
+        <p>"I'd also write down what we're not testing: framework behaviour, third-party libraries, trivial
+          mapping. And I'd set a time budget — PR feedback under ten minutes — because once the suite is
+          slow, people batch changes and stop running it locally, and the whole strategy degrades regardless
+          of how good the tests are."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reason from risk, or recite the pyramid?</li>
+        <li>Do you know the real trade-offs of E2E tests and in-memory providers?</li>
+        <li>Do you treat suite speed as a design constraint?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "80% coverage" as the strategy.</li>
+        <li><span class="redflag">Red flag:</span> "unit test everything and mock all dependencies" — produces
+          tests that pass while the system is broken.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you test a message consumer end to end?</li>
+          <li>What's your view on the in-memory EF Core provider?</li>
+          <li>How do you keep integration tests isolated when they share a database?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>CI takes 45 minutes and people have started merging without waiting. What do you do?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The behaviour is the real problem. A gate people route around is worse than no gate, because it
+          creates the illusion of verification. So I'd treat suite duration as an incident for the delivery
+          process, not a nice-to-have."</p>
+        <p>"First, measure. Test suites are almost always dominated by a small number of tests — usually E2E
+          tests, tests with real sleeps, and integration tests that rebuild a database per test. Profiling
+          usually finds 10% of tests consuming 80% of the time."</p>
+        <p>"Then concrete moves. Parallelise across agents — the easiest win, often 4–5×. Replace
+          <code>Thread.Sleep</code> with proper waiting or deterministic time control. Share expensive setup
+          safely: one database container per test collection with per-test transaction rollback or unique
+          tenant IDs, rather than recreating it per test."</p>
+        <p>"Then split the pipeline by risk. Fast unit and integration tests block the PR; slow E2E and
+          performance tests run post-merge on main with alerting — so failures still surface but don't gate
+          every change."</p>
+        <p>"And I'd delete or quarantine tests that have never caught a regression but fail intermittently.
+          They're pure cost."</p>
+        <p>"Longer term, if E2E is where the time goes, that usually means coverage is at the wrong level.
+          Moving those assertions down to integration tests is both faster and gives better failure
+          localisation. I'd set an explicit ten-minute budget for the PR gate and treat exceeding it as a
+          build failure, so it doesn't creep back."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you treat developer feedback latency as a real engineering problem?</li>
+        <li>Do you know concrete techniques, or just "optimise the tests"?</li>
+        <li>Are you willing to delete tests?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you decide which tests are safe to move out of the blocking gate?</li>
+          <li>What if the slowness is one integration suite nobody understands?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A critical bug reached production despite passing tests and QA. How do you respond? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Fix and stabilise first — rollback or flag off, verify recovery, communicate. The analysis comes
+          after the bleeding stops."</p>
+        <p>"Then it should be blameless in a specific sense: look for the conditions that made the mistake
+          possible, not the person who made it."</p>
+        <p>"The question I want answered isn't 'who missed it' but 'at which point could this have been caught
+          most cheaply, and why wasn't it?' That usually lands in one of three places. The scenario was never
+          a requirement — so the gap is upstream, and the fix is a checklist question about that class of
+          failure. Or it wasn't testable at any level we run — it only shows up with production data skew or
+          concurrent traffic — and then the honest answer is that the fix is detection and rollback speed,
+          not more tests. Or the test existed but asserted the wrong thing."</p>
+        <p>"Then I'd write one or two specific actions with owners and dates: a regression test at the level
+          that would have caught it, and usually an alert that would have detected it in minutes instead of
+          hours."</p>
+        <p>"I'd resist adding a broad new process step like another manual sign-off. That slows every future
+          change to address one past failure and rarely catches the next one. Honestly, the most valuable
+          outcome is usually improved <em>detection</em>, not prevention — over a long enough period something
+          always gets through, and what distinguishes a good team is how fast they notice and how small the
+          blast radius was."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Blameless analysis instinct.</li>
+        <li>Do you accept that some defects can't be prevented economically?</li>
+        <li>Are your corrective actions proportionate and specific?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "QA should have caught it."</li>
+        <li><span class="redflag">Red flag:</span> "add more manual testing before release."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the same class of bug recurs three months later?</li>
+          <li>How would you have detected this in production within five minutes?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

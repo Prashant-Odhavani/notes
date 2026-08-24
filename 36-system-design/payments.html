@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Payment Processing System — System Design Exercises</title>
+<meta name="description" content="A worked design: idempotency, the state machine, webhooks, reconciliation, refunds, and never storing card data.">
+<meta name="keywords" content="payment system design idempotency key state machine payment intent webhook handling signature verification reconciliation refunds chargebacks PCI DSS SAQ A tokenization double charge ledger money handling">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/payments.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Payment Processing System</h1>
+    <p class="subtitle">Money makes every distributed-systems problem consequential. The design is mostly about
+      making failure detectable and recoverable rather than preventing it.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Assumed answer</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Do we handle card data?</td><td><strong>No — a provider does</strong></td><td>Keeps us out of PCI scope. Non-negotiable</td></tr>
+        <tr><td>Provider?</td><td>Stripe-like, with idempotency keys and webhooks</td><td>Their primitives shape ours</td></tr>
+        <tr><td>What's unacceptable?</td><td><strong>Double-charging; losing a payment record</strong></td><td>Drives idempotency and reconciliation</td></tr>
+        <tr><td>Refunds and partial refunds?</td><td>Yes</td><td>Payment isn't a single event; it's a lifecycle</td></tr>
+        <tr><td>Volume?</td><td>Thousands per day, peaks of tens per second</td><td><strong>Not a scale problem at all</strong></td></tr>
+        <tr><td>Regulatory?</td><td>SCA/3DS in the EU; full audit trail required</td><td>Async approval steps; immutable history</td></tr>
+        <tr><td>Out of scope</td><td>Pricing, tax calculation, invoicing, payouts</td><td>Focus on charge correctness</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — say clearly that this is not a scale problem</div>
+    <p style="margin:0">Tens of transactions a second is trivially within a single relational database. So a candidate
+      who starts sharding, or reaches for an eventually-consistent store, has misread the question.
+      <br><br>
+      <strong>The difficulty here is correctness under partial failure</strong>, not throughput. Specifically: what
+      happens when you call the provider and don't get a response? What happens when the charge succeeds and your
+      database write fails? How do you know, hours later, whether the money moved?
+      <br><br>
+      Which means the design choices are the opposite of a high-scale system: <strong>a single relational database
+      with real transactions</strong>, strong consistency everywhere, and an append-only audit trail. Boring, and
+      correct.
+      <br><br>
+      Saying that explicitly — "I'd use SQL with transactions because the volumes don't justify anything else and I
+      want the strongest consistency I can get" — is a stronger answer than proposing something distributed, because
+      it shows you're matching the design to the actual risk.</p>
+  </div>
+
+  <h2 id="pci">Staying out of PCI scope <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rule</th><th>Reason</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Card details never touch your servers</strong></td><td>Hosted fields or a redirect; the browser posts directly to the provider</td></tr>
+        <tr><td><strong>You store a token, never a number</strong></td><td>A token is useless elsewhere</td></tr>
+        <tr><td><strong>Never log a request body</strong> on a payment path</td><td>Logs are widely readable and long-lived</td></tr>
+        <tr><td>Store only the last four digits and brand</td><td>Enough for a user to recognise the card</td></tr>
+        <tr><td>Provider's SDK for the collection UI</td><td><strong>Keeps you at SAQ A</strong>, the lightest assessment</td></tr>
+        <tr><td>Webhook signatures verified</td><td>Otherwise anyone can claim a payment succeeded</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The single most valuable architectural decision is never seeing the card number</div>
+    <p style="margin:0">Using the provider's hosted fields — an iframe, or a redirect — means the card details go from
+      the customer's browser <strong>directly to the provider</strong> and never through your infrastructure. You
+      receive a token.
+      <br><br>
+      That drops your PCI DSS obligation to <strong>SAQ A</strong>, the simplest self-assessment questionnaire. If
+      card data touches your servers, you're at SAQ D: penetration testing, network segmentation, formal key
+      management, quarterly scans, and an annual audit. That's a substantial and permanent cost, in engineering time
+      as much as money.
+      <br><br>
+      So the decision isn't primarily about security posture — it's about <strong>compliance scope</strong>, and it's
+      one of the clearest cost-reduction decisions available in a payment design. Worth stating in those terms.
+      <br><br>
+      The related discipline: <strong>never log request bodies on payment endpoints.</strong> A well-meaning debug log
+      that captures the full request can put card data in your log store, which puts your log store in PCI scope, and
+      it will be a compliance finding even though nothing was breached. This is one of the few places where a logging
+      decision has regulatory consequences.
+      <br><br>
+      And <strong>verify webhook signatures</strong>. An unverified webhook endpoint means anyone who knows the URL
+      can POST "payment succeeded" and receive goods for free.</p>
+  </div>
+
+  <h2 id="idempotency">Idempotency <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — the window that causes double charges"><code class="language-text">  Client            Your API                Provider
+    |                  |                       |
+    |--- POST pay ---->|                       |
+    |                  |---- charge ---------->|
+    |                  |                       |  charge SUCCEEDS
+    |                  |<--- x  timeout  --x---|  response LOST
+    |                  |                       |
+    |   no response    |  you do not know if the money moved
+    |   client retries |
+    |--- POST pay ---->|---- charge ---------->|  WITHOUT an idempotency key,
+    |                  |                       |  this charges AGAIN
+</code></pre>
+
+  <pre data-label="csharp — client key, unique index, provider key" class="code-good"><code class="language-csharp">public async Task&lt;PaymentResult&gt; PayAsync(PayRequest req, CancellationToken ct)
+{
+    // 1. The key comes from the CLIENT, per logical payment attempt.
+    //    Generated server-side would give a retry a new key and defeat the point.
+    var attempt = new PaymentAttempt
+    {
+        IdempotencyKey = req.IdempotencyKey,     // UNIQUE INDEX on (TenantId, Key)
+        OrderId        = req.OrderId,
+        AmountMinor    = req.AmountMinor,
+        Currency       = req.Currency,
+        Status         = PaymentStatus.Pending
+    };
+
+    try
+    {
+        // 2. Insert FIRST. The database arbitrates, not an application check.
+        _db.PaymentAttempts.Add(attempt);
+        await _db.SaveChangesAsync(ct);
+    }
+    catch (DbUpdateException e) when (e.IsUniqueViolation())
+    {
+        // A retry, or a concurrent duplicate. Return the ORIGINAL outcome.
+        var existing = await _db.PaymentAttempts
+            .SingleAsync(a =&gt; a.IdempotencyKey == req.IdempotencyKey, ct);
+
+        return existing.Status switch
+        {
+            PaymentStatus.Succeeded =&gt; PaymentResult.From(existing),
+            PaymentStatus.Failed    =&gt; PaymentResult.From(existing),
+            // Still in flight - do NOT charge again. Tell the client to poll.
+            _                       =&gt; PaymentResult.InProgress(existing.Id)
+        };
+    }
+
+    // 3. Pass the same key to the provider, so even if OUR logic fails,
+    //    THEY deduplicate. Defence in depth, and free.
+    var result = await _provider.ChargeAsync(new ChargeRequest
+    {
+        Token          = req.PaymentToken,
+        AmountMinor    = req.AmountMinor,
+        Currency       = req.Currency,
+        IdempotencyKey = req.IdempotencyKey
+    }, ct);
+
+    attempt.Apply(result);                       // Succeeded / Failed / RequiresAction
+    await _db.SaveChangesAsync(ct);
+    return PaymentResult.From(attempt);
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Three layers, and each covers a different failure</div>
+    <p style="margin:0"><strong>The client-generated key</strong> is what makes a retry recognisable as the same
+      logical attempt. Generated server-side, every retry gets a new key and deduplicates nothing — which is the most
+      common way this is implemented wrongly.
+      <br><br>
+      <strong>The unique index</strong> is what makes it correct under concurrency. An application-level "have we
+      already processed this key?" check is a check-then-act race that both callers pass. Insert first and let the
+      constraint decide.
+      <br><br>
+      <strong>Passing the key to the provider</strong> covers the case where your own logic is wrong or your process
+      dies between the insert and the charge. The provider then returns the original charge rather than creating a
+      second one. It costs nothing and it's the layer that saves you when the other two have a gap.
+      <br><br>
+      The subtle case worth calling out is the <strong><code>Pending</code></strong> branch. If a duplicate arrives
+      while the first attempt is still in flight, you must <em>not</em> charge — but you also can't return a result you
+      don't have. Returning "in progress, poll this id" is correct. Returning an error invites another retry, and
+      charging is a double charge.
+      <br><br>
+      And <strong>record intent before acting</strong>: the row exists before the charge is attempted. So a process
+      that dies mid-charge leaves evidence that a charge may have happened, which reconciliation can resolve. The
+      reverse order leaves money moved with no record at all — which is the one genuinely unrecoverable
+      state.</p>
+  </div>
+
+  <h2 id="state-machine">The state machine <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — explicit states, and transitions only in one direction"><code class="language-text">                     Pending
+                    /   |    \
+                   /    |     \
+      RequiresAction  Failed   Succeeded
+        (3DS/SCA)               /      \
+             |                 /        \
+             +--> Succeeded   /    PartiallyRefunded --> Refunded
+             +--> Failed     /              |
+                            +--> Disputed --+--> ChargebackLost
+                                            +--> ChargebackWon
+
+RULES:
+  - transitions are append-only events; the row's status is a projection
+  - a terminal state is never left except by an explicit new event
+  - unknown provider status  ->  stay Pending, let reconciliation resolve it
+  - NEVER delete or overwrite history. Money needs an audit trail.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — model it as events, and never guess a state</div>
+    <p style="margin:0">Two design choices carry most of the weight here.
+      <br><br>
+      <strong>Append-only transitions.</strong> Every state change is a recorded event with a timestamp, a source
+      (API, webhook, reconciliation, manual) and the provider's reference. The current status is a projection of
+      those. That gives you an audit trail that's a regulatory requirement, and it makes "why is this payment in this
+      state?" answerable months later. Overwriting a status column loses exactly the information you need during a
+      dispute.
+      <br><br>
+      <strong>Never infer a state you don't have.</strong> If a provider call times out, the correct status is
+      <strong><code>Pending</code></strong> — not <code>Failed</code>. Marking it failed is the dangerous move: the
+      customer may have been charged, and now your records say otherwise, so nothing will ever reconcile it and the
+      customer has to notice.
+      <br><br>
+      <code>Pending</code> is uncomfortable and it's honest: <em>we don't know</em>. Reconciliation resolves it
+      against the provider, which is exactly what reconciliation is for.
+      <br><br>
+      That principle generalises: <strong>an unknown outcome is a distinct state, not a failure.</strong> Collapsing
+      "we don't know" into "it failed" is how money goes missing in ledgers — and it's the single most common modelling
+      error in payment systems.</p>
+  </div>
+
+  <h2 id="webhooks">Webhooks <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Requirement</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Verify the signature</strong></td><td>Otherwise anyone can claim a payment succeeded</td></tr>
+        <tr><td><strong>Return 200 fast; process asynchronously</strong></td><td>Slow handlers get retried, then disabled</td></tr>
+        <tr><td><strong>Idempotent by event id</strong></td><td><strong>Webhooks are delivered more than once</strong></td></tr>
+        <tr><td><strong>Handle out-of-order arrival</strong></td><td><code>refunded</code> can arrive before <code>succeeded</code></td></tr>
+        <tr><td><strong>Ignore unknown event types</strong></td><td>Providers add events; don't fail on them</td></tr>
+        <tr><td>Don't trust amounts blindly</td><td>Verify against your own record</td></tr>
+        <tr><td>Reconcile anyway</td><td><strong>A webhook can be missed entirely</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Webhooks are notifications, not a source of truth</div>
+    <p style="margin:0">Treating a webhook as authoritative is the mistake. They arrive twice, out of order, late,
+      or — if your endpoint was down long enough for the provider to give up — <strong>not at all</strong>.
+      <br><br>
+      So the handler's job is narrow: verify the signature, record the event by its id (unique index, so redelivery is
+      a no-op), return 200 immediately, and process from a queue. A handler that does real work inline gets retried
+      because it was slow, and providers eventually disable an endpoint that keeps failing.
+      <br><br>
+      Out-of-order handling matters concretely: a <code>refund.succeeded</code> arriving before
+      <code>payment.succeeded</code> must not crash and must not leave the payment marked as merely refunded with no
+      record of the charge. Use the provider's event timestamp or sequence to reject anything older than what you've
+      already applied — <a href="../35-scaling-scenarios/distributed.html#ordering">version-based rejection</a> rather
+      than enforcing order.
+      <br><br>
+      And the crucial point: <strong>the webhook is a fast path, not the guarantee.</strong> The guarantee is
+      reconciliation. If you rely on webhooks alone, a few hours of endpoint downtime means permanently missing
+      payments in your records — and you'd never know which ones.</p>
+  </div>
+
+  <h2 id="reconciliation">Reconciliation <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mismatch</th><th>Meaning</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Provider has a charge, we don't</strong></td>
+          <td><strong>Charged and unrecorded — the worst case</strong></td>
+          <td>Investigate; fulfil or refund. Always alert</td>
+        </tr>
+        <tr>
+          <td>We have <code>Pending</code>, provider has succeeded</td>
+          <td>A lost response or a missed webhook</td>
+          <td>Mark succeeded, complete fulfilment</td>
+        </tr>
+        <tr>
+          <td>We have <code>Pending</code>, provider has nothing</td>
+          <td>The charge never happened</td>
+          <td>Mark failed after a grace period</td>
+        </tr>
+        <tr>
+          <td>Amounts differ</td>
+          <td>A partial capture, currency conversion, or a bug</td>
+          <td>Investigate individually</td>
+        </tr>
+        <tr>
+          <td>We have succeeded, provider has refunded</td>
+          <td>A missed refund webhook</td>
+          <td>Apply the refund; check fulfilment</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — reconciliation is the design, not an afterthought</div>
+    <p style="margin:0">Most candidates describe the happy path and idempotency. Reconciliation is what separates a
+      design that <em>mostly</em> works from one you'd trust with money.
+      <br><br>
+      The reasoning is unavoidable: <strong>you cannot make a charge at a provider and a write to your database
+      atomic.</strong> There is no transaction spanning both. So a window exists where they disagree, and no amount of
+      care in the code closes it — you can only make the disagreement <em>detectable</em>.
+      <br><br>
+      Which means a scheduled job — daily at minimum, hourly for higher volumes — that fetches provider transactions
+      for a period and compares them against your records. Every mismatch is either resolved automatically or raised
+      for a human.
+      <br><br>
+      Two things that make it genuinely useful rather than theatre. <strong>Alert on mismatch count</strong>, because
+      a job that logs discrepancies nobody reads is worse than none — it creates the impression of coverage.
+      And <strong>decide the policy in advance</strong> for the hard case: a charge the provider has and you don't.
+      Refund it, or honour it and fix records? That's a business decision, and having made it beforehand means nobody
+      guesses at 2am.
+      <br><br>
+      The same reasoning applies to <code>Pending</code> attempts that never resolved: a sweeper queries the provider
+      after a grace period and settles them, rather than leaving rows in limbo forever.</p>
+  </div>
+
+  <h2 id="refunds">Refunds, disputes and the ledger <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="note tip">
+    <div class="note-title">A refund is a new transaction, not an undo</div>
+    <p style="margin:0">This is the same distinction as <a href="../35-scaling-scenarios/distributed.html#partial">
+      compensation versus rollback</a>, and here it's literal: the original charge <strong>still happened</strong>.
+      The customer sees a charge and a credit on their statement, the card fees on the original may not be returned,
+      and both appear in your accounting.
+      <br><br>
+      So refunds are modelled as their own records linked to the payment, with their own idempotency keys, their own
+      states, and support for <strong>partial and multiple</strong> refunds — the sum of which must never exceed the
+      original amount. That last constraint belongs in the database, enforced by a check on insert, not in application
+      logic.
+      <br><br>
+      <strong>Disputes and chargebacks</strong> are worse, because they're initiated externally and arrive as
+      webhooks. You have a fixed window to submit evidence, so the system needs to notify someone and record what was
+      submitted — a chargeback lost by default because nobody saw the notification is a pure and avoidable loss.
+      <br><br>
+      On the <strong>ledger</strong>: for anything beyond simple payments, a double-entry ledger — every movement as
+      balanced entries, append-only — is worth the effort. It makes the books provably balanced and it's what finance
+      teams and auditors expect. A single <code>Balance</code> column that gets updated is very hard to audit and
+      impossible to explain once it's wrong.
+      <br><br>
+      And always store money as <strong>minor units in an integer</strong> with an explicit currency.
+      <code>decimal</code> is acceptable; <code>double</code> is a genuine defect, because binary floating point
+      cannot represent 0.10 exactly and the errors accumulate silently across sums.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>This is a correctness problem, not a scale problem — a single SQL database with transactions.</li>
+      <li>Never let card data touch your servers; that's the difference between SAQ A and SAQ D.</li>
+      <li>Never log request bodies on payment paths.</li>
+      <li>Idempotency in three layers: client key, unique index, provider key.</li>
+      <li>Insert first — an application-level duplicate check is a race.</li>
+      <li>A duplicate arriving mid-flight gets "in progress", not an error and not a charge.</li>
+      <li>Record intent before charging; the reverse leaves money moved with no record.</li>
+      <li>Append-only state transitions — the status is a projection.</li>
+      <li>An unknown outcome is <code>Pending</code>, never <code>Failed</code>.</li>
+      <li>Webhooks are a fast path: verify signature, dedupe by event id, return 200, process async.</li>
+      <li>Handle out-of-order webhooks by timestamp rejection.</li>
+      <li>Reconciliation is the guarantee, because charge and write can't be atomic.</li>
+      <li>Alert on mismatches, and pre-decide the policy for a charge you have no record of.</li>
+      <li>A refund is a new transaction; enforce the total in the database.</li>
+      <li>Money as integer minor units with a currency — never <code>double</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Design a payment system. What can go wrong, and how do you handle it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+      <span class="s-label">How I'd answer</span>
+      <p>"I'd start by saying what this <em>isn't</em>: at thousands of payments a day it's not a scale problem. A
+        single relational database with real transactions is the right choice, and I'd want the strongest consistency
+        available. <strong>The difficulty is correctness under partial failure.</strong>"</p>
+      <p>"<strong>First decision, and the highest-value one: card data never touches our servers.</strong> The
+        provider's hosted fields or a redirect, so details go from the browser straight to them and we get a token.
+        That's the difference between PCI SAQ A and SAQ D — penetration testing, segmentation, key management,
+        quarterly scans, an annual audit. It's a compliance-scope decision as much as a security one."</p>
+      <p>"Related: <strong>never log request bodies on payment endpoints.</strong> A debug log capturing the full
+        request puts card data in your log store and your log store in PCI scope — a compliance finding with nothing
+        actually breached."</p>
+      <p>"<strong>The central failure is the lost response.</strong> We call the provider, the charge succeeds, and the
+        response never arrives — a timeout, a dropped connection, our process dying. We don't know whether the money
+        moved. If the client retries and we charge again, we've double-charged, and nothing was broken: the provider
+        behaved correctly and so did we."</p>
+      <p>"That's why <strong>idempotency is a design requirement rather than a bug fix</strong>, and I'd do it in
+        three layers."</p>
+      <p>"<strong>A client-generated idempotency key</strong> per logical attempt. Generated server-side, every retry
+        gets a new key and deduplicates nothing — that's the most common wrong implementation."</p>
+      <p>"<strong>A unique index</strong> on that key, and we insert first and treat a constraint violation as a
+        duplicate. An application-level 'have we processed this?' check is check-then-act, which both concurrent
+        callers pass. <strong>The database has to be the arbiter, not the code.</strong>"</p>
+      <p>"<strong>The same key passed to the provider</strong>, so even if our logic has a gap, they deduplicate. It's
+        free and it's the layer that saves you."</p>
+      <p>"There's a subtle case in the duplicate path: if the first attempt is still <code>Pending</code>, I must not
+        charge, and I can't return a result I don't have. So I return 'in progress, poll this id'. Returning an error
+        invites another retry; charging is a double charge."</p>
+      <p>"<strong>On state modelling, two rules.</strong> Transitions are <strong>append-only events</strong> — status
+        is a projection — because money needs an audit trail and 'why is this payment in this state?' has to be
+        answerable months later during a dispute."</p>
+      <p>"And <strong>never infer a state you don't have.</strong> A timeout means <code>Pending</code>, not
+        <code>Failed</code>. Marking it failed is dangerous: the customer may have been charged while our records say
+        otherwise, so nothing will reconcile it and the customer has to notice. <strong>An unknown outcome is a
+        distinct state, not a failure</strong> — collapsing those is how money goes missing."</p>
+      <p>"<strong>Webhooks</strong> for asynchronous outcomes — 3DS completion, refunds, disputes. Verify the
+        signature, or anyone who knows the URL can claim a payment succeeded. Dedupe by event id, because webhooks are
+        delivered more than once. Return 200 immediately and process from a queue, because slow handlers get retried
+        and eventually disabled. And handle out-of-order arrival — a refund event can arrive before the charge
+        event — by rejecting anything older than what's been applied."</p>
+      <p>"But I'd be explicit that <strong>webhooks are a fast path, not the guarantee.</strong>"</p>
+      <p>"<strong>The guarantee is reconciliation</strong>, and this is the part I'd emphasise most. You
+        <em>cannot</em> make a charge at a provider and a database write atomic — there's no transaction spanning both.
+        So a window exists where they disagree and no amount of careful code closes it. You can only make it
+        detectable."</p>
+      <p>"So: a scheduled job comparing provider transactions against our records. Anything in <code>Pending</code>
+        past a grace period gets queried and settled. A charge they have and we don't is alerted immediately — that's
+        the worst case, a customer charged with nothing recorded."</p>
+      <p>"Two things that make it real rather than theatre. <strong>Alert on the mismatch count</strong>, because a job
+        logging discrepancies nobody reads creates a false sense of coverage. And <strong>pre-decide the
+        policy</strong> for a charge with no record: refund, or honour and fix. That's a business decision, and having
+        made it in advance means nobody guesses during an incident."</p>
+      <p>"<strong>A few things I'd get right in the data model.</strong> Money as integer minor units with an explicit
+        currency — <code>double</code> is a genuine defect, since binary floating point can't represent 0.10 and errors
+        accumulate. Refunds as their own records with their own idempotency keys, supporting partial and multiple
+        refunds, with the constraint that the total never exceeds the original <em>enforced in the
+        database</em>. And a refund modelled as a new transaction, because the original charge still happened —
+        the customer sees both on their statement."</p>
+    </div>
+    <h5>What they're really checking</h5>
+    <ul>
+      <li>Do you keep card data out of scope, and explain why in compliance terms?</li>
+      <li>Do you identify the lost-response window as the core problem?</li>
+      <li>Do you use a client key, a unique index and the provider's key?</li>
+      <li>Do you know a timeout means Pending, not Failed?</li>
+      <li>Do you treat webhooks as unreliable and reconciliation as the guarantee?</li>
+      <li>Do you pre-decide the mismatch policy?</li>
+      <li>Do you get money representation right?</li>
+    </ul>
+    <h5>Weak answers</h5>
+    <ul>
+      <li><span class="redflag">Red flag:</span> no idempotency mechanism.</li>
+      <li><span class="redflag">Red flag:</span> marking a timeout as failed.</li>
+      <li><span class="redflag">Red flag:</span> treating webhooks as guaranteed, with no reconciliation.</li>
+      <li><span class="redflag">Red flag:</span> storing amounts as floating point.</li>
+    </ul>
+    <div class="followups">
+      <div class="note-title">Likely follow-ups</div>
+      <ul>
+        <li>The provider charged and your write failed. Walk me through the recovery.</li>
+        <li>How do you handle 3DS, where approval happens out of band?</li>
+        <li>Why a double-entry ledger rather than a balance column?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

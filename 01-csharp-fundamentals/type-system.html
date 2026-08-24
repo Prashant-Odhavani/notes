@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Types &amp; Memory Layout — C# Fundamentals</title>
+<meta name="description" content="Value vs reference types, stack vs heap, boxing, class vs struct vs record, string immutability, equality and nullable reference types - explained simply with C# examples.">
+<meta name="keywords" content="value type reference type stack heap boxing unboxing class vs struct record readonly struct string immutable equality GetHashCode nullable reference types csharp interview">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="01-csharp-fundamentals/type-system.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Types &amp; Memory Layout</h1>
+    <p class="subtitle">The single highest-value C# topic for interviews. Almost every "why did that
+      happen?" bug in .NET traces back to something on this page.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Value type</strong> — assignment <em>copies</em> the data. <strong>Reference type</strong>
+        — assignment copies the <em>address</em>, so both variables see one object.</li>
+      <li>Value types: <code>int</code>, <code>bool</code>, <code>decimal</code>, <code>DateTime</code>,
+        <code>struct</code>, <code>enum</code>. Reference types: <code>class</code>,
+        <code>interface</code>, <code>string</code>, arrays, delegates.</li>
+      <li><strong>Boxing</strong> = putting a value type on the heap so it can be treated as
+        <code>object</code>. Allocates. In a hot loop, it hurts.</li>
+      <li><code>string</code> is a <em>reference type</em> that <em>behaves</em> like a value — immutable,
+        with value equality.</li>
+      <li><code>record</code> gives you value equality and a <code>with</code> expression. Use it for data,
+        not for entities with identity.</li>
+      <li>Override <code>Equals</code>? You <strong>must</strong> override <code>GetHashCode</code> too, or
+        your objects go missing in dictionaries.</li>
+    </ul>
+  </div>
+
+  <h2 id="value-vs-reference">Value types vs reference types <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A <strong>value type</strong> variable holds <em>the thing itself</em>. Copy it and you get two
+      independent things.</p>
+    <p>A <strong>reference type</strong> variable holds <em>directions to the thing</em>. Copy it and you
+      get two sets of directions to <em>one</em> thing.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>Value type = a photocopy.</strong> I photocopy a document and hand it to you. You scribble
+      on yours; mine is untouched.</p>
+    <p><strong>Reference type = a shared Google Doc link.</strong> I send you the link. You edit it, and I
+      see the change immediately — because there was only ever one document.</p>
+  </div>
+
+  <h3 id="see-the-difference">See it happen</h3>
+
+  <pre data-label="csharp — reference type: one object, two variables"><code class="language-csharp">public class OrderClass { public int Total; }
+
+var a = new OrderClass { Total = 100 };
+var b = a;              // copies the ADDRESS
+b.Total = 500;
+
+Console.WriteLine(a.Total);   // 500  <- a changed too</code></pre>
+
+  <pre data-label="csharp — value type: two independent copies"><code class="language-csharp">public struct OrderStruct { public int Total; }
+
+var x = new OrderStruct { Total = 100 };
+var y = x;              // copies the DATA
+y.Total = 500;
+
+Console.WriteLine(x.Total);   // 100  <- x is untouched</code></pre>
+
+  <p>Same code shape, opposite result. The only difference is <code>class</code> versus
+    <code>struct</code>.</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake — the one that bites in real code</div>
+    <p style="margin:0">Passing a <code>List&lt;T&gt;</code> into a method and being surprised that the
+      caller's list changed.</p>
+    <pre data-label="csharp — this modifies the caller's list" class="code-bad"><code class="language-csharp">void AddDefaults(List&lt;string&gt; items)
+{
+    items.Add("default");        // the CALLER's list now has this
+}</code></pre>
+    <p style="margin:0"><code>List&lt;T&gt;</code> is a reference type. You didn't get a copy of the list —
+      you got directions to it. If you want the caller protected, take
+      <code>IReadOnlyList&lt;T&gt;</code> or copy it yourself.</p>
+  </div>
+
+  <h3 id="ref-vs-out">What about <code>ref</code>? <span class="lvl lvl-i">🟡 Intermediate</span></h3>
+
+  <p><code>ref</code> passes the <em>variable itself</em>, not its contents. That lets you reassign what the
+    caller's variable points at:</p>
+
+  <pre data-label="csharp — with and without ref"><code class="language-csharp">void Replace(List&lt;string&gt; list)      { list = new List&lt;string&gt; { "new" }; }
+void ReplaceRef(ref List&lt;string&gt; list) { list = new List&lt;string&gt; { "new" }; }
+
+var items = new List&lt;string&gt; { "old" };
+
+Replace(items);
+Console.WriteLine(items[0]);      // "old"  - reassigned only the local parameter
+
+ReplaceRef(ref items);
+Console.WriteLine(items[0]);      // "new"  - reassigned the caller's variable</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Reference type ≠ passed by reference.</p>
+    <p>By default C# passes the <em>reference by value</em>. You can change the object's contents, but you
+      can't repoint the caller's variable — unless you use <code>ref</code>.</p>
+  </div>
+
+  <h2 id="stack-heap">Stack and heap <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>The <strong>stack</strong> is a small, fast scratchpad tied to the currently running method. It's
+      cleaned up automatically when the method returns.</p>
+    <p>The <strong>heap</strong> is a large shared area for objects that must outlive the method. The
+      garbage collector cleans it up later.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>The stack is your desk — you pile things on it while you work, and it's swept clean when you finish
+      the task.</p>
+    <p>The heap is the warehouse. Things live there long-term, and someone has to come round and clear out
+      what nobody references any more.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Stack</th><th>Heap</th></tr></thead>
+      <tbody>
+        <tr><td>Holds</td><td>Locals, parameters, and value types <em>declared as locals</em></td><td>Objects (all reference types), and value types that are <em>fields of</em> an object</td></tr>
+        <tr><td>Cleanup</td><td>Automatic on method return</td><td>Garbage collector</td></tr>
+        <tr><td>Speed</td><td>Very fast — just moves a pointer</td><td>Slower to allocate; costs GC work later</td></tr>
+        <tr><td>Size</td><td>Small (~1 MB per thread by default)</td><td>Large</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The nuance that impresses <span class="pill pill-senior">⭐ Senior-level</span></div>
+    <p style="margin:0">"Value types live on the stack" is the textbook answer and it's <strong>not
+      quite true</strong>.
+      <br><br>
+      A value type lives <em>wherever its container lives</em>. An <code>int</code> local sits on the stack.
+      An <code>int</code> field inside a class sits on the heap, inside that object. A struct captured by a
+      lambda or held in an <code>async</code> method's state machine also ends up on the heap.
+      <br><br>
+      Saying that — and adding that the stack/heap split is a CLR implementation detail, not a language
+      guarantee — is a strong senior answer.</p>
+  </div>
+
+  <h2 id="boxing">Boxing and unboxing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Boxing</strong> wraps a value type in an object on the heap, so it can be used where an
+      <code>object</code> is expected.</p>
+    <p><strong>Unboxing</strong> pulls the value back out — and it requires a cast, which can fail.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>You have a £5 note. To post it, you put it in an envelope — that's boxing. The envelope is a new
+      thing that had to be created, and it's not free.</p>
+    <p>Do that once and nobody cares. Do it a million times in a loop and you've generated a million
+      envelopes for the bin collector to deal with.</p>
+  </div>
+
+  <pre data-label="csharp — boxing, visible"><code class="language-csharp">int number = 42;
+
+object boxed = number;        // BOXING: allocates on the heap
+int unboxed = (int)boxed;     // UNBOXING: copies the value back out
+
+// This throws InvalidCastException - the box holds an int, not a long
+long wrong = (long)boxed;</code></pre>
+
+  <h3 id="boxing-hidden">Where boxing hides</h3>
+
+  <p>Explicit boxing is rare. The problem is the accidental kind:</p>
+
+  <pre data-label="csharp — bad: boxes on every iteration" class="code-bad"><code class="language-csharp">// 1. Old non-generic collections - boxes every single item
+var list = new System.Collections.ArrayList();
+for (var i = 0; i &lt; 1_000_000; i++) list.Add(i);      // 1M boxes
+
+// 2. String concatenation with a value type
+string s = "Count: " + 42;                             // 42 gets boxed
+
+// 3. Non-generic Equals / interfaces
+int x = 5;
+bool same = x.Equals((object)5);                        // boxes the argument</code></pre>
+
+  <pre data-label="csharp — generics avoid it entirely" class="code-good"><code class="language-csharp">// Generic collections are typed - no boxing
+var list = new List&lt;int&gt;();
+for (var i = 0; i &lt; 1_000_000; i++) list.Add(i);       // zero boxes
+
+// Interpolation with a value type calls the type's own ToString
+string s = $"Count: {42}";                              // no boxing in modern .NET</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Generics exist largely to eliminate boxing.</strong></p>
+    <p>Before C# 2.0, storing an <code>int</code> in a collection meant boxing it. That's why
+      <code>ArrayList</code> is a museum piece and <code>List&lt;T&gt;</code> is what you use.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Keep it in proportion</div>
+    <p style="margin:0">Boxing is a <strong>hot-path</strong> concern. One box in a request handler is
+      irrelevant. A million boxes inside a tight loop shows up in a profiler as GC pressure.
+      <br><br>
+      In an interview, say that. "I'd avoid it in a loop over a large collection; I wouldn't restructure
+      readable code to remove a single box" is a better answer than treating all allocation as evil.</p>
+  </div>
+
+  <h2 id="class-struct">class vs struct — how to choose <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>class</code></th><th><code>struct</code></th></tr></thead>
+      <tbody>
+        <tr><td>Kind</td><td>Reference type</td><td>Value type</td></tr>
+        <tr><td>Assignment</td><td>Copies the reference</td><td>Copies all the data</td></tr>
+        <tr><td>Default equality</td><td>Reference equality (same object?)</td><td>Value equality (same contents?)</td></tr>
+        <tr><td>Can be <code>null</code></td><td>Yes</td><td>Only as <code>Nullable&lt;T&gt;</code> / <code>T?</code></td></tr>
+        <tr><td>Inheritance</td><td>Yes</td><td>No (can implement interfaces)</td></tr>
+        <tr><td>Allocation</td><td>Heap, always</td><td>Inline — wherever it's declared</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>The practical rule:</strong> use a <code>class</code> unless <em>all</em> of these are true:</p>
+
+  <ol class="steps">
+    <li>It logically represents a single value (a point, a money amount, a date range).</li>
+    <li>It's small — roughly 16 bytes or less.</li>
+    <li>It's immutable.</li>
+    <li>It won't be boxed frequently.</li>
+  </ol>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — the mutable struct</div>
+    <p style="margin:0">This is the classic C# gotcha, and it's worth being able to explain:</p>
+    <pre data-label="csharp — the update silently does nothing" class="code-bad"><code class="language-csharp">struct Counter { public int Value; }
+
+var counters = new List&lt;Counter&gt; { new Counter { Value = 0 } };
+
+counters[0].Value = 5;        // won't even compile - "cannot modify the return value"
+
+var c = counters[0];          // this compiles...
+c.Value = 5;                  // ...but modifies a COPY
+Console.WriteLine(counters[0].Value);   // 0 - the list is unchanged</code></pre>
+    <p style="margin:0"><code>counters[0]</code> returns a <em>copy</em> of the struct, so you mutate the
+      copy and throw it away. The fix is to make structs <code>readonly</code> so the compiler stops you
+      trying — or use a class.</p>
+  </div>
+
+  <pre data-label="csharp — a struct done right" class="code-good"><code class="language-csharp">// readonly: the compiler enforces that nothing can mutate it
+public readonly struct Point(double X, double Y)
+{
+    public double DistanceTo(Point other) =&gt;
+        Math.Sqrt(Math.Pow(X - other.X, 2) + Math.Pow(Y - other.Y, 2));
+}</code></pre>
+
+  <h2 id="records">Records <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A <code>record</code> is a class (or struct) where the compiler writes the boring parts for you:
+      value equality, a readable <code>ToString</code>, and a <code>with</code> expression for copying.</p>
+    <p>Use it when the type is <strong>data</strong>. Use a plain class when the type has
+      <strong>identity and behaviour</strong>.</p>
+  </div>
+
+  <pre data-label="csharp — what a record gives you free"><code class="language-csharp">public record Money(decimal Amount, string Currency);
+
+var a = new Money(10, "GBP");
+var b = new Money(10, "GBP");
+
+Console.WriteLine(a == b);          // True  - value equality, free
+Console.WriteLine(a);               // Money { Amount = 10, Currency = GBP }
+
+var c = a with { Amount = 20 };     // copy with one change</code></pre>
+
+  <p>Compare that to a plain class, where <code>a == b</code> would be <code>False</code> because they're
+    two different objects.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Use</th><th>When</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><code>record</code> (class)</td><td>Data with value semantics, possibly largish</td><td>DTOs, API requests, events, commands</td></tr>
+        <tr><td><code>readonly record struct</code></td><td>Small immutable value, avoid heap allocation</td><td><code>Money</code>, <code>Point</code>, an ID wrapper</td></tr>
+        <tr><td><code>class</code></td><td>Has identity, lifecycle and behaviour</td><td><code>Order</code>, <code>Customer</code> — an entity</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake — <code>with</code> is a shallow copy</div>
+    <p style="margin:0">If a record holds a <code>List&lt;T&gt;</code>, the copy and the original
+      <strong>share the same list</strong>. Add to one and it appears in the other.
+      <br><br>
+      The record itself is immutable; what it points at may not be. Hold
+      <code>ImmutableArray&lt;T&gt;</code> or expose <code>IReadOnlyList&lt;T&gt;</code> over a defensively
+      copied array if you need it immutable all the way down.</p>
+  </div>
+
+  <h2 id="enums">Enums — and the trap when you persist them <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An enum is a named set of integer constants. It's a <strong>value type</strong>.</p>
+    <p>Its job is to replace magic numbers and loose strings with something the compiler can check.</p>
+  </div>
+
+  <pre data-label="csharp — the numbers are real, and they matter"><code class="language-csharp">public enum OrderStatus
+{
+    Draft = 0,        // assigned explicitly - do this
+    Paid = 1,
+    Shipped = 2,
+    Cancelled = 3
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — reordering a persisted enum</div>
+    <p style="margin:0">By default an enum's members are numbered <code>0, 1, 2…</code> in declaration
+      order, and databases usually store that <strong>number</strong>.
+      <br><br>
+      So if someone later inserts a value in the middle:</p>
+    <pre data-label="csharp — every stored row now means something different" class="code-bad"><code class="language-csharp">public enum OrderStatus
+{
+    Draft,            // 0
+    PendingPayment,   // 1  <- inserted here
+    Paid,             // 2  (was 1)
+    Shipped,          // 3  (was 2)
+    Cancelled         // 4  (was 3)
+}</code></pre>
+    <p style="margin:0">Every row that stored <code>1</code> meaning "Paid" now reads back as
+      "PendingPayment". Nothing errors. Nothing warns. Your data has silently changed meaning.
+      <br><br>
+      <strong>Two defences:</strong> always assign values explicitly and never reuse or reorder them, or
+      persist the enum as a <em>string</em> so the stored value is self-describing. Strings cost a little
+      space and buy you safety and readable data.</p>
+  </div>
+
+  <p>Two more things worth knowing:</p>
+
+  <ul>
+    <li><strong>An enum can hold a value that isn't defined.</strong> <code>(OrderStatus)99</code> compiles
+      and runs. So validate input with <code>Enum.IsDefined</code> at boundaries, and always handle the
+      unexpected case in a <code>switch</code>.</li>
+    <li><strong><code>[Flags]</code></strong> lets you combine values as bits — assign powers of two
+      (<code>1, 2, 4, 8</code>) and use <code>HasFlag</code> or bitwise operators. Useful for permission
+      sets.</li>
+  </ul>
+
+  <h2 id="string">Why <code>string</code> is special <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>string</code> is a <strong>reference type</strong> that <strong>behaves like a value
+      type</strong>: it's immutable, and <code>==</code> compares the text rather than the address.</p>
+  </div>
+
+  <pre data-label="csharp — immutability means every change allocates"><code class="language-csharp">var s = "hello";
+s.ToUpper();                     // does nothing to s - returns a NEW string
+Console.WriteLine(s);            // "hello"
+
+s = s.ToUpper();                 // reassignment is what changes s
+Console.WriteLine(s);            // "HELLO"
+
+// Value-style equality, even though string is a reference type
+Console.WriteLine("abc" == "abc");   // True</code></pre>
+
+  <p>Immutability is why strings are safe to share between threads and safe to use as dictionary keys.
+    It's also why the loop below is a classic performance mistake:</p>
+
+  <pre data-label="csharp — bad: allocates a new string every iteration" class="code-bad"><code class="language-csharp">var result = "";
+foreach (var line in tenThousandLines)
+    result += line;              // ~10,000 string allocations, each copying everything so far</code></pre>
+
+  <pre data-label="csharp — StringBuilder mutates one buffer" class="code-good"><code class="language-csharp">var sb = new StringBuilder();
+foreach (var line in tenThousandLines)
+    sb.Append(line);
+var result = sb.ToString();      // one allocation at the end</code></pre>
+
+  <div class="note info">
+    <div class="note-title">Don't over-apply it <span class="pill pill-good">💡 Good to know</span></div>
+    <p style="margin:0">Concatenating three or four strings is fine — the compiler turns
+      <code>a + b + c</code> into a single <code>String.Concat</code> call. <code>StringBuilder</code> is
+      for <strong>loops</strong> and unknown-length building, not for every concatenation.</p>
+  </div>
+
+  <h2 id="equality">Equality: <code>==</code>, <code>Equals</code>, and <code>GetHashCode</code> <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Comparison</th><th>Default behaviour</th></tr></thead>
+      <tbody>
+        <tr><td><code>==</code> on a class</td><td>Reference equality — <em>are these the same object?</em></td></tr>
+        <tr><td><code>==</code> on a struct</td><td>Doesn't compile unless the struct defines the operator</td></tr>
+        <tr><td><code>==</code> on <code>string</code> / <code>record</code></td><td>Value equality (both override it)</td></tr>
+        <tr><td><code>.Equals()</code></td><td>Reference equality for classes; field-by-field for structs and records</td></tr>
+        <tr><td><code>ReferenceEquals()</code></td><td>Always reference equality — can't be overridden</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — the missing <code>GetHashCode</code></div>
+    <p style="margin:0">If you override <code>Equals</code> you <strong>must</strong> override
+      <code>GetHashCode</code>. Here's what happens if you don't:</p>
+    <pre data-label="csharp — the object vanishes" class="code-bad"><code class="language-csharp">public class CustomerId
+{
+    public int Value { get; init; }
+    public override bool Equals(object? o) =&gt; o is CustomerId c &amp;&amp; c.Value == Value;
+    // GetHashCode NOT overridden - inherits reference-based hashing
+}
+
+var dict = new Dictionary&lt;CustomerId, string&gt;();
+dict[new CustomerId { Value = 1 }] = "Ada";
+
+var lookup = new CustomerId { Value = 1 };
+Console.WriteLine(dict.ContainsKey(lookup));   // False!</code></pre>
+    <p style="margin:0">A dictionary finds the bucket using the <em>hash</em>, and only then compares with
+      <code>Equals</code>. Two "equal" objects with different hashes land in different buckets, so the
+      lookup never even gets to the comparison.
+      <br><br>
+      <strong>The rule:</strong> equal objects must have equal hash codes. Using a
+      <code>record</code> gets both right for free — which is the main reason to prefer records for
+      value-like types.</p>
+  </div>
+
+  <h2 id="nullable">Nullable types <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Two different features share the <code>?</code> syntax, and mixing them up is common.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Nullable <em>value</em> types</th><th>Nullable <em>reference</em> types</th></tr></thead>
+      <tbody>
+        <tr><td>Example</td><td><code>int?</code>, <code>DateTime?</code></td><td><code>string?</code>, <code>Order?</code></td></tr>
+        <tr><td>Since</td><td>C# 2.0</td><td>C# 8.0</td></tr>
+        <tr><td>What it is</td><td>A real type: <code>Nullable&lt;int&gt;</code></td><td>Compile-time annotation only</td></tr>
+        <tr><td>Runtime effect</td><td>Yes — wraps the value plus a <code>HasValue</code> flag</td><td><strong>None.</strong> Erased at compile time</td></tr>
+        <tr><td>Enforcement</td><td>The type system</td><td>Compiler warnings — that's all</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Nullable reference types are <strong>warnings, not guarantees</strong>.</p>
+    <p>A non-nullable <code>string</code> can still be null at runtime — from reflection, deserialization,
+      or a library that doesn't have annotations. So still validate data crossing your boundaries.</p>
+  </div>
+
+  <pre data-label="csharp — turn it on, and treat the warnings as errors"><code class="language-csharp">// In the .csproj - this is the single highest-value setting in a new project
+&lt;Nullable&gt;enable&lt;/Nullable&gt;
+&lt;TreatWarningsAsErrors&gt;true&lt;/TreatWarningsAsErrors&gt;</code></pre>
+
+  <pre data-label="csharp — what the compiler now catches"><code class="language-csharp">string name = null;          // warning: cannot convert null to non-nullable
+string? maybe = null;        // fine - explicitly nullable
+
+Console.WriteLine(maybe.Length);          // warning: possible null dereference
+Console.WriteLine(maybe?.Length ?? 0);    // fine</code></pre>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Value = copied, reference = shared. This one distinction explains most surprise-mutation bugs.</li>
+      <li>Reference types are still passed <em>by value</em> — you need <code>ref</code> to repoint the caller's variable.</li>
+      <li>Value types live wherever their container lives, not "always on the stack".</li>
+      <li>Boxing allocates. It matters in loops, not in one-off code.</li>
+      <li>Prefer <code>class</code>; use <code>struct</code> only for small immutable values.</li>
+      <li>Never write a mutable struct. Mark structs <code>readonly</code>.</li>
+      <li><code>string</code> is an immutable reference type with value equality — use <code>StringBuilder</code> in loops.</li>
+      <li>Override <code>Equals</code> ⇒ override <code>GetHashCode</code>. Or just use a <code>record</code>.</li>
+      <li>Nullable reference types are compile-time only. Still validate at boundaries.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Assuming a method got a copy of your list.</strong> It got the same list.</li>
+    <li><strong>Mutable structs</strong> — modifications silently apply to a copy.</li>
+    <li><strong>Overriding <code>Equals</code> without <code>GetHashCode</code></strong> — objects disappear
+      from dictionaries and <code>Distinct()</code> stops working.</li>
+    <li><strong><code>+=</code> on strings inside a loop.</strong></li>
+    <li><strong>Using <code>ArrayList</code>, <code>Hashtable</code></strong> or other non-generic
+      collections — boxing plus no type safety.</li>
+    <li><strong>Treating a non-nullable reference as guaranteed non-null</strong> after deserialization.</li>
+    <li><strong>Big structs</strong> passed around by value, where the copying costs more than a heap
+      allocation would have.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What's the difference between a value type and a reference type?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A value type variable holds the data itself, so assigning it copies the data — you end up with
+          two independent values. A reference type variable holds a reference to an object, so assigning it
+          copies the reference, and both variables point at the same object."</p>
+        <p>"The consequence is what actually matters day to day. If I pass a <code>List</code> into a method
+          and it calls <code>Add</code>, the caller's list has changed — because there was only ever one
+          list. If I pass a struct and the method modifies it, the caller sees nothing."</p>
+        <p>"On memory: value types are typically on the stack and reference types on the heap, but I'd
+          qualify that — a value type lives wherever its container lives. An <code>int</code> field inside a
+          class is on the heap, inside that object. It's also a CLR implementation detail rather than a
+          language guarantee."</p>
+        <p>"And one thing people get wrong: 'reference type' doesn't mean 'passed by reference'. C# passes
+          the reference <em>by value</em>, so I can change the object's contents but I can't repoint the
+          caller's variable unless I use <code>ref</code>."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you go past the definition to the consequence?</li>
+        <li>Do you know the "value types are on the stack" simplification is imprecise?</li>
+        <li>Do you understand pass-by-value of a reference?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "value types go on the stack, reference types on the heap" and stopping there.</li>
+        <li><span class="redflag">Red flag:</span> saying reference types are passed by reference.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Is <code>string</code> a value or reference type? Why does it behave the way it does?</li>
+          <li>What's boxing?</li>
+          <li>When would you choose a struct?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What is boxing, and why should you care?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Boxing is wrapping a value type in an object on the heap so it can be used where
+          <code>object</code> is expected. Unboxing is casting it back out — and that cast can fail at
+          runtime if the types don't match exactly."</p>
+        <p>"The reason to care is allocation. Every box is a heap allocation, which means GC pressure. In a
+          loop over a large collection that's measurable; in a one-off call it's irrelevant."</p>
+        <p>"What matters practically is knowing where it hides, because explicit boxing is rare. The
+          classic sources are non-generic collections like <code>ArrayList</code>, which boxes every item;
+          calling a non-generic <code>Equals</code> or comparing through <code>object</code>; and older
+          string formatting paths."</p>
+        <p>"That's really what generics were introduced for. <code>List&lt;int&gt;</code> stores ints
+          directly with no boxing, whereas <code>ArrayList</code> boxes a million ints into a million
+          objects. Same for <code>IComparable&lt;T&gt;</code> over the non-generic version."</p>
+        <p>"I'd keep it proportionate though. I'd remove boxing from a hot path if a profiler pointed at it —
+          I wouldn't make readable code worse to avoid a single box."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know where boxing happens without being told?</li>
+        <li>Do you connect it to generics and to GC pressure?</li>
+        <li>Do you keep performance claims proportionate?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Does <code>$"{someInt}"</code> box? Has that changed across .NET versions?</li>
+          <li>What happens when a struct implements an interface and you call through the interface?</li>
+          <li>How would you detect boxing in a running application?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you use a struct instead of a class?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Rarely — my default is a class, and I'd want a specific reason to deviate."</p>
+        <p>"I'd use a struct when the type represents a single logical value, it's small — roughly 16 bytes
+          or less — it's immutable, and it won't be boxed a lot. Things like a point, a money amount, a
+          strongly-typed ID wrapper. Framework examples are <code>DateTime</code>,
+          <code>TimeSpan</code>, <code>Guid</code>."</p>
+        <p>"The payoff is avoiding a heap allocation, which matters if you're creating millions of them. But
+          if it's large, you've replaced one cheap allocation with expensive copying on every assignment and
+          every method call, so you can easily make things worse."</p>
+        <p>"The rule I hold firmly is: <strong>never write a mutable struct.</strong> If you put one in a
+          collection, the indexer returns a copy, so modifying what you read out silently does nothing —
+          and it's a genuinely confusing bug because the code looks correct. I mark structs
+          <code>readonly</code> so the compiler enforces it."</p>
+        <p>"In modern C# I'd usually reach for <code>readonly record struct</code>. It gives me
+          immutability, value equality and a correct <code>GetHashCode</code> without writing any of it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you default to the safe option and justify deviating?</li>
+        <li>Do you know the mutable-struct trap?</li>
+        <li>Do you know large structs can be slower, not faster?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "structs are faster, so use them for performance."</li>
+        <li><span class="redflag">Red flag:</span> not knowing the collection-indexer copy problem.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does <code>readonly struct</code> actually change?</li>
+          <li>What's <code>ref struct</code> for?</li>
+          <li>Can a struct inherit? Can it implement an interface?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Why must you override <code>GetHashCode</code> when you override <code>Equals</code>? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Because hash-based collections use the hash code to decide <em>where</em> to look, and only use
+          <code>Equals</code> to confirm once they're in the right bucket."</p>
+        <p>"So if two objects are equal but return different hash codes, they get put in different buckets.
+          A dictionary lookup computes the hash, goes to that bucket, doesn't find the key there, and reports
+          it isn't present — without ever calling <code>Equals</code>. The object is effectively invisible."</p>
+        <p>"It breaks more than dictionaries: <code>HashSet</code>, <code>Distinct()</code>,
+          <code>GroupBy</code> and <code>ToDictionary</code> all rely on the same contract."</p>
+        <p>"The contract itself is: equal objects <em>must</em> have equal hash codes. The reverse isn't
+          required — unequal objects may collide, and the collection handles that by comparing within the
+          bucket."</p>
+        <p>"There's a second trap worth mentioning: the hash must be <strong>stable while the object is in
+          the collection</strong>. If you hash on a mutable property and then change it, the object is now
+          in the wrong bucket and you can't find or remove it. That's an argument for hashing only on
+          immutable identity."</p>
+        <p>"In practice I'd avoid writing either by hand. A <code>record</code> generates both correctly, and
+          if I do need custom logic I'd use <code>HashCode.Combine</code> rather than inventing an
+          arithmetic scheme."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <em>how</em> a hash table works, not just the rule?</li>
+        <li>Do you know the contract is one-directional?</li>
+        <li>Do you spot the mutable-key problem?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does <code>record</code> generate for equality, exactly?</li>
+          <li>Should <code>GetHashCode</code> be stable across process restarts?</li>
+          <li>How would you implement equality for an entity with a database ID?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Model money in C#. What type do you choose and why?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd use a <code>readonly record struct Money(decimal Amount, string Currency)</code>, and I'd
+          justify each part."</p>
+        <p>"<code>decimal</code> rather than <code>double</code>, because <code>double</code> is binary
+          floating point and can't represent 0.1 exactly. That produces rounding errors that accumulate,
+          which is unacceptable for money. <code>decimal</code> is base-10 and has the precision for
+          financial values."</p>
+        <p>"A <code>struct</code> because money is a single small immutable value and there may be a lot of
+          them. <code>readonly</code> so the compiler guarantees immutability and I can't hit the
+          mutable-struct copy trap."</p>
+        <p>"A <code>record</code> because I want value equality — ten pounds is ten pounds regardless of
+          which instance it is — and records give me correct <code>Equals</code> and
+          <code>GetHashCode</code> without hand-writing them."</p>
+        <p>"The currency is the important design point. Carrying it in the type means I can reject adding
+          GBP to USD in the <code>Add</code> method rather than silently producing a wrong total. I'd
+          validate in the constructor so an invalid <code>Money</code> can't exist anywhere in the program."</p>
+        <p>"For storage I'd map amount and currency as two columns with an explicit precision and scale —
+          something like <code>decimal(19,4)</code> — because letting the database pick a default is how you
+          get silent truncation. And if it needed to support many currencies with different minor units, I'd
+          consider storing integer minor units instead of decimals."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know why <code>double</code> is wrong for money? This is close to a required answer.</li>
+        <li>Do you put currency <em>in</em> the type rather than alongside it?</li>
+        <li>Do you think about persistence precision?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> <code>double</code>, or <code>decimal</code> with no reason given.</li>
+        <li><span class="redflag">Red flag:</span> a bare <code>decimal</code> with currency tracked separately — that's how mismatched-currency bugs happen.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle dividing money three ways without losing a penny?</li>
+          <li>How would you map this in EF Core?</li>
+          <li>What about currencies with no minor unit, like the yen?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

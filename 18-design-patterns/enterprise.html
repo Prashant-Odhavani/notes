@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enterprise Patterns — Design Patterns</title>
+<meta name="description" content="Repository, Unit of Work, Specification, Dependency Injection, CQRS and Event Sourcing — with the naive code each replaces and where each stops being worth it.">
+<meta name="keywords" content="repository pattern EF Core unit of work specification pattern dependency injection CQRS command query separation read model projection event sourcing aggregate eventual consistency">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="18-design-patterns/enterprise.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Enterprise Patterns</h1>
+    <p class="subtitle">The patterns that shape whole applications. CQRS is the one worth understanding
+      properly, because it exists at several levels and people conflate them.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Repository</strong> — abstracts data access. <code>DbSet</code> is already one, so a thin
+        wrapper adds little.</li>
+      <li><strong>Unit of Work</strong> — one transaction across several changes.
+        <code>SaveChanges</code> is this.</li>
+      <li><strong>Specification</strong> — a reusable, composable query predicate.</li>
+      <li><strong>Dependency Injection</strong> — depend on abstractions, supplied from outside.</li>
+      <li><strong>CQRS</strong> — separate models for reading and writing. Comes in <em>levels</em>.</li>
+      <li><strong>Event Sourcing</strong> — store the events, derive the state. Powerful and expensive.</li>
+      <li><strong>CQRS ≠ Event Sourcing.</strong> Conflating them is the most common error here.</li>
+    </ul>
+  </div>
+
+  <h2 id="repository">Repository <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A repository gives the domain a collection-like way to reach persistence, so business logic doesn't
+      contain queries.</p>
+    <p>The interesting question in .NET isn't what it is — it's <strong>whether you need one on top of EF
+      Core</strong>.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The generic repository is the anti-pattern</div>
+    <pre data-label="csharp" class="code-bad"><code class="language-csharp">public interface IRepository&lt;T&gt; where T : class
+{
+    Task&lt;T?&gt; GetByIdAsync(int id);
+    Task&lt;IEnumerable&lt;T&gt;&gt; GetAllAsync();          // loads the entire table
+    Task&lt;IEnumerable&lt;T&gt;&gt; FindAsync(Expression&lt;Func&lt;T, bool&gt;&gt; predicate);
+    Task AddAsync(T entity);
+    Task UpdateAsync(T entity);
+    Task DeleteAsync(T entity);
+}</code></pre>
+    <p style="margin:0">This is <code>DbSet&lt;T&gt;</code> with fewer capabilities. It adds a layer and
+      <strong>removes</strong> the ability to project, include, or compose — so callers either fetch whole
+      entities they don't need, or the interface grows an escape hatch returning
+      <code>IQueryable</code>, at which point it's abstracting nothing.
+      <br><br>
+      <code>GetAllAsync</code> is the tell: it invites loading a whole table into memory, and it appears in
+      nearly every generic repository.
+      <br><br>
+      And the usual justification — "we could swap the database" — almost never happens, and wouldn't work
+      anyway, because provider differences leak through regardless.</p>
+  </div>
+
+  <pre data-label="csharp — a repository worth having: intention-revealing" class="code-good"><code class="language-csharp">public interface IOrderRepository
+{
+    Task&lt;Order?&gt; GetForFulfilmentAsync(Guid id, CancellationToken ct);
+    Task&lt;IReadOnlyList&lt;Order&gt;&gt; GetOverdueAsync(DateOnly asOf, CancellationToken ct);
+    Task AddAsync(Order order, CancellationToken ct);
+}
+
+public sealed class OrderRepository(AppDbContext db) : IOrderRepository
+{
+    // The AGGREGATE is loaded correctly - the caller can't forget an Include
+    public Task&lt;Order?&gt; GetForFulfilmentAsync(Guid id, CancellationToken ct) =&gt;
+        db.Orders
+          .Include(o =&gt; o.Lines)
+          .Include(o =&gt; o.ShippingAddress)
+          .FirstOrDefaultAsync(o =&gt; o.Id == id, ct);
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — what a repository is actually for</div>
+    <p style="margin:0">Not database swapping. Two real things:
+      <br><br>
+      <strong>1. Guarding the aggregate boundary.</strong> <code>GetForFulfilmentAsync</code> guarantees the
+      order arrives with its lines and address loaded. A caller using <code>DbSet</code> directly can forget an
+      <code>Include</code>, then hit a lazy-load or a null reference at the point the domain method needs it.
+      That's the strongest argument, and it's about <em>correctness</em>, not abstraction.
+      <br><br>
+      <strong>2. Naming the query in domain terms.</strong> <code>GetOverdueAsync</code> puts "what overdue
+      means" in one place instead of the predicate being re-derived slightly differently in three services.
+      <br><br>
+      So: <strong>a repository per aggregate with named methods, on the write side.</strong> For reads, query
+      <code>DbContext</code> directly with a projection — wrapping that in a repository only costs you EF's
+      capabilities. That's also why the same codebase legitimately has repositories for commands and none for
+      queries, which is <a href="#cqrs">CQRS at its simplest</a>.</p>
+  </div>
+
+  <h2 id="unit-of-work">Unit of Work <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="remember">
+    <span class="r-label">You already have one</span>
+    <p><strong><code>DbContext</code> is a Unit of Work.</strong> It tracks changes and
+      <code>SaveChanges</code> commits them in a single transaction.</p>
+    <p>So wrapping it in an <code>IUnitOfWork</code> that calls <code>SaveChanges</code> is usually a
+      pass-through with extra indirection.</p>
+  </div>
+
+  <pre data-label="csharp — a wrapper that earns its place, if any does"><code class="language-csharp">public interface IUnitOfWork
+{
+    Task&lt;int&gt; SaveChangesAsync(CancellationToken ct = default);
+}
+// Justification: the domain layer can commit without referencing DbContext,
+// so it doesn't take a dependency on EF Core. That's an architecture
+// decision, not a technical necessity - and it is a thin one.</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The real pitfall: multiple <code>SaveChanges</code> calls</div>
+    <p style="margin:0">One <code>SaveChanges</code> is one transaction. <strong>Two calls are two
+      transactions</strong>, so a failure between them leaves the first committed.
+      <br><br>
+      That's how you get an order with no stock deduction. Covered in detail on the
+      <a href="../11-ef-core/transactions-concurrency.html">EF Core transactions page</a>, and it's a more
+      practically important thing to know than whether to wrap <code>DbContext</code> in an interface.</p>
+  </div>
+
+  <h2 id="specification">Specification <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — before: the same predicate, redefined everywhere" class="code-bad"><code class="language-csharp">// OrderService
+var active = db.Orders.Where(o =&gt; !o.IsDeleted &amp;&amp; o.Status != OrderStatus.Cancelled);
+
+// ReportService - subtly different, and now the numbers disagree
+var active = db.Orders.Where(o =&gt; o.Status != OrderStatus.Cancelled);
+
+// ExportService - a third variation
+var active = db.Orders.Where(o =&gt; !o.IsDeleted &amp;&amp; o.Status == OrderStatus.Placed);</code></pre>
+
+  <pre data-label="csharp — one definition, composable" class="code-good"><code class="language-csharp">public static class OrderSpecs
+{
+    public static Expression&lt;Func&lt;Order, bool&gt;&gt; Active =&gt;
+        o =&gt; !o.IsDeleted &amp;&amp; o.Status != OrderStatus.Cancelled;
+
+    public static Expression&lt;Func&lt;Order, bool&gt;&gt; PlacedAfter(DateTime utc) =&gt;
+        o =&gt; o.CreatedUtc &gt; utc;
+}
+
+// Composable, and still translated to SQL
+var recent = db.Orders.Where(OrderSpecs.Active)
+                      .Where(OrderSpecs.PlacedAfter(cutoff));</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">When it's worth it — and the simpler alternative</div>
+    <p style="margin:0">The value is a <strong>single definition of a business concept</strong> used in several
+      places. "Active", "overdue", "eligible for refund" — where the definition drifting causes reports to
+      disagree with the application.
+      <br><br>
+      It must be an <code>Expression&lt;Func&lt;T, bool&gt;&gt;</code>, not a <code>Func&lt;T, bool&gt;</code>. A
+      plain delegate can't be translated to SQL, so EF would load the table and filter in memory — the
+      <a href="../11-ef-core/querying.html#deferred">client-evaluation trap</a>.
+      <br><br>
+      For soft delete and tenancy specifically, a <a href="../11-ef-core/querying.html#query-filters">global
+      query filter</a> is better — it applies automatically so nobody can forget it, where a specification still
+      has to be remembered at each call site.
+      <br><br>
+      The full GoF Specification with <code>And</code>/<code>Or</code>/<code>Not</code> combinators and expression
+      rewriting is usually more machinery than the problem justifies. Static expression properties get most of
+      the benefit.</p>
+  </div>
+
+  <h2 id="di">Dependency Injection <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The distinction worth being precise about</span>
+    <p><strong>Dependency Inversion</strong> is the principle: depend on abstractions, and let the high-level
+      policy define the abstraction rather than the low-level detail.</p>
+    <p><strong>Dependency Injection</strong> is the technique: supply dependencies from outside instead of
+      constructing them internally.</p>
+    <p><strong>An IoC container</strong> is the tool that automates the wiring. You can do DI without one.</p>
+  </div>
+
+  <pre data-label="csharp — before: dependencies constructed internally" class="code-bad"><code class="language-csharp">public class OrderService
+{
+    private readonly SqlOrderRepository _repo = new(
+        new SqlConnection("Server=prod;..."));            // hard-coded, untestable
+    private readonly SmtpEmailSender _email = new("smtp.corp.local");
+
+    // Cannot test without a database and an SMTP server.
+    // Cannot change either without editing this class.
+}</code></pre>
+
+  <pre data-label="csharp — after: supplied from outside" class="code-good"><code class="language-csharp">public class OrderService(IOrderRepository repo, IEmailSender email)
+{
+    // Dependencies are visible in the signature and substitutable in tests.
+    // This class no longer knows SQL Server or SMTP exist.
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — where the interface should live</div>
+    <p style="margin:0">Dependency <em>inversion</em> is about more than using an interface. It's about
+      <strong>who owns it</strong>.
+      <br><br>
+      If <code>IEmailSender</code> lives in the infrastructure project alongside
+      <code>SmtpEmailSender</code>, the domain still points at infrastructure — you've added an interface without
+      inverting anything.
+      <br><br>
+      If <code>IEmailSender</code> lives in the <strong>domain or application layer</strong>, defined in terms the
+      domain cares about, and infrastructure implements it, then the dependency arrow points inward. That's the
+      inversion, and it's what makes <a href="../19-architecture/application-architecture.html">Clean
+      Architecture</a> work.
+      <br><br>
+      The practical test: <em>can the domain project compile with no reference to the infrastructure
+      project?</em> If not, you have DI but not inversion.</p>
+  </div>
+
+  <h2 id="cqrs">CQRS <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Use a different model for reading than for writing.</strong></p>
+    <p>That's the whole idea. Everything else — separate handlers, separate databases, event sourcing — is an
+      implementation choice layered on top, and conflating those with the principle is where confusion starts.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A restaurant kitchen and its menu describe the same food differently.</p>
+    <p>The kitchen needs recipes, quantities, allergen rules and process order — everything needed to
+      <em>make</em> it correctly. The menu needs a name, a description and a price.</p>
+    <p>Printing the recipe on the menu would be absurd. So would asking the chef to cook from the menu.</p>
+  </div>
+
+  <h3 id="cqrs-why">Why one model serves both badly</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Write side</th><th>Read side</th></tr></thead>
+      <tbody>
+        <tr><td>Cares about</td><td>Invariants, validation, transactions</td><td>Shape, speed, joining across aggregates</td></tr>
+        <tr><td>Natural model</td><td>Rich domain objects, one aggregate at a time</td><td>Flat DTOs, denormalized, whatever the screen needs</td></tr>
+        <tr><td>Volume</td><td>Usually lower</td><td>Usually 10–100× higher</td></tr>
+        <tr><td>Consistency need</td><td><strong>Strong</strong></td><td>Often "a few seconds stale is fine"</td></tr>
+        <tr><td>Shape stability</td><td>Changes with business rules</td><td>Changes with every UI redesign</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — before: one model forced to do both" class="code-bad"><code class="language-csharp">// A "get order summary" that goes through the domain model
+public async Task&lt;OrderSummaryDto&gt; GetSummaryAsync(Guid id)
+{
+    // Loads the full aggregate - lines, address, payments, history -
+    // because the repository guarantees a complete aggregate.
+    var order = await _orderRepository.GetByIdAsync(id);
+
+    // ...to display four fields.
+    return new OrderSummaryDto(
+        order.Id,
+        order.Customer.Name,           // another join, or a lazy load
+        order.Lines.Count,             // loaded 200 lines to count them
+        order.Lines.Sum(l =&gt; l.Total)  // and to add them up in memory
+    );
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What's wrong with it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Loads far more than it needs</strong> — the whole aggregate for four fields</td></tr>
+        <tr><td><strong>Aggregates in memory</strong> that the database would compute in one pass</td></tr>
+        <tr><td><strong>Change tracking overhead</strong> on entities nobody will modify</td></tr>
+        <tr><td><strong>Cross-aggregate reads fight the boundary.</strong> "Orders with customer name and latest payment" spans three aggregates, so either you load three or you break the boundary</td></tr>
+        <tr><td><strong>The domain model gets distorted</strong> by read requirements — navigation properties added purely so a screen can display something</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="cqrs-levels">CQRS comes in levels <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>What it means</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Separate models, one database</strong></td>
+          <td>Writes go through the domain; reads project directly to DTOs</td>
+          <td><strong>Nearly none.</strong> Start here</td>
+        </tr>
+        <tr>
+          <td><strong>2. Separate read store</strong></td>
+          <td>Denormalized tables or views, updated from the write side</td>
+          <td>Eventual consistency, sync mechanism</td>
+        </tr>
+        <tr>
+          <td><strong>3. Separate database or service</strong></td>
+          <td>Read store is a different technology — Elasticsearch, a replica</td>
+          <td>Real operational complexity</td>
+        </tr>
+        <tr>
+          <td><strong>4. Plus event sourcing</strong></td>
+          <td>Events are the source of truth; read models are projections</td>
+          <td><strong>High.</strong> A different way of building software</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — level 1: the version almost everyone should use" class="code-good"><code class="language-csharp">// WRITE: through the domain model, enforcing invariants
+public async Task&lt;Result&gt; Handle(ShipOrder cmd, CancellationToken ct)
+{
+    var order = await _orders.GetForFulfilmentAsync(cmd.OrderId, ct);
+    if (order is null) return Result.NotFound();
+
+    order.Ship(cmd.ShippedAtUtc);          // the rules live in the aggregate
+    await _uow.SaveChangesAsync(ct);
+    return Result.Ok();
+}
+
+// READ: skips the domain entirely. Projects exactly what the screen needs.
+public Task&lt;OrderSummaryDto?&gt; Handle(GetOrderSummary q, CancellationToken ct) =&gt;
+    _db.Orders
+       .AsNoTracking()                      // no change tracking
+       .Where(o =&gt; o.Id == q.OrderId)
+       .Select(o =&gt; new OrderSummaryDto(    // SQL computes the aggregates
+           o.Id,
+           o.Customer.Name,                 // one JOIN, one column
+           o.Lines.Count(),                 // COUNT in the database
+           o.Lines.Sum(l =&gt; l.Total)))      // SUM in the database
+       .FirstOrDefaultAsync(ct);</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — level 1 is free, and it's what CQRS usually means</div>
+    <p style="margin:0">Level 1 needs <strong>no extra infrastructure, no eventual consistency, and no new
+      technology.</strong> It's one database and two code paths.
+      <br><br>
+      The write path uses repositories and the domain model, so invariants are enforced in one place. The read
+      path queries <code>DbContext</code> directly with a projection, so it fetches four columns instead of an
+      object graph and lets SQL do the aggregation.
+      <br><br>
+      That's the version I'd apply by default, and it captures most of the benefit. It's also why the same
+      codebase legitimately has repositories for writes and none for reads — that isn't inconsistency, it's the
+      pattern.
+      <br><br>
+      <strong>Levels 2 and above buy read scalability at the cost of eventual consistency</strong>, and that's a
+      genuine architectural commitment. Being able to separate "CQRS the principle" from "CQRS with a separate
+      event-sourced read store" is the discriminating answer, because a lot of people believe CQRS <em>requires</em>
+      the whole apparatus and dismiss it as over-engineering on that basis.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">What level 2+ actually costs</div>
+    <p style="margin:0">Once the read store is separate, it's updated <strong>after</strong> the write —
+      so a user can save something and not see it in a list. That's a UX problem, not just a technical one, and
+      it needs deliberate handling: return the written entity rather than re-reading, or read from the write
+      model immediately after a write. Same
+      <a href="../10-sql/scaling-operations.html#replication-lag">read-your-own-writes</a> problem as a
+      replica.
+      <br><br>
+      You also need a sync mechanism that's reliable — a <a href="../19-architecture/distributed-data.html#outbox">
+      change feed or outbox</a>, not a dual write — plus a way to <strong>rebuild</strong> the read model when it
+      drifts or its shape changes. Teams routinely forget the rebuild path and then can't change the read model
+      shape.
+      <br><br>
+      So the honest position: go to level 2 when reads genuinely can't be served from the write model, not
+      because CQRS is supposed to look like that.</p>
+  </div>
+
+  <h2 id="event-sourcing">Event Sourcing <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Instead of storing current state, store <strong>every change as an immutable event</strong>. Current state
+      is derived by replaying them.</p>
+    <p>A bank statement rather than just a balance — and the balance is computed from the statement.</p>
+  </div>
+
+  <pre data-label="csharp — the aggregate rebuilt from its history"><code class="language-csharp">public sealed class Account
+{
+    public Money Balance { get; private set; } = Money.Zero;
+
+    // State is derived, never stored
+    public static Account From(IEnumerable&lt;IAccountEvent&gt; history)
+    {
+        var account = new Account();
+        foreach (var e in history) account.Apply(e);
+        return account;
+    }
+
+    private void Apply(IAccountEvent e) =&gt; Balance = e switch
+    {
+        Deposited d  =&gt; Balance + d.Amount,
+        Withdrawn w  =&gt; Balance - w.Amount,
+        _ =&gt; Balance
+    };
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Gains</th><th>Costs</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Complete audit trail</strong> — by construction, not by adding logging</td><td><strong>Querying is hard</strong> — you need projections for everything</td></tr>
+        <tr><td><strong>Time travel</strong> — reconstruct any past state</td><td><strong>Event schema versioning is permanent</strong>; old events must stay readable forever</td></tr>
+        <tr><td><strong>New read models from history</strong> — answer questions you hadn't thought of</td><td><strong>Eventual consistency</strong> throughout</td></tr>
+        <tr><td><strong>Natural fit for event-driven integration</strong></td><td><strong>Steep learning curve</strong>; unfamiliar to most teams</td></tr>
+        <tr><td>Concurrency via expected-version checks</td><td>Snapshots needed once streams get long</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">CQRS is not Event Sourcing — the most common conflation</div>
+    <p style="margin:0"><strong>CQRS</strong> means separate read and write models. You can do it with one SQL
+      database and two LINQ queries.
+      <br><br>
+      <strong>Event Sourcing</strong> means events are the source of truth. It's a persistence strategy.
+      <br><br>
+      They're frequently used together — event sourcing makes querying hard, so you need CQRS read models to make
+      it usable. But <strong>CQRS does not require event sourcing</strong>, and treating them as one thing is why
+      people believe CQRS is inherently heavy.
+      <br><br>
+      If someone proposes "CQRS" and means event sourcing with separate stores and eventual consistency, that's a
+      much bigger commitment than level 1 — and worth separating explicitly before the team agrees to it.
+      <br><br>
+      My default: <strong>CQRS at level 1 freely; event sourcing only where the audit trail or temporal queries
+      are a genuine domain requirement</strong> — finance, compliance, anything where "what did it look like on
+      the 14th?" is a real question. Not as a general architecture.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Generic <code>IRepository&lt;T&gt;</code> is <code>DbSet</code> with fewer features. Use
+        intention-revealing methods per aggregate.</li>
+      <li>A repository's real value is guarding the aggregate boundary, not swapping databases.</li>
+      <li><code>DbContext</code> is already a Unit of Work; two <code>SaveChanges</code> calls are two
+        transactions.</li>
+      <li>Specifications must be <code>Expression&lt;Func&lt;T,bool&gt;&gt;</code> to reach SQL; query filters are
+        better for soft delete and tenancy.</li>
+      <li>DI without inversion is just constructor parameters — the interface must live with the high-level
+        policy.</li>
+      <li>CQRS means separate read and write <em>models</em>. Level 1 is one database, two code paths, and
+        nearly free.</li>
+      <li>Level 2+ buys read scale at the cost of eventual consistency and a rebuild path you must build.</li>
+      <li>Event sourcing gives audit and time travel; it costs querying, versioning and team familiarity.</li>
+      <li><strong>CQRS ≠ Event Sourcing.</strong> Separate them explicitly in any design conversation.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Generic repository over EF Core</strong>, losing projection and composition.</li>
+    <li><strong><code>GetAllAsync</code></strong> inviting whole-table loads.</li>
+    <li><strong>Repositories on the read side</strong>, blocking projections.</li>
+    <li><strong>Two <code>SaveChanges</code> calls</strong> where atomicity was required.</li>
+    <li><strong><code>Func&lt;T,bool&gt;</code> instead of <code>Expression</code></strong>, forcing client
+      evaluation.</li>
+    <li><strong>Interfaces in the infrastructure layer</strong> — DI without inversion.</li>
+    <li><strong>Believing CQRS requires separate databases.</strong></li>
+    <li><strong>Jumping to level 2 CQRS</strong> without needing read scale.</li>
+    <li><strong>No rebuild path</strong> for a read model.</li>
+    <li><strong>Event sourcing as a default architecture.</strong></li>
+    <li><strong>Conflating CQRS with Event Sourcing.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Do you need a repository if you're using EF Core? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Sometimes, and not the generic kind."</p>
+        <p>"<code>DbSet&lt;T&gt;</code> is already a repository and <code>DbContext</code> is already a unit of
+          work, so a generic <code>IRepository&lt;T&gt;</code> with
+          <code>GetById</code>/<code>GetAll</code>/<code>Add</code>/<code>Update</code>/<code>Delete</code> is
+          strictly <em>less</em> capable than what it wraps. It removes projection, <code>Include</code>, and
+          composition — so callers either fetch whole entities they don't need, or you add an escape hatch
+          returning <code>IQueryable</code>, and then it's abstracting nothing."</p>
+        <p>"<code>GetAllAsync</code> is the tell. It invites loading an entire table into memory, and it appears
+          in almost every generic repository I've seen."</p>
+        <p>"The usual justification is 'we could swap the database'. That almost never happens, and it wouldn't
+          work anyway — provider differences leak through, and a generic interface doesn't hide them."</p>
+        <p>"<strong>What I would use is a repository per aggregate with intention-revealing methods.</strong>
+          <code>IOrderRepository</code> with <code>GetForFulfilmentAsync</code> and
+          <code>GetOverdueAsync</code>."</p>
+        <p>"Two genuine reasons for that."</p>
+        <p>"<strong>Guarding the aggregate boundary.</strong> <code>GetForFulfilmentAsync</code> guarantees the
+          order comes back with its lines and address loaded. Using <code>DbSet</code> directly, a caller can
+          forget an <code>Include</code> and then hit a null reference where the domain method needed the lines.
+          That's a correctness argument, not an abstraction one, and it's the strongest reason."</p>
+        <p>"<strong>Naming the query in domain language.</strong> <code>GetOverdueAsync</code> puts the definition
+          of 'overdue' in one place, rather than three services each deriving a slightly different predicate and
+          the reports disagreeing."</p>
+        <p>"The important qualifier: <strong>this is for the write side.</strong> For reads I'd query
+          <code>DbContext</code> directly with a projection — <code>AsNoTracking</code>, <code>Select</code> into a
+          DTO — because wrapping that in a repository only costs me EF's capabilities."</p>
+        <p>"And that asymmetry is deliberate rather than inconsistent. Repositories for commands, direct queries
+          for reads, <strong>is CQRS at its simplest level</strong> — separate models for reading and writing,
+          one database, no extra infrastructure."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>DbSet</code> is already a repository?</li>
+        <li>Can you explain what a generic repository <em>removes</em>?</li>
+        <li>Do you dismiss the database-swapping justification?</li>
+        <li>Do you know the aggregate-boundary argument?</li>
+        <li>Do you connect write/read asymmetry to CQRS?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "yes, for testability" — EF has an in-memory provider and you
+          can substitute at a higher level.</li>
+        <li><span class="redflag">Red flag:</span> "to swap the database" as the main reason.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you test code that uses <code>DbContext</code> directly?</li>
+          <li>Where does the Specification pattern fit?</li>
+          <li>Would you have a repository for reads?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Explain CQRS. When would you use it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"CQRS is <strong>using a different model for reading than for writing</strong>. That's the entire
+          principle — everything else is an implementation choice."</p>
+        <p>"I'd start there deliberately, because the most common confusion is thinking CQRS <em>requires</em>
+          separate databases and event sourcing. It doesn't, and that belief is why people dismiss it as
+          over-engineering."</p>
+        <p>"<strong>Why it exists:</strong> the two sides have genuinely different needs. The write side cares
+          about invariants, validation and transactions — so a rich domain model, one aggregate at a time. The
+          read side cares about shape and speed, and frequently needs data joined across aggregates. Read volume
+          is typically ten to a hundred times higher, and the read shape changes with every UI redesign while the
+          write model changes with business rules."</p>
+        <p>"Forcing both through one model gives you the worst of each: loading a full aggregate with two hundred
+          lines to display four fields and count them in memory, and read queries that fight the aggregate
+          boundary because the screen needs data from three of them."</p>
+        <p>"The part I'd emphasise is that <strong>CQRS comes in levels</strong>, and they have wildly different
+          costs."</p>
+        <p>"<strong>Level 1 — separate models, one database.</strong> Writes go through repositories and the
+          domain model. Reads query <code>DbContext</code> directly with <code>AsNoTracking</code> and a
+          projection into a DTO, so SQL does the counting and summing. That's <em>free</em> — no new
+          infrastructure, no eventual consistency, no new technology. Just two code paths. This is what I'd apply
+          by default, and it captures most of the benefit."</p>
+        <p>"<strong>Level 2 — a separate read store.</strong> Denormalized tables updated from the write side.
+          Now you have eventual consistency, which is a real commitment: a user can save something and not see it
+          in a list. That needs handling deliberately — return the written entity rather than re-reading, or read
+          from the write model right after a write. It's the same read-your-own-writes problem as a database
+          replica."</p>
+        <p>"<strong>Level 3 — a different technology</strong>, like Elasticsearch for search. Real operational
+          complexity."</p>
+        <p>"<strong>Level 4 — plus event sourcing.</strong> A different way of building software."</p>
+        <p>"So my answer on when: <strong>level 1 almost always</strong>, because it costs nothing and the
+          projection is simply better code. <strong>Level 2 when reads genuinely can't be served from the write
+          model</strong> — a dashboard aggregating across many aggregates, or read volume that needs its own
+          scaling. Not because CQRS is supposed to look like that."</p>
+        <p>"Two things I'd insist on before agreeing to level 2 or above. A <strong>reliable sync
+          mechanism</strong> — a change feed or an outbox, never a dual write, because that's the classic way the
+          two stores silently diverge. And a <strong>rebuild path</strong>, so the read model can be regenerated
+          from the source of truth when it drifts or its shape changes. Teams forget the rebuild and then can't
+          change the read model without a migration nobody wants to attempt."</p>
+        <p>"And to be explicit: <strong>CQRS is not Event Sourcing.</strong> They pair well — event sourcing makes
+          querying hard, so it needs CQRS projections to be usable — but CQRS needs one SQL database and two
+          queries. If someone says CQRS and means event sourcing, that's worth separating before the team commits
+          to it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you state the principle without the apparatus?</li>
+        <li>Do you know it has levels with different costs?</li>
+        <li>Do you know level 1 is essentially free?</li>
+        <li>Do you raise eventual consistency and read-your-own-writes?</li>
+        <li>Do you require a sync mechanism and a rebuild path?</li>
+        <li>Do you separate it from event sourcing?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "CQRS means two databases".</li>
+        <li><span class="redflag">Red flag:</span> conflating it with event sourcing.</li>
+        <li><span class="redflag">Red flag:</span> recommending it universally, or dismissing it entirely.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you keep the read model in sync?</li>
+          <li>How do you handle a user not seeing their own write?</li>
+          <li>When is event sourcing actually justified?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

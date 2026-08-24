@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event Hubs — Azure</title>
+<meta name="description" content="Partitions, consumer groups, checkpointing, throughput units and Capture — the log-based streaming model and where it differs from a queue.">
+<meta name="keywords" content="Azure Event Hubs partitions partition key consumer groups checkpointing EventProcessorClient throughput units processing units Capture retention Kafka endpoint ordering at-least-once">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/event-hubs.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Event Hubs</h1>
+    <p class="subtitle">A partitioned log, not a queue. Once that distinction lands, everything else about the
+      service follows from it.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>It's a log.</strong> Reading doesn't remove anything; events expire on retention.</li>
+      <li><strong>Partitions are the unit of ordering and of parallelism.</strong></li>
+      <li><strong>Partition key → hash → partition.</strong> Same key, same partition, ordered.</li>
+      <li><strong>Consumer groups are independent cursors</strong> over the same data.</li>
+      <li><strong>One active reader per partition per consumer group.</strong> That's your parallelism
+        ceiling.</li>
+      <li><strong>Checkpointing is your progress marker</strong> — and it's how duplicates happen.</li>
+      <li><strong>Partition count can be increased but not decreased</strong>, and increasing changes key
+        mapping.</li>
+    </ul>
+  </div>
+
+  <h2 id="log-vs-queue">The log model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Service Bus queue</th><th>Event Hubs</th></tr></thead>
+      <tbody>
+        <tr><td>Reading</td><td><strong>Removes the message</strong></td><td><strong>Advances a cursor</strong>. Data stays</td></tr>
+        <tr><td>Per-message state</td><td>Locks, delivery count, dead-letter</td><td><strong>None</strong> — no per-event tracking</td></tr>
+        <tr><td>Retry one message</td><td>Abandon it; redelivered</td><td><strong>Not possible in isolation</strong></td></tr>
+        <tr><td>Replay</td><td>No</td><td><strong>Yes</strong> — reset the offset</td></tr>
+        <tr><td>Multiple consumers of the same data</td><td>Topics with subscriptions</td><td><strong>Consumer groups</strong></td></tr>
+        <tr><td>Throughput</td><td>Thousands/sec</td><td><strong>Millions/sec</strong></td></tr>
+        <tr><td>Built for</td><td>Commands and work distribution</td><td><strong>Telemetry and event streams</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — no per-event state is the whole design trade</div>
+    <p style="margin:0">Service Bus tracks every message individually: a lock, a delivery count, a dead-letter
+      destination. That's what makes per-message retry and poison-message handling possible, and it's also what
+      caps throughput — that bookkeeping costs something per message.
+      <br><br>
+      Event Hubs tracks <strong>one number per partition per consumer group</strong>: the offset. That's the entire
+      consumer state. Which is why it handles millions of events a second, and why the features you'd expect from a
+      queue simply don't exist.
+      <br><br>
+      The consequence people meet in production: <strong>you cannot dead-letter a single bad event.</strong> If
+      event 5,000 in a partition throws, your options are to skip it, to stop the partition, or to write it
+      somewhere yourself. There's no platform mechanism.
+      <br><br>
+      So error handling on Event Hubs is <em>your</em> code: catch, write the failure to a Service Bus queue or
+      blob for later, and carry on. If you stop instead, the partition stalls and lag grows behind one bad event.
+      <br><br>
+      "Event Hubs for volume, Service Bus for per-message guarantees" is the summary — and it's the reason many
+      systems use both.</p>
+  </div>
+
+  <h2 id="partitions">Partitions <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — how an event reaches a partition"><code class="language-text">  With a partition key:
+     hash(partitionKey)  ->  partition 3      (same key always lands on 3)
+     Order guaranteed WITHIN partition 3, never across partitions
+
+  Without a partition key:
+     round-robin across all partitions
+     Maximum spread, NO ordering guarantee at all
+
+  Consumers:
+     partition 0 --+
+     partition 1 --+--> consumer group "billing"    (independent offsets)
+     partition 2 --+
+     partition 3 --+
+
+     the same partitions --> consumer group "analytics"  (its own offsets)</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Fact</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Ordering is per partition only</strong></td><td>Events needing order must share a key</td></tr>
+        <tr><td><strong>One active reader per partition per group</strong></td><td>Partition count is the parallelism ceiling</td></tr>
+        <tr><td><strong>Count can increase, never decrease</strong></td><td>Under-provisioning is fixable; over-provisioning is permanent</td></tr>
+        <tr><td><strong>Increasing changes key→partition mapping</strong></td><td><strong>Ordering breaks across the change</strong></td></tr>
+        <tr><td>Premium and Dedicated allow more partitions</td><td>Standard is capped at 32 per hub</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Choosing the partition key is the decision you can't easily undo</div>
+    <p style="margin:0">Three things follow from the key, and they pull against each other.
+      <br><br>
+      <strong>Ordering.</strong> Only events with the same key are ordered relative to each other. So if
+      per-device or per-account ordering matters, that has to be the key.
+      <br><br>
+      <strong>Distribution.</strong> A key with skewed values sends most traffic to one partition. One partition
+      becomes the bottleneck while others idle — and <strong>adding partitions doesn't help</strong>, because the
+      hot key still hashes to a single one. This is exactly the
+      <a href="../15-dynamodb/fundamentals.html#limits">hot partition</a> problem, and it shows up
+      identically in <a href="../22-kafka/fundamentals.html#topics-partitions">Kafka</a>,
+      <a href="../14-cosmos-db/fundamentals.html#hot-partitions">Cosmos DB</a> and DynamoDB. Same physics every time.
+      <br><br>
+      <strong>Parallelism.</strong> Ordering within a key means one consumer processes that key's events serially.
+      A coarse key (region, tenant) gives you order at the cost of throughput.
+      <br><br>
+      And the trap: <strong>if you later increase the partition count, keys remap.</strong> Events for one key that
+      were on partition 3 start landing on partition 7 — while partition 3 still holds unprocessed earlier events
+      for that key. Ordering is broken across the boundary, and no amount of consumer care fixes it.
+      <br><br>
+      So the practical advice is to <strong>provision partitions generously at creation</strong>. They're cheap in
+      Standard, the count can't go down, and increasing it later is the operation with real consequences. Choosing
+      32 when you needed 8 costs nothing; choosing 4 when you needed 32 is a migration.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Do you actually need ordering?</div>
+    <p style="margin:0">A lot of the difficulty here disappears if the answer is no.
+      <br><br>
+      Telemetry, click events, metrics, logs, most audit records — these don't need ordering. Omit the partition
+      key, get round-robin distribution, perfect balance and maximum parallelism.
+      <br><br>
+      Ordering matters when events describe <strong>transitions of the same entity</strong>: created → updated →
+      deleted for one order, or state changes for one device. Processing those out of order produces the wrong final
+      state.
+      <br><br>
+      Even then there's often a way out: <strong>make the events idempotent and carry a version</strong>, and the
+      consumer can discard anything older than what it has already applied. Then order doesn't matter, and you get
+      the distribution benefits back. It's more work in the consumer and usually the better trade at high volume.</p>
+  </div>
+
+  <h2 id="consumer-groups">Consumer groups and checkpointing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the processor client, which handles the hard parts" class="code-good"><code class="language-csharp">// EventProcessorClient does load balancing across instances and stores
+// checkpoints in blob storage. Do not hand-roll this.
+var processor = new EventProcessorClient(
+    checkpointStore: new BlobContainerClient(blobUri, credential),
+    consumerGroup: "billing",
+    fullyQualifiedNamespace: ns,
+    eventHubName: "telemetry",
+    credential);
+
+processor.ProcessEventAsync += async args =&gt;
+{
+    try
+    {
+        await Handle(args.Data, args.CancellationToken);
+    }
+    catch (Exception ex)
+    {
+        // No dead-letter here. Record it yourself and MOVE ON,
+        // or this one event stalls the whole partition.
+        await _poison.SendAsync(args.Data, ex, args.CancellationToken);
+        _log.EventFailed(args.Partition.PartitionId, args.Data.SequenceNumber, ex);
+    }
+
+    // Checkpoint periodically, not per event - each one is a storage write
+    if (args.Data.SequenceNumber % 100 == 0)
+        await args.UpdateCheckpointAsync(args.CancellationToken);
+};
+
+processor.ProcessErrorAsync += args =&gt;
+{
+    _log.ProcessorError(args.Operation, args.PartitionId, args.Exception);
+    return Task.CompletedTask;   // the processor recovers on its own
+};</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — checkpoint frequency is a duplicates-versus-cost dial</div>
+    <p style="margin:0">A checkpoint is "I have processed up to here." On restart or rebalance, processing resumes
+      from the last checkpoint.
+      <br><br>
+      <strong>Checkpoint per event</strong> and duplicates are minimal — but every checkpoint is a write to blob
+      storage, so throughput collapses and you're paying for storage operations at event volume.
+      <br><br>
+      <strong>Checkpoint every 10,000 events</strong> and throughput is excellent, but a crash reprocesses up to
+      10,000 events.
+      <br><br>
+      There is no setting that removes the trade, because <strong>Event Hubs is at-least-once, always</strong>. Even
+      per-event checkpointing has a window: you process, then checkpoint, and a crash between them replays that
+      event.
+      <br><br>
+      Which is why the real answer is the same one that appears throughout the handbook: <strong>make the consumer
+      idempotent</strong>, then checkpoint on an interval that suits your throughput — every few hundred events or
+      every few seconds — and stop worrying about duplicates.
+      <br><br>
+      "At-least-once delivery plus an idempotent consumer gives an exactly-once <em>effect</em>" is the framing that
+      matters, and it's identical to
+      <a href="../22-kafka/fundamentals.html#offsets">Kafka offset commits</a> and
+      <a href="../20-microservices/data-consistency.html#idempotency">idempotency keys</a> in HTTP.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Consumer groups are cursors, not filters</div>
+    <p style="margin:0">A consumer group doesn't select a subset of events. Every group sees <strong>every
+      event</strong> in the hub; the group only tracks where it has read to.
+      <br><br>
+      So adding a consumer group for analytics doesn't reduce what the billing group receives, and it doesn't cost
+      extra throughput on the ingress side. Egress does count against your throughput units, though — a second
+      consumer group doubles the read volume.
+      <br><br>
+      Two more limits worth knowing. <strong>Standard tier allows 20 consumer groups</strong>, which is plenty for
+      most designs but not unlimited. And <strong>only one active reader per partition per group</strong> — a second
+      instance trying to read the same partition in the same group is rejected, which is why the processor client
+      does ownership-based load balancing rather than letting everyone read everything.
+      <br><br>
+      If you want filtering, that's <a href="event-grid.html">Event Grid</a> or a Service Bus topic. Event Hubs
+      delivers everything and expects the consumer to decide.</p>
+  </div>
+
+  <h2 id="capacity">Capacity and retention <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tier</th><th>Capacity unit</th><th>Gives you</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Basic</strong></td><td>Throughput unit (TU)</td>
+          <td>1 MB/s in, 2 MB/s out per TU. <strong>One consumer group, no Capture</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Standard</strong></td><td>Throughput unit</td>
+          <td>Same per-TU rate, up to 20 TUs, <strong>auto-inflate</strong>, Capture, 20 consumer groups</td>
+        </tr>
+        <tr>
+          <td><strong>Premium</strong></td><td>Processing unit (PU)</td>
+          <td>Isolated compute, longer retention, more partitions, <strong>predictable latency</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Dedicated</strong></td><td>Capacity unit (CU)</td>
+          <td>A whole cluster. Very high scale, 90-day retention</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Auto-inflate goes up and never comes down</div>
+    <p style="margin:0"><strong>Auto-inflate</strong> raises throughput units automatically when you exceed the
+      current allocation, up to a limit you set. It's worth enabling, because exceeding your TUs means
+      <strong>ingress throttling</strong> — producers get 429s and events are rejected, which for telemetry means
+      permanently lost data.
+      <br><br>
+      The thing to know: <strong>it does not scale back down.</strong> A traffic spike that pushes you from 4 TUs to
+      20 leaves you paying for 20 indefinitely until someone notices.
+      <br><br>
+      So enable it as a safety net <em>and</em> alert on the TU count changing, so the scale-up is visible and
+      someone can reduce it deliberately. Treating auto-inflate as fire-and-forget is a recurring source of
+      surprise on the bill.
+      <br><br>
+      Premium's processing units behave differently and don't have this shape, which is part of what you're paying
+      for.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Retention</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td>Standard default</td><td><strong>1 day</strong>, up to 7</td></tr>
+        <tr><td>Premium / Dedicated</td><td>Up to 90 days</td></tr>
+        <tr><td><strong>Capture</strong></td><td>Automatic write to Blob or Data Lake in Avro, on a time or size window</td></tr>
+        <tr><td>Effect on replay</td><td><strong>You can only replay within retention</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — Capture is the cheap answer to "we need the history"</div>
+    <p style="margin:0">Retention is the limit on replay: if you keep one day and a consumer bug is found on
+      Thursday affecting Monday's events, those events are gone.
+      <br><br>
+      Extending retention is one answer and it's the expensive one — you're paying streaming-service prices to store
+      cold data.
+      <br><br>
+      <strong>Capture</strong> writes every event to Blob Storage or Data Lake automatically, in Avro, with no code
+      at all. Storage costs a fraction of Event Hubs retention, and you get an indefinite archive that's directly
+      queryable by Synapse, Databricks or Fabric.
+      <br><br>
+      So the pattern is: <strong>short retention on the hub for live consumers, Capture for history and
+      reprocessing.</strong> The hub handles the last few hours; the archive handles everything else.
+      <br><br>
+      The trade to state: replaying from Capture isn't the same as resetting an offset — you're reading Avro files
+      from storage, so it's a separate code path you have to write and test. Worth building <em>before</em> you need
+      it, because the day you need it is a bad day to write new code.</p>
+  </div>
+
+  <h2 id="kafka">The Kafka endpoint <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="note info">
+    <div class="note-title">Protocol compatibility, not Kafka</div>
+    <p style="margin:0">Standard tier and above expose a <strong>Kafka-protocol endpoint</strong>, so an existing
+      Kafka producer or consumer can point at Event Hubs with a configuration change and no code change.
+      <br><br>
+      That's genuinely useful for migration and for reusing Kafka tooling and client libraries. What you get is the
+      protocol — not the ecosystem.
+      <br><br>
+      <strong>Kafka Streams, ksqlDB, log compaction and transactions are not supported.</strong> So if the
+      application depends on those, it isn't a configuration change; it's a redesign.
+      <br><br>
+      The honest framing: Event Hubs is a managed streaming service with a Kafka-shaped door. Use it to avoid
+      running <a href="../22-kafka/index.html">Kafka</a> yourself, not to get Kafka's full feature set.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>It's a log — reading advances a cursor, events expire on retention.</li>
+      <li>No per-event state, so no per-message retry and no dead-letter. You handle failures.</li>
+      <li>One bad event handled badly stalls a partition.</li>
+      <li>Partition key decides ordering, distribution and parallelism at once.</li>
+      <li>A hot key can't be fixed by adding partitions.</li>
+      <li>Partition count can only go up, and increasing it remaps keys and breaks ordering.</li>
+      <li>Provision partitions generously at creation.</li>
+      <li>Consumer groups are independent cursors over all events, not filters.</li>
+      <li>One active reader per partition per consumer group.</li>
+      <li>Checkpoint frequency trades duplicates against cost; at-least-once always.</li>
+      <li>Idempotent consumers make the duplicate question go away.</li>
+      <li>Auto-inflate scales up and never down — alert on it.</li>
+      <li>Capture gives cheap indefinite history; short retention on the hub.</li>
+      <li>The Kafka endpoint is protocol compatibility, not the Kafka ecosystem.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Using Event Hubs for work that needs per-message retry</strong> — that's Service Bus.</li>
+    <li><strong>Throwing on a bad event</strong> and stalling the partition.</li>
+    <li><strong>Too few partitions</strong>, capping consumer parallelism permanently.</li>
+    <li><strong>A skewed partition key</strong>, so one partition carries most traffic.</li>
+    <li><strong>Increasing partition count</strong> on a hub where ordering matters.</li>
+    <li><strong>Checkpointing per event</strong>, destroying throughput.</li>
+    <li><strong>Assuming exactly-once</strong> and building a non-idempotent consumer.</li>
+    <li><strong>Auto-inflate enabled with no alert</strong>, leaving TUs high forever.</li>
+    <li><strong>Long retention instead of Capture</strong>, paying streaming prices for cold data.</li>
+    <li><strong>Expecting consumer groups to filter events.</strong></li>
+    <li><strong>Assuming the Kafka endpoint means Kafka Streams works.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>When would you choose Event Hubs over Service Bus? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The distinction I'd start from is <strong>a queue versus a log</strong>, because every other difference
+          follows from it."</p>
+        <p>"<strong>Service Bus is a queue.</strong> Reading a message removes it. The broker tracks each message
+          individually — a lock, a delivery count, a dead-letter destination. That per-message bookkeeping is what
+          gives you retry, poison-message handling, sessions and transactions."</p>
+        <p>"<strong>Event Hubs is a log.</strong> Reading advances a cursor; the data stays until retention expires.
+          The only consumer state is one offset per partition per consumer group. Which is why it does millions of
+          events a second — there's almost no bookkeeping — and why the queue features simply don't exist."</p>
+        <p>"So I'd choose by what the message <em>is</em>."</p>
+        <p>"<strong>Service Bus for commands and work</strong> — 'process this payment', 'send this email'. Things
+          where each message matters individually, must be retried on failure, and must not be lost. One consumer
+          should handle it, and if it fails repeatedly it needs to go somewhere a human can look."</p>
+        <p>"<strong>Event Hubs for telemetry and event streams</strong> — IoT readings, click events, application
+          metrics, audit trails. High volume, individually less important, and often
+          <strong>multiple independent consumers</strong> want the same data: one writing to a warehouse, one
+          running real-time alerts, one archiving."</p>
+        <p>"That last point is a real differentiator. With Event Hubs, adding a consumer group is free from the
+          producer's perspective — nobody changes, everyone gets everything. And <strong>replay</strong>: I can
+          reset an offset and reprocess a day's events, which is invaluable when a consumer had a bug. A queue can't
+          do that; the messages are gone."</p>
+        <p>"The main thing I'd flag as a trap: <strong>Event Hubs has no dead-letter queue.</strong> If one event
+          fails to process, there's no platform mechanism. Your options are to skip it, stop the partition, or write
+          it somewhere yourself. And stopping is dangerous — the partition stalls and lag grows behind one bad
+          event."</p>
+        <p>"So error handling is your code, and it has to be deliberate: catch, record the failure to a Service Bus
+          queue or blob, continue. Teams that pick Event Hubs for throughput and then need per-message reliability
+          end up rebuilding queue semantics badly on top of a log."</p>
+        <p>"And it's not either/or — a common shape is Event Hubs for ingestion at volume, then a consumer that
+          converts the events that need reliable individual handling into Service Bus messages. Each service does
+          what it's good at."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have the queue-versus-log distinction?</li>
+        <li>Do you connect it to why throughput differs?</li>
+        <li>Do you know Event Hubs has no dead-letter?</li>
+        <li>Do you value replay and multiple consumer groups?</li>
+        <li>Do you see them as complementary?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "Event Hubs is faster" as the whole answer.</li>
+        <li><span class="redflag">Red flag:</span> expecting dead-lettering on Event Hubs.</li>
+        <li><span class="redflag">Red flag:</span> no mention of replay or consumer groups.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle a poison event on Event Hubs?</li>
+          <li>How do you get ordering?</li>
+          <li>What if you need both patterns?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Consumer lag is growing on one partition only. Diagnose it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"One partition and not the others is a strong signal — it rules out a general capacity problem, because
+          if the consumer were simply too slow every partition would lag. So something is specific to this
+          partition or its reader."</p>
+        <p>"I'd work through four causes, in the order they're likely."</p>
+        <p>"<strong>Partition key skew.</strong> Most likely. If the key is something like tenant id or device id
+          and one value dominates — a large customer, a misbehaving device sending 100× the normal rate — that key
+          hashes to one partition, and that partition receives disproportionate traffic while the others idle."</p>
+        <p>"I'd confirm it by comparing incoming event counts per partition, which the metrics give directly. And the
+          important consequence: <strong>adding partitions doesn't fix this.</strong> The hot key still hashes to a
+          single partition. Same physics as a hot partition in DynamoDB or Cosmos, and the fix is the same — change
+          the key so the hot value spreads, typically by adding a suffix, or drop ordering entirely for that traffic
+          and go round-robin."</p>
+        <p>"<strong>A stalled or repeatedly failing reader.</strong> If the handler throws on a specific event and
+          the code retries indefinitely or rethrows, that partition makes no progress while every other partition
+          continues. Lag on exactly one partition with normal event rates is the signature."</p>
+        <p>"I'd look for repeated exceptions with the same sequence number in the logs. This is the Event Hubs
+          failure mode that catches people, because there's <strong>no dead-letter</strong> to absorb a poison event
+          — a single bad message can hold up a partition indefinitely. The fix is to record the failure elsewhere
+          and move on."</p>
+        <p>"<strong>Ownership churn.</strong> If the processor client is rebalancing repeatedly — instances scaling
+          up and down, or checkpoint storage being slow or throttled — a partition can lose and regain ownership
+          constantly and spend its time re-establishing rather than processing. I'd check the error handler's output
+          and the blob checkpoint store for throttling, which is easy to overlook because it's a different
+          resource."</p>
+        <p>"<strong>Slow processing for that partition's data specifically.</strong> If one partition happens to
+          carry events that are more expensive to handle — larger payloads, a code path hitting a slower dependency
+          — it processes more slowly with nothing actually broken. Comparing per-event processing duration by
+          partition distinguishes this from the others."</p>
+        <p>"For diagnosis I'd want <strong>lag per partition</strong> as a metric, computed as the difference
+          between the last enqueued sequence number and the checkpointed one. That's the number worth alerting on,
+          and per-partition rather than aggregate — an average across 32 partitions hides exactly this
+          situation."</p>
+        <p>"On mitigation: I'd separate <strong>catching up</strong> from <strong>fixing the cause</strong>. If it's
+          a poison event, skipping it restores flow immediately and I can investigate the recorded failure
+          afterwards. If it's skew, catching up may require temporarily throttling the hot producer, because a
+          single reader per partition per consumer group is a hard ceiling — I can't add consumers to drain one
+          partition faster."</p>
+        <p>"That ceiling is worth saying explicitly, because it's the constraint that makes this different from a
+          queue: with Service Bus I'd add consumers. Here I can't, so the answer is either fewer events on that
+          partition or faster processing per event."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you recognise per-partition lag as skew or a stalled reader?</li>
+        <li>Do you know adding partitions doesn't fix a hot key?</li>
+        <li>Do you know a poison event stalls a partition with no dead-letter?</li>
+        <li>Do you consider checkpoint-store throttling?</li>
+        <li>Do you know one reader per partition is a hard ceiling?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "scale out the consumer" — it can't help one partition.</li>
+        <li><span class="redflag">Red flag:</span> "add partitions" for a hot key.</li>
+        <li><span class="redflag">Red flag:</span> only monitoring aggregate lag.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you change the partition key without breaking ordering?</li>
+          <li>How do you compute lag per partition?</li>
+          <li>What if the hot tenant legitimately sends that volume?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

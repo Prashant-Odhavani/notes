@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASP.NET Core — Overview</title>
+<meta name="description" content="How ASP.NET Core handles a request, what to prioritise for interviews, and how this section is organised.">
+<meta name="keywords" content="aspnet core overview request pipeline middleware kestrel minimal api controllers interview senior">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="07-aspnet-core/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>ASP.NET Core</h1>
+    <p class="subtitle">The web framework. Built directly on the platform features from the previous
+      section — so if DI and hosting are clear, this is mostly about the request pipeline.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>A request flows through a <strong>pipeline of middleware</strong>, in registration order, and back
+        out again.</li>
+      <li><strong>Order matters and mis-ordering rarely errors</strong> — it just behaves subtly wrong.</li>
+      <li><strong>Kestrel</strong> is the web server. Behind IIS/nginx it's a reverse proxy setup; it can
+        also be public-facing.</li>
+      <li><strong>Minimal APIs</strong> and <strong>controllers</strong> are two front ends over the same
+        routing and binding. Not a performance choice.</li>
+      <li>Everything scoped is scoped <strong>per request</strong> — which is why the DI material came first.</li>
+      <li>The framework gives you validation, auth, rate limiting and health checks. Don't hand-roll them.</li>
+    </ul>
+  </div>
+
+  <h2 id="request-lifecycle">What happens to a request <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A request enters at the server, passes down through a stack of middleware, reaches your endpoint, and
+      then the response passes back <strong>up through the same stack</strong>.</p>
+  </div>
+
+  <pre data-label="the shape of a request" class="code-good"><code class="language-text" data-nohl>  HTTP request
+       │
+  ┌────▼──────────────────────────────────────────┐
+  │ Kestrel  (parses HTTP, TLS, connection limits)│
+  └────┬──────────────────────────────────────────┘
+       │
+  ┌────▼───────────────┐
+  │ Exception handler  │  ── wraps everything below it
+  ├────────────────────┤
+  │ HTTPS redirect     │
+  ├────────────────────┤
+  │ Static files       │  ── may short-circuit here
+  ├────────────────────┤
+  │ Routing            │  ── decides WHICH endpoint
+  ├────────────────────┤
+  │ CORS               │
+  ├────────────────────┤
+  │ Authentication     │  ── who are you?
+  ├────────────────────┤
+  │ Authorization      │  ── may you do this?
+  ├────────────────────┤
+  │ Rate limiting      │
+  ├────────────────────┤
+  │ Your endpoint      │  ── controller action or minimal API handler
+  └────────────────────┘
+       │
+  response travels back UP through each layer</code></pre>
+
+  <p>Two properties of that diagram cause most ASP.NET Core bugs:</p>
+
+  <ol class="steps">
+    <li><strong>Any layer can short-circuit.</strong> Static files returns a file and never calls what's
+      below. Authorization can return 403 and stop.</li>
+    <li><strong>Code runs on the way out too.</strong> Anything after <code>await next()</code> executes as
+      the response unwinds — which is how response logging and timing work.</li>
+  </ol>
+
+  <p>That's the <a href="../18-design-patterns/behavioral.html#chain">Chain of Responsibility</a> pattern,
+    and the ordering rules are covered in detail on the
+    <a href="pipeline-routing.html">pipeline page</a>.</p>
+
+  <h2 id="what-it-gives-you">What the framework already does for you <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>A recurring interview signal is knowing what <em>not</em> to write yourself:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Need</th><th>Built in</th><th>Don't</th></tr></thead>
+      <tbody>
+        <tr><td>Validation</td><td>Data annotations, <code>[ApiController]</code> auto-400</td><td>Hand-written null checks in every action</td></tr>
+        <tr><td>Auth</td><td>JWT bearer, cookies, policies, claims</td><td>Roll your own token parsing</td></tr>
+        <tr><td>Error responses</td><td><code>ProblemDetails</code> (RFC 7807)</td><td>Invent a custom error shape</td></tr>
+        <tr><td>Rate limiting</td><td><code>AddRateLimiter</code> (.NET 7+)</td><td>A dictionary of counters</td></tr>
+        <tr><td>Health checks</td><td><code>AddHealthChecks</code></td><td>A <code>/ping</code> endpoint returning 200</td></tr>
+        <tr><td>HTTP clients</td><td><code>IHttpClientFactory</code></td><td><code>new HttpClient()</code> per request</td></tr>
+        <tr><td>Background work</td><td><code>BackgroundService</code></td><td>A <code>Timer</code> in a static field</td></tr>
+        <tr><td>Output caching</td><td><code>AddOutputCache</code> (.NET 7+)</td><td>A static dictionary</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Saying "I'd use the built-in rate limiter rather than writing one, because getting
+      the algorithm and the partitioning right is the hard part and it's already solved" reads much better
+      than describing a hand-rolled solution.
+      <br><br>
+      The corollary matters too: know <em>where the built-in thing stops being enough</em>. The built-in rate
+      limiter is per-instance, so across three replicas you need a distributed store.</p>
+  </div>
+
+  <h2 id="contents">Section contents</h2>
+  <div class="card-grid" data-section-index></div>
+
+  <div class="note info">
+    <div class="note-title">Where this sits in the learning path</div>
+    <p style="margin:0">This assumes <a href="../06-dotnet-platform/hosting-di-config.html">hosting and
+      DI</a> — scoped lifetimes, the host, configuration — and
+      <a href="../05-csharp-advanced/async-await.html">async/await</a>, because every handler is async.
+      <br><br>
+      Next is <a href="../08-http-web-apis/index.html">HTTP &amp; Web API design</a>, which covers the
+      protocol and contract side: status codes, caching, REST, OAuth. This section is the framework; that
+      one is the design.</p>
+  </div>
+
+  <h2 id="priorities">What to prioritise <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Priority</th><th>Topic</th><th>Why it comes up</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><a href="pipeline-routing.html">Middleware order</a></td><td>Asked constantly, and mis-ordering causes real bugs</td></tr>
+        <tr><td>2</td><td><a href="security.html">Authentication vs authorization</a></td><td>Universally asked; also where security holes live</td></tr>
+        <tr><td>3</td><td><a href="performance-resilience.html"><code>HttpClientFactory</code>, Polly</a></td><td>Socket exhaustion is a classic production story</td></tr>
+        <tr><td>4</td><td><a href="apis.html">Model binding and validation</a></td><td>Everyday work; over-posting is a security question</td></tr>
+        <tr><td>5</td><td><a href="background-services.html">Background services</a></td><td>Scope handling and the host-shutdown trap</td></tr>
+        <tr><td>6</td><td><a href="api-lifecycle.html">Versioning and error handling</a></td><td>Design-level; separates senior answers</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="minimal-vs-controllers">Minimal APIs or controllers? <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>A question that comes up in most .NET interviews now, and where the expected answer has shifted.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Minimal APIs</th><th>Controllers</th></tr></thead>
+      <tbody>
+        <tr><td>Introduced</td><td>.NET 6</td><td>Since the beginning</td></tr>
+        <tr><td>Boilerplate</td><td>Very little</td><td>A class per group of endpoints</td></tr>
+        <tr><td>Filters</td><td>Endpoint filters (.NET 7+)</td><td>Full action/result/exception filter pipeline</td></tr>
+        <tr><td>Model binding</td><td>Same underlying system</td><td>Same underlying system</td></tr>
+        <tr><td>Discoverability</td><td>Can sprawl unless organised deliberately</td><td>Convention makes it obvious where things live</td></tr>
+        <tr><td>Best for</td><td>Focused APIs, microservices, vertical slices</td><td>Large APIs with lots of shared cross-cutting behaviour</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The honest answer</span>
+    <p>Performance is <strong>not</strong> the differentiator. They share routing, binding and the pipeline;
+      minimal APIs have a marginal edge that almost never matters.</p>
+    <p>Choose on <strong>organisation</strong>: how many endpoints, how much shared behaviour, and how the
+      team navigates the codebase.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake with minimal APIs</div>
+    <p style="margin:0">Putting every endpoint in <code>Program.cs</code>. It's fine for a demo and unusable
+      at forty endpoints.
+      <br><br>
+      Group them into extension methods per feature — <code>app.MapOrderEndpoints()</code> — with each
+      feature in its own file. That gives you the brevity of minimal APIs with the discoverability of
+      controllers, and it lines up with
+      <a href="../19-architecture/application-architecture.html#vertical-slice">vertical slice
+      architecture</a>.</p>
+  </div>
+
+  <h2 id="interview-questions">Warm-up interview question</h2>
+
+  <details class="qa">
+    <summary>Walk me through what happens when a request hits an ASP.NET Core API. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Kestrel accepts the connection and parses the HTTP request — that's the actual web server. In
+          production it's often behind IIS or nginx as a reverse proxy, though it can be public-facing."</p>
+        <p>"Then a <code>HttpContext</code> is created and passed into the middleware pipeline. Each piece of
+          middleware gets the context plus a delegate for the rest of the pipeline, so it can do work, call
+          the next one, and then do more work as the response comes back out."</p>
+        <p>"A typical order is exception handling first so it wraps everything, then HTTPS redirection,
+          static files, routing, CORS, authentication, authorization, rate limiting, and finally the
+          endpoint."</p>
+        <p>"Along the way a <strong>DI scope</strong> is created for the request — that's what makes scoped
+          services scoped, and it's disposed when the response completes. That's also why injecting a
+          <code>DbContext</code> works cleanly per request and why capturing it in a singleton breaks."</p>
+        <p>"At the endpoint, model binding populates parameters from the route, query string and body,
+          validation runs, and the handler executes. The result gets written to the response, which then
+          unwinds back up through the middleware — so anything after <code>await next()</code> runs on the
+          way out."</p>
+        <p>"The part I'd emphasise is that ordering is load-bearing and mis-ordering usually doesn't throw.
+          Put authorization before authentication and it silently fails to find an identity. Put exception
+          handling too late and your custom error format doesn't apply to anything above it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's a pipeline, and that it's bidirectional?</li>
+        <li>Do you connect the request scope to DI lifetimes?</li>
+        <li>Do you know mis-ordering fails silently?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "the controller handles it" — skips the whole pipeline.</li>
+        <li><span class="redflag">Red flag:</span> no mention of middleware or ordering.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What breaks if authentication comes after authorization?</li>
+          <li>Where would you add rate limiting, and why there?</li>
+          <li>What's the difference between <code>Use</code>, <code>Run</code> and <code>Map</code>?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

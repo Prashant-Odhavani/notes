@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance, Testing &amp; Security — Angular</title>
+<meta name="description" content="Diagnosing rendering cost, a testing strategy that stays maintainable, and how Angular protects against XSS — plus where it doesn't.">
+<meta name="keywords" content="Angular performance profiler virtual scrolling testing TestBed component harness Jasmine Jest Playwright XSS sanitization bypassSecurityTrust CSRF token storage CSP SSR hydration">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="31-angular/performance-testing.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Performance, Testing &amp; Security</h1>
+    <p class="subtitle">Three areas where the interview question is usually "how would you find out?" rather
+      than "what's the answer?"</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Profile with Angular DevTools</strong> before optimising — it shows change detection cost per
+        component.</li>
+      <li><strong>Virtual scrolling</strong> for long lists; render what's visible, not what exists.</li>
+      <li><strong>Test behaviour, not implementation.</strong> Component harnesses over DOM queries.</li>
+      <li><strong>Angular escapes interpolation by default</strong> — that's your main XSS protection.</li>
+      <li><strong><code>bypassSecurityTrust*</code> disables it.</strong> Treat every use as a security
+        review.</li>
+      <li><strong>Tokens in memory, refresh in an HttpOnly cookie.</strong> Not
+        <code>localStorage</code>.</li>
+      <li><strong>SSR needs care</strong> — no <code>window</code> on the server.</li>
+    </ul>
+  </div>
+
+  <h2 id="diagnosing">Diagnosing performance <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>Tells you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Angular DevTools profiler</strong></td><td>Change detection cycles, and time per component. <strong>Start here for interaction problems</strong></td></tr>
+        <tr><td><strong>Chrome Performance panel</strong></td><td>Long tasks, layout, paint. For jank not caused by Angular</td></tr>
+        <tr><td><strong>Lighthouse</strong></td><td>Core Web Vitals, initial load</td></tr>
+        <tr><td><strong><code>source-map-explorer</code></strong></td><td>What's in the bundle</td></tr>
+        <tr><td><strong>Network panel</strong></td><td>N+1 API calls, oversized payloads</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Separate the two problems first</span>
+    <p><strong>Slow to load</strong> is a bundle and network problem — lazy loading, payload size, request
+      count. Covered on <a href="forms-routing-http.html#lazy-loading">the routing page</a>.</p>
+    <p><strong>Slow to interact</strong> is nearly always
+      <a href="reactivity.html#change-detection">change detection</a> — method calls in templates, default
+      strategy, missing <code>track</code>.</p>
+    <p>They have no overlap, so diagnosing which one you have saves most of the work.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The profiler makes this concrete</div>
+    <p style="margin:0">Angular DevTools shows each change detection cycle as a bar chart, with time attributed
+      per component. So you can see <em>how often</em> cycles run and <em>which component</em> dominates
+      them.
+      <br><br>
+      What you're looking for: cycles firing far more often than the user is interacting — that's usually
+      something in the zone triggering constantly, like a <code>setInterval</code> or a mousemove handler. Or one
+      component consuming most of the time, which points at expensive template work.
+      <br><br>
+      Guessing at <code>OnPush</code> without this is how people spend a week adding change detection strategies
+      and see no improvement, because the actual cause was a method call in a template.</p>
+  </div>
+
+  <h2 id="rendering">Rendering cost <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="html — virtual scrolling for long lists" class="code-good"><code class="language-html">&lt;!-- Renders only the visible rows, regardless of list length --&gt;
+&lt;cdk-virtual-scroll-viewport itemSize="48" class="viewport"&gt;
+  &lt;div *cdkVirtualFor="let row of rows; trackBy: trackById" class="row"&gt;
+    {{ row.name }}
+  &lt;/div&gt;
+&lt;/cdk-virtual-scroll-viewport&gt;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Problem</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Thousands of DOM nodes</strong></td><td>Virtual scrolling — render the visible window only</td></tr>
+        <tr><td><strong>List re-creating every node</strong></td><td><code>track</code> on a stable id</td></tr>
+        <tr><td><strong>Expensive template expressions</strong></td><td><code>computed()</code> signals</td></tr>
+        <tr><td><strong>Whole tree checked constantly</strong></td><td><code>OnPush</code>, or signals</td></tr>
+        <tr><td><strong>High-frequency events</strong></td><td><code>runOutsideAngular</code>, then <code>markForCheck</code> when needed</td></tr>
+        <tr><td><strong>Large images</strong></td><td><code>NgOptimizedImage</code> — lazy loading, srcset, priority hints</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the DOM node count matters independently of Angular</div>
+    <p style="margin:0">A table with 5,000 rows and ten columns is 50,000 cells. Even with perfect change
+      detection, that's a large DOM — and browser layout, paint and memory costs scale with node count
+      regardless of framework.
+      <br><br>
+      So the answer isn't a better change detection strategy, it's <strong>rendering fewer nodes</strong>. Virtual
+      scrolling renders perhaps 20 rows and recycles them as you scroll, so the DOM stays constant no matter how
+      long the list is.
+      <br><br>
+      The alternative is <strong>server-side paging</strong>, which is often better still — it also reduces the
+      payload and the query cost. "Do we need 5,000 rows in the browser at all?" is usually the right first
+      question, and it connects to the
+      <a href="../08-http-web-apis/rest-design.html">unbounded query surface</a> problem on the API side.</p>
+  </div>
+
+  <h2 id="testing">Testing strategy <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>Test</th><th>Proportion</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Unit</strong></td><td>Services, pipes, validators, pure functions — no <code>TestBed</code> needed</td><td><strong>Most</strong></td></tr>
+        <tr><td><strong>Component</strong></td><td>Rendering and interaction, with mocked services</td><td>Some — the valuable ones</td></tr>
+        <tr><td><strong>Integration</strong></td><td>Several components together, real routing</td><td>A few key flows</td></tr>
+        <tr><td><strong>E2E</strong></td><td>Playwright or Cypress against a running app</td><td><strong>Few</strong> — critical journeys only</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="typescript — a service test needs no Angular machinery" class="code-good"><code class="language-typescript">describe('DiscountCalculator', () =&gt; {
+  it('applies volume discount above the threshold', () =&gt; {
+    const calc = new DiscountCalculator();          // just a class
+    expect(calc.apply(1200)).toBe(1080);
+  });
+});</code></pre>
+
+  <pre data-label="typescript — a component test with a harness" class="code-good"><code class="language-typescript">describe('OrderFormComponent', () =&gt; {
+  let fixture: ComponentFixture&lt;OrderFormComponent&gt;;
+  let loader: HarnessLoader;
+  const api = jasmine.createSpyObj&lt;OrderApi&gt;('OrderApi', ['save']);
+
+  beforeEach(async () =&gt; {
+    await TestBed.configureTestingModule({
+      imports: [OrderFormComponent, NoopAnimationsModule],
+      providers: [{ provide: OrderApi, useValue: api }]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(OrderFormComponent);
+    loader  = TestbedHarnessEnvironment.loader(fixture);
+    fixture.detectChanges();
+  });
+
+  it('disables submit until the form is valid', async () =&gt; {
+    const submit = await loader.getHarness(MatButtonHarness.with({ text: 'Save' }));
+    expect(await submit.isDisabled()).toBe(true);
+
+    const input = await loader.getHarness(MatInputHarness.with({ selector: '#reference' }));
+    await input.setValue('ORD-1041');
+
+    expect(await submit.isDisabled()).toBe(false);
+  });
+});</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Component harnesses are the maintainability answer</div>
+    <p style="margin:0">Tests written against the DOM —
+      <code>fixture.nativeElement.querySelector('.mat-mdc-input-element')</code> — break whenever the component
+      library changes its internal markup. That's happened repeatedly with Angular Material, and it invalidates
+      hundreds of tests at once for no behavioural reason.
+      <br><br>
+      A <strong>harness</strong> is a stable API over a component: <code>setValue()</code>,
+      <code>isDisabled()</code>, <code>click()</code>. The library maintains the harness alongside the markup, so
+      upgrades don't break your tests.
+      <br><br>
+      Harnesses also work in both unit tests and Playwright, so the same interaction code is reusable across
+      levels. That's a genuinely strong point to raise, because brittle DOM selectors are the main reason teams
+      abandon component testing.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Test behaviour, not implementation</div>
+    <p style="margin:0">A test asserting that <code>component.isLoading === true</code> is testing a private
+      field. Rename it and the test fails despite nothing being broken.
+      <br><br>
+      A test asserting that <em>a spinner is visible while the request is in flight</em> tests what the user
+      experiences. Refactor freely and it still passes.
+      <br><br>
+      That's the difference between a test suite that enables refactoring and one that prevents it — and
+      "our tests break every time we refactor" is a symptom of testing implementation.
+      <br><br>
+      Practical version: assert on rendered output and emitted events, mock at the service boundary, and don't
+      reach into component internals.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">A note on <code>fakeAsync</code> and <code>waitForAsync</code></div>
+    <p style="margin:0"><code>fakeAsync</code> with <code>tick()</code> lets you control time synchronously —
+      useful for testing debounced inputs or timers without actually waiting.
+      <br><br>
+      <code>waitForAsync</code> plus <code>fixture.whenStable()</code> waits for real async work to settle.
+      <br><br>
+      Modern preference is to <code>await</code> harness methods, which handle stabilisation internally, so you
+      rarely need either explicitly. Knowing they exist matters mostly for maintaining older test suites — and
+      note that <code>fakeAsync</code> depends on Zone.js, so zoneless applications need a different
+      approach.</p>
+  </div>
+
+  <h2 id="xss">XSS and sanitization <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What Angular does for you</span>
+    <p>Angular treats all interpolated values as <strong>untrusted text</strong> and escapes them. So
+      <code>{{ userInput }}</code> renders <code>&lt;script&gt;</code> as visible characters, not as a script.</p>
+    <p>That's the default, it's on everywhere, and it's why XSS in Angular applications is comparatively
+      rare.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Binding</th><th>Angular's behaviour</th></tr></thead>
+      <tbody>
+        <tr><td><code>{{ value }}</code></td><td><strong>Escaped.</strong> Always safe</td></tr>
+        <tr><td><code>[textContent]</code></td><td>Escaped</td></tr>
+        <tr><td><code>[innerHTML]</code></td><td><strong>Sanitized</strong> — strips scripts and event handlers, keeps safe markup</td></tr>
+        <tr><td><code>[src]</code>, <code>[href]</code></td><td>Sanitized against <code>javascript:</code> URLs</td></tr>
+        <tr><td><code>[style]</code></td><td>Sanitized</td></tr>
+        <tr><td><strong><code>bypassSecurityTrustHtml</code></strong></td><td><strong>No protection at all</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="typescript — the dangerous escape hatch" class="code-bad"><code class="language-typescript">// Disables Angular's sanitization entirely for this value
+this.content = this.sanitizer.bypassSecurityTrustHtml(userSuppliedHtml);
+// If userSuppliedHtml contains &lt;img src=x onerror="steal()"&gt;, it executes.</code></pre>
+
+  <div class="note danger">
+    <div class="note-title"><code>bypassSecurityTrust*</code> is a security decision, not a formatting one</div>
+    <p style="margin:0">The name is deliberately alarming and people use it anyway — usually to render rich text
+      or an embedded SVG that Angular's sanitizer stripped.
+      <br><br>
+      The rule: <strong>only ever bypass for content you generated or that came from a trusted, controlled
+      source.</strong> Never for anything a user supplied, and never for anything from an API you don't
+      control.
+      <br><br>
+      If you genuinely need user-supplied rich text, sanitize it with a dedicated library like DOMPurify with an
+      explicit allow-list, and ideally do it <strong>server-side on write</strong> so the stored data is already
+      safe. Sanitizing on render means every read path has to remember.
+      <br><br>
+      In review I'd treat every occurrence of <code>bypassSecurityTrust</code> as requiring a comment explaining
+      why the source is trusted. It's the one Angular API where a mistake is directly exploitable.</p>
+  </div>
+
+  <h2 id="tokens">Token storage <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Location</th><th>XSS exposure</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><code>localStorage</code></td><td><strong>Readable by any script</strong></td><td>Avoid for tokens</td></tr>
+        <tr><td><code>sessionStorage</code></td><td>Same, scoped to the tab</td><td>Marginally better, same flaw</td></tr>
+        <tr><td>In-memory (a service field)</td><td><strong>Not persisted</strong>; lost on refresh</td><td><strong>Good for access tokens</strong></td></tr>
+        <tr><td><code>HttpOnly</code> cookie</td><td><strong>Unreadable by JavaScript</strong></td><td><strong>Best for refresh tokens</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The recommended shape</span>
+    <p><strong>Access token in memory. Refresh token in an <code>HttpOnly</code>, <code>Secure</code>,
+      <code>SameSite</code> cookie.</strong></p>
+    <p>A short-lived access token in a service field is gone on refresh — so the app silently calls the refresh
+      endpoint, which authenticates via the cookie the browser sends automatically and that JavaScript can't
+      read.</p>
+    <p>An XSS payload can then use the API while the page is open, which is bad, but it <strong>cannot steal a
+      long-lived credential</strong> to use later from elsewhere. That's the meaningful difference.</p>
+    <p>With cookies you need <a href="../08-http-web-apis/auth-security.html">CSRF protection</a> — which
+      Angular's <code>HttpClient</code> supports via <code>XSRF-TOKEN</code> handling.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Content Security Policy is the defence in depth</div>
+    <p style="margin:0">A strict CSP limits what an injected script can do even if XSS occurs — blocking inline
+      scripts, restricting which origins can be contacted, preventing exfiltration to an attacker's domain.
+      <br><br>
+      Angular works with a strict CSP, though it needs configuration for its own inline styles — a nonce, via
+      <code>ngCspNonce</code>.
+      <br><br>
+      Worth mentioning because it demonstrates layered thinking: escaping prevents most XSS, CSP limits the damage
+      when something gets through, and <code>HttpOnly</code> cookies limit what can be stolen. No single control
+      is relied upon.</p>
+  </div>
+
+  <h2 id="ssr">Server-side rendering <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Gains</th><th>Costs</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Crawlable and link-previewable</strong> content</td><td>A Node server to run and scale</td></tr>
+        <tr><td>Faster first contentful paint</td><td>Browser APIs unavailable during render</td></tr>
+        <tr><td>Better on slow devices — less client work</td><td>Hydration complexity</td></tr>
+        <tr><td>Improved Core Web Vitals</td><td>Harder debugging — two execution environments</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The <code>window</code> problem</div>
+    <pre data-label="typescript" class="code-bad"><code class="language-typescript">ngOnInit() {
+  const width = window.innerWidth;        // ReferenceError on the server
+  localStorage.getItem('theme');          // same
+}</code></pre>
+    <pre data-label="typescript — guard on platform" class="code-good"><code class="language-typescript">private readonly platformId = inject(PLATFORM_ID);
+
+ngOnInit() {
+  if (isPlatformBrowser(this.platformId)) {
+    const width = window.innerWidth;
+  }
+}
+// Or move it to ngAfterViewInit, which doesn't run during SSR.</code></pre>
+    <p style="margin:0">There is no <code>window</code>, <code>document</code> or <code>localStorage</code> in
+      Node. Any code touching them during initialisation crashes the server render — and because the client-side
+      build works fine, this only appears when SSR is enabled.
+      <br><br>
+      Third-party libraries are the common culprit, and you often can't fix them — which is why some libraries
+      have to be loaded browser-only.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Non-destructive hydration is the meaningful improvement</div>
+    <p style="margin:0">Historically Angular's SSR threw away the server-rendered DOM and re-rendered from
+      scratch on the client — so users saw content, then a flicker as it was replaced, and there was a burst of
+      work on load.
+      <br><br>
+      <strong>Non-destructive hydration</strong> (v16+, stable and default in v17+) reuses the existing DOM and
+      only attaches event listeners and state. No flicker, much less work, materially better Core Web Vitals.
+      <br><br>
+      It requires the server and client to render the <em>same</em> output. Non-deterministic rendering —
+      <code>Math.random()</code>, <code>Date.now()</code>, anything environment-dependent — causes hydration
+      mismatches, which log warnings and fall back to re-rendering that subtree. That's the practical constraint
+      worth knowing.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Separate slow-to-load from slow-to-interact; they have different causes and fixes.</li>
+      <li>Profile with Angular DevTools before adding <code>OnPush</code> anywhere.</li>
+      <li>Virtual scrolling or server paging for long lists — DOM node count costs regardless of
+        framework.</li>
+      <li>Most tests should be plain unit tests with no <code>TestBed</code>.</li>
+      <li>Component harnesses survive library markup changes; DOM selectors don't.</li>
+      <li>Test rendered behaviour, not internal fields.</li>
+      <li>Angular escapes interpolation and sanitizes <code>innerHTML</code> by default.</li>
+      <li><code>bypassSecurityTrust*</code> removes that entirely — trusted sources only, sanitize server-side
+        on write.</li>
+      <li>Access token in memory, refresh token in an <code>HttpOnly</code> cookie, plus CSRF protection.</li>
+      <li>CSP limits the damage if XSS still occurs.</li>
+      <li>SSR: guard browser APIs, and keep rendering deterministic for hydration.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Adding <code>OnPush</code> everywhere</strong> without profiling first.</li>
+    <li><strong>Rendering thousands of rows</strong> instead of virtualising or paging.</li>
+    <li><strong>Tests coupled to component library markup.</strong></li>
+    <li><strong>Asserting on private fields</strong> rather than behaviour.</li>
+    <li><strong>Too many E2E tests</strong> — slow, flaky, expensive to maintain.</li>
+    <li><strong><code>bypassSecurityTrustHtml</code> with user content.</strong></li>
+    <li><strong>JWTs in <code>localStorage</code>.</strong></li>
+    <li><strong>Cookies without CSRF protection.</strong></li>
+    <li><strong><code>window</code> access during SSR initialisation.</strong></li>
+    <li><strong>Non-deterministic rendering</strong> breaking hydration.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How does Angular protect against XSS, and where does that protection stop? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Angular treats every interpolated value as <strong>untrusted text and escapes it</strong>. So
+          <code>{{ userInput }}</code> containing a script tag renders the tag as visible characters rather than
+          executing it. That's on by default everywhere, which is why XSS in Angular apps is comparatively
+          rare."</p>
+        <p>"It goes further for specific bindings. <code>[innerHTML]</code> is <strong>sanitized</strong> — it
+          strips scripts and event handlers while keeping safe markup, so you can render formatted content
+          without opening a hole. <code>[src]</code> and <code>[href]</code> are checked against
+          <code>javascript:</code> URLs, and <code>[style]</code> is sanitized too."</p>
+        <p>"Where it stops is <strong><code>bypassSecurityTrustHtml</code></strong> and its siblings. Those
+          disable sanitization completely for that value. The name is deliberately alarming and people still
+          reach for it — usually because the sanitizer stripped something they wanted, like an embedded SVG or
+          rich-text markup."</p>
+        <p>"So my rule is: <strong>only bypass for content you generated or that came from a source you
+          control.</strong> Never for user input, never for an API you don't own. And in code review I'd treat
+          every occurrence as needing a comment explaining why the source is trusted — it's the one Angular API
+          where a mistake is directly exploitable."</p>
+        <p>"If the requirement genuinely is user-supplied rich text, the answer is a dedicated sanitizer like
+          DOMPurify with an explicit allow-list, and ideally <strong>applied server-side on write</strong> so
+          the stored value is already safe. Sanitizing on render means every read path has to remember to do
+          it — and one that forgets is the vulnerability."</p>
+        <p>"Two adjacent things I'd raise because they're part of the same picture."</p>
+        <p>"<strong>Token storage.</strong> Escaping is the primary defence, but if XSS does occur, what can it
+          steal? A JWT in <code>localStorage</code> is readable by any script, so it can be exfiltrated and used
+          later from anywhere. An access token held in memory plus a refresh token in an
+          <code>HttpOnly</code> cookie means the attacker can act while the page is open but can't take a
+          durable credential away. That's a meaningful reduction in impact."</p>
+        <p>"<strong>Content Security Policy</strong> as defence in depth — it restricts what an injected script
+          can do even when escaping fails, particularly blocking exfiltration to an attacker's domain. Angular
+          supports a strict CSP with a nonce for its inline styles."</p>
+        <p>"So the layered view: escaping prevents most XSS, CSP limits what a successful injection can do, and
+          <code>HttpOnly</code> cookies limit what it can steal."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know escaping is the default and sanitization applies to <code>innerHTML</code>?</li>
+        <li>Do you know <code>bypassSecurityTrust*</code> removes it?</li>
+        <li>Do you sanitize server-side on write rather than on render?</li>
+        <li>Do you connect it to token storage and CSP?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you safely render user-submitted markdown?</li>
+          <li>What's the CSRF risk with cookies?</li>
+          <li>How does the refresh flow work with an in-memory token?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How would you test an Angular application? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd aim for most of the value at the cheapest level, and be deliberate about what each level is
+          <em>for</em> — because the failure mode is a suite that's slow, flaky and breaks on every
+          refactor."</p>
+        <p>"<strong>Most tests should be plain unit tests with no Angular machinery at all.</strong> Services,
+          validators, pipes, pure functions — instantiate the class with stub dependencies and assert. No
+          <code>TestBed</code>, no fixture, milliseconds to run. If a service is hard to test this way it usually
+          means it's doing too much, so the difficulty is useful information."</p>
+        <p>"<strong>Component tests</strong> for rendering and interaction logic, with services mocked at the
+          boundary. The key discipline is <strong>testing behaviour rather than implementation</strong>. Asserting
+          <code>component.isLoading === true</code> tests a private field — rename it and the test fails though
+          nothing broke. Asserting that a spinner is visible while a request is in flight tests what the user
+          experiences, and survives refactoring."</p>
+        <p>"For interacting with components I'd use <strong>component harnesses</strong> rather than DOM queries.
+          Tests written against <code>querySelector('.mat-mdc-input-element')</code> break whenever the library
+          changes its internal markup — which Angular Material has done repeatedly, invalidating hundreds of
+          tests for no behavioural reason. A harness is a stable API the library maintains alongside its markup,
+          and the same harness code works in Playwright too."</p>
+        <p>"<strong>A few integration tests</strong> where several components and real routing interact — the
+          places where the wiring is the risk rather than any individual piece."</p>
+        <p>"<strong>Few E2E tests</strong>, covering critical journeys only: log in, place an order, check out.
+          They're the most valuable tests when they fail legitimately and the most expensive to maintain. A large
+          E2E suite becomes flaky, and a flaky suite gets ignored — at which point it's worse than not having
+          it, because it consumes CI time and trains people to re-run failures."</p>
+        <p>"Some specifics that matter in practice."</p>
+        <p>"<strong>Mock at the HTTP boundary</strong> with <code>HttpTestingController</code>, not by stubbing
+          your own service methods. That way you're testing your service's real logic including error handling,
+          and you can assert the request shape."</p>
+        <p>"<strong>Don't test the framework.</strong> A test proving <code>*ngIf</code> hides an element is
+          testing Angular, not your code."</p>
+        <p>"<strong>Async handling</strong> — <code>await</code> harness methods where possible, since they
+          stabilise internally. <code>fakeAsync</code> with <code>tick()</code> for time-dependent things like
+          debounced inputs. Worth noting <code>fakeAsync</code> relies on Zone.js, so zoneless apps need a
+          different approach."</p>
+        <p>"And the honest position on coverage: <strong>coverage percentage is a weak signal.</strong> 90%
+          coverage of getters and setters tells you nothing. I'd rather have thorough tests on the business rules
+          and the error paths than uniform coverage — and I'd specifically make sure the failure cases are
+          tested, because those are what break in production and what nobody exercises manually."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you push most tests to the cheapest level?</li>
+        <li>Do you test behaviour rather than internals?</li>
+        <li>Do you know harnesses and why they matter?</li>
+        <li>Are you realistic about E2E cost and flakiness?</li>
+        <li>Do you have a view on coverage as a metric?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "aim for 100% coverage."</li>
+        <li><span class="redflag">Red flag:</span> mostly E2E tests.</li>
+        <li><span class="redflag">Red flag:</span> asserting on component private state.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you test a component with a signal input?</li>
+          <li>How do you keep E2E tests from being flaky?</li>
+          <li>How would you test an interceptor?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

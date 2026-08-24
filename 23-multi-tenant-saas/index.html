@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Tenant SaaS — Overview</title>
+<meta name="description" content="What multi-tenancy actually requires, the decisions that are hard to reverse, and why a cross-tenant data leak is the failure that matters most.">
+<meta name="keywords" content="multi-tenant SaaS overview tenant isolation cross tenant data leak noisy neighbour per tenant cost tenancy decisions .NET architecture">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="23-multi-tenant-saas/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Multi-Tenant SaaS</h1>
+    <p class="subtitle">One system serving many customers who must never see each other's data. The isolation
+      decision shapes everything else, and it's expensive to change.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="what-it-requires">What multi-tenancy actually requires <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>One deployment serves many organisations. Each tenant experiences it as <em>their</em> system, and must
+      never be able to reach another tenant's data — by any route, including bugs.</p>
+    <p>The engineering problem isn't the feature work. It's that <strong>every single query, every cache key,
+      every log line and every background job has to be tenant-aware</strong>, and one that isn't is a
+      breach.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>What it means in practice</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Data isolation</strong></td>
+          <td>No query can return another tenant's rows. Enforced structurally, not by discipline</td>
+        </tr>
+        <tr>
+          <td><strong>Performance isolation</strong></td>
+          <td>One tenant's heavy usage must not degrade others — the noisy-neighbour problem</td>
+        </tr>
+        <tr>
+          <td><strong>Tenant context</strong></td>
+          <td>Every request, job and message must know which tenant it's acting for</td>
+        </tr>
+        <tr>
+          <td><strong>Per-tenant configuration</strong></td>
+          <td>Features, limits, branding, and sometimes region</td>
+        </tr>
+        <tr>
+          <td><strong>Operational granularity</strong></td>
+          <td>Restore one tenant, migrate one tenant, delete one tenant's data on request</td>
+        </tr>
+        <tr>
+          <td><strong>Cost attribution</strong></td>
+          <td>Knowing what each tenant costs you, which is harder than it sounds</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The failure that matters more than all the others</div>
+    <p style="margin:0">A <strong>cross-tenant data leak</strong> is not an ordinary bug. It's a breach — reportable
+      under GDPR, potentially contract-terminating, and the kind of incident that ends a B2B SaaS product's
+      reputation.
+      <br><br>
+      And it's usually caused by something small: one query missing its <code>WHERE TenantId = @tenantId</code>,
+      a cache key without the tenant in it, a background job iterating all records, or an admin endpoint that
+      forgot to scope.
+      <br><br>
+      Which is why the answer is never "be careful in code review". It has to be
+      <strong>structural</strong> — a mechanism that makes the unscoped query impossible or harmless:
+      <a href="../11-ef-core/querying.html#query-filters">global query filters</a>,
+      <a href="../10-sql/azure-sql.html#security">row-level security</a>, or separate databases.
+      <br><br>
+      If your protection is "developers remember", you will have a leak eventually. That framing — defence in
+      depth, structural not procedural — is the single most important thing to convey on this topic.</p>
+  </div>
+
+  <h2 id="the-decisions">The decisions, and how reversible they are <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Decision</th><th>Reversibility</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Isolation model</strong> — shared schema, schema-per-tenant, database-per-tenant</td>
+          <td><strong>Hard.</strong> Changing it is a data migration for every tenant</td>
+        </tr>
+        <tr>
+          <td><strong>Tenant identifier</strong> — where it lives, how it's resolved</td>
+          <td><strong>Hard.</strong> It's in every table and every request path</td>
+        </tr>
+        <tr>
+          <td><strong>Whether tenant id is on every table</strong></td>
+          <td><strong>Hard.</strong> Retrofitting means a schema change plus backfill</td>
+        </tr>
+        <tr>
+          <td>Throttling and quota policy</td>
+          <td>Moderate — mostly configuration</td>
+        </tr>
+        <tr>
+          <td>Feature flags per tenant</td>
+          <td>Easy</td>
+        </tr>
+        <tr>
+          <td>Billing and metering</td>
+          <td>Moderate — depends on what you instrumented</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Put the tenant id on every tenant-owned table from day one, even if you start with a shared
+      schema.</strong></p>
+    <p>It costs a column. It buys you the ability to enforce isolation structurally, to migrate a single tenant
+      later, and to move to a different isolation model without a full redesign.</p>
+    <p>Retrofitting it into a live system with hundreds of tables is one of the least pleasant projects
+      available.</p>
+  </div>
+
+  <h2 id="isolation-spectrum">The isolation spectrum <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Shared schema</th><th>Schema per tenant</th><th>Database per tenant</th></tr></thead>
+      <tbody>
+        <tr><td>Isolation</td><td>Logical only</td><td>Moderate</td><td><strong>Strong</strong></td></tr>
+        <tr><td>Cost per tenant</td><td><strong>Lowest</strong></td><td>Moderate</td><td>Highest</td></tr>
+        <tr><td>Leak risk</td><td><strong>Highest</strong> — one bad query</td><td>Lower</td><td><strong>Near zero</strong></td></tr>
+        <tr><td>Restore one tenant</td><td><strong>Very hard</strong></td><td>Moderate</td><td><strong>Trivial</strong></td></tr>
+        <tr><td>Noisy neighbour</td><td><strong>Likely</strong></td><td>Possible</td><td>Contained</td></tr>
+        <tr><td>Schema migration</td><td><strong>One migration</strong></td><td>N migrations</td><td>N migrations</td></tr>
+        <tr><td>Tenants supported</td><td>Very many</td><td>Hundreds</td><td>Hundreds to low thousands</td></tr>
+        <tr><td>Best for</td><td>Many small tenants, low-touch</td><td>Middle ground</td><td><strong>Enterprise, regulated, few large tenants</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the hybrid model is what mature products actually run</div>
+    <p style="margin:0">The three models are usually presented as a choice. In practice successful products run
+      <strong>more than one at once</strong>.
+      <br><br>
+      The common shape: <strong>most tenants share a schema</strong> in a pooled database, because they're small
+      and numerous and cost matters. <strong>Large or regulated tenants get their own database</strong>, because
+      they demand isolation, have data-residency requirements, or generate enough load to be a noisy
+      neighbour.
+      <br><br>
+      The key architectural requirement is that <strong>a tenant can be moved between models without a rewrite</strong>
+      — which means the application resolves the tenant's connection at runtime from a catalogue, rather than
+      having one connection string in configuration.
+      <br><br>
+      "I'd design so a tenant can graduate to its own database when it needs to" is a strong answer, because it
+      accepts that the requirements differ per customer instead of forcing one trade-off on everyone. Same
+      reasoning as <a href="../10-sql/azure-sql.html#elastic-pools">graduating a tenant out of an elastic
+      pool</a>.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="isolation-models.html">Tenant Isolation Models</a></td>
+          <td>The models in detail, the hybrid approach, schema migration across many databases, and choosing
+              between them</td>
+        </tr>
+        <tr>
+          <td><a href="tenant-context.html">Tenant Context &amp; Security</a></td>
+          <td><strong>The most important page.</strong> Resolving and propagating tenant context, enforcing
+              isolation structurally, and the specific ways leaks happen</td>
+        </tr>
+        <tr>
+          <td><a href="scaling-operations.html">Scaling &amp; Noisy Neighbours</a></td>
+          <td>Per-tenant throttling, resource isolation, monitoring per tenant, and disaster recovery
+              granularity</td>
+        </tr>
+        <tr>
+          <td><a href="lifecycle-billing.html">Onboarding, Billing &amp; Migration</a></td>
+          <td>Automated provisioning, usage metering, per-tenant feature flags, moving a tenant, and
+              offboarding</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="dotnet">The .NET picture <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td>Tenant resolution</td><td>Middleware reading a subdomain, header, or a JWT claim</td></tr>
+        <tr><td>Tenant context</td><td>A scoped service; <strong>never</strong> a static or <code>AsyncLocal</code> you set manually</td></tr>
+        <tr><td>Data isolation</td><td><a href="../11-ef-core/querying.html#query-filters">EF Core global query filters</a> plus SQL row-level security</td></tr>
+        <tr><td>Connection per tenant</td><td>Resolved at runtime from a catalogue, via <code>IDbContextFactory</code></td></tr>
+        <tr><td>Cache isolation</td><td>The tenant id in <strong>every</strong> cache key</td></tr>
+        <tr><td>Background jobs</td><td>Tenant id carried in the message; a scope created per tenant</td></tr>
+        <tr><td>Per-tenant limits</td><td>Redis-backed rate limiting keyed by tenant</td></tr>
+        <tr><td>Observability</td><td>Tenant id as a log property and a trace <em>baggage</em> item</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The mistake that's specific to .NET</div>
+    <p style="margin:0">EF Core caches the <strong>model</strong> per <code>DbContext</code> <em>type</em>, not per
+      instance. So a global query filter that captures a tenant id incorrectly can be baked into the cached model
+      — and then <strong>one tenant's filter is applied to another tenant's requests</strong>.
+      <br><br>
+      That's a cross-tenant leak that appears only under concurrency, in production, and passes every test that
+      runs one tenant at a time.
+      <br><br>
+      The safe pattern is to reference a <em>field on the context instance</em> that EF re-reads per query, and to
+      configure <code>IModelCacheKeyFactory</code> if the filter's shape varies per tenant. Covered on
+      <a href="tenant-context.html">the tenant context page</a>, and it's the single highest-value .NET-specific
+      detail in this section.</p>
+  </div>
+
+  <details class="qa">
+    <summary>How would you design a multi-tenant SaaS application? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start with questions, because the isolation decision is the one that's hardest to reverse and it
+          depends entirely on the customer profile."</p>
+        <p>"<strong>How many tenants, and how large?</strong> Ten thousand small tenants and fifty enterprise
+          customers are completely different problems. <strong>What do they demand?</strong> Enterprise B2B
+          contracts frequently require data isolation, data residency, or their own encryption keys. <strong>What's
+          the compliance position</strong> — GDPR, HIPAA, SOC 2? And <strong>can one tenant generate enough load
+          to affect others?</strong>"</p>
+        <p>"For most products my answer is a <strong>hybrid</strong>: shared schema in a pooled database for the
+          many small tenants, with the ability for a large or regulated tenant to graduate to its own database. The
+          key architectural requirement is that <strong>the connection is resolved at runtime from a tenant
+          catalogue</strong> rather than sitting in configuration, so moving a tenant between models doesn't
+          require a rewrite."</p>
+        <p>"But whichever model, the thing I'd be most careful about is <strong>data isolation, enforced
+          structurally rather than by discipline</strong>."</p>
+        <p>"A cross-tenant leak isn't an ordinary bug — it's a reportable breach and potentially
+          contract-terminating. And it's caused by something small: one query missing its tenant predicate, a
+          cache key without the tenant in it, a background job iterating all records, or an admin endpoint that
+          forgot to scope."</p>
+        <p>"So I'd want <strong>defence in depth</strong>. <strong>EF Core global query filters</strong> so the
+          predicate is applied automatically and a developer can't forget it. <strong>SQL row-level
+          security</strong> underneath, so even a hand-written query or a direct database connection is filtered —
+          that's the layer that protects you when the application layer is bypassed. And the <strong>tenant id on
+          every tenant-owned table</strong> from day one, even in a shared schema, because it's what makes both
+          of those possible and retrofitting it later is horrible."</p>
+        <p>"For <strong>tenant context</strong>, middleware resolves the tenant — from a subdomain, a header, or
+          preferably a JWT claim since that's signed and can't be spoofed — and puts it in a scoped service.
+          Crucially, <strong>the tenant must never be taken from user-supplied input</strong> without validating
+          that the authenticated principal is entitled to it. A tenant id in a request body or query string that's
+          trusted is the most direct possible leak."</p>
+        <p>"Then the parts people forget: <strong>the tenant id must be in every cache key</strong>, or one
+          tenant's cached response is served to another. <strong>Background jobs and message consumers</strong>
+          need the tenant carried in the message and a scope created per tenant, because there's no HTTP request
+          to resolve from. And <strong>the tenant id belongs in logs and traces</strong> — as trace baggage — so
+          the first question in any incident, 'is this one tenant or everyone?', is answerable."</p>
+        <p>"On <strong>noisy neighbours</strong>, per-tenant rate limiting backed by Redis so the limit is global
+          across instances, plus per-tenant query monitoring so I can see which tenant is generating load. In a
+          pooled database, per-database caps if I'm using elastic pools."</p>
+        <p>"And I'd plan the <strong>operational granularity</strong> up front, because it's usually retrofitted
+          badly: restoring one tenant's data, migrating one tenant to a different database, and deleting a
+          tenant's data completely on request. That last one is a GDPR requirement and it's genuinely hard in a
+          shared schema — you need to know every table and every backup that contains their data."</p>
+        <p>"One .NET-specific trap I'd flag: <strong>EF Core caches the model per context type, not per
+          instance.</strong> A global query filter that captures the tenant id wrongly can bake one tenant's
+          filter into the cached model and apply it to another tenant's requests. That's a leak that only appears
+          under concurrency and passes every single-tenant test."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask about tenant profile before choosing a model?</li>
+        <li>Do you propose a hybrid with runtime connection resolution?</li>
+        <li>Do you insist on structural isolation with defence in depth?</li>
+        <li>Do you cover caches, background jobs and logs — not just queries?</li>
+        <li>Do you refuse to trust a client-supplied tenant id?</li>
+        <li>Do you plan per-tenant restore and deletion?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add a TenantId column and filter in queries" with no
+          enforcement mechanism.</li>
+        <li><span class="redflag">Red flag:</span> picking an isolation model with no questions.</li>
+        <li><span class="redflag">Red flag:</span> no mention of caches or background jobs.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you migrate 500 databases' schemas safely?</li>
+          <li>How do you delete one tenant's data from backups?</li>
+          <li>How would you detect a leak before a customer does?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section builds on
+      <a href="../10-sql/azure-sql.html#elastic-pools">Azure SQL elastic pools</a>,
+      <a href="../11-ef-core/querying.html#query-filters">EF Core global query filters</a>, and
+      <a href="../14-cosmos-db/fundamentals.html#hierarchical">Cosmos hierarchical partition keys</a> — the
+      per-store mechanics are covered there, and this section is about the architecture that uses them.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

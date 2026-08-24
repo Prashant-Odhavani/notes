@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API &amp; Service Scaling — Scaling Scenarios</title>
+<meta name="description" content="Ten times the traffic, CPU spikes, memory growth, latency without CPU, connection pool exhaustion and thread pool starvation — diagnosed in order.">
+<meta name="keywords" content="API scaling 10x traffic thread pool starvation sync over async connection pool exhaustion memory leak GC gen2 CPU spike latency without CPU load shedding rate limiting queue based load levelling HttpClient socket exhaustion">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="35-scaling-scenarios/api.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>API &amp; Service Scaling</h1>
+    <p class="subtitle">Five scenarios. In four of them the instinctive fix is wrong, and the reason is always that
+      something finite is being contended.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Latency up, CPU low</strong> → queueing: thread pool, connection pool, or CPU throttling.</li>
+      <li><strong>Sync-over-async is the most common .NET scaling bug.</strong></li>
+      <li><strong>Connection pools are per-instance</strong>, but the database limit is shared.</li>
+      <li><strong>Scaling out multiplies connection demand</strong> — it can make contention worse.</li>
+      <li><strong>Memory rising and never recovering</strong> after GC is a leak, not sizing.</li>
+      <li><strong>Reject rather than queue</strong> when overloaded — a slow system is worse than a fast refusal.</li>
+      <li><strong><code>IHttpClientFactory</code></strong>, or you'll exhaust sockets or cache DNS forever.</li>
+    </ul>
+  </div>
+
+  <h2 id="ten-x">Scenario: traffic goes up 10× <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Check, in order</th><th>Because</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Is it a real 10× or one caller?</strong></td><td>A misbehaving client or a scraper isn't a capacity problem</td></tr>
+        <tr><td><strong>What broke first?</strong></td><td>The first thing to saturate names the bottleneck</td></tr>
+        <tr><td><strong>Are we CPU-bound, or waiting?</strong></td><td>Decides whether more instances help at all</td></tr>
+        <tr><td><strong>Database connections and DTU/RU</strong></td><td><strong>The usual real ceiling</strong></td></tr>
+        <tr><td><strong>Is the app stateless?</strong></td><td>Scaling out breaks session, in-memory cache, timers</td></tr>
+        <tr><td><strong>Are downstream dependencies keeping up?</strong></td><td>You may just be moving the queue</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Scaling out is where most people start, and it often makes it worse</div>
+    <p style="margin:0">If the constraint is the <strong>database</strong> — and it usually is — then more application
+      instances means more connections competing for the same finite server capacity.
+      <br><br>
+      Concretely: each instance has its own connection pool, default 100 for SQL Server. Three instances is up to 300
+      connections; ten instances is 1,000 — against a database that has a hard limit and will start rejecting or
+      queueing. So you've converted "the app is slow" into "the app can't connect", which is worse and looks
+      unrelated.
+      <br><br>
+      The same applies to <strong>any shared downstream</strong>: a third-party API with a rate limit, a Redis
+      instance, a Service Bus namespace. Scaling the tier that isn't the bottleneck just applies more pressure to the
+      one that is.
+      <br><br>
+      And scaling out only works at all if the app is <strong>stateless</strong>. In-memory session, an in-memory
+      cache, a rate limiter counting locally, and — the damaging one —
+      <a href="../24-azure/app-service.html#scaling">a background timer that now runs on every instance</a>, so a
+      nightly job fires ten times.
+      <br><br>
+      So the honest sequence is: <strong>find what saturated first, and scale that.</strong> Which is often the
+      database, and the fix there is usually queries and indexes rather than a bigger tier.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The controls that actually hold under 10×</div>
+    <p style="margin:0">Beyond capacity, four things change the shape of the problem rather than the size of the
+      machine.
+      <br><br>
+      <strong>Caching.</strong> If 80% of requests read the same data, caching removes 80% of the database load —
+      which is a far bigger lever than any tier increase. Check the read/write ratio first, because that's what
+      decides whether it's worth it.
+      <br><br>
+      <strong>Rate limiting per caller.</strong> Distributed, not per-instance, or it multiplies as you scale. This
+      also protects you from the case where the 10× is one bad client.
+      <br><br>
+      <strong>Queue-based load levelling.</strong> If the work doesn't need a synchronous answer, accept the request,
+      return 202 with a status URL, and process from a queue. Then a traffic spike grows a queue rather than timing
+      out — the system degrades in latency instead of failing. That's the single most effective structural change for
+      spiky load.
+      <br><br>
+      <strong>Load shedding.</strong> Above a threshold, reject fast with 429 and <code>Retry-After</code>. Sounds
+      worse than queueing and isn't: <strong>a request that times out after 30 seconds consumed resources and helped
+      nobody</strong>. Fast rejection keeps the system alive for the requests it can serve, and tells the client
+      something useful.</p>
+  </div>
+
+  <h2 id="latency-no-cpu">Scenario: latency is terrible, CPU is fine <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Signature</th><th>Confirm with</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Thread pool starvation</strong></td>
+          <td>Latency scales with concurrency; queue length rising</td>
+          <td><code>dotnet-counters</code>: queue length, thread count</td>
+        </tr>
+        <tr>
+          <td><strong>Connection pool exhaustion</strong></td>
+          <td>Timeouts mentioning "pool", waits before any query runs</td>
+          <td>Pool wait time; <code>Timeout expired</code> errors</td>
+        </tr>
+        <tr>
+          <td><strong>CPU throttling</strong> (containers)</td>
+          <td><strong>Average CPU low</strong> because it's paused, not idle</td>
+          <td><code>container_cpu_cfs_throttled_seconds_total</code></td>
+        </tr>
+        <tr>
+          <td><strong>A slow dependency</strong></td>
+          <td>Dependency duration accounts for the time</td>
+          <td>Dependency telemetry</td>
+        </tr>
+        <tr>
+          <td><strong>Lock contention</strong></td>
+          <td>Threads blocked on the same monitor</td>
+          <td><code>dotnet-stack</code> — many threads, same frame</td>
+        </tr>
+        <tr>
+          <td><strong>GC pause</strong></td>
+          <td>Latency spikes correlate with Gen2 collections</td>
+          <td>GC pause time, allocation rate</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — the bug behind most thread pool starvation" class="code-bad"><code class="language-csharp">// WRONG - blocks a thread pool thread for the duration of the I/O
+public IActionResult Get(int id)
+{
+    var order = _service.GetOrderAsync(id).Result;      // or .Wait(), or .GetAwaiter().GetResult()
+    return Ok(order);
+}
+// Under load: every request occupies a pool thread while waiting on the
+// database. The pool injects new threads slowly (roughly 1-2 per second),
+// so requests queue. CPU stays low - nothing is computing, everything waits.
+// Latency climbs with concurrency and looks like a database problem.</code></pre>
+
+  <pre data-label="csharp — and the fix" class="code-good"><code class="language-csharp">public async Task&lt;IActionResult&gt; Get(int id, CancellationToken ct)
+{
+    var order = await _service.GetOrderAsync(id, ct);   // thread returns to the pool
+    return Ok(order);
+}
+// While awaiting I/O, no thread is held. The same pool serves far more
+// concurrent requests. Async all the way down - one .Result deep in a
+// call chain reintroduces the problem.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — thread pool starvation is the .NET scaling bug</div>
+    <p style="margin:0">It's the most common cause of "the app is slow under load but CPU is low" in .NET, and the
+      mechanism is worth being able to explain rather than just recognising the fix.
+      <br><br>
+      A blocking call on a thread pool thread holds that thread for the whole duration of the I/O. The pool starts
+      with roughly one thread per core and <strong>injects additional threads slowly</strong> — around one or two per
+      second — because the heuristic assumes threads are busy computing, not blocked.
+      <br><br>
+      So under a burst, requests arrive faster than threads become available. They queue. Latency climbs steeply with
+      concurrency, and CPU stays low because <strong>nothing is computing — everything is waiting</strong>.
+      <br><br>
+      It typically presents as a database problem, because the visible symptom is slow queries. The queries are fine;
+      the requests are queueing before they reach the database.
+      <br><br>
+      Two things make it worse. It's <strong>self-reinforcing</strong>: slower responses mean more concurrent
+      in-flight requests, which means more blocked threads. And <strong>one <code>.Result</code> deep in a call
+      chain</strong> is enough — a fully async controller calling a synchronous helper still blocks.
+      <br><br>
+      Immediate mitigation is <code>ThreadPool.SetMinThreads</code> to raise the floor, which buys time and does not
+      fix it. The fix is async all the way down. Finding the offenders: analyzer rules for sync-over-async, or
+      <code>dotnet-stack</code> in production showing dozens of threads parked on the same
+      <code>.GetAwaiter().GetResult()</code> frame.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Connection pool exhaustion looks identical and isn't</div>
+    <p style="margin:0">Also latency-with-low-CPU, and the distinguishing detail is <em>where</em> the wait happens:
+      requests wait <strong>before any query executes</strong>, and the error mentions the pool —
+      <em>"Timeout expired. The timeout period elapsed prior to obtaining a connection from the pool."</em>
+      <br><br>
+      Common causes, in order:
+      <br><br>
+      <strong>Connections not disposed.</strong> A missing <code>using</code>, or a <code>DbContext</code> resolved
+      as a singleton so it never releases. The pool drains and never recovers.
+      <br><br>
+      <strong>Connections held too long.</strong> A long transaction, or a connection opened before an HTTP call and
+      still held during it. The pool size is adequate; the holding time isn't.
+      <br><br>
+      <strong>Genuinely too small for the concurrency.</strong> The legitimate case, and the one people assume
+      first.
+      <br><br>
+      The trap: <strong>raising the pool size scales the problem rather than fixing it.</strong> The database has its
+      own connection limit, and pools are per-instance — so three instances at 200 each is 600 connections against a
+      server that may cap lower. You move the failure from the app to the database, where it's harder to diagnose.
+      <br><br>
+      So diagnose holding time before increasing size. The right pool size is a function of concurrency <em>and</em>
+      how long each connection is held; halving the holding time is equivalent to doubling the pool, and it doesn't
+      cost the database anything.</p>
+  </div>
+
+  <h2 id="memory">Scenario: memory keeps growing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Shape</th><th>Means</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Rises and never falls after GC</strong></td>
+          <td><strong>A leak</strong> — something roots the objects</td>
+          <td>Find the root; a bigger limit only delays it</td>
+        </tr>
+        <tr>
+          <td><strong>Tracks concurrency, falls after</strong></td>
+          <td>Per-request buffering</td>
+          <td>Stream instead of buffer; page the query</td>
+        </tr>
+        <tr>
+          <td><strong>Sawtooth, stable ceiling</strong></td>
+          <td><strong>Normal</strong> — that's the GC working</td>
+          <td>Nothing, unless pause time hurts</td>
+        </tr>
+        <tr>
+          <td><strong>High but flat</strong></td>
+          <td>Server GC holding memory by design</td>
+          <td>Usually fine; consider Workstation GC in small containers</td>
+        </tr>
+        <tr>
+          <td><strong>Sudden step, then flat</strong></td>
+          <td>A cache filled once</td>
+          <td>Bound the cache — size limits and expiry</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The .NET leak suspects, in order</div>
+    <p style="margin:0"><strong>An unbounded cache</strong> or a static dictionary that only ever grows. The most
+      common by a distance, and often intentional code that nobody bounded — <code>IMemoryCache</code> with no
+      <code>SizeLimit</code>, or a <code>ConcurrentDictionary</code> used as a cache with no eviction.
+      <br><br>
+      <strong>Event handlers never unsubscribed.</strong> A subscription roots the subscriber, so a long-lived
+      publisher keeps every short-lived subscriber alive.
+      <br><br>
+      <strong>Captured context in a long-lived delegate.</strong> A lambda registered once capturing a scoped service
+      keeps that whole object graph — including a <code>DbContext</code> and its change tracker — alive forever.
+      <br><br>
+      <strong><code>HttpClient</code> created per request</strong>, which leaks sockets in <code>TIME_WAIT</code>
+      rather than managed memory — so it presents as connection failures rather than memory growth.
+      <code>IHttpClientFactory</code> fixes both that and the opposite problem, a singleton client caching DNS
+      forever.
+      <br><br>
+      <strong>A DI lifetime mistake:</strong> a scoped service captured by a singleton, so one request's object graph
+      never releases.
+      <br><br>
+      To find it: <code>dotnet-gcdump</code> twice, several minutes apart, and compare. <strong>What grew between the
+      snapshots is the answer</strong>, and the retention path shows what's rooting it. Much faster than reasoning
+      about the code.
+      <br><br>
+      And remember the container interaction: <strong>.NET sizes the GC heap from the memory limit</strong>, so a
+      tight limit makes the GC work harder — high CPU and pause time — and may still get OOM-killed. Raising the limit
+      can reduce CPU, which is genuinely counterintuitive.</p>
+  </div>
+
+  <h2 id="cpu">Scenario: CPU spikes to 100% <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Clue</th></tr></thead>
+      <tbody>
+        <tr><td><strong>GC pressure</strong></td><td>High allocation rate; CPU tracks Gen2 collections</td></tr>
+        <tr><td><strong>Regex backtracking</strong></td><td>One request pins a core. <strong>Possibly an attack</strong></td></tr>
+        <tr><td><strong>Serialisation of large payloads</strong></td><td>Correlates with response size</td></tr>
+        <tr><td><strong>An accidental hot loop</strong></td><td>New since a deployment</td></tr>
+        <tr><td><strong>Synchronous crypto or compression</strong></td><td>Genuinely CPU-bound work on request threads</td></tr>
+        <tr><td><strong>In-memory filtering</strong></td><td>Fetching 100k rows to return 20</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two CPU causes worth knowing specifically</div>
+    <p style="margin:0"><strong>GC pressure.</strong> High CPU with high allocation rate usually means excessive
+      allocation, not expensive computation. Typical sources: string concatenation in a loop, LINQ over large
+      collections creating intermediate arrays, boxing, and materialising an entire query result to filter it in
+      memory. The fix is to allocate less — <code>Span&lt;T&gt;</code>, pooling, and pushing filtering into the
+      database — rather than tuning the GC.
+      <br><br>
+      <strong>Regex backtracking.</strong> A catastrophically backtracking pattern can take exponential time on a
+      crafted input, so one request saturates a core indefinitely. If the pattern is applied to user input,
+      <strong>that's a denial-of-service vector</strong>, not just a performance issue.
+      <br><br>
+      The mitigations: always set a <code>matchTimeout</code>, use
+      <code>RegexOptions.NonBacktracking</code> where the pattern allows it, and prefer the source-generated
+      <code>[GeneratedRegex]</code> attribute. If a single endpoint pins one core while others are fine, this is high
+      on the list — and it's easy to confirm from a stack sample.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Find what saturated first, and scale that — usually not the app tier.</li>
+      <li>Scaling out multiplies connection demand on a shared database.</li>
+      <li>Scaling out requires a stateless app, or timers and caches break.</li>
+      <li>Caching, per-caller rate limits, queue-based levelling and load shedding change the shape.</li>
+      <li>Fast rejection beats a request that times out after consuming resources.</li>
+      <li>Latency with low CPU: thread pool, connection pool, CPU throttling, or a slow dependency.</li>
+      <li>Sync-over-async holds a pool thread and the pool grows slowly — hence queueing.</li>
+      <li>One <code>.Result</code> deep in the chain is enough to cause it.</li>
+      <li>Connection pool waits happen before any query runs; fix holding time before pool size.</li>
+      <li>Memory rising and never recovering after GC is a leak; compare two gcdumps.</li>
+      <li>Unbounded caches are the leading .NET leak.</li>
+      <li><code>IHttpClientFactory</code> for both socket exhaustion and DNS caching.</li>
+      <li>High CPU is often allocation, not computation.</li>
+      <li>Regex backtracking on user input is a DoS vector — always set a timeout.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Scaling out when the database is the bottleneck.</strong></li>
+    <li><strong>Raising the connection pool size</strong> without checking holding time.</li>
+    <li><strong>Scaling out a stateful app</strong>, multiplying timers and breaking sessions.</li>
+    <li><strong>Blocking on async</strong> anywhere in the request path.</li>
+    <li><strong>Reading CPU percent</strong> instead of throttled seconds in a container.</li>
+    <li><strong>Raising the memory limit</strong> for what is actually a leak.</li>
+    <li><strong>An unbounded <code>IMemoryCache</code></strong> with no size limit or expiry.</li>
+    <li><strong><code>new HttpClient()</code> per request</strong>, exhausting sockets.</li>
+    <li><strong>Regex on user input with no timeout.</strong></li>
+    <li><strong>Filtering in memory</strong> after fetching everything.</li>
+    <li><strong>Queueing indefinitely under overload</strong> rather than shedding load.</li>
+    <li><strong>Per-instance rate limiting</strong>, so the limit multiplies with scale.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Traffic is about to increase 10×. What do you do? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"If I have warning, the first thing I'd do is <strong>find the actual bottleneck rather than guess
+          it</strong> — because 'add more instances' is the instinctive answer and it's frequently wrong."</p>
+        <p>"<strong>Load test to find what breaks first.</strong> That's the whole exercise: push until something
+          saturates, and the thing that saturates first is what you scale. Everything else is speculation."</p>
+        <p>"In my experience it's usually <strong>the database</strong>, and that matters because it inverts the
+          obvious fix. Each app instance has its own connection pool — 100 by default for SQL Server — so three
+          instances is up to 300 connections and ten is 1,000, against a database with a hard limit. Scaling the app
+          tier converts 'the app is slow' into 'the app can't connect', which is worse and looks unrelated."</p>
+        <p>"So the sequence is: <strong>identify the constraint, then relieve it.</strong> If it's the database,
+          that's queries and indexes first — a missing index that's fine at current volume can be catastrophic at
+          10×, because a scan that costs 50ms on 100,000 rows costs seconds on a million."</p>
+        <p>"Then I'd check the things that only break at scale."</p>
+        <p>"<strong>Is the app stateless?</strong> In-memory session, an in-memory cache, a rate limiter counting
+          locally — all break silently across instances. And the one that does real damage: a background timer inside
+          the web app now runs on <em>every</em> instance, so a nightly job fires ten times. Nothing errors; the work
+          just happens repeatedly."</p>
+        <p>"<strong>Any sync-over-async in the request path?</strong> This is the .NET-specific one and it doesn't
+          show up at low load. A blocking call holds a thread pool thread for the whole I/O duration, and the pool
+          injects new threads at roughly one or two per second — so under a burst, requests queue and latency climbs
+          steeply while CPU stays low, because nothing is computing. It typically presents as a database problem when
+          the queries are fine."</p>
+        <p>"<strong>Then the structural changes</strong>, which help more than capacity."</p>
+        <p>"<strong>Caching</strong>, if the read/write ratio justifies it. If 80% of requests read the same data,
+          that removes 80% of database load — a much bigger lever than any tier increase."</p>
+        <p>"<strong>Queue-based load levelling</strong> for anything that doesn't need a synchronous answer: accept,
+          return 202 with a status URL, process from a queue. Then a spike grows a queue instead of timing out — the
+          system degrades in latency rather than failing. That's the most effective single change for spiky
+          load."</p>
+        <p>"<strong>Distributed rate limiting per caller</strong> — distributed specifically, because a per-instance
+          limiter multiplies as you scale, so a 100-per-minute limit becomes 1,000 across ten instances."</p>
+        <p>"<strong>Load shedding.</strong> Above a threshold, reject fast with 429 and <code>Retry-After</code>.
+          That sounds worse than queueing and isn't: a request that times out after 30 seconds consumed resources and
+          helped nobody. Fast rejection keeps the system alive for what it can serve."</p>
+        <p>"<strong>Autoscaling configured ahead of time</strong>, with a sensible minimum — because scale-out isn't
+          instant and a cold start under load is its own problem. And on the classic App Service and APIM tiers,
+          scaling takes long enough that you cannot do it reactively during a spike."</p>
+        <p>"<strong>If it's already happening</strong> with no warning, the order changes: mitigate first. Scale what
+          I can, enable caching, disable expensive non-essential features by flag, rate-limit the heaviest callers.
+          Then diagnose properly once service is stable — but I'd capture metrics and a dump before restarting
+          anything, because a restart destroys the evidence and it'll recur."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you load test rather than guess the bottleneck?</li>
+        <li>Do you know scaling out pressures the database?</li>
+        <li>Do you check statelessness and background timers?</li>
+        <li>Do you raise sync-over-async as a load-only failure?</li>
+        <li>Do you reach for queueing and load shedding, not just capacity?</li>
+        <li>Do you know per-instance rate limits multiply?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "scale out and add a cache" with no diagnosis.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of connection limits.</li>
+        <li><span class="redflag">Red flag:</span> queueing indefinitely instead of shedding.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you find sync-over-async in a large codebase?</li>
+          <li>What would you cache, and how would you invalidate it?</li>
+          <li>How do you decide the load-shedding threshold?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Latency is 5 seconds, CPU is 20%, the database says queries take 10ms. Explain it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Those three facts together are very informative. The database is fast and the CPU is idle, so
+          <strong>the time is being spent waiting, and it isn't waiting on the database doing work</strong>. Almost
+          certainly requests are queueing <em>before</em> they reach it."</p>
+        <p>"My first hypothesis is <strong>thread pool starvation from sync-over-async</strong>, because it produces
+          exactly this signature."</p>
+        <p>"The mechanism: a blocking call — <code>.Result</code>, <code>.Wait()</code>,
+          <code>.GetAwaiter().GetResult()</code> — holds a thread pool thread for the entire duration of the I/O. The
+          pool starts around one thread per core and injects more at roughly one or two per second, because the
+          heuristic assumes threads are computing rather than blocked."</p>
+        <p>"So under load, requests arrive faster than threads free up and they queue. The 10ms query is genuinely
+          10ms; the request spent 4.99 seconds waiting for a thread to run it on. And CPU is low because
+          <strong>nothing is computing — everything is waiting</strong>."</p>
+        <p>"I'd confirm with <code>dotnet-counters</code>: <strong>thread pool queue length rising</strong> and thread
+          count climbing slowly. And <code>dotnet-stack</code> to see the stacks — if dozens of threads are parked on
+          the same <code>.GetAwaiter().GetResult()</code> frame, that's conclusive. Both work in a container via
+          <code>kubectl debug</code>."</p>
+        <p>"The second candidate with the same signature is <strong>connection pool exhaustion</strong>, and the
+          distinguishing detail is where the wait happens: requests wait before any query executes, and the error
+          mentions the pool — 'timeout period elapsed prior to obtaining a connection'. That fits 'the database says
+          queries are 10ms' too, because the database only sees the queries that got a connection."</p>
+        <p>"Causes there: connections not disposed, a <code>DbContext</code> registered as a singleton, connections
+          held across an HTTP call, or a pool genuinely too small. I'd check pool wait time to distinguish."</p>
+        <p>"Third, if this is in a container, <strong>CPU throttling</strong>. A CPU limit is enforced per 100ms
+          period, so a container that consumes its quota is <em>paused</em> for the remainder. Average CPU looks low
+          precisely because it's paused rather than idle — which is why 20% is not the reassurance it appears to be. I'd
+          check <code>container_cpu_cfs_throttled_seconds_total</code>, not CPU percent."</p>
+        <p>"Fourth, <strong>lock contention</strong> — a <code>lock</code> or semaphore serialising requests through a
+          critical section. Also low CPU, also scales with concurrency, and <code>dotnet-stack</code> distinguishes it
+          because the blocked threads share a different frame."</p>
+        <p>"The question that separates these fastest: <strong>does latency scale with concurrency?</strong> If yes,
+          it's queueing — one of the four above. If a single request in isolation is also slow, then it's a genuinely
+          slow path and I'd be looking at something else entirely, like a dependency the telemetry isn't
+          capturing."</p>
+        <p>"On mitigation: <code>ThreadPool.SetMinThreads</code> raises the floor and buys time, and I'd be explicit
+          that it's a workaround — it hides the problem at moderate load and the same wall reappears higher up. The
+          fix is async all the way down, and I'd note that <strong>one <code>.Result</code> deep in the call
+          chain</strong> is enough, so a fully async controller can still starve. Analyzer rules catch these at build
+          time, which is the structural version of the fix."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you conclude the time is spent queueing, not working?</li>
+        <li>Can you explain the thread pool injection mechanism?</li>
+        <li>Do you distinguish pool exhaustion from thread starvation?</li>
+        <li>Do you know CPU percent hides throttling?</li>
+        <li>Do you name the tools that confirm it?</li>
+        <li>Do you treat <code>SetMinThreads</code> as a workaround?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add more instances."</li>
+        <li><span class="redflag">Red flag:</span> concluding it's fine because CPU is low.</li>
+        <li><span class="redflag">Red flag:</span> <code>SetMinThreads</code> presented as the fix.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you prove it's thread starvation and not the pool?</li>
+          <li>What if it's a third-party library blocking internally?</li>
+          <li>How would you prevent this reaching production again?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

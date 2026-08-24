@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fundamentals — DynamoDB</title>
+<meta name="description" content="Partition and sort keys, query vs scan, GSIs and LSIs, consistency options, conditional writes and item limits.">
+<meta name="keywords" content="DynamoDB partition key sort key composite primary key query scan GSI global secondary index LSI local secondary index eventually consistent strongly consistent read conditional write optimistic locking 400KB item limit sparse index projection">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="15-dynamodb/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Fundamentals</h1>
+    <p class="subtitle">Keys, queries and indexes. Four concepts, and they determine everything the table can
+      ever do.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Partition key</strong> decides <em>where</em> the item lives. <strong>Sort key</strong>
+        decides <em>order within</em> that partition.</li>
+      <li><strong>Query</strong> needs the partition key and is efficient. <strong>Scan</strong> reads the whole
+        table.</li>
+      <li><strong>The sort key is where range queries and hierarchies come from.</strong> It's the most
+        underused feature.</li>
+      <li><strong>GSI</strong> = a different partition key, eventually consistent, its own capacity.
+        <strong>LSI</strong> = same partition key, different sort key.</li>
+      <li><strong>Reads are eventually consistent by default.</strong> Strongly consistent costs 2×.</li>
+      <li><strong>Conditional writes</strong> are how you get atomicity and optimistic concurrency.</li>
+      <li><strong>400 KB item limit</strong>, and 10 GB per partition-key value if you use an LSI.</li>
+    </ul>
+  </div>
+
+  <h2 id="keys">Partition key and sort key <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>The <strong>partition key</strong> is hashed to decide which physical partition stores the item. That's
+      how DynamoDB finds data in constant time regardless of table size.</p>
+    <p>The <strong>sort key</strong> orders items <em>within</em> a partition. That's what turns a key-value
+      store into something you can range-query.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key type</th><th>Structure</th><th>Capability</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Simple</strong></td>
+          <td>Partition key only</td>
+          <td>Pure key-value. Get one item by key. Nothing else</td>
+        </tr>
+        <tr>
+          <td><strong>Composite</strong></td>
+          <td>Partition key + sort key</td>
+          <td><strong>Get one item, or a sorted range within a partition.</strong> Far more useful</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>The sort key is where most of DynamoDB's power lives, and it's the part people underuse.</strong></p>
+    <p>With a composite key you can ask: "all of this user's orders since March, newest first", "the latest
+      version of this document", "all events for this device in this hour" — all as a single efficient
+      query.</p>
+    <p>A table with only a partition key can answer exactly one question: give me this item.</p>
+  </div>
+
+  <pre data-label="csharp — a range query on the sort key" class="code-good"><code class="language-csharp">// Table: PK = "USER#123", SK = "ORDER#2024-06-01#1041"
+var request = new QueryRequest
+{
+    TableName = "app",
+    KeyConditionExpression = "PK = :pk AND begins_with(SK, :prefix)",
+    ExpressionAttributeValues = new Dictionary&lt;string, AttributeValue&gt;
+    {
+        [":pk"]     = new AttributeValue { S = "USER#123" },
+        [":prefix"] = new AttributeValue { S = "ORDER#2024-06" }
+    },
+    ScanIndexForward = false,       // descending - newest first
+    Limit = 20
+};</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Sort key condition</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>SK = :v</code></td><td>Exact match — one item</td></tr>
+        <tr><td><code>SK &lt; :v</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code></td><td>Range</td></tr>
+        <tr><td><code>SK BETWEEN :a AND :b</code></td><td>Bounded range</td></tr>
+        <tr><td><code>begins_with(SK, :p)</code></td><td><strong>Prefix</strong> — the hierarchy workhorse</td></tr>
+        <tr><td colspan="2"><em>No</em> <code>contains</code>, <code>ends_with</code>, or arbitrary expressions — the sort key is sorted lexicographically, so only prefix and range work</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Why sort keys are strings with delimiters</div>
+    <p style="margin:0">Sort keys are compared <strong>lexicographically</strong>. So encoding a hierarchy as
+      <code>ORDER#2024-06-01#1041</code> means <code>begins_with(SK, "ORDER#2024-06")</code> gets that month,
+      and <code>begins_with(SK, "ORDER#")</code> gets all orders.
+      <br><br>
+      Two consequences. Use <strong>ISO-8601 dates</strong> (<code>2024-06-01</code>), because lexicographic
+      order matches chronological order — <code>01/06/2024</code> does not. And
+      <strong>zero-pad numbers</strong>: <code>ITEM#0042</code> sorts correctly where <code>ITEM#42</code>
+      sorts after <code>ITEM#300</code>.
+      <br><br>
+      That's a small detail that causes genuinely confusing bugs, because the query works and returns the wrong
+      order.</p>
+  </div>
+
+  <h2 id="query-vs-scan">Query vs scan <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Query</th><th>Scan</th></tr></thead>
+      <tbody>
+        <tr><td>Requires</td><td><strong>The partition key</strong></td><td>Nothing</td></tr>
+        <tr><td>Reads</td><td>Only the matching partition</td><td><strong>Every item in the table</strong></td></tr>
+        <tr><td>Cost</td><td>Proportional to results</td><td><strong>Proportional to table size</strong></td></tr>
+        <tr><td>Scales</td><td>Constant as the table grows</td><td><strong>Degrades linearly forever</strong></td></tr>
+        <tr><td>Verdict</td><td>What you should always be doing</td><td>A design smell in application code</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Filter expressions don't reduce cost</div>
+    <p style="margin:0">This is the most expensive misunderstanding in DynamoDB.
+      <br><br>
+      A <code>FilterExpression</code> is applied <strong>after</strong> items are read and
+      <strong>after</strong> capacity is consumed. So a scan with a filter returning 10 items out of a million
+      still reads and charges for all one million.
+      <br><br>
+      It looks like a <code>WHERE</code> clause and it behaves like filtering in application code — with the
+      network transfer avoided but none of the cost.
+      <br><br>
+      <strong>Only key conditions reduce what's read.</strong> Filters are for trimming results you've already
+      paid for, which is occasionally useful and never an optimisation.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Scan is acceptable when</th></tr></thead>
+      <tbody>
+        <tr><td>A one-off migration or backfill</td></tr>
+        <tr><td>An admin or debugging tool on a small table</td></tr>
+        <tr><td>Exporting the whole table anyway</td></tr>
+        <tr><td>A genuinely tiny table — a few hundred config items</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Anything else on a request path means the key design doesn't serve that access pattern, and the fix is a
+    GSI or a different key structure — not a faster scan.</p>
+
+  <h2 id="indexes">GSIs and LSIs <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why they exist</span>
+    <p>The table's key structure supports one access pattern well. A <strong>secondary index</strong> gives you
+      another one, by maintaining a copy of the data under different keys.</p>
+    <p>That's the important mental model: <strong>a GSI is a managed, automatically-maintained duplicate of your
+      data with different keys.</strong> Not a pointer structure like a relational index.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>GSI (Global)</th><th>LSI (Local)</th></tr></thead>
+      <tbody>
+        <tr><td>Partition key</td><td><strong>Can be different</strong></td><td>Must be the same as the table's</td></tr>
+        <tr><td>Sort key</td><td>Any attribute</td><td>A different attribute</td></tr>
+        <tr><td>Consistency</td><td><strong>Eventually consistent only</strong></td><td>Strongly consistent available</td></tr>
+        <tr><td>Capacity</td><td><strong>Its own</strong></td><td>Shares the table's</td></tr>
+        <tr><td>Create later</td><td><strong>Yes</strong></td><td><strong>No — only at table creation</strong></td></tr>
+        <tr><td>Count limit</td><td>20 (soft)</td><td>5, fixed</td></tr>
+        <tr><td>Size constraint</td><td>None</td><td><strong>Imposes a 10 GB limit per partition-key value</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Use GSIs. Avoid LSIs.</strong></p>
+    <p>An LSI can only be created with the table — so if you need another one later, that's a table migration.
+      And it imposes a <strong>10 GB ceiling per partition-key value</strong> on the whole table, which is a
+      significant constraint accepted for very little benefit.</p>
+    <p>The only thing an LSI offers that a GSI doesn't is strongly consistent reads on the index. If you need
+      that, use it deliberately — otherwise GSI, always.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">GSI throttling is a separate failure mode</div>
+    <p style="margin:0">A GSI has <strong>its own capacity</strong>, and writes to the table propagate to it. So
+      if the GSI is under-provisioned, <strong>writes to the base table get throttled</strong> — because
+      DynamoDB can't accept a write it cannot replicate to the index.
+      <br><br>
+      That's a confusing symptom: your table has plenty of capacity, and writes are failing. The cause is an
+      index you weren't monitoring.
+      <br><br>
+      Same applies to a <strong>hot partition in the GSI</strong>. A GSI whose partition key has low cardinality
+      — <code>status</code>, say — creates a hot partition that throttles base-table writes. Worth designing GSI
+      keys as carefully as the table's own.</p>
+  </div>
+
+  <h3 id="projections">Index projections</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Projection</th><th>Copies</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td><code>KEYS_ONLY</code></td><td>Just the keys</td><td>Cheapest storage; needs a second read for other attributes</td></tr>
+        <tr><td><code>INCLUDE</code></td><td>Keys plus named attributes</td><td><strong>Usually right</strong> — enough to serve the query</td></tr>
+        <tr><td><code>ALL</code></td><td>Everything</td><td>No extra read, doubles storage and write cost</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Projection is a real cost decision</div>
+    <p style="margin:0">A GSI with <code>ALL</code> is a full second copy of the table — double the storage, and
+      every write costs capacity on both.
+      <br><br>
+      <code>KEYS_ONLY</code> is cheapest but means a follow-up <code>BatchGetItem</code> for the actual
+      attributes, which is an extra round trip and extra capacity.
+      <br><br>
+      <strong><code>INCLUDE</code> with exactly the attributes the query needs is normally the right answer</strong>
+      — and note that if the projection doesn't cover an attribute you filter on, DynamoDB
+      <em>cannot</em> fetch it from the base table during an index query. The attribute simply isn't there. That
+      surprises people expecting relational index behaviour.</p>
+  </div>
+
+  <h3 id="sparse-index">Sparse indexes — the underused trick</h3>
+
+  <pre data-label="text — only items with the attribute appear in the index"><code class="language-text">Table items:
+  { PK: "ORDER#1", status: "shipped" }                        -- not in the GSI
+  { PK: "ORDER#2", status: "pending", pendingSince: "2024-06-01" }   -- IS in the GSI
+
+GSI: partition key = pendingSince
+  -> contains only pending orders. Tiny index, cheap to query and maintain.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — sparse indexes replace the "query by status" problem</div>
+    <p style="margin:0">"Find all pending orders" is the classic DynamoDB modelling problem. A GSI on
+      <code>status</code> is bad — low cardinality, so one hot partition holds every pending order.
+      <br><br>
+      A <strong>sparse index</strong> solves it elegantly: only write the <code>pendingSince</code> attribute
+      while the order <em>is</em> pending, and remove it when the status changes. Items without the attribute
+      don't appear in the index at all.
+      <br><br>
+      So the index contains only the small working set. It's tiny, it fits in cache, it's cheap to maintain, and
+      it shrinks automatically as orders are processed — items leave the index when the attribute is removed.
+      <br><br>
+      This is the DynamoDB equivalent of a <a href="../12-postgresql/indexing.html#partial">partial index</a>,
+      and knowing it is a strong signal because it's not obvious from the documentation.</p>
+  </div>
+
+  <h2 id="consistency">Consistency <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Read type</th><th>Guarantee</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Eventually consistent</strong> <em>(default)</em></td><td>May not reflect a very recent write</td><td><strong>0.5 RCU</strong> per 4 KB</td></tr>
+        <tr><td><strong>Strongly consistent</strong></td><td>Reflects all completed writes</td><td><strong>1 RCU</strong> per 4 KB — 2×</td></tr>
+        <tr><td><strong>Transactional read</strong></td><td>Serializable, across items</td><td><strong>2 RCU</strong> per 4 KB — 4×</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">GSIs are always eventually consistent</div>
+    <p style="margin:0">There is no strongly-consistent read on a GSI, at any price. The index is updated
+      asynchronously after the base table write.
+      <br><br>
+      The lag is normally milliseconds, and it means <strong>write-then-query-the-GSI can miss the item you just
+      wrote</strong>. That's a read-your-own-writes bug in the same family as
+      <a href="../10-sql/scaling-operations.html#replication-lag">replica lag</a>.
+      <br><br>
+      If a flow writes an item and immediately needs to find it via a GSI, restructure so it reads by primary
+      key instead — or return the item you already have rather than re-querying.</p>
+  </div>
+
+  <h2 id="conditional">Conditional writes <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — atomic conditional update: no read-modify-write" class="code-good"><code class="language-csharp">var request = new UpdateItemRequest
+{
+    TableName = "inventory",
+    Key = new Dictionary&lt;string, AttributeValue&gt; { ["PK"] = new AttributeValue { S = sku } },
+    UpdateExpression    = "SET stock = stock - :qty",
+    ConditionExpression = "stock &gt;= :qty",          // checked atomically
+    ExpressionAttributeValues = new Dictionary&lt;string, AttributeValue&gt;
+    {
+        [":qty"] = new AttributeValue { N = qty.ToString() }
+    }
+};
+
+try { await client.UpdateItemAsync(request); }
+catch (ConditionalCheckFailedException)
+{
+    throw new InsufficientStockException(sku);      // condition wasn't met
+}</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Conditional expressions are how DynamoDB gives you correctness without transactions.</strong></p>
+    <p>The condition is evaluated atomically with the write, so there's no window between checking and
+      changing. That's the same
+      <a href="../10-sql/transactions.html#atomic-update">atomic-conditional-update pattern</a> as everywhere
+      else, and here it's the primary tool rather than a nice option.</p>
+    <p>Two staple uses: <code>attribute_not_exists(PK)</code> for an insert-if-absent, and a version check for
+      optimistic concurrency.</p>
+  </div>
+
+  <pre data-label="csharp — optimistic concurrency and idempotent insert" class="code-good"><code class="language-csharp">// Optimistic locking on a version attribute
+ConditionExpression = "version = :expected",
+UpdateExpression    = "SET #s = :status, version = version + :one"
+
+// Idempotent insert - fails if the item already exists
+ConditionExpression = "attribute_not_exists(PK)"
+// ConditionalCheckFailedException = already processed. The idempotency primitive.</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">This is the idempotency primitive</div>
+    <p style="margin:0"><code>attribute_not_exists(PK)</code> plus catching
+      <code>ConditionalCheckFailedException</code> is a complete
+      <a href="../08-http-web-apis/reliability.html#idempotency-keys">idempotency key</a> implementation.
+      <br><br>
+      Insert succeeds → do the work. Condition fails → already handled, return the previous result. One
+      operation, no race window, no read-then-write gap.
+      <br><br>
+      Exactly the same shape as <a href="../12-postgresql/fundamentals.html#upsert">Postgres <code>ON CONFLICT DO
+      NOTHING</code></a> and a unique-constraint violation in SQL Server. Three databases, one pattern —
+      recognising that is worth more than memorising any of them.</p>
+  </div>
+
+  <h2 id="limits">Limits that shape design <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Limit</th><th>Value</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Item size</strong></td><td><strong>400 KB</strong></td><td>Large content goes to S3 with a pointer in the item</td></tr>
+        <tr><td><strong>Query result page</strong></td><td>1 MB</td><td>Paginate with <code>LastEvaluatedKey</code>; a query may return nothing but still have more</td></tr>
+        <tr><td><strong>Partition throughput</strong></td><td>3,000 RCU / 1,000 WCU</td><td>The hot-partition ceiling</td></tr>
+        <tr><td><strong>Partition-key value size</strong></td><td>10 GB <em>if an LSI exists</em></td><td>Another reason to avoid LSIs</td></tr>
+        <tr><td><strong><code>BatchGetItem</code></strong></td><td>100 items / 16 MB</td><td>Chunk larger batches</td></tr>
+        <tr><td><strong><code>TransactWriteItems</code></strong></td><td>100 items</td><td>Bounds a transactional unit of work</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The 1 MB pagination trap</div>
+    <p style="margin:0">A query stops at 1 MB of data read — <em>before</em> applying a filter expression. So a
+      query with a filter can return <strong>zero items and still have more results</strong>, because the 1 MB it
+      read all got filtered out.
+      <br><br>
+      <strong>An empty result set does not mean "no more data".</strong> The only end-of-data signal is
+      <code>LastEvaluatedKey</code> being null. Code that stops paginating on an empty page silently misses
+      results, and it's data-dependent so it passes testing.
+      <br><br>
+      Same class of bug as
+      <a href="../14-cosmos-db/queries-indexing.html#pagination">Cosmos continuation tokens</a> — check the
+      token, never the result count.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Partition key decides location; sort key decides order within it and enables ranges.</li>
+      <li>Sort keys are lexicographic — use ISO dates and zero-padded numbers.</li>
+      <li>Query needs the partition key; scan reads everything and degrades forever.</li>
+      <li><strong>Filter expressions don't reduce cost</strong> — they apply after reading.</li>
+      <li>A GSI is a maintained duplicate under different keys. Use GSIs, avoid LSIs.</li>
+      <li>An under-provisioned or hot GSI throttles <em>base table writes</em>.</li>
+      <li><code>INCLUDE</code> projections normally; a missing attribute can't be fetched from the base
+        table.</li>
+      <li>Sparse indexes solve "query by status" without a hot partition.</li>
+      <li>GSIs are always eventually consistent — no strongly consistent read exists.</li>
+      <li>Conditional expressions give atomicity and idempotency without transactions.</li>
+      <li>An empty query page doesn't mean end of data — check <code>LastEvaluatedKey</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Believing a filter expression saves capacity.</strong></li>
+    <li><strong>Scans on request paths</strong> because the key design doesn't fit.</li>
+    <li><strong>Creating LSIs</strong>, accepting the 10 GB limit and immutability for little gain.</li>
+    <li><strong>Not monitoring GSI capacity</strong>, so base-table writes throttle inexplicably.</li>
+    <li><strong>A low-cardinality GSI partition key</strong> such as <code>status</code>.</li>
+    <li><strong>Expecting strongly consistent GSI reads.</strong></li>
+    <li><strong>Write then immediately query a GSI</strong>, missing the item.</li>
+    <li><strong>Non-ISO dates or unpadded numbers in sort keys</strong>, giving wrong order.</li>
+    <li><strong>Stopping pagination on an empty page.</strong></li>
+    <li><strong>Read-modify-write</strong> instead of a conditional expression.</li>
+    <li><strong>Large blobs in items</strong> against the 400 KB limit.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What's the difference between a query and a scan? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A <strong>query</strong> requires the partition key. DynamoDB hashes it, goes straight to that
+          partition, and reads only the matching items — optionally narrowed by a sort key condition. The cost is
+          proportional to what you get back, and it stays constant as the table grows."</p>
+        <p>"A <strong>scan</strong> reads <em>every item in the table</em>. Cost is proportional to table size,
+          so it degrades linearly forever."</p>
+        <p>"The thing I'd emphasise, because it's the most expensive misunderstanding in DynamoDB:
+          <strong>a filter expression does not reduce cost.</strong> It's applied <em>after</em> items are read
+          and after capacity is consumed. So a scan with a filter that returns 10 items out of a million still
+          reads and charges for all million. It looks like a <code>WHERE</code> clause and it's really
+          client-side filtering with the network transfer saved."</p>
+        <p>"<strong>Only key conditions reduce what's read.</strong> Filters trim results you've already paid
+          for."</p>
+        <p>"There's a related trap: a query or scan stops at <strong>1 MB of data read, before filtering</strong>.
+          So a filtered query can return zero items and still have more results. An empty result set is not the
+          end of the data — the only signal is <code>LastEvaluatedKey</code> being null. Code that stops
+          paginating on an empty page silently misses results, and it's data-dependent so it passes testing."</p>
+        <p>"On when a scan is acceptable: one-off migrations, backfills, exports, an admin tool on a genuinely
+          tiny table. Never on a request path."</p>
+        <p>"And the important framing — <strong>if I find myself needing a scan for a normal application
+          feature, that's not a query problem, it's a modelling problem.</strong> It means the key structure
+          doesn't serve that access pattern, and the fix is a GSI or a different key design. Optimising the scan
+          — parallel segments, tighter filters — is treating the symptom."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know filters don't reduce cost? That's the discriminating one.</li>
+        <li>Do you know the 1 MB / empty-page trap?</li>
+        <li>Do you treat a needed scan as a modelling failure?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you find all orders with status "pending"?</li>
+          <li>What's a parallel scan, and when is it justified?</li>
+          <li>How do you paginate correctly?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>You need to find all orders with status "pending". How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is the classic DynamoDB modelling question, and the two obvious answers are both wrong — which
+          is why it's asked."</p>
+        <p>"<strong>A scan with a filter on status</strong> is what people reach for first. It reads the entire
+          table and charges for all of it, then discards the non-pending items. Correct results, cost
+          proportional to table size, and it degrades forever as the table grows."</p>
+        <p>"<strong>A GSI with <code>status</code> as the partition key</strong> looks like the proper fix and is
+          arguably worse. <code>status</code> has maybe five distinct values, so every pending order lands in
+          <em>one</em> partition. That partition is capped at 3,000 RCU and 1,000 WCU, so it becomes a hot
+          partition — and because a GSI shares the write path, <strong>throttling on that index throttles writes
+          to the base table</strong>. You've turned a read problem into a write outage."</p>
+        <p>"<strong>The right answer is a sparse index.</strong>"</p>
+        <p>"I'd only write a <code>pendingSince</code> attribute while the order <em>is</em> pending, and
+          <code>REMOVE</code> it when the status changes. Then a GSI partitioned on something
+          high-cardinality — a date bucket, say — with <code>pendingSince</code> as the sort key. Items without
+          the attribute don't appear in the index at all."</p>
+        <p>"So the index contains only the current working set — maybe a few thousand items rather than the whole
+          table. It's tiny, it stays in cache, it's cheap to maintain, and it <strong>shrinks
+          automatically</strong> as orders are processed, because removing the attribute removes the index entry.
+          That last property is what makes it elegant: the index is self-cleaning."</p>
+        <p>"On the partition key for that GSI, I'd avoid a single constant value even though the index is small —
+          that's still one partition and still capped. A date bucket like
+          <code>PENDING#2024-06-01</code> spreads it while keeping the query targeted, since a worker processing
+          pending orders knows roughly which days to look at."</p>
+        <p>"I'd use <code>INCLUDE</code> projection with just the attributes the worker needs — order id,
+          customer, total — rather than <code>ALL</code>, since <code>ALL</code> duplicates the whole table and
+          doubles write cost on every order."</p>
+        <p>"And I'd note the GSI is <strong>eventually consistent</strong>, always — there's no strongly
+          consistent read on a GSI at any price. For a background worker picking up pending orders, a few
+          milliseconds of lag is irrelevant. If something needed to write an order and immediately find it via
+          this index, that would be a read-your-own-writes bug and I'd restructure to read by primary key
+          instead."</p>
+        <p>"The general lesson I'd draw: <strong>in DynamoDB, 'query by low-cardinality attribute' is always a
+          sparse index question.</strong> Same shape for 'unprocessed', 'flagged for review', 'needs retry' —
+          any small working set within a large table. It's the direct equivalent of a partial index in
+          Postgres."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reject both the scan and the naive GSI?</li>
+        <li>Do you know a low-cardinality GSI key creates a hot partition?</li>
+        <li>Do you know GSI throttling affects base-table writes?</li>
+        <li>Do you know the sparse index pattern?</li>
+        <li>Do you think about the GSI's own partition key and projection?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "scan with a filter."</li>
+        <li><span class="redflag">Red flag:</span> "GSI on status" with no cardinality concern.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of the GSI-to-base-table write coupling.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you remove an attribute in an update expression?</li>
+          <li>What if you needed to page through millions of pending items?</li>
+          <li>How does this compare to a Postgres partial index?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

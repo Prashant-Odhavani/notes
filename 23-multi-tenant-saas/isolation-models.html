@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tenant Isolation Models — Multi-Tenant SaaS</title>
+<meta name="description" content="Shared schema, schema-per-tenant and database-per-tenant compared honestly, the hybrid model mature products actually run, and migrating schemas across many databases.">
+<meta name="keywords" content="tenant isolation shared schema pooled schema per tenant database per tenant hybrid pod model tenant catalogue schema migration many databases sharding elastic pool data residency">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="23-multi-tenant-saas/isolation-models.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Tenant Isolation Models</h1>
+    <p class="subtitle">The decision that shapes everything else — and the one you should design to be able to
+      change per tenant rather than globally.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Shared schema</strong> — cheapest, highest leak risk, hardest per-tenant operations.</li>
+      <li><strong>Database per tenant</strong> — strongest isolation, trivial per-tenant restore, most
+        expensive.</li>
+      <li><strong>Schema per tenant</strong> — a middle ground that inherits problems from both.</li>
+      <li><strong>The hybrid is what mature products run</strong> — pooled by default, dedicated on demand.</li>
+      <li><strong>Resolve the connection at runtime from a catalogue</strong>, never from configuration.</li>
+      <li><strong>Migrating N databases is the real operational cost</strong> of the dedicated models.</li>
+      <li><strong>Every migration must work with both old and new application code.</strong></li>
+    </ul>
+  </div>
+
+  <h2 id="shared-schema">Shared schema <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>One database, one set of tables, and a <code>TenantId</code> column on every tenant-owned table. Every
+      query filters by it.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strengths</th><th>Weaknesses</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Lowest cost per tenant</strong> — one database, shared capacity</td><td><strong>Highest leak risk</strong> — one missing predicate</td></tr>
+        <tr><td><strong>One schema migration</strong> for everyone</td><td><strong>Per-tenant restore is very hard</strong></td></tr>
+        <tr><td>Scales to very many tenants</td><td>Noisy neighbours share indexes, buffer pool and locks</td></tr>
+        <tr><td>Simple deployment and monitoring</td><td>Per-tenant deletion is genuinely difficult</td></tr>
+        <tr><td>Cross-tenant analytics are trivial</td><td>No per-tenant data residency or encryption keys</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The two problems that bite later, not at launch</div>
+    <p style="margin:0"><strong>Restoring one tenant.</strong> A customer asks you to roll back a bad bulk import
+      from Tuesday. With a shared schema you cannot restore the database — that would revert every other tenant
+      too. So you restore a <em>copy</em> to a point in time, then selectively copy that tenant's rows back across
+      every affected table, respecting foreign keys. That's bespoke work under time pressure, and it's the request
+      that most often exposes the model's limits.
+      <br><br>
+      <strong>Deleting one tenant completely.</strong> GDPR erasure means removing their data from every table
+      <em>and</em> from backups. In a shared schema, the backups contain other tenants too, so you cannot simply
+      delete them — you're relying on retention expiry, and you need a documented answer for the gap.
+      <br><br>
+      Neither is a reason to avoid a shared schema. Both are reasons to <strong>know the answer before a customer
+      asks</strong>, because inventing it during an incident is considerably worse.</p>
+  </div>
+
+  <h2 id="database-per-tenant">Database per tenant <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strengths</th><th>Weaknesses</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Isolation is structural</strong> — a leak requires connecting to the wrong database</td><td><strong>Highest cost</strong>, especially with idle tenants</td></tr>
+        <tr><td><strong>Per-tenant restore is trivial</strong></td><td><strong>N schema migrations</strong> per release</td></tr>
+        <tr><td><strong>Per-tenant deletion is a drop</strong></td><td>N databases to monitor, back up and connect to</td></tr>
+        <tr><td>Noisy neighbours are contained</td><td>Cross-tenant reporting needs a separate store</td></tr>
+        <tr><td>Data residency and per-tenant keys are possible</td><td>Connection pool fragmentation across many databases</td></tr>
+        <tr><td>Per-tenant performance tuning</td><td>Provisioning is now a workflow, not an insert</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Elastic pools make the cost argument much weaker</div>
+    <p style="margin:0">The usual objection is cost: 500 databases sized for their peaks is expensive.
+      <br><br>
+      <a href="../10-sql/azure-sql.html#elastic-pools">Elastic pools</a> change that — many databases share a pool
+      of capacity, so you pay for aggregate usage rather than per-database peaks. You keep database-per-tenant
+      isolation with pooled economics.
+      <br><br>
+      It works because tenant peaks are usually <strong>uncorrelated</strong> — different time zones and working
+      patterns. If all tenants were busy simultaneously a pool wouldn't help, and that's the thing to verify
+      against metrics rather than assume.
+      <br><br>
+      Two details to configure: a <strong>per-database maximum</strong> so one tenant can't consume the whole pool
+      (the noisy-neighbour control), and a <strong>minimum</strong> for tenants with contractual performance
+      commitments.
+      <br><br>
+      So "database per tenant is too expensive" is a weaker argument than it used to be, and mentioning pools is
+      a good practical signal.</p>
+  </div>
+
+  <h2 id="schema-per-tenant">Schema per tenant <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The middle option</span>
+    <p>One database, one schema per tenant — <code>acme.Orders</code>, <code>globex.Orders</code>. Isolation by
+      schema rather than by column or by database.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">It inherits problems from both sides</div>
+    <p style="margin:0">Better isolation than a shared schema, and it still shares a database — so
+      <strong>noisy neighbours remain</strong>, since tenants compete for the same buffer pool, CPU and log.
+      <br><br>
+      And you get the <strong>N-migrations problem</strong> of database-per-tenant without the benefits: you still
+      can't restore one tenant independently, because point-in-time restore operates on the whole database.
+      <br><br>
+      It also scales worse than people expect. Hundreds of schemas each with dozens of tables produces tens of
+      thousands of objects, which slows metadata operations and makes tooling unhappy.
+      <br><br>
+      So it's a legitimate choice in a narrow band — you want stronger-than-column isolation, have a moderate
+      tenant count, and can't justify separate databases. But <strong>if you're taking on N migrations anyway,
+      database-per-tenant usually gives more for the same operational cost.</strong> That's the argument worth
+      making.</p>
+  </div>
+
+  <h2 id="hybrid">The hybrid model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">What mature products actually run</span>
+    <p><strong>Pooled shared schema for the many small tenants. A dedicated database for large, regulated or
+      noisy ones.</strong></p>
+    <p>The three models are usually presented as a choice. In practice you want <em>both</em>, because the
+      requirements genuinely differ per customer — and forcing one trade-off on everyone means either overpaying
+      for small tenants or under-serving large ones.</p>
+  </div>
+
+  <pre data-label="text — tenants placed by their needs"><code class="language-text">  Tenant catalogue (the routing table):
+
+  tenant     model        connection
+  ---------- ------------ --------------------------------
+  acme       dedicated    Server=eu-1;Database=t_acme       <- enterprise, EU residency
+  globex     dedicated    Server=us-1;Database=t_globex     <- high volume, noisy
+  small-co   pooled       Server=pool-1;Database=shared_a   <- one of 400
+  tiny-ltd   pooled       Server=pool-1;Database=shared_a
+  ...
+
+  The application resolves the connection per request from this table.
+  Moving a tenant between models is a data migration plus a row update.</code></pre>
+
+  <pre data-label="csharp — runtime connection resolution" class="code-good"><code class="language-csharp">public sealed class TenantDbContextFactory(
+    ITenantContext tenant,
+    ITenantCatalogue catalogue,
+    IOptions&lt;DbOptions&gt; options)
+{
+    public async Task&lt;AppDbContext&gt; CreateAsync(CancellationToken ct)
+    {
+        // Cached in memory; the catalogue changes rarely
+        var placement = await catalogue.GetPlacementAsync(tenant.TenantId, ct);
+
+        var builder = new DbContextOptionsBuilder&lt;AppDbContext&gt;()
+            .UseSqlServer(placement.ConnectionString);
+
+        return new AppDbContext(builder.Options, tenant);
+    }
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — runtime resolution is the architectural requirement</div>
+    <p style="margin:0">The hybrid model only works if the application <strong>resolves the connection at runtime
+      from a catalogue</strong> rather than reading one connection string from configuration.
+      <br><br>
+      Once it does, moving a tenant from pooled to dedicated is a data migration plus a catalogue update — no code
+      change, no redeploy. Without it, that move is a code change and a special case, so in practice it never
+      happens and large tenants stay in the pool causing problems.
+      <br><br>
+      So this is the decision that determines whether the model is <em>changeable per tenant</em>. It costs
+      little to build up front and is expensive to retrofit, because every data-access path assumes a single
+      configured connection.
+      <br><br>
+      Two practical points: <strong>cache the catalogue</strong>, since it changes rarely and you don't want a
+      lookup per request; and be aware that many distinct connection strings mean
+      <strong>fragmented connection pools</strong> — each string gets its own pool, so with hundreds of
+      dedicated tenants you can exhaust connections in a way a single pool wouldn't.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Promote a tenant to dedicated when</th></tr></thead>
+      <tbody>
+        <tr><td>They contractually require data isolation, residency, or their own encryption keys</td></tr>
+        <tr><td>Their load measurably degrades pooled neighbours</td></tr>
+        <tr><td>They need per-tenant restore or retention guarantees</td></tr>
+        <tr><td>They're large enough that per-tenant cost attribution matters commercially</td></tr>
+        <tr><td>Compliance requires demonstrable physical separation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="pods">The pod model <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Scaling beyond one deployment</span>
+    <p>A <strong>pod</strong> (or cell, or shard) is a complete, independent copy of the whole stack — app
+      instances, database, cache — serving a subset of tenants.</p>
+    <p>You scale by adding pods rather than by growing one deployment.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Gains</th><th>Costs</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Blast radius is one pod</strong>, not everyone</td><td>Significant operational complexity</td></tr>
+        <tr><td><strong>Deploy to one pod first</strong> — a natural canary</td><td>N of everything to monitor and patch</td></tr>
+        <tr><td>Per-region pods give data residency</td><td>Tenant-to-pod routing must be reliable</td></tr>
+        <tr><td>Known capacity per pod, so growth is predictable</td><td>Moving a tenant between pods is real work</td></tr>
+        <tr><td>A noisy tenant affects only its pod</td><td>Cross-pod reporting needs aggregation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The underrated benefit is deployment safety</div>
+    <p style="margin:0">Pods give you a <strong>genuine canary</strong> at the infrastructure level: deploy to one
+      pod holding 5% of tenants, watch it, then roll forward. A bad release affects a known, bounded set of
+      customers rather than everyone.
+      <br><br>
+      That's more valuable than the scaling argument for most products, because the scaling ceiling is rarely the
+      real constraint — deployment risk is.
+      <br><br>
+      It also caps the blast radius of an outage: a pod failure is a visible incident for those tenants and
+      invisible to the rest, which changes the shape of your SLA conversations.
+      <br><br>
+      The honest caveat: this is a lot of machinery. It suits products with many tenants and a platform team.
+      Reaching for it early is over-engineering, and it's the kind that's hard to unwind.</p>
+  </div>
+
+  <h2 id="migrations">Migrating schemas across many databases <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">This is the real operational cost of the dedicated models</span>
+    <p>One schema change becomes <strong>N migrations</strong>, each of which can fail independently — so at any
+      moment some tenants are on the new schema and some aren't.</p>
+    <p>Which means <strong>every migration must work with both the old and the new application code</strong>. Not
+      as a nice-to-have — as a structural requirement, because you cannot migrate 500 databases atomically.</p>
+  </div>
+
+  <ol class="steps">
+    <li><strong>Make every migration backward compatible.</strong> Add nullable columns, add tables, never rename
+      or drop in the same release as the code that stops using them.</li>
+    <li><strong>Version each database</strong> and record it in the catalogue, so you always know the true
+      state.</li>
+    <li><strong>Migrate a canary set first</strong> — internal tenants, then a handful of small ones.</li>
+    <li><strong>Roll forward in batches</strong>, with a bounded concurrency so you don't saturate the
+      server.</li>
+    <li><strong>Make migrations idempotent and resumable</strong>, because some will fail and be retried.</li>
+    <li><strong>Report progress and failures</strong> per tenant — a dashboard, not a log file.</li>
+    <li><strong>Contract in a later release</strong>, once every database is migrated and no code reads the old
+      shape.</li>
+  </ol>
+
+  <div class="note danger">
+    <div class="note-title">Expand and contract, over separate releases</div>
+    <p style="margin:0">Renaming a column looks like one change and cannot be done in one release when the
+      migration isn't atomic across tenants.
+      <br><br>
+      <strong>Release 1 (expand):</strong> add the new column, write to both, read from the old. Works with old
+      and new code.
+      <br><br>
+      <strong>Release 2:</strong> read from the new column. Both columns still exist.
+      <br><br>
+      <strong>Release 3 (contract):</strong> stop writing the old column, then drop it — only once every database
+      has been migrated and telemetry confirms nothing reads it.
+      <br><br>
+      Three releases for a rename feels excessive and is the only safe sequence. Attempting it in one means that
+      during the rollout, new code hits un-migrated databases and old code hits migrated ones — and both
+      break.
+      <br><br>
+      Same discipline as <a href="../20-microservices/communication.html#contracts">API contract versioning</a>,
+      applied to schemas: you cannot change both sides simultaneously.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Failure is normal at scale, so plan for partial state</div>
+    <p style="margin:0">With 500 databases, a migration run will have failures — a database mid-restore, a lock
+      timeout, one tenant with unexpected data that violates a new constraint.
+      <br><br>
+      So the design requirements are: <strong>idempotent</strong> migrations that can be re-run safely,
+      <strong>resumable</strong> batches that don't restart from the beginning,
+      <strong>per-tenant version tracking</strong> so you know exactly who's where, and
+      <strong>the application tolerating both schemas</strong> for the duration.
+      <br><br>
+      The failure mode to avoid is a migration that half-succeeds with no record of which tenants completed —
+      then you're inspecting 500 databases by hand to find out.
+      <br><br>
+      EF Core migrations work per-context, so the usual shape is a small orchestrator that enumerates the
+      catalogue and applies migrations tenant by tenant with retry, rather than a single
+      <code>dotnet ef database update</code>.</p>
+  </div>
+
+  <h2 id="choosing">Choosing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>If…</th><th>Then</th></tr></thead>
+      <tbody>
+        <tr><td>Thousands of small self-serve tenants</td><td><strong>Shared schema</strong>, pooled</td></tr>
+        <tr><td>Tens of enterprise tenants with contracts</td><td><strong>Database per tenant</strong></td></tr>
+        <tr><td>A mix — and most products are</td><td><strong>Hybrid</strong>, with runtime resolution</td></tr>
+        <tr><td>Regulated data, or residency requirements</td><td>Database per tenant, possibly per region</td></tr>
+        <tr><td>Per-tenant restore is a stated requirement</td><td>Database per tenant</td></tr>
+        <tr><td>Very many tenants and a platform team</td><td>Pods, each internally pooled</td></tr>
+        <tr><td>You genuinely don't know yet</td><td><strong>Shared schema with tenant id everywhere</strong>, designed to allow extraction</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — start pooled, but design for extraction</div>
+    <p style="margin:0">If the customer profile is uncertain, a shared schema is the right start: cheapest, one
+      migration, fastest to build.
+      <br><br>
+      The critical caveat is to <strong>design so a tenant can be extracted later</strong>. That means: the tenant
+      id on <em>every</em> tenant-owned table from day one, no cross-tenant foreign keys, connection resolution
+      through a catalogue even while every tenant resolves to the same connection, and no query that assumes all
+      tenants live together.
+      <br><br>
+      Those cost almost nothing up front. Without them, extracting your first enterprise customer means a schema
+      change, a data-access rewrite, and a migration — at exactly the moment a large deal depends on it.
+      <br><br>
+      "Start pooled, keep extraction cheap" is the answer that shows you've thought about the second year, not
+      just the launch.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Shared schema is cheapest and has the highest leak risk plus the hardest per-tenant operations.</li>
+      <li>Know your answer for per-tenant restore and GDPR deletion <em>before</em> a customer asks.</li>
+      <li>Database per tenant makes isolation structural and restore trivial, at N migrations.</li>
+      <li>Elastic pools substantially weaken the cost objection to dedicated databases.</li>
+      <li>Schema per tenant inherits noisy neighbours and N migrations without per-tenant restore.</li>
+      <li>The hybrid is what mature products run — pooled by default, dedicated on demand.</li>
+      <li>Runtime connection resolution from a catalogue is what makes the hybrid possible.</li>
+      <li>Many connection strings fragment connection pools.</li>
+      <li>Pods bound the blast radius and give a genuine deployment canary.</li>
+      <li>Every migration must work with both old and new code — expand/contract over three releases.</li>
+      <li>Migrations must be idempotent, resumable, and version-tracked per tenant.</li>
+      <li>Start pooled if unsure, but keep extraction cheap.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No tenant id on some tables</strong>, blocking extraction later.</li>
+    <li><strong>Cross-tenant foreign keys</strong>, making a tenant impossible to separate.</li>
+    <li><strong>One connection string in configuration</strong>, so the model can't vary per tenant.</li>
+    <li><strong>Discovering per-tenant restore is impossible</strong> when a customer asks.</li>
+    <li><strong>No answer for GDPR deletion</strong> in a shared schema.</li>
+    <li><strong>Schema per tenant</strong> chosen without realising it keeps noisy neighbours.</li>
+    <li><strong>Renaming a column in one release</strong> across many databases.</li>
+    <li><strong>Non-idempotent migrations</strong> that can't be retried.</li>
+    <li><strong>No per-tenant schema version tracking.</strong></li>
+    <li><strong>Elastic pools with no per-database cap.</strong></li>
+    <li><strong>Reaching for pods</strong> before the tenant count justifies it.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Which isolation model would you choose, and why? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It depends on the customer profile, so I'd ask first — but my structural answer is usually a
+          <strong>hybrid</strong>, because the requirements genuinely differ per customer and forcing one
+          trade-off on everyone means either overpaying for small tenants or under-serving large ones."</p>
+        <p>"The questions I'd want answered: <strong>how many tenants and how large?</strong> Ten thousand
+          self-serve accounts and fifty enterprise customers are different problems. <strong>What do contracts
+          require</strong> — data isolation, residency, customer-managed encryption keys? <strong>Is per-tenant
+          restore a stated requirement?</strong> And <strong>can one tenant generate enough load to affect
+          others?</strong>"</p>
+        <p>"<strong>Shared schema</strong> — one database, a <code>TenantId</code> column everywhere — is
+          cheapest, scales to very many tenants, and is one migration for everyone. Its costs are the highest
+          leak risk, since one missing predicate is a breach, and genuinely hard per-tenant operations."</p>
+        <p>"I'd raise those operational limits specifically, because they surface later rather than at launch.
+          <strong>Restoring one tenant</strong> means restoring a copy to a point in time and selectively copying
+          their rows back across every affected table respecting foreign keys — bespoke work under time pressure.
+          And <strong>GDPR deletion</strong> means their data is in backups alongside everyone else's, so you're
+          relying on retention expiry and need a documented answer for the gap. Neither rules out shared schema;
+          both need an answer before a customer asks."</p>
+        <p>"<strong>Database per tenant</strong> makes isolation structural — a leak requires connecting to the
+          wrong database, not forgetting a <code>WHERE</code> clause. Restore is trivial, deletion is a drop,
+          noisy neighbours are contained, and residency and per-tenant keys become possible. The cost is
+          <strong>N schema migrations</strong> per release and N of everything to operate."</p>
+        <p>"On cost I'd push back on the usual objection: <strong>elastic pools substantially weaken it</strong>.
+          Many databases share a pool of capacity, so you pay for aggregate usage rather than per-database peaks —
+          isolation with pooled economics. That works because tenant peaks are typically uncorrelated across time
+          zones, which I'd verify against metrics rather than assume. And I'd set a per-database maximum, because
+          without it one tenant can consume the whole pool."</p>
+        <p>"<strong>Schema per tenant</strong> I'd generally argue against. It gives better isolation than a
+          shared schema and still shares a database — so noisy neighbours remain — and it takes on the
+          N-migrations cost <em>without</em> gaining per-tenant restore, since point-in-time restore operates on
+          the whole database. If you're paying for N migrations anyway, separate databases give more for the same
+          operational cost."</p>
+        <p>"So concretely: <strong>pooled shared schema for the many small tenants, dedicated databases for large,
+          regulated or noisy ones.</strong>"</p>
+        <p>"The architectural requirement that makes that work is <strong>resolving the connection at runtime from
+          a tenant catalogue</strong> rather than reading one connection string from configuration. Then moving a
+          tenant from pooled to dedicated is a data migration plus a catalogue row update — no code change. Without
+          it, that move is a special case, so in practice it never happens and large tenants stay in the pool
+          causing problems."</p>
+        <p>"And if I genuinely didn't know the customer profile yet, I'd <strong>start with a shared schema but
+          design for extraction</strong>: tenant id on every tenant-owned table from day one, no cross-tenant
+          foreign keys, and connection resolution through a catalogue even while everything resolves to the same
+          connection. Those cost almost nothing now and are expensive to retrofit — and you'll want them the
+          moment a large deal requires isolation."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask about tenant profile and contracts first?</li>
+        <li>Do you know the per-tenant restore and GDPR problems?</li>
+        <li>Do you know elastic pools change the cost argument?</li>
+        <li>Can you argue against schema-per-tenant specifically?</li>
+        <li>Do you require runtime connection resolution?</li>
+        <li>Do you design for extraction when starting pooled?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> picking a model with no questions.</li>
+        <li><span class="redflag">Red flag:</span> "database per tenant is too expensive" with no mention of
+          pools.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of the migration cost.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you migrate 500 databases safely?</li>
+          <li>How would you move a tenant from pooled to dedicated with no downtime?</li>
+          <li>How do you do cross-tenant reporting?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

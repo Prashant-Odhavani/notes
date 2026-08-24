@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PostgreSQL — Overview</title>
+<meta name="description" content="What actually differs from SQL Server, why it matters for .NET developers, and how this section is organised.">
+<meta name="keywords" content="PostgreSQL vs SQL Server differences Npgsql EF Core provider MVCC vacuum heap table identifiers case sensitivity migration from SQL Server">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="12-postgresql/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>PostgreSQL</h1>
+    <p class="subtitle">Increasingly the default choice for new .NET systems. Most of your SQL knowledge
+      transfers — the parts that don't are what interviews probe.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="why">Why a .NET developer meets PostgreSQL <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Since .NET became cross-platform, the reasons to pair it with SQL Server became weaker.</p>
+    <p>PostgreSQL has <strong>no licence cost</strong>, runs everywhere, is the default in most cloud
+      marketplaces, and has a genuinely excellent EF Core provider (Npgsql). So a lot of greenfield .NET now
+      ships on Postgres.</p>
+  </div>
+
+  <p>Which means two interview scenarios are common: <em>"we use Postgres, are you comfortable with it?"</em>
+    and <em>"we're moving off SQL Server — what would you watch out for?"</em> This section is written for
+    both.</p>
+
+  <h2 id="key-differences">The differences that actually matter <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>SQL Server</th><th>PostgreSQL</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Row versions</strong></td>
+          <td>Optional — versions go to tempdb (RCSI)</td>
+          <td><strong>Always.</strong> Old versions live in the table itself, hence <code>VACUUM</code></td>
+        </tr>
+        <tr>
+          <td><strong>Table storage</strong></td>
+          <td>Clustered index <em>is</em> the table</td>
+          <td><strong>Heap.</strong> All indexes are secondary, all point to a physical location</td>
+        </tr>
+        <tr>
+          <td><strong>Readers block writers</strong></td>
+          <td>Yes by default (locking <code>READ COMMITTED</code>)</td>
+          <td><strong>Never.</strong> MVCC is the only mode</td>
+        </tr>
+        <tr>
+          <td><strong>Identifier case</strong></td>
+          <td>Case-insensitive, preserved</td>
+          <td><strong>Folded to lowercase</strong> unless double-quoted</td>
+        </tr>
+        <tr>
+          <td><strong>String comparison</strong></td>
+          <td>Case-<em>insensitive</em> by default collation</td>
+          <td><strong>Case-sensitive</strong> by default</td>
+        </tr>
+        <tr>
+          <td><strong>Index types</strong></td>
+          <td>B-tree, columnstore, full-text</td>
+          <td>B-tree, <strong>GIN, GiST, BRIN, Hash</strong> — much richer</td>
+        </tr>
+        <tr>
+          <td><strong>JSON</strong></td>
+          <td><code>nvarchar</code> plus functions</td>
+          <td><strong><code>jsonb</code></strong> — a real indexable type</td>
+        </tr>
+        <tr>
+          <td><strong>DDL in transactions</strong></td>
+          <td>Mostly yes</td>
+          <td><strong>Fully transactional</strong> — a failed migration rolls back cleanly</td>
+        </tr>
+        <tr>
+          <td><strong>Procedural language</strong></td>
+          <td>T-SQL</td>
+          <td>PL/pgSQL, plus others</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The three that cause real bugs</span>
+    <ol>
+      <li><strong>Case sensitivity.</strong> <code>WHERE Email = 'Bob@x.com'</code> won't match
+        <code>bob@x.com</code>. This breaks logins on day one of a migration.</li>
+      <li><strong>Identifier folding.</strong> A table created as <code>"Order"</code> must always be quoted;
+        created as <code>Order</code> it becomes <code>order</code>. Mixing the two produces
+        "relation does not exist" on a table you can see.</li>
+      <li><strong><code>VACUUM</code>.</strong> Dead row versions accumulate in the table. Postgres cleans up
+        automatically, but a workload that outruns autovacuum causes bloat, and eventually a
+        transaction-ID wraparound emergency.</li>
+    </ol>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the one-sentence summary</div>
+    <p style="margin:0">"PostgreSQL keeps old row versions <strong>in the table</strong>; SQL Server keeps them
+      in tempdb, and only if you ask."
+      <br><br>
+      That single design difference explains why Postgres readers never block writers, why
+      <code>VACUUM</code> exists, why <code>COUNT(*)</code> can't use an index-only scan the way it does
+      elsewhere, why updates are effectively delete-plus-insert, and why bloat is a thing you monitor.
+      <br><br>
+      Being able to derive all of that from one fact is a much better answer than listing features.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">Fundamentals &amp; Data Types</a></td>
+          <td>Types worth knowing, identifier and collation traps, arrays, <code>jsonb</code>, sequences,
+              schemas, and the .NET mapping details</td>
+        </tr>
+        <tr>
+          <td><a href="indexing.html">Indexing</a></td>
+          <td>B-tree, GIN, GiST, BRIN; partial and expression indexes; index-only scans and why the visibility
+              map matters</td>
+        </tr>
+        <tr>
+          <td><a href="mvcc-transactions.html">MVCC, Transactions &amp; Locking</a></td>
+          <td>Snapshots, isolation levels including real <code>SERIALIZABLE</code>, row locks,
+              <code>SKIP LOCKED</code>, advisory locks</td>
+        </tr>
+        <tr>
+          <td><a href="performance.html">Planner, EXPLAIN &amp; Tuning</a></td>
+          <td>Reading <code>EXPLAIN ANALYZE</code>, statistics, join strategies, and the configuration
+              settings that actually matter</td>
+        </tr>
+        <tr>
+          <td><a href="operations.html">Vacuum, Partitioning, Replication &amp; HA</a></td>
+          <td>Autovacuum tuning, bloat, wraparound, declarative partitioning, streaming replication,
+              connection pooling, failover</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="dotnet">The .NET side <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — EF Core with Npgsql"><code class="language-csharp">builder.Services.AddDbContext&lt;AppDbContext&gt;(o =&gt;
+    o.UseNpgsql(connectionString, npg =&gt;
+    {
+        npg.EnableRetryOnFailure(5);
+        npg.MigrationsHistoryTable("__ef_migrations", "public");
+    })
+    // Postgres folds unquoted identifiers to lowercase, so snake_case
+    // avoids quoting everything. Requires EFCore.NamingConventions.
+    .UseSnakeCaseNamingConvention());</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>EF Core concept</th><th>SQL Server</th><th>PostgreSQL / Npgsql</th></tr></thead>
+      <tbody>
+        <tr><td>Concurrency token</td><td><code>[Timestamp]</code> / <code>rowversion</code></td><td><code>b.UseXminAsConcurrencyToken()</code></td></tr>
+        <tr><td>Identity column</td><td><code>IDENTITY</code></td><td><code>UseIdentityByDefaultColumn()</code> (or a sequence)</td></tr>
+        <tr><td>Sequential GUIDs</td><td><code>NEWSEQUENTIALID()</code></td><td>Not needed — heap storage, so random UUIDs don't split pages</td></tr>
+        <tr><td>Case-insensitive search</td><td>Default collation</td><td><code>citext</code>, or a non-deterministic collation</td></tr>
+        <tr><td>JSON column</td><td><code>nvarchar(max)</code></td><td><code>jsonb</code> — queryable and indexable</td></tr>
+        <tr><td>Full-text</td><td>Full-text catalogue</td><td><code>tsvector</code> + GIN index</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The GUID point is worth internalising</div>
+    <p style="margin:0">On SQL Server, a random GUID as the clustered key causes constant
+      <a href="../10-sql/fundamentals.html#guids">page splits</a>, because the clustered index <em>is</em> the
+      table and rows must be stored in key order.
+      <br><br>
+      PostgreSQL tables are <strong>heaps</strong> — rows go wherever there's room. So a random UUID primary key
+      has no equivalent insert penalty. Index pages still split, but that's far less costly than reorganising
+      the table.
+      <br><br>
+      That's a genuinely useful thing to know if you're carrying SQL Server habits across, and a good concrete
+      answer to "what would you do differently on Postgres?"</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Connection pooling needs more thought here</div>
+    <p style="margin:0">PostgreSQL uses <strong>one OS process per connection</strong>, not a thread. So
+      connections are considerably more expensive than on SQL Server, and a few hundred is a lot.
+      <br><br>
+      Npgsql pools client-side, which handles a single application. But several services, or a serverless
+      platform that scales to many instances, will exhaust <code>max_connections</code> — at which point you
+      need <strong>PgBouncer</strong> or the cloud provider's equivalent in front.
+      <br><br>
+      Covered on the <a href="operations.html#pooling">operations page</a>. It comes up often because it's the
+      first thing that breaks when a .NET service scales out.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Version context</div>
+    <p style="margin:0">Content targets <strong>PostgreSQL 15–17</strong>. Where a feature is version-specific
+      it's named — <code>MERGE</code> in 15, parallel <code>VACUUM</code> improvements, and the incremental
+      backup added in 17.
+      <br><br>
+      Managed variants (Azure Database for PostgreSQL Flexible Server, AWS RDS/Aurora) differ mainly in what
+      they let you configure and in how HA is provided; the engine behaviour described here is the same.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section assumes the <a href="../10-sql/index.html">SQL section</a> — indexing
+      fundamentals, isolation levels, execution plans. The concepts transfer; the mechanics differ, and this
+      section covers the differences rather than repeating the basics.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

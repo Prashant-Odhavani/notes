@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Controllers, Minimal APIs &amp; Binding — ASP.NET Core</title>
+<meta name="description" content="Model binding, validation, over-posting, filters, action results and how controllers compare with minimal APIs in practice.">
+<meta name="keywords" content="model binding validation data annotations FluentValidation over-posting mass assignment DTO ApiController filters action filter endpoint filter IActionResult TypedResults content negotiation">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="07-aspnet-core/apis.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Controllers, Minimal APIs &amp; Binding</h1>
+    <p class="subtitle">How data gets from an HTTP request into your method parameters — and the binding
+      mistake that's actually a security vulnerability.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Model binding</strong> fills your parameters from the route, query string, body, headers
+        and form.</li>
+      <li>Simple types bind from route/query by default; complex types bind from the <strong>body</strong>.</li>
+      <li><strong>Over-posting</strong> (mass assignment) is the real risk: binding straight to an entity
+        lets a caller set fields you never exposed.</li>
+      <li><code>[ApiController]</code> gives automatic 400s on validation failure and
+        <code>ProblemDetails</code> responses.</li>
+      <li><strong>Filters</strong> are for cross-cutting concerns per endpoint; middleware is for
+        cross-cutting concerns per request.</li>
+      <li>Prefer <code>TypedResults</code> over <code>Results</code> — you get the status codes in OpenAPI
+        for free.</li>
+    </ul>
+  </div>
+
+  <h2 id="model-binding">Model binding <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Model binding is the framework reading the raw HTTP request and <strong>filling in your method
+      parameters</strong> for you.</p>
+    <p>You never parse the query string or deserialize the body by hand.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Source</th><th>Bound by default from</th><th>Explicit attribute</th></tr></thead>
+      <tbody>
+        <tr><td>Route values</td><td>Simple types matching a route parameter name</td><td><code>[FromRoute]</code></td></tr>
+        <tr><td>Query string</td><td>Simple types not matched by the route</td><td><code>[FromQuery]</code></td></tr>
+        <tr><td>Body (JSON)</td><td><strong>Complex types</strong></td><td><code>[FromBody]</code></td></tr>
+        <tr><td>Headers</td><td>Never automatically</td><td><code>[FromHeader]</code></td></tr>
+        <tr><td>Form fields</td><td>Complex types on form posts</td><td><code>[FromForm]</code></td></tr>
+        <tr><td>DI container</td><td>Registered services</td><td><code>[FromServices]</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — binding from three sources in one signature"><code class="language-csharp">// GET /api/orders/3f2a.../lines?page=2&amp;size=50
+[HttpGet("/api/orders/{orderId:guid}/lines")]
+public async Task&lt;IActionResult&gt; GetLines(
+    Guid orderId,                     // from the route
+    int page,                         // from the query string
+    int size,                         // from the query string
+    [FromHeader(Name = "X-Tenant")] string tenant,
+    CancellationToken ct)             // supplied by the framework
+{ /* ... */ }</code></pre>
+
+  <div class="note info">
+    <div class="note-title">One body parameter only</div>
+    <p style="margin:0">A request has one body, so you can bind <strong>one</strong> complex type from it.
+      Two <code>[FromBody]</code> parameters is a runtime error.
+      <br><br>
+      If you need several things, wrap them in one request object — which you should be doing anyway, per the
+      over-posting section below.</p>
+  </div>
+
+  <h2 id="over-posting">Over-posting — a binding bug that's a security hole <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — bad: binding straight to the entity" class="code-bad"><code class="language-csharp">public class Order
+{
+    public Guid Id { get; set; }
+    public string CustomerId { get; set; } = "";
+    public decimal Total { get; set; }
+    public OrderStatus Status { get; set; }      // internal
+    public bool IsInternalTestOrder { get; set; } // internal
+    public decimal DiscountApplied { get; set; }  // internal!
+}
+
+[HttpPost("/api/orders")]
+public async Task&lt;IActionResult&gt; Create(Order order) { /* ... */ }</code></pre>
+
+  <p>The client controls the whole JSON body. So they can send:</p>
+
+  <pre data-label="json — a request the API never intended to accept" class="code-bad"><code class="language-json">{
+  "customerId": "acme",
+  "total": 100.00,
+  "status": "Paid",
+  "discountApplied": 99.99,
+  "isInternalTestOrder": true
+}</code></pre>
+
+  <p>Nothing is malformed. The binder does exactly what it's designed to do. Your order is now marked paid
+    with a 99.99 discount, and it never went near a payment provider.</p>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Never bind a request body directly to an entity.</strong></p>
+    <p>Bind to a request DTO containing <em>only</em> the fields a caller is allowed to set, then map.</p>
+  </div>
+
+  <pre data-label="csharp — a DTO makes the attack surface explicit" class="code-good"><code class="language-csharp">// The contract: exactly what a caller may send. Nothing else exists to set.
+public sealed record CreateOrderRequest(
+    [property: Required] string CustomerId,
+    [property: MinLength(1)] IReadOnlyList&lt;OrderLineRequest&gt; Lines);
+
+[HttpPost("/api/orders")]
+public async Task&lt;IActionResult&gt; Create(CreateOrderRequest request, CancellationToken ct)
+{
+    // Status, discount and totals are decided HERE, by the domain - not by the caller.
+    var order = Order.Create(request.CustomerId, request.Lines);
+    await _repo.AddAsync(order, ct);
+    return CreatedAtAction(nameof(Get), new { id = order.Id }, OrderResponse.From(order));
+}</code></pre>
+
+  <p>Two benefits beyond security. The DTO <em>documents</em> the contract, so OpenAPI shows callers exactly
+    what's accepted. And it decouples your API from your database schema — you can rename an entity property
+    without breaking clients.</p>
+
+  <h2 id="validation">Validation <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — data annotations, and what [ApiController] does with them"><code class="language-csharp">public sealed class CreateCustomerRequest
+{
+    [Required, EmailAddress]
+    public string Email { get; init; } = "";
+
+    [Required, StringLength(100, MinimumLength = 2)]
+    public string Name { get; init; } = "";
+
+    [Range(18, 120)]
+    public int Age { get; init; }
+}</code></pre>
+
+  <p>With <code>[ApiController]</code> on the controller, a failed validation returns
+    <strong>400 automatically</strong>, formatted as <code>ProblemDetails</code> with the field errors — you
+    write no code for it.</p>
+
+  <pre data-label="json — what the client gets, for free"><code class="language-json">{
+  "type": "https://tools.ietf.org/html/rfc7231#section-6.5.1",
+  "title": "One or more validation errors occurred.",
+  "status": 400,
+  "errors": {
+    "Email": [ "The Email field is not a valid e-mail address." ],
+    "Age": [ "The field Age must be between 18 and 120." ]
+  }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Data annotations</th><th>FluentValidation</th></tr></thead>
+      <tbody>
+        <tr><td>Where rules live</td><td>Attributes on the model</td><td>A separate validator class</td></tr>
+        <tr><td>Conditional rules</td><td>Awkward</td><td>Natural (<code>When</code>)</td></tr>
+        <tr><td>Async rules (e.g. uniqueness)</td><td>No</td><td>Yes</td></tr>
+        <tr><td>Testable in isolation</td><td>Not really</td><td>Yes</td></tr>
+        <tr><td>Good for</td><td>Simple shape validation</td><td>Business rules, cross-field logic</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Where validation belongs</div>
+    <p style="margin:0">Request validation checks the <em>shape</em> — required fields, formats, ranges. It
+      answers "is this a well-formed request?"
+      <br><br>
+      It does <strong>not</strong> replace domain invariants. "Total must equal the sum of the lines" or
+      "cannot ship an unpaid order" belong in the domain object, where they can't be bypassed by another
+      code path — see <a href="../02-oop/fundamentals.html#encapsulation">encapsulation</a>.
+      <br><br>
+      A rule that only exists in a request validator is a rule that a background job or an admin tool will
+      violate.</p>
+  </div>
+
+  <h2 id="results">Returning results <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — TypedResults documents itself" class="code-good"><code class="language-csharp">app.MapGet("/api/orders/{id:guid}",
+    async Task&lt;Results&lt;Ok&lt;OrderResponse&gt;, NotFound&gt;&gt; (
+        Guid id, IOrderRepository repo, CancellationToken ct) =&gt;
+{
+    var order = await repo.GetAsync(id, ct);
+    return order is null
+        ? TypedResults.NotFound()
+        : TypedResults.Ok(OrderResponse.From(order));
+});</code></pre>
+
+  <p>The <code>Results&lt;Ok&lt;T&gt;, NotFound&gt;</code> return type declares the possible responses, so
+    OpenAPI generates accurate documentation with no <code>[ProducesResponseType]</code> attributes. With
+    plain <code>IResult</code> the framework has no idea what you might return.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Situation</th><th>Return</th></tr></thead>
+      <tbody>
+        <tr><td>Read succeeded</td><td><code>200 Ok(dto)</code></td></tr>
+        <tr><td>Created something</td><td><code>201 Created</code> + a <code>Location</code> header</td></tr>
+        <tr><td>Accepted for later processing</td><td><code>202 Accepted</code> + a status URL</td></tr>
+        <tr><td>Succeeded, nothing to return</td><td><code>204 NoContent</code></td></tr>
+        <tr><td>Malformed request</td><td><code>400 BadRequest</code></td></tr>
+        <tr><td>Not found <em>or</em> not yours</td><td><code>404 NotFound</code></td></tr>
+        <tr><td>Business rule violated</td><td><code>409 Conflict</code> or <code>422</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Why 404 for "not yours"</div>
+    <p style="margin:0">Returning 403 for a record that belongs to another tenant confirms that the record
+      <em>exists</em>, which lets an attacker enumerate valid IDs.
+      <br><br>
+      404 leaks nothing. See <a href="security.html#resource-authorization">resource authorization</a>.</p>
+  </div>
+
+  <h2 id="filters">Filters <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Middleware</strong> runs for every request, before routing decides anything.</p>
+    <p><strong>Filters</strong> run around a specific endpoint, and they know which endpoint it is and what
+      the bound arguments are.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Use middleware when</th><th>Use a filter when</th></tr></thead>
+      <tbody>
+        <tr><td>It applies to every request</td><td>It applies to some endpoints</td></tr>
+        <tr><td>You need it before routing (HTTPS redirect, CORS)</td><td>You need the model-bound arguments</td></tr>
+        <tr><td>It's transport-level</td><td>It's application-level</td></tr>
+        <tr><td>Examples: correlation ID, compression, exception handling</td><td>Examples: audit logging with the entity ID, per-action caching</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — an endpoint filter for minimal APIs" class="code-good"><code class="language-csharp">public sealed class AuditFilter(ILogger&lt;AuditFilter&gt; log) : IEndpointFilter
+{
+    public async ValueTask&lt;object?&gt; InvokeAsync(
+        EndpointFilterInvocationContext context, EndpointFilterDelegate next)
+    {
+        // Filters can see the BOUND arguments - middleware cannot
+        var request = context.Arguments.OfType&lt;CreateOrderRequest&gt;().FirstOrDefault();
+        log.LogInformation("Creating order for {CustomerId}", request?.CustomerId);
+
+        return await next(context);
+    }
+}
+
+app.MapPost("/api/orders", CreateOrder).AddEndpointFilter&lt;AuditFilter&gt;();</code></pre>
+
+  <p>That's the distinction that matters: the filter can read <code>CreateOrderRequest.CustomerId</code>
+    because binding has already happened. Middleware would have to parse the body itself — and consuming the
+    body stream would break the endpoint.</p>
+
+  <h2 id="controllers-vs-minimal">Controllers vs minimal APIs, concretely <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — the same endpoint, both ways"><code class="language-csharp">// Controller
+[ApiController]
+[Route("api/orders")]
+public sealed class OrdersController(IOrderRepository repo) : ControllerBase
+{
+    [HttpGet("{id:guid}")]
+    [ProducesResponseType&lt;OrderResponse&gt;(200)]
+    [ProducesResponseType(404)]
+    public async Task&lt;IActionResult&gt; Get(Guid id, CancellationToken ct)
+    {
+        var order = await repo.GetAsync(id, ct);
+        return order is null ? NotFound() : Ok(OrderResponse.From(order));
+    }
+}
+
+// Minimal API
+app.MapGet("/api/orders/{id:guid}",
+    async Task&lt;Results&lt;Ok&lt;OrderResponse&gt;, NotFound&gt;&gt; (
+        Guid id, IOrderRepository repo, CancellationToken ct) =&gt;
+{
+    var order = await repo.GetAsync(id, ct);
+    return order is null ? TypedResults.NotFound() : TypedResults.Ok(OrderResponse.From(order));
+});</code></pre>
+
+  <p>Note that the minimal version needs no <code>[ProducesResponseType]</code> attributes — the return type
+    carries that information.</p>
+
+  <div class="note tip">
+    <div class="note-title">Keeping minimal APIs organised</div>
+    <p style="margin:0">The failure mode is forty endpoints in <code>Program.cs</code>. Group them into
+      extension methods per feature:</p>
+    <pre data-label="csharp"><code class="language-csharp">// Features/Orders/OrderEndpoints.cs
+public static class OrderEndpoints
+{
+    public static void MapOrderEndpoints(this WebApplication app)
+    {
+        var group = app.MapGroup("/api/orders")
+                       .RequireAuthorization()
+                       .WithTags("Orders");
+
+        group.MapGet("/{id:guid}", GetOrder);
+        group.MapPost("/", CreateOrder);
+    }
+}
+
+// Program.cs stays one line per feature
+app.MapOrderEndpoints();</code></pre>
+    <p style="margin:0">That gives you minimal-API brevity with controller-like discoverability.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Simple types bind from route/query, complex types from the body. One body parameter only.</li>
+      <li>Never bind the body to an entity — over-posting lets callers set internal fields.</li>
+      <li>Request DTOs make the contract explicit and decouple the API from the schema.</li>
+      <li><code>[ApiController]</code> gives automatic 400 + <code>ProblemDetails</code> on validation failure.</li>
+      <li>Request validation checks shape; domain invariants belong in the domain.</li>
+      <li>Filters see bound arguments; middleware doesn't. That's how you choose.</li>
+      <li><code>TypedResults</code> documents your status codes automatically.</li>
+      <li>Return 404, not 403, for records that aren't the caller's.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Binding to EF entities</strong> — over-posting, and it couples your API to your schema.</li>
+    <li><strong>Returning entities directly</strong>, leaking internal fields and creating circular
+      references in JSON.</li>
+    <li><strong>Validation rules only in the request validator</strong>, so other code paths bypass them.</li>
+    <li><strong>Reading the body in middleware</strong> without enabling buffering, so the endpoint gets
+      nothing.</li>
+    <li><strong>Returning 200 with an error object</strong> instead of a proper status code.</li>
+    <li><strong>Forgetting <code>CancellationToken</code></strong> on the action signature.</li>
+    <li><strong>Route constraints used as validation</strong>, giving 404 where 400 was intended.</li>
+    <li><strong>All minimal API endpoints in <code>Program.cs</code></strong>.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What is over-posting and how do you prevent it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Over-posting — sometimes called mass assignment — is when you bind a request body directly to an
+          entity, and the caller sets properties you never intended to expose."</p>
+        <p>"The concrete example: an <code>Order</code> entity with <code>Status</code> and
+          <code>DiscountApplied</code> properties. If the endpoint takes <code>Order</code> as its parameter,
+          a client can post JSON that sets status to Paid and discount to 99.99. Nothing is malformed — the
+          binder is doing exactly what it's designed to do. You've just let the client decide fields the
+          business logic owns."</p>
+        <p>"The fix is a request DTO containing only what a caller may legitimately send —
+          <code>CustomerId</code> and the lines, say. Status and discount are then decided by the domain, and
+          there's literally no property for the client to set."</p>
+        <p>"That has two other benefits worth mentioning. It documents the contract, so OpenAPI shows callers
+          exactly what's accepted. And it decouples the API from the database schema — I can rename an entity
+          property without it becoming a breaking API change."</p>
+        <p>"I'd do the same on the way out. Returning entities directly leaks internal fields, and with EF it
+          also risks serializing navigation properties into circular references or accidentally triggering
+          lazy loads during serialization."</p>
+        <p>"If for some reason I couldn't introduce a DTO, the older mitigation is a binding include list —
+          <code>[Bind(nameof(Order.CustomerId))]</code> — but that's a denylist-by-omission and easy to get
+          wrong when someone adds a property. The DTO is the structural fix."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know this is a security issue, not a style preference?</li>
+        <li>Can you give a concrete exploitable example?</li>
+        <li>Do you apply the same reasoning to responses?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> not knowing the term or the risk.</li>
+        <li><span class="redflag">Red flag:</span> "validate the input" — validation doesn't stop a caller
+          setting a field that passes validation.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where should mapping between DTO and entity live?</li>
+          <li>How do you avoid writing three near-identical classes per endpoint?</li>
+          <li>What goes wrong if you return EF entities from an API?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you use a filter instead of middleware?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The deciding factor is whether I need to know <em>which endpoint</em> is running and what its
+          arguments are."</p>
+        <p>"Middleware runs before routing has necessarily resolved an endpoint, and it only sees the raw
+          <code>HttpContext</code>. That's right for transport-level concerns that apply to everything —
+          exception handling, HTTPS redirection, CORS, response compression, adding a correlation ID."</p>
+        <p>"Filters run around a specific endpoint, after model binding. So they can see the bound arguments
+          and the endpoint metadata. That's what you need for application-level concerns — audit logging that
+          includes the customer ID from the request, per-action caching, or a validation filter."</p>
+        <p>"The concrete example: if I want to log the customer ID on order creation, a filter can just read
+          it from the bound <code>CreateOrderRequest</code>. Middleware would have to read and parse the body
+          itself — and if it consumes the request stream without enabling buffering, the endpoint then gets
+          an empty body. That's a real bug people hit."</p>
+        <p>"There's also a scope difference: middleware applies to every request whether you want it to or
+          not, whereas a filter can be attached per endpoint or per route group. So if something applies to
+          some endpoints, a filter is the honest choice rather than middleware with a path check."</p>
+        <p>"For minimal APIs the mechanism is <code>IEndpointFilter</code>; for controllers it's the fuller
+          filter pipeline with action, result and exception filters."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know filters see bound arguments and middleware doesn't?</li>
+        <li>Do you know the request-body-stream trap?</li>
+        <li>Do you consider scope — all requests vs some endpoints?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you read the request body in middleware safely?</li>
+          <li>What's the order of the controller filter types?</li>
+          <li>Where would you put a global exception handler — middleware or filter?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

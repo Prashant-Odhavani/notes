@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kafka — Overview</title>
+<meta name="description" content="How Kafka differs fundamentally from a message queue, when that difference matters, and when Service Bus is the better choice.">
+<meta name="keywords" content="Kafka overview distributed log vs message queue replay event streaming when to use Kafka vs Service Bus RabbitMQ .NET Confluent operational cost">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="22-kafka/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Kafka</h1>
+    <p class="subtitle">Not a message queue. A distributed, replayable log — and that single difference drives
+      everything about when it's the right choice.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="not-a-queue">Kafka is not a queue <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The one difference that matters</span>
+    <p>A queue <strong>deletes</strong> a message once it's consumed. The message is a unit of work that gets
+      done and disappears.</p>
+    <p>Kafka <strong>appends to a log and keeps it</strong>. Consumers track their own position. Reading doesn't
+      remove anything — so many independent consumers can read the same data, and any of them can
+      <strong>rewind</strong>.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A queue is a <strong>to-do list</strong>. You take an item, do it, cross it off. It's gone.</p>
+    <p>Kafka is a <strong>ledger</strong>. Entries are written in order and never removed. Different readers keep
+      bookmarks at different pages, and anyone can go back and re-read from any point.</p>
+    <p>That's why "replay the last three days of events into a new service" is natural in Kafka and impossible
+      with a queue.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Message queue (Service Bus, RabbitMQ)</th><th>Kafka</th></tr></thead>
+      <tbody>
+        <tr><td>After consumption</td><td><strong>Message is deleted</strong></td><td><strong>Retained until the retention policy expires it</strong></td></tr>
+        <tr><td>Position tracking</td><td>Broker tracks it</td><td><strong>Consumer tracks its own offset</strong></td></tr>
+        <tr><td>Replay</td><td>No</td><td><strong>Yes — reset the offset</strong></td></tr>
+        <tr><td>Multiple independent readers</td><td>Needs a subscription each, from now on</td><td><strong>Native, including historical data</strong></td></tr>
+        <tr><td>Throughput</td><td>High</td><td><strong>Very high</strong> — sequential disk writes</td></tr>
+        <tr><td>Per-message operations</td><td><strong>Yes</strong> — dead-letter, defer, complete individually</td><td><strong>No</strong> — the log is append-only</td></tr>
+        <tr><td>Ordering</td><td>Per session</td><td>Per partition</td></tr>
+        <tr><td>Operational cost</td><td>Low if managed</td><td><strong>High</strong> unless fully managed</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the consequences of an append-only log</div>
+    <p style="margin:0">Because the log is immutable and consumers only track an offset, <strong>Kafka cannot do
+      per-message operations</strong>. There's no "dead-letter this one message and carry on", no "defer this for
+      ten minutes", no "complete message 5 but not message 4".
+      <br><br>
+      That's not a missing feature — it's inherent to the design. Offsets are positions in a sequence, so
+      acknowledging message 6 implicitly acknowledges everything before it.
+      <br><br>
+      Practically that means <strong>you build dead-lettering yourself</strong>: catch the failure, produce the
+      message to a separate error topic, and commit the offset anyway. And <strong>a poison message you don't
+      handle blocks its partition indefinitely</strong>, because you can't skip it without committing past it.
+      <br><br>
+      Service Bus gives you all of that in the broker. So "Kafka has higher throughput" is true and often
+      irrelevant — the real question is whether you need <strong>replay and multiple independent readers</strong>
+      enough to give up per-message control.</p>
+  </div>
+
+  <h2 id="when">When Kafka is the right choice <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Good fit</th><th>Poor fit</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Several independent consumers of the same stream</strong> — analytics, search index,
+              audit, cache invalidation</td>
+          <td><strong>Task distribution</strong> — "one worker should do this job"</td>
+        </tr>
+        <tr>
+          <td><strong>Replay is a requirement</strong> — rebuild a read model, onboard a new consumer with
+              history</td>
+          <td><strong>Per-message control needed</strong> — dead-letter, defer, priority</td>
+        </tr>
+        <tr>
+          <td><strong>Very high sustained throughput</strong> — hundreds of thousands of events a second</td>
+          <td><strong>Request/reply</strong> — that's an RPC, not a stream</td>
+        </tr>
+        <tr>
+          <td><strong>Event sourcing</strong> — the log <em>is</em> the source of truth</td>
+          <td><strong>Low volume</strong> — the operational cost dwarfs the benefit</td>
+        </tr>
+        <tr>
+          <td><strong>Stream processing</strong> — windowed aggregation, joins over streams</td>
+          <td><strong>Small team, no platform support</strong></td>
+        </tr>
+        <tr>
+          <td><strong>A durable buffer</strong> between systems with different speeds</td>
+          <td><strong>Scheduled/delayed delivery</strong> — no native support</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The deciding question</span>
+    <p><strong>Do you need to replay, or do you need many independent readers of the same events?</strong></p>
+    <p>If yes — Kafka's design is genuinely different and worth the operational cost.</p>
+    <p>If no, and you mainly need reliable work distribution with per-message handling — <strong>Azure Service
+      Bus or RabbitMQ is the better tool</strong>, and choosing Kafka means taking on complexity for capabilities
+      you won't use.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The operational cost is the part that's understated</div>
+    <p style="margin:0">Self-hosted Kafka is a genuinely demanding system to run. Broker sizing, partition
+      planning, replication factors, ISR configuration, rebalance tuning, retention and compaction policies,
+      consumer lag monitoring, and — historically — a ZooKeeper cluster alongside it.
+      <br><br>
+      Partition count in particular is a decision you largely commit to upfront: you can add partitions, but doing
+      so <strong>changes which partition a key maps to</strong>, which breaks the ordering guarantee for existing
+      keys. You cannot reduce them at all.
+      <br><br>
+      So unless there's a platform team, use a <strong>managed service</strong> — Confluent Cloud, Azure Event
+      Hubs with the Kafka endpoint, or MSK. The economics change completely: Event Hubs in particular gives you a
+      Kafka-compatible endpoint with none of the broker operations, which for a .NET shop on Azure is frequently
+      the pragmatic answer.
+      <br><br>
+      "We'd use Event Hubs rather than running Kafka ourselves" is a strong, practical answer.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">Architecture &amp; Fundamentals</a></td>
+          <td>Topics, partitions and offsets; replication and ISR; how producers and consumers actually work;
+              consumer groups</td>
+        </tr>
+        <tr>
+          <td><a href="delivery-ordering.html">Delivery Semantics &amp; Ordering</a></td>
+          <td>At-most/least/exactly-once, the idempotent producer, transactions, partition keys and what
+              ordering really guarantees</td>
+        </tr>
+        <tr>
+          <td><a href="operations.html">Operations &amp; Scaling</a></td>
+          <td>Rebalancing, consumer lag, retention and compaction, partition sizing, and failure recovery</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="dotnet">Kafka from .NET <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>Confluent.Kafka</code></strong></td><td>The standard client. A wrapper over librdkafka, so it's mature and fast. Lower level than most .NET libraries</td></tr>
+        <tr><td><strong>MassTransit with the Kafka rider</strong></td><td>Familiar consumer abstractions, retry and serialisation. Some Kafka specifics are hidden</td></tr>
+        <tr><td><strong>Azure Event Hubs</strong></td><td>Kafka-protocol compatible. Use the Kafka client, or the native SDK for a better .NET experience</td></tr>
+        <tr><td><strong>Streamiz</strong></td><td>Kafka Streams for .NET. Less mature than the JVM original</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Stream processing is where .NET is genuinely behind</div>
+    <p style="margin:0">Kafka Streams and ksqlDB are JVM-first, and the .NET equivalents are considerably less
+      mature. So <strong>windowed aggregations, stream-table joins and stateful stream processing are much harder
+      from .NET</strong> than from Java.
+      <br><br>
+      That's worth knowing as an honest constraint. If the requirement is heavy stream processing, the options are
+      a JVM service for that part, Azure Stream Analytics, or accepting a less mature library.
+      <br><br>
+      For the common case — produce and consume events with partitioned ordering —
+      <code>Confluent.Kafka</code> is entirely solid and there's no gap. It's specifically the
+      <em>processing topology</em> layer that's thin.</p>
+  </div>
+
+  <details class="qa">
+    <summary>Kafka or Azure Service Bus? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They solve different problems, so I'd start from what the workload actually needs rather than
+          comparing throughput numbers."</p>
+        <p>"<strong>The fundamental difference is that a queue deletes a message when it's consumed, and Kafka
+          keeps it.</strong> Kafka is an append-only log where consumers track their own offset — so reading
+          doesn't remove anything, many independent consumers can read the same data, and any of them can
+          rewind."</p>
+        <p>"So the deciding question is: <strong>do I need replay, or many independent readers of the same
+          events?</strong>"</p>
+        <p>"If yes, Kafka's design is genuinely different and worth the cost. Rebuilding a read model from three
+          days of history, onboarding a new consumer that needs to process everything from the beginning, having
+          analytics and search indexing and audit all consume the same stream independently — those are natural in
+          Kafka and impossible with a queue."</p>
+        <p>"If no, <strong>Service Bus is the better tool</strong> — and I'd say that plainly rather than
+          defaulting to Kafka because it's the more impressive answer."</p>
+        <p>"The reason is that Service Bus gives you things Kafka structurally cannot. <strong>Per-message
+          operations</strong>: dead-letter this one message, defer that one for ten minutes, complete message 5
+          but not message 4. Kafka can't do any of that, because an offset is a position in a sequence —
+          acknowledging message 6 implicitly acknowledges everything before it."</p>
+        <p>"So with Kafka you <strong>build dead-lettering yourself</strong>: catch the failure, produce to an
+          error topic, commit the offset anyway. And an unhandled poison message <strong>blocks its partition
+          indefinitely</strong>, because you can't skip past it without committing. Service Bus handles all of
+          that in the broker, along with scheduled delivery and duplicate detection."</p>
+        <p>"For a typical .NET line-of-business system — send this invoice, process this order, notify these
+          services — that per-message control matters far more than throughput. Most systems are nowhere near
+          Kafka's throughput advantage being relevant."</p>
+        <p>"<strong>The operational cost is the other half.</strong> Self-hosted Kafka is demanding: broker
+          sizing, partition planning, replication and ISR configuration, rebalance tuning, retention and
+          compaction, lag monitoring. Partition count especially is largely a one-way decision — you can add
+          partitions, but that changes which partition a key maps to and breaks ordering for existing keys, and
+          you can't reduce them at all."</p>
+        <p>"So unless there's a platform team, I'd use a managed service. For a .NET shop on Azure,
+          <strong>Event Hubs with the Kafka endpoint</strong> is often the pragmatic answer — Kafka-compatible
+          protocol, no broker operations."</p>
+        <p>"One honest constraint if the plan involves stream processing: <strong>Kafka Streams and ksqlDB are
+          JVM-first</strong> and the .NET equivalents are much less mature. So windowed aggregations and
+          stream-table joins are meaningfully harder from .NET. Producing and consuming is fine; it's the
+          processing topology layer that's thin."</p>
+        <p>"And they're not mutually exclusive — a common shape is Kafka as the event backbone for
+          analytics and integration, with Service Bus for command-style work distribution where per-message
+          handling matters."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the log-versus-queue distinction and its consequences?</li>
+        <li>Do you know Kafka can't do per-message operations?</li>
+        <li>Will you recommend Service Bus when it fits?</li>
+        <li>Are you realistic about operational cost?</li>
+        <li>Do you know the .NET stream-processing gap?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "Kafka, it's faster" as the reasoning.</li>
+        <li><span class="redflag">Red flag:</span> treating them as interchangeable brokers.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of the operational burden.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you dead-letter in Kafka?</li>
+          <li>What breaks when you add partitions?</li>
+          <li>How does Event Hubs differ from real Kafka?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section assumes <a href="../21-messaging/index.html">the messaging patterns page</a> —
+      delivery guarantees, idempotent consumers, ordering and the outbox. Those concepts apply to Kafka too; this
+      section covers what's specific to the log model.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

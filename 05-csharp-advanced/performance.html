@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance, Reflection &amp; Internals — C# Advanced</title>
+<meta name="description" content="How to measure C# performance properly, reflection and its cost, expression trees, source generators, and the optimisations that actually matter.">
+<meta name="keywords" content="csharp performance BenchmarkDotNet reflection cost expression trees compiled expression source generators AOT attributes profiling premature optimisation">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="05-csharp-advanced/performance.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Performance, Reflection &amp; Internals</h1>
+    <p class="subtitle">How to know something is faster rather than believe it — plus the metaprogramming
+      features that power DI containers, ORMs and serializers.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Measure, don't guess.</strong> Use <code>BenchmarkDotNet</code>, not a
+        <code>Stopwatch</code> in a loop.</li>
+      <li>Optimise what a <strong>profiler</strong> points at. Intuition about hot paths is usually wrong.</li>
+      <li><strong>Reflection is slow</strong> because it resolves at runtime and skips inlining. Cache the
+        lookup, or compile a delegate once.</li>
+      <li><strong>Expression trees</strong> are code as data. They power EF Core's SQL translation and fast
+        object mapping.</li>
+      <li><strong>Source generators</strong> do the same work at <em>compile</em> time — the modern
+        alternative to runtime reflection.</li>
+      <li>The biggest wins are almost never micro-optimisations. They're algorithmic, or a removed database
+        round trip.</li>
+    </ul>
+  </div>
+
+  <h2 id="measuring">Measuring properly <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>You cannot reason about .NET performance from reading code. The JIT, the GC and the CPU all
+      interfere.</p>
+    <p>The only reliable answer comes from measuring — and measuring correctly is harder than it looks.</p>
+  </div>
+
+  <pre data-label="csharp — a naive benchmark that will mislead you" class="code-bad"><code class="language-csharp">var sw = Stopwatch.StartNew();
+for (var i = 0; i &lt; 1_000_000; i++) DoWork();
+Console.WriteLine(sw.ElapsedMilliseconds);</code></pre>
+
+  <p>Four things make this untrustworthy:</p>
+
+  <ol class="steps">
+    <li><strong>JIT warm-up.</strong> The first calls are interpreted or unoptimised. You're measuring
+      compilation, not execution.</li>
+    <li><strong>No GC isolation.</strong> A collection triggered by unrelated code lands in your timing.</li>
+    <li><strong>Dead code elimination.</strong> If the result is unused, the JIT may remove the call
+      entirely — and you'll measure an empty loop.</li>
+    <li><strong>One sample.</strong> No variance, no confidence interval. You can't tell a real 5%
+      improvement from noise.</li>
+  </ol>
+
+  <pre data-label="csharp — BenchmarkDotNet handles all of that" class="code-good"><code class="language-csharp">[MemoryDiagnoser]                        // also reports allocations
+public class StringBenchmarks
+{
+    private readonly string[] _lines = Enumerable.Range(0, 1000)
+                                                 .Select(i =&gt; $"line {i}")
+                                                 .ToArray();
+
+    [Benchmark(Baseline = true)]
+    public string Concatenation()
+    {
+        var result = "";
+        foreach (var l in _lines) result += l;
+        return result;
+    }
+
+    [Benchmark]
+    public string Builder()
+    {
+        var sb = new StringBuilder();
+        foreach (var l in _lines) sb.Append(l);
+        return sb.ToString();
+    }
+}</code></pre>
+
+  <p>It warms up, runs many iterations, discards outliers, reports mean and standard deviation, and with
+    <code>[MemoryDiagnoser]</code> tells you allocations and GC counts per operation. Returning the value
+    also prevents dead-code elimination.</p>
+
+  <div class="note tip">
+    <div class="note-title">Best practice</div>
+    <p style="margin:0">Always report <strong>allocations alongside time</strong>. Two implementations can
+      have identical throughput in a benchmark while one allocates 10× more — and under real load that extra
+      GC pressure is what hurts.
+      <br><br>
+      Also: benchmark in <strong>Release</strong> configuration. Debug builds disable optimisations, so Debug
+      numbers are meaningless.</p>
+  </div>
+
+  <h3 id="profiling">Benchmarking vs profiling</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Benchmarking</th><th>Profiling</th></tr></thead>
+      <tbody>
+        <tr><td>Answers</td><td>"Is A faster than B?"</td><td>"Where is the time actually going?"</td></tr>
+        <tr><td>Scope</td><td>One isolated method</td><td>The whole application</td></tr>
+        <tr><td>Tool</td><td>BenchmarkDotNet</td><td>dotnet-trace, dotnet-counters, Visual Studio profiler</td></tr>
+        <tr><td>Use it</td><td><em>After</em> you know what to optimise</td><td><em>To find</em> what to optimise</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The right order</span>
+    <p><strong>Profile first, then benchmark.</strong></p>
+    <p>Profiling tells you which 3% of the code matters. Benchmarking then proves your change to that 3%
+      actually helped. Doing it the other way round means optimising code nobody executes.</p>
+  </div>
+
+  <h2 id="reflection">Reflection <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Reflection lets code <strong>inspect and use types it wasn't compiled against</strong> — read
+      properties by name, call methods by name, create instances of types discovered at runtime.</p>
+  </div>
+
+  <p>It's how a lot of the framework works: DI containers finding constructors, serializers reading
+    properties, test runners discovering <code>[Fact]</code> methods, ORMs mapping columns.</p>
+
+  <pre data-label="csharp — inspecting a type at runtime"><code class="language-csharp">var type = typeof(Order);
+
+foreach (var prop in type.GetProperties())
+    Console.WriteLine($"{prop.Name}: {prop.PropertyType.Name}");
+
+// Create and populate without compile-time knowledge
+var instance = Activator.CreateInstance(type)!;
+type.GetProperty("Total")!.SetValue(instance, 99.99m);</code></pre>
+
+  <h3 id="reflection-cost">Why it's slow, and what to do</h3>
+
+  <p>Reflection is roughly one to two orders of magnitude slower than direct access. The reasons:</p>
+
+  <ul>
+    <li>Member lookup is a <strong>string-based search</strong> through metadata.</li>
+    <li>Calls go through an <strong>indirection layer</strong> that can't be inlined.</li>
+    <li>Arguments get <strong>boxed</strong> into <code>object[]</code>.</li>
+    <li>Security and type checks happen on every call.</li>
+  </ul>
+
+  <pre data-label="csharp — bad: reflecting inside the loop" class="code-bad"><code class="language-csharp">foreach (var order in orders)                     // 100,000 iterations
+{
+    var prop = typeof(Order).GetProperty("Total"); // string lookup, every time
+    var total = (decimal)prop!.GetValue(order)!;   // boxed
+}</code></pre>
+
+  <pre data-label="csharp — better: hoist the lookup out" class="code-good"><code class="language-csharp">var prop = typeof(Order).GetProperty("Total")!;   // once
+foreach (var order in orders)
+{
+    var total = (decimal)prop.GetValue(order)!;    // still boxes, but no lookup
+}</code></pre>
+
+  <pre data-label="csharp — best: compile a delegate once" class="code-good"><code class="language-csharp">// Build a strongly-typed getter from an expression tree, then reuse it.
+// After this, calls are close to direct property access speed.
+private static readonly Func&lt;Order, decimal&gt; GetTotal = BuildGetter();
+
+static Func&lt;Order, decimal&gt; BuildGetter()
+{
+    var param = Expression.Parameter(typeof(Order), "o");
+    var body  = Expression.Property(param, nameof(Order.Total));
+    return Expression.Lambda&lt;Func&lt;Order, decimal&gt;&gt;(body, param).Compile();
+}</code></pre>
+
+  <p>That's the technique real libraries use. AutoMapper, Dapper and the DI container all build and cache
+    compiled delegates rather than reflecting on every call — which is why they're fast despite being
+    reflection-based at startup.</p>
+
+  <div class="note warn">
+    <div class="note-title">Reflection and trimming / AOT</div>
+    <p style="margin:0">If you publish with trimming or Native AOT, reflection becomes a real problem: the
+      trimmer can't see that a type is used only via reflection, so it removes it — and you get a runtime
+      failure that didn't happen in a normal build.
+      <br><br>
+      That's a large part of why <strong>source generators</strong> exist, and why
+      <code>System.Text.Json</code> gained a source-generated mode.</p>
+  </div>
+
+  <h2 id="expression-trees">Expression trees <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An expression tree is <strong>your code represented as data</strong> — a tree of objects describing
+      what the code <em>means</em>, rather than compiled instructions.</p>
+    <p>Because it's data, you can read it. And because you can read it, you can translate it into something
+      else.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A <code>Func</code> is a <strong>sealed machine</strong>. You can press the button and get a result,
+      but you can't see inside.</p>
+    <p>An <code>Expression</code> is the <strong>blueprint</strong> for that machine. You can read it,
+      analyse it, and build a different machine from it — say, one made of SQL.</p>
+  </div>
+
+  <pre data-label="csharp — same lambda, fundamentally different things"><code class="language-csharp">Func&lt;Order, bool&gt;             compiled = o =&gt; o.Total &gt; 100;   // executable
+Expression&lt;Func&lt;Order, bool&gt;&gt; tree     = o =&gt; o.Total &gt; 100;   // inspectable
+
+var binary = (BinaryExpression)tree.Body;
+Console.WriteLine(binary.NodeType);   // GreaterThan
+Console.WriteLine(binary.Left);       // o.Total
+Console.WriteLine(binary.Right);      // 100</code></pre>
+
+  <p>This is exactly how EF Core turns LINQ into SQL — it walks the tree and emits
+    <code>WHERE [Total] &gt; @p0</code>. Covered from the LINQ side in
+    <a href="../04-linq/index.html#expression-trees">LINQ in depth</a>.</p>
+
+  <p><strong>The two things you'd actually use them for:</strong></p>
+
+  <ol class="steps">
+    <li><strong>Composable, translatable filters.</strong> An <code>Expression&lt;Func&lt;T, bool&gt;&gt;</code>
+      can be combined and passed to EF; a <code>Func</code> cannot. That's the basis of the
+      <a href="../18-design-patterns/enterprise.html#specification">Specification pattern</a>.</li>
+    <li><strong>Fast dynamic access.</strong> Compile a delegate once instead of reflecting repeatedly, as
+      shown above.</li>
+  </ol>
+
+  <div class="note info">
+    <div class="note-title">Also: strongly-typed member names</div>
+    <p style="margin:0">Expression trees are how APIs get compile-time-safe property references:
+      <code>builder.Property(o =&gt; o.Total)</code> in EF's fluent API, or
+      <code>Include(o =&gt; o.Customer)</code>. The library reads the tree to find the member name, so a
+      rename is caught by the compiler rather than failing at runtime like a magic string would.</p>
+  </div>
+
+  <h2 id="attributes">Attributes <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An attribute is <strong>metadata attached to code</strong>. It does nothing by itself — something
+      else has to read it and act on it.</p>
+  </div>
+
+  <pre data-label="csharp — declaring and reading one"><code class="language-csharp">[AttributeUsage(AttributeTargets.Class)]
+public sealed class AuditedAttribute(string category) : Attribute
+{
+    public string Category { get; } = category;
+}
+
+[Audited("Financial")]
+public class Invoice { }
+
+// Something has to look for it - usually at startup, then cache the result
+var attr = typeof(Invoice).GetCustomAttribute&lt;AuditedAttribute&gt;();
+Console.WriteLine(attr?.Category);      // "Financial"</code></pre>
+
+  <p>This is the model behind <code>[HttpGet]</code>, <code>[Required]</code>, <code>[Fact]</code>,
+    <code>[Authorize]</code> — declarative markers that a framework discovers by reflection.</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Reading attributes on a hot path. <code>GetCustomAttribute</code> is reflection, so
+      it's slow. Scan once at startup and cache into a dictionary — which is exactly what ASP.NET Core does
+      when it builds the endpoint table, rather than reflecting per request.</p>
+  </div>
+
+  <h2 id="source-generators">Source generators <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A source generator inspects your code <strong>at compile time</strong> and writes additional C# that
+      gets compiled alongside it.</p>
+    <p>It's reflection's job, done before the program runs.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Runtime reflection</th><th>Source generator</th></tr></thead>
+      <tbody>
+        <tr><td>When it runs</td><td>Every call, or once at startup</td><td>At build time</td></tr>
+        <tr><td>Runtime cost</td><td>Real</td><td>Zero — it's just normal compiled code</td></tr>
+        <tr><td>Startup cost</td><td>Can be significant</td><td>None</td></tr>
+        <tr><td>Trimming / AOT</td><td>Often breaks</td><td>Works — the code is visible to the compiler</td></tr>
+        <tr><td>Debuggable</td><td>Hard</td><td>Yes — you can inspect the generated source</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Where you'll already be using them, whether you know it or not:</p>
+
+  <ul>
+    <li><strong><code>System.Text.Json</code></strong> source-generated serialization — no reflection, works
+      under AOT.</li>
+    <li><strong><code>[LoggerMessage]</code></strong> — generates high-performance logging methods with no
+      boxing and no string allocation when the level is disabled.</li>
+    <li><strong><code>[GeneratedRegex]</code></strong> — compiles the regex at build time instead of
+      startup.</li>
+    <li><strong>Records</strong> — arguably the original: the compiler generates <code>Equals</code>,
+      <code>GetHashCode</code>, <code>ToString</code> and <code>Deconstruct</code> for you.</li>
+  </ul>
+
+  <pre data-label="csharp — the logging one, which is worth adopting"><code class="language-csharp">public static partial class Log
+{
+    [LoggerMessage(Level = LogLevel.Warning,
+                   Message = "Order {OrderId} failed validation: {Reason}")]
+    public static partial void OrderInvalid(ILogger logger, Guid orderId, string reason);
+}
+
+// Call site: no boxing of orderId, and if Warning is disabled nothing is formatted.
+Log.OrderInvalid(_logger, order.Id, "missing address");</code></pre>
+
+  <p>Compared with <code>_logger.LogWarning("Order {OrderId} ...", order.Id, reason)</code>, this avoids
+    boxing the <code>Guid</code> into <code>object[]</code> and skips formatting entirely when the level is
+    off. On a high-volume path that's a measurable win for a one-line change.</p>
+
+  <h2 id="what-actually-matters">What actually moves the needle <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>This is the most useful part of the page for interviews. Optimisations, roughly in order of impact:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Impact</th><th>Change</th><th>Typical gain</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Huge</strong></td><td>Remove an N+1 query</td><td>100 round trips → 1</td></tr>
+        <tr><td><strong>Huge</strong></td><td>Add a missing database index</td><td>Seconds → milliseconds</td></tr>
+        <tr><td><strong>Huge</strong></td><td>Fix an O(n²) algorithm (e.g. <code>Contains</code> on a list in a loop)</td><td>Minutes → milliseconds</td></tr>
+        <tr><td><strong>Large</strong></td><td>Cache an expensive repeated computation or call</td><td>Depends on hit rate</td></tr>
+        <tr><td><strong>Large</strong></td><td>Parallelise independent I/O with <code>WhenAll</code></td><td>Sum of latencies → max</td></tr>
+        <tr><td><strong>Large</strong></td><td>Project only the columns needed</td><td>Less I/O, less allocation</td></tr>
+        <tr><td>Medium</td><td>Remove blocking calls causing thread pool starvation</td><td>Fixes a latency cliff</td></tr>
+        <tr><td>Small</td><td>Pool large buffers, avoid LOH churn</td><td>Lower GC pressure</td></tr>
+        <tr><td>Tiny</td><td>Replace LINQ with a <code>for</code> loop</td><td>Nanoseconds per item</td></tr>
+        <tr><td>Tiny</td><td><code>StringBuilder</code> for four concatenations</td><td>Nothing measurable</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>The top of that table is <strong>I/O and algorithms</strong>. The bottom is <strong>allocation
+      micro-optimisation</strong>.</p>
+    <p>Engineers reach for the bottom because it's visible in the code they're reading. The wins are at the
+      top.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">How to say this in an interview</div>
+    <p style="margin:0">"My first question is always <em>where is the time going</em> — and in a typical .NET
+      web app the answer is almost never CPU in my C#. It's a database round trip, a missing index, or an
+      HTTP call I'm waiting on. So I'd profile, find the dominant cost, and fix that. I'd only look at
+      allocations and LINQ overhead once a profiler shows CPU or GC is genuinely the bottleneck."
+      <br><br>
+      That answer demonstrates judgement, which is what the question is testing.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Profile to find <em>what</em> to optimise; benchmark to prove the fix. In that order.</li>
+      <li><code>BenchmarkDotNet</code> in Release, with <code>[MemoryDiagnoser]</code>. Never a raw
+        <code>Stopwatch</code>.</li>
+      <li>Reflection is 10–100× slower. Cache the lookup, or compile a delegate once.</li>
+      <li>Expression trees are code as data — the basis of SQL translation and fast dynamic access.</li>
+      <li>Source generators do reflection's work at compile time, and survive trimming/AOT.</li>
+      <li>The big wins are I/O and algorithms, not allocations.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Optimising without measuring</strong>, then being unable to say whether it helped.</li>
+    <li><strong>Benchmarking in Debug</strong>, or with a <code>Stopwatch</code> and one iteration.</li>
+    <li><strong>Reflecting inside a loop</strong> instead of hoisting or compiling a delegate.</li>
+    <li><strong>Reading attributes per request</strong> rather than caching at startup.</li>
+    <li><strong>Micro-optimising LINQ</strong> while an N+1 query dominates the request.</li>
+    <li><strong>Reporting time without allocations</strong> — GC pressure only shows up under real load.</li>
+    <li><strong>Using reflection-based serialization under AOT</strong> and hitting runtime failures.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>How do you approach a performance problem? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I start by defining what 'slow' means and for whom — is it p95 latency on one endpoint, is it
+          throughput under load, is it memory growth? Optimising without a target means you can't tell when
+          you're done."</p>
+        <p>"Then I measure before changing anything. In a .NET web app the time is almost never CPU in my own
+          code — it's a database round trip, a missing index, or an external HTTP call. So I'd look at
+          distributed tracing or Application Insights first, to see the breakdown between my code and its
+          dependencies."</p>
+        <p>"Once I know the dominant cost, I fix that. The order of impact is fairly consistent: remove an
+          N+1 query, add a missing index, fix an accidental O(n²), then caching and parallelising independent
+          I/O. Those are order-of-magnitude changes. Allocation tuning and LINQ-versus-loop are percentage
+          changes, so I only go there once a profiler says CPU or GC is the bottleneck."</p>
+        <p>"When I do make a micro-optimisation, I prove it with <code>BenchmarkDotNet</code> in Release with
+          <code>[MemoryDiagnoser]</code>, so I get allocations as well as time. A <code>Stopwatch</code> in a
+          loop measures JIT warm-up and random GC pauses more than it measures my code."</p>
+        <p>"And I'd verify in production, not just in the benchmark. I've seen changes that were clearly
+          faster in isolation and made no difference at all to the user, because the real bottleneck was
+          somewhere else entirely."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you measure first, or optimise on instinct?</li>
+        <li>Do you know I/O usually dominates in a web app?</li>
+        <li>Do you know how to benchmark correctly?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> jumping straight to "avoid LINQ, use <code>StringBuilder</code>".</li>
+        <li><span class="redflag">Red flag:</span> "add more servers" before diagnosing.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the difference between profiling and benchmarking?</li>
+          <li>Where would you look first if CPU is at 90%?</li>
+          <li>How do you profile a container you can't attach a debugger to?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why is reflection slow, and how would you make a reflection-heavy path fast?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It's slow for a few compounding reasons. Member lookup is a string-based search through type
+          metadata. The invocation goes through an indirection layer the JIT can't inline. Arguments get
+          boxed into an <code>object[]</code>. And there are access and type checks on every call. Together
+          that's typically one to two orders of magnitude slower than direct access."</p>
+        <p>"The first fix is just to stop doing the lookup repeatedly. If <code>GetProperty("Total")</code> is
+          inside a loop, hoist it out — the <code>PropertyInfo</code> is reusable. That alone removes most of
+          the cost in a lot of real code."</p>
+        <p>"The proper fix is to <strong>compile a delegate once</strong>. Build an expression tree
+          representing the property access and call <code>.Compile()</code>, cache the resulting
+          <code>Func&lt;Order, decimal&gt;</code> in a static field, and after that you're at close to direct
+          property access speed. That's the technique Dapper and AutoMapper use — reflect once at startup,
+          then execute compiled delegates."</p>
+        <p>"The modern answer, though, is often to avoid runtime reflection entirely and use a
+          <strong>source generator</strong>. It does the same inspection at compile time and emits ordinary
+          C#, so there's zero runtime cost, no startup penalty, and — importantly — it survives trimming and
+          Native AOT. Reflection tends to break under trimming, because the trimmer can't see that a type is
+          only used reflectively and removes it."</p>
+        <p>"That's exactly why <code>System.Text.Json</code> gained a source-generated mode, and why
+          <code>[LoggerMessage]</code> and <code>[GeneratedRegex]</code> exist."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the specific reasons, not just "reflection is slow"?</li>
+        <li>Do you know the compiled-delegate technique?</li>
+        <li>Bonus: source generators, and the trimming/AOT angle.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does Dapper map columns to properties so quickly?</li>
+          <li>What breaks under Native AOT, and why?</li>
+          <li>When would you write your own source generator?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

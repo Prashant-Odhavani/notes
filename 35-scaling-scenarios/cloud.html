@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Scaling Scenarios — Scaling Scenarios</title>
+<meta name="description" content="Service-specific failure modes and limits for App Service, AKS, Functions, Service Bus, Event Hubs, SQL and Cosmos — with what the metric hides in each case.">
+<meta name="keywords" content="Azure scaling App Service scale out ARR affinity AKS autoscaler pending pods Functions cold start Flex Consumption Service Bus lock duration prefetch Event Hubs partition Azure SQL DTU log rate Cosmos 429 SNAT port exhaustion">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="35-scaling-scenarios/cloud.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Azure Scaling Scenarios</h1>
+    <p class="subtitle">Service-specific limits and failure modes. In most of these the default metric is reassuring
+      and the real constraint is somewhere else.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>App Service:</strong> ARR affinity on by default defeats scale-out.</li>
+      <li><strong>SNAT port exhaustion</strong> is the outbound limit nobody expects.</li>
+      <li><strong>AKS:</strong> pending pods usually mean requests, IP exhaustion, or no capacity.</li>
+      <li><strong>Functions:</strong> scaling is capped by partition count for Event Hubs and Cosmos triggers.</li>
+      <li><strong>Service Bus:</strong> lock duration and prefetch cause most redelivery problems.</li>
+      <li><strong>Azure SQL:</strong> log write rate is often the ceiling, not CPU.</li>
+      <li><strong>Cosmos:</strong> aggregate RU utilisation hides a hot partition.</li>
+      <li><strong>Classic APIM and App Service tiers</strong> can't be scaled reactively — 30–45 minutes.</li>
+    </ul>
+  </div>
+
+  <h2 id="app-service">App Service <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Likely cause</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Scaling out doesn't help</strong></td><td><strong>ARR affinity on</strong> — clients stay pinned to their original instance</td></tr>
+        <tr><td><strong>Users randomly logged out after scaling</strong></td><td>In-memory session</td></tr>
+        <tr><td><strong>A nightly job runs several times</strong></td><td>A background timer running on every instance</td></tr>
+        <tr><td><strong>Outbound calls fail under load</strong></td><td><strong>SNAT port exhaustion</strong></td></tr>
+        <tr><td>Background work stops overnight</td><td>Always On disabled; the app unloaded when idle</td></tr>
+        <tr><td>First requests after deploy are slow</td><td>No warm-up configured on the slot swap</td></tr>
+        <tr><td>Can't scale during an incident</td><td>Plan change takes minutes; tier changes restart</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">SNAT port exhaustion — the outbound limit that surprises everyone</div>
+    <p style="margin:0">Instances share a limited pool of <strong>SNAT ports</strong> for outbound connections to
+      public endpoints. Each distinct destination connection consumes one, and a closed connection holds its port in
+      <code>TIME_WAIT</code> for a period afterwards.
+      <br><br>
+      So an app making many outbound HTTP calls exhausts the pool and new outbound connections
+      <strong>fail or hang</strong> — while CPU, memory and request counts all look completely normal. It presents as
+      "the third-party API is down", and it isn't.
+      <br><br>
+      The leading cause is <strong><code>new HttpClient()</code> per request</strong>. Each instance opens fresh
+      connections rather than reusing a pool, so port consumption scales with request volume instead of with the
+      number of destinations.
+      <br><br>
+      Fixes, in order:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong><code>IHttpClientFactory</code></strong>, or a properly reused client, so connections are pooled and
+        ports are reused. This alone resolves most cases.</li>
+      <li><strong>Private endpoints or service endpoints</strong> for Azure services, so that traffic doesn't consume
+        SNAT ports at all.</li>
+      <li><strong>A NAT Gateway</strong>, which provides a much larger port pool and a stable outbound IP as a
+        bonus.</li>
+      <li><strong>Connection lifetime limits</strong> so pooled connections are recycled rather than accumulating.</li>
+    </ul>
+    <p style="margin:8px 0 0">Worth knowing because <strong>the App Service metrics don't show it clearly</strong> —
+      it's in the Diagnose and Solve blade under SNAT, and if you don't know the concept exists you won't find
+      it.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">ARR affinity is the reason scale-out sometimes does nothing</div>
+    <p style="margin:0">App Service enables session affinity by <em>default</em>, pinning each client to one instance
+      with a cookie. It exists so legacy stateful apps survive scale-out.
+      <br><br>
+      For a stateless app it's actively harmful. Adding instances doesn't relieve existing clients, because they stay
+      pinned to the instance they started on — so you scale from two to six and the load distribution barely
+      changes.
+      <br><br>
+      It also prevents graceful instance replacement, and losing an instance drops those users' state rather than
+      failing over.
+      <br><br>
+      <strong>Turn it off for anything stateless.</strong> It's one setting, and if the app genuinely needs it, that's
+      a signal to move session state to Redis rather than to keep the pinning.</p>
+  </div>
+
+  <h2 id="aks">AKS <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Pods stuck <code>Pending</code></strong></td><td>No node has the requested CPU/memory; or the autoscaler can't add one</td></tr>
+        <tr><td><strong>The autoscaler adds a node and it never becomes ready</strong></td><td><strong>VNet IP exhaustion</strong> with traditional Azure CNI</td></tr>
+        <tr><td><strong>HPA scales down under a queue backlog</strong></td><td>Scaling on CPU for I/O-bound work — needs KEDA</td></tr>
+        <tr><td><strong>Cluster-wide DNS failures</strong></td><td>CoreDNS starved by application pods on the system node pool</td></tr>
+        <tr><td><strong>Latency high, CPU low</strong></td><td><strong>CPU throttling</strong> — check throttled seconds, not percent</td></tr>
+        <tr><td>Pods restarting under load</td><td>Memory limit too low; .NET sizes the GC heap from it</td></tr>
+        <tr><td>502s on every deployment</td><td>No <code>preStop</code> delay; endpoint removal races SIGTERM</td></tr>
+        <tr><td>A drain never completes</td><td>A PodDisruptionBudget with no slack</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Pending pods: check requests before capacity</div>
+    <p style="margin:0"><code>kubectl describe pod</code> names the reason in Events, and the most common one isn't a
+      genuine capacity shortage — it's <strong>requests that don't fit any node</strong>. A pod requesting 8 CPU on a
+      cluster of 4-core nodes will never schedule, however many nodes you add.
+      <br><br>
+      The next most common is <strong>over-requesting across the board</strong>. Because the scheduler allocates on
+      requests rather than usage, a cluster where every pod requests four times what it uses looks full at 25% real
+      utilisation — and the autoscaler dutifully adds nodes nobody needs. Right-sizing requests from observed p95 usage
+      commonly reclaims 2–4×.
+      <br><br>
+      Then the AKS-specific one: <strong>IP exhaustion</strong>. With traditional Azure CNI, every pod consumes a VNet
+      IP and addresses are pre-allocated per node based on maximum pods — so a node configured for 110 pods reserves
+      110 addresses on joining. Thirty nodes is 3,300 addresses against a <code>/24</code> holding 251. The autoscaler
+      adds a node, there are no IPs, and it never becomes ready.
+      <br><br>
+      That one can't be fixed in place, because a subnet in use can't be resized — hence <strong>Azure CNI
+      Overlay</strong> as the correct default, where only nodes consume VNet addresses.</p>
+  </div>
+
+  <h2 id="functions">Functions <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Blob-triggered function is minutes late</strong></td><td><strong>The classic blob trigger polls.</strong> Use the Event Grid trigger</td></tr>
+        <tr><td><strong>Scaling stops well below the backlog</strong></td><td><strong>Capped by partition count</strong> for Event Hubs and Cosmos triggers</td></tr>
+        <tr><td><strong>Cold starts hurting latency</strong></td><td>Consumption plan; consider Flex Consumption with always-ready instances</td></tr>
+        <tr><td><strong>The database is overwhelmed as functions scale</strong></td><td>Hundreds of instances × their own connection pools</td></tr>
+        <tr><td>Durable orchestration behaves oddly</td><td>Non-deterministic code in the orchestrator</td></tr>
+        <tr><td>Timeouts on long work</td><td>Consumption plan execution limit; use Durable or a different host</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Functions scaling out is what breaks the database</div>
+    <p style="margin:0">This is the most common Functions scaling incident, and it's counterintuitive because the
+      platform is doing exactly what you asked.
+      <br><br>
+      A queue backlog causes the platform to add instances — dozens, or hundreds. <strong>Each instance has its own
+      connection pool.</strong> So two hundred instances with a modest pool each is thousands of connections against a
+      database with a hard limit.
+      <br><br>
+      The result is connection timeouts across the whole system, including from your web app, which was
+      healthy — because it's now competing with two hundred function instances for the same finite server.
+      <br><br>
+      Fixes:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Cap the scale-out</strong> — <code>functionAppScaleLimit</code>, or maximum instance count on Flex
+        Consumption. The most direct control, and the one people don't know exists.</li>
+      <li><strong>Reduce batch concurrency</strong> so each instance does more per invocation rather than each
+        invocation opening its own resources.</li>
+      <li><strong>Lower the per-instance pool size</strong>, since a function instance handling a few messages doesn't
+        need a pool of 100.</li>
+      <li><strong>Reserve database headroom</strong> for the interactive workload, so batch processing can't starve
+        user-facing requests.</li>
+    </ul>
+    <p style="margin:8px 0 0">The general lesson: <strong>elastic compute in front of a fixed-capacity dependency
+      moves the failure, it doesn't remove it.</strong> Automatic scaling is only safe if everything downstream can
+      absorb the resulting concurrency — which is the same reasoning as scaling out a web app onto a shared
+      database.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Partition count is a hard scaling ceiling</div>
+    <p style="margin:0">For Event Hubs and Cosmos change feed triggers, <strong>the platform will not create more
+      instances than there are partitions or leases</strong>, because there's nothing for the extra instances to
+      read.
+      <br><br>
+      So a hub with four partitions gives at most four concurrent function instances, however large the backlog.
+      Scaling settings, plan tier and instance limits make no difference — and the metric shows the function
+      <em>not</em> scaling while lag grows, which looks like a platform fault.
+      <br><br>
+      Which makes the partition count a capacity decision taken at creation, and one you can't easily reverse:
+      increasing it later <a href="../24-azure/event-hubs.html#partitions">remaps keys and breaks ordering</a>. This
+      is the concrete reason to provision partitions generously up front.
+      <br><br>
+      If you're already at the ceiling and can't add partitions, the remaining levers are <strong>processing faster
+      per event</strong> — larger batches, less per-event work — or <strong>fanning out</strong>: the triggered function
+      does minimal work and posts to a queue, where a queue-triggered function scales without the partition
+      constraint.</p>
+  </div>
+
+  <h2 id="messaging">Service Bus and Event Hubs <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Messages processed twice</strong></td><td><strong>Lock expired</strong> mid-processing; renew or shorten the work</td></tr>
+        <tr><td><strong>Messages delayed despite idle consumers</strong></td><td><strong>Prefetch</strong> — messages held by a busy consumer, locks ticking</td></tr>
+        <tr><td>Dead-letter queue filling up</td><td>Delivery count exceeded, or a serialisation failure</td></tr>
+        <tr><td><strong>Sessions processing slowly</strong></td><td>One consumer per session; a large session serialises</td></tr>
+        <tr><td>Event Hubs lag on one partition</td><td>Key skew, a stalled consumer, or checkpoint-store throttling</td></tr>
+        <tr><td>Throughput unit throttling</td><td>Ingress exceeds TUs; enable auto-inflate <em>and alert on it</em></td></tr>
+        <tr><td>Cannot add consumers to catch up</td><td>One reader per partition per consumer group</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — lock duration and prefetch explain most Service Bus oddities</div>
+    <p style="margin:0">Two settings cause most of the confusing behaviour, and they interact.
+      <br><br>
+      <strong>Lock duration</strong> is how long a received message is invisible to other consumers. If processing
+      takes longer, the lock expires, the message is redelivered, and <strong>you now have two consumers doing the same
+      work</strong> — while the first one's eventual <code>Complete</code> fails with a lock-lost exception.
+      <br><br>
+      The fix is either to renew the lock while working — the SDK can do this automatically — or to make the work
+      shorter than the lock. Raising the lock duration is the blunt option and it delays recovery when a consumer
+      genuinely dies.
+      <br><br>
+      <strong>Prefetch</strong> pulls messages to the client ahead of processing, which improves throughput and has a
+      catch: <strong>prefetched messages have their locks running</strong>. So a consumer that prefetches 100 messages
+      and processes them slowly will see later ones expire while still in its local buffer — and meanwhile those
+      messages are invisible to the idle consumer next door.
+      <br><br>
+      That's the "messages are delayed but consumers are idle" symptom, and it's why prefetch should be modest — a
+      few times the concurrent processing count, not hundreds — unless processing is genuinely fast.
+      <br><br>
+      Both come back to the same principle: <strong>a message held is a message nobody else can process</strong>, so
+      hold time is the thing to minimise.</p>
+  </div>
+
+  <h2 id="sql">Azure SQL <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>What to check</th></tr></thead>
+      <tbody>
+        <tr><td><strong>DTU at 100%</strong></td><td><strong>Which resource</strong> — CPU, data IO, or log IO. They're different problems</td></tr>
+        <tr><td><strong>Writes throttled, CPU low</strong></td><td><strong>Log write rate</strong> — a per-tier hard limit</td></tr>
+        <tr><td>Connection failures under load</td><td>Worker or session limits; pools across many instances</td></tr>
+        <tr><td>Sudden slowdown, no deployment</td><td>Plan regression — Query Store, force the previous plan</td></tr>
+        <tr><td>Intermittent timeouts</td><td>Blocking; check wait statistics for <code>LCK_</code></td></tr>
+        <tr><td>Serverless tier: cold delays</td><td>Auto-pause resuming; not suitable for latency-sensitive work</td></tr>
+        <tr><td>Reads slow only during reports</td><td>Reporting on the primary — use a read replica</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Log write rate is the limit nobody plans for</div>
+    <p style="margin:0">Every Azure SQL tier caps <strong>transaction log write throughput</strong> in MB/s, and it's
+      a hard limit reached long before CPU on write-heavy workloads.
+      <br><br>
+      The symptom is distinctive: <strong>writes are slow or throttled while CPU sits low</strong>. Which looks like a
+      mystery if you're only watching DTU as a single number, because DTU blends CPU, data IO and log IO — so 100% DTU
+      tells you nothing about <em>which</em> resource is the constraint.
+      <br><br>
+      So the diagnostic is to check the individual metrics rather than the composite:
+      <code>sys.dm_db_resource_stats</code> reports CPU, data IO and log IO separately, and
+      <code>LOG_RATE_GOVERNOR</code> appearing in wait statistics is conclusive.
+      <br><br>
+      Fixes are about generating less log: <strong>batch writes</strong> rather than one row per statement,
+      <strong>drop unused indexes</strong> since every index is logged on every write, avoid updating columns that
+      didn't change, and use <strong>minimal logging</strong> for bulk loads where the recovery model allows.
+      Scaling the tier raises the limit and is the expensive answer.
+      <br><br>
+      Worth knowing simply because <strong>"DTU is at 100%" is not a diagnosis</strong> — it's the start of one.</p>
+  </div>
+
+  <h2 id="cosmos">Cosmos DB <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+      <tbody>
+        <tr><td><strong>429s at low aggregate RU utilisation</strong></td><td><strong>Hot partition.</strong> Adding RUs won't help</td></tr>
+        <tr><td>Queries far more expensive than expected</td><td>Cross-partition fan-out, or no index on the filter</td></tr>
+        <tr><td><strong>Costs rising faster than traffic</strong></td><td>Indexing every property, large documents, or over-provisioning</td></tr>
+        <tr><td>Reads not seeing a just-written value</td><td>Session token not propagated across instances</td></tr>
+        <tr><td>Change feed processor lag</td><td>Lease container throttled, or too few leases</td></tr>
+        <tr><td>Autoscale costing more than expected</td><td>Autoscale bills at a premium; a steady load suits provisioned</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Aggregate RU utilisation is the most misleading metric in Azure</div>
+    <p style="margin:0">Throughput is provisioned per container and <strong>divided evenly across physical
+      partitions</strong>. So 10,000 RU/s across ten partitions is 1,000 RU/s each, and a single hot key can throttle
+      while total consumption reads 11%.
+      <br><br>
+      Which produces the exact contradiction people report: <em>"we're getting 429s and the portal says we're using
+      15% of our RUs."</em> Both are true.
+      <br><br>
+      And the instinctive fix is worse than useless — doubling to 20,000 RU/s gives twenty partitions at 1,000 each,
+      so the hot key's share is unchanged while the bill doubles. In some cases the per-partition share
+      <em>shrinks</em>.
+      <br><br>
+      So the metric to use is <strong>normalised RU consumption per partition key range</strong>, which Azure Monitor
+      exposes and which shows this immediately. Then the real options are increasing key cardinality — a synthetic
+      suffix, or <a href="../24-azure/event-hubs.html#partitions">hierarchical partition keys</a> — caching the hot key
+      as an immediate mitigation, or separating an outlier tenant.
+      <br><br>
+      The transferable lesson, and it appears throughout this section: <strong>an aggregate metric across partitions,
+      instances or tenants will reassure you while a single unit is failing.</strong> Split by dimension before
+      believing any headline number.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>App Service: turn off ARR affinity for stateless apps.</li>
+      <li>SNAT port exhaustion presents as a third-party outage — use <code>IHttpClientFactory</code>.</li>
+      <li>AKS pending pods: check requests and IP exhaustion before capacity.</li>
+      <li>Over-requesting makes a cluster look full at 25% utilisation.</li>
+      <li>Azure CNI Overlay avoids IP exhaustion, which can't be fixed in place.</li>
+      <li>Functions scaling out overwhelms fixed-capacity dependencies — cap the scale-out.</li>
+      <li>Event Hubs and Cosmos triggers cap instances at the partition count.</li>
+      <li>Service Bus: lock duration and prefetch cause most redelivery and delay problems.</li>
+      <li>A prefetched message has a running lock and is invisible to idle consumers.</li>
+      <li>Azure SQL: DTU is a composite — check CPU, data IO and log IO separately.</li>
+      <li>Log write rate throttles writes while CPU looks low.</li>
+      <li>Cosmos: aggregate RU utilisation hides a hot partition completely.</li>
+      <li>Adding RUs cannot fix a hot key and may reduce its share.</li>
+      <li>Split every metric by dimension before trusting the headline.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Scaling out App Service with ARR affinity on.</strong></li>
+    <li><strong><code>new HttpClient()</code> per request</strong>, exhausting SNAT ports.</li>
+    <li><strong>Adding AKS nodes</strong> when requests don't fit any node size.</li>
+    <li><strong>Traditional Azure CNI on a small subnet.</strong></li>
+    <li><strong>HPA on CPU</strong> for a queue consumer.</li>
+    <li><strong>Uncapped Function scale-out</strong> against a fixed-capacity database.</li>
+    <li><strong>Expecting Functions to scale past the partition count.</strong></li>
+    <li><strong>A large prefetch</strong> with slow processing.</li>
+    <li><strong>Processing longer than the lock duration</strong> without renewal.</li>
+    <li><strong>Reading DTU as one number</strong> instead of its components.</li>
+    <li><strong>Scaling the SQL tier</strong> for a log-rate limit caused by unbatched writes.</li>
+    <li><strong>Adding RUs for a hot partition.</strong></li>
+    <li><strong>Auto-inflate with no alert</strong>, leaving throughput units high permanently.</li>
+    <li><strong>Assuming classic App Service or APIM can be scaled reactively.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Outbound HTTP calls start failing under load, but CPU and memory are fine. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"On App Service or a VM-based service, my first thought is <strong>SNAT port exhaustion</strong> — because
+          that's the failure mode that specifically affects <em>outbound</em> connections while every normal metric
+          looks healthy."</p>
+        <p>"The mechanism: instances share a limited pool of SNAT ports for outbound connections to public endpoints.
+          Each connection to a distinct destination consumes one, and a closed connection holds its port in
+          <code>TIME_WAIT</code> for a while afterwards. Once the pool is exhausted, new outbound connections fail or
+          hang."</p>
+        <p>"It's deceptive because <strong>nothing in the usual metrics moves</strong>. CPU, memory, request count and
+          response time on inbound requests all look fine. The symptom looks like the third-party API being down — and
+          the third party is fine."</p>
+        <p>"<strong>The most common cause is <code>new HttpClient()</code> per request.</strong> Each one opens fresh
+          connections rather than reusing a pool, so port consumption scales with request volume rather than with the
+          number of destinations. Which is why it only appears under load — at low traffic the ports recycle fast
+          enough."</p>
+        <p>"That's slightly counterintuitive because <code>HttpClient</code> implements <code>IDisposable</code>, so
+          disposing it looks correct. Disposing it is exactly what causes the problem, because the underlying
+          connection goes to <code>TIME_WAIT</code>."</p>
+        <p>"<strong>I'd confirm it</strong> in the Diagnose and Solve Problems blade, which has a SNAT-specific
+          detector showing port allocation and failures. That's worth knowing because it's not in the default metrics
+          view — if you don't know the concept exists you won't find it."</p>
+        <p>"<strong>Fixes, in order.</strong> <strong><code>IHttpClientFactory</code></strong> so connections are
+          pooled and reused — that alone resolves most cases, and it also fixes the opposite problem of a singleton
+          client caching DNS forever, which matters when a dependency fails over."</p>
+        <p>"<strong>Private endpoints or service endpoints</strong> for Azure services, so that traffic doesn't
+          traverse the public path and doesn't consume SNAT ports at all. Often the biggest single reduction, since a
+          lot of outbound traffic is to Azure services."</p>
+        <p>"<strong>A NAT Gateway</strong>, which gives a much larger port pool — and a stable outbound IP as a
+          bonus, which solves the separate problem of third parties allow-listing your IP and it changing when you
+          scale."</p>
+        <p>"<strong>Bounded connection lifetime</strong> so pooled connections are recycled rather than accumulating,
+          which <code>IHttpClientFactory</code> handles via <code>PooledConnectionLifetime</code>."</p>
+        <p>"<strong>Other candidates</strong> with the same shape I'd rule out. <strong>Thread pool
+          starvation</strong>, if there's sync-over-async — but that would slow <em>inbound</em> requests too, so
+          outbound-only failures point away from it. <strong>The dependency actually being slow</strong>, which
+          dependency telemetry would show as duration rather than connection failures.
+          <strong>DNS</strong> — either a singleton client with a stale cached address, or resolution failures."</p>
+        <p>"<strong>In AKS</strong> the equivalent problem exists at the load balancer or NAT Gateway level, with
+          ports shared across the whole node pool — so one chatty pod can exhaust ports for everything on that node.
+          Same diagnosis, different place to look."</p>
+        <p>"The general lesson I'd draw: <strong>the limits that catch you are the ones the default dashboard doesn't
+          show.</strong> Inbound metrics look healthy because the problem is entirely on the outbound side — which is
+          why knowing the platform's specific limits matters as much as general debugging skill."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know SNAT port exhaustion exists?</li>
+        <li>Do you know <code>HttpClient</code> misuse is the usual cause?</li>
+        <li>Do you know disposing it is what creates the problem?</li>
+        <li>Do you know where to confirm it?</li>
+        <li>Do you rule out thread starvation and DNS?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "the third-party API is down."</li>
+        <li><span class="redflag">Red flag:</span> scaling out, which adds instances that each exhaust ports.</li>
+        <li><span class="redflag">Red flag:</span> unaware of any outbound connection limit.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why does disposing <code>HttpClient</code> make it worse?</li>
+          <li>What does a singleton client get wrong instead?</li>
+          <li>How does this present in AKS?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your Function scales to 200 instances and the whole platform breaks. Explain. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The platform did exactly what it was configured to do, and that's the problem:
+          <strong>elastic compute in front of a fixed-capacity dependency moves the failure rather than removing
+          it.</strong>"</p>
+        <p>"The mechanism: a queue backlog causes the scale controller to add instances. <strong>Each instance has its
+          own connection pool.</strong> Two hundred instances with even a modest pool each is thousands of connections
+          against a database with a hard connection limit."</p>
+        <p>"So the database starts rejecting connections — and it rejects them for <em>everyone</em>, including the web
+          application that was perfectly healthy and is now competing with two hundred function instances for the same
+          finite server. A batch workload has taken down the interactive one."</p>
+        <p>"The same applies to any downstream with a fixed ceiling: a third-party API with a rate limit, Redis, or a
+          Cosmos container with provisioned RUs. Two hundred instances hitting a rate-limited API means almost every
+          call is throttled, and if there are retries it's much worse."</p>
+        <p>"<strong>Fixes, and the first one is the direct control.</strong>"</p>
+        <p>"<strong>Cap the scale-out</strong> — <code>functionAppScaleLimit</code>, or maximum instance count on Flex
+          Consumption. That's the setting people don't know exists, and it's the difference between elastic and
+          unbounded. I'd size it from what the database can actually support."</p>
+        <p>"<strong>Reduce per-instance resource use.</strong> A function instance handling a handful of messages
+          doesn't need a connection pool of 100 — lowering <code>Max Pool Size</code> means more instances fit within
+          the same database budget."</p>
+        <p>"<strong>Increase batch size instead of instance count.</strong> Processing 32 messages per invocation
+          rather than 1 gets the same throughput with far fewer instances and far fewer connections. Usually the best
+          trade, because the per-invocation overhead was the inefficiency."</p>
+        <p>"<strong>Reserve headroom for the interactive workload.</strong> Either separate databases, or explicit
+          limits so batch work can't consume everything the user-facing path needs. That's the same 'per tenant, not
+          global' fairness reasoning applied to workload classes."</p>
+        <p>"<strong>The partition-count case is worth mentioning</strong> because it's the mirror image. For Event Hubs
+          and Cosmos change feed triggers, the platform <em>won't</em> scale past the partition count — so you can also
+          have the opposite problem: lag growing while the function refuses to scale, which looks like a platform
+          fault and is a design constraint. That count is fixed at creation and increasing it later remaps keys."</p>
+        <p>"<strong>How I'd have caught it earlier:</strong> load test with a realistic backlog, not a trickle. This
+          failure only appears when the scale controller actually scales, so a test that never triggers scaling proves
+          nothing. And alert on database connection counts and rejections, not just on the function's own
+          metrics — because the function looks healthy throughout; it's everything else that's failing."</p>
+        <p>"The principle I'd state: <strong>autoscaling is only safe if every downstream dependency can absorb the
+          concurrency it produces.</strong> Otherwise you've built a very efficient way to overwhelm your own
+          database — and it's the same reasoning as scaling out a web app onto a shared database, just with a much
+          higher ceiling."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you connect instance count to connection count?</li>
+        <li>Do you know the scale limit setting exists?</li>
+        <li>Do you prefer larger batches over more instances?</li>
+        <li>Do you protect the interactive workload?</li>
+        <li>Do you know the partition-count ceiling as the mirror problem?</li>
+        <li>Do you note the function's own metrics look healthy?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> scaling the database as the only answer.</li>
+        <li><span class="redflag">Red flag:</span> treating unbounded autoscaling as inherently good.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of per-instance connection pools.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you choose the scale limit?</li>
+          <li>What if the backlog then never drains?</li>
+          <li>How does this differ on Flex Consumption?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

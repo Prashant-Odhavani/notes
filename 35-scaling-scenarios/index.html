@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview &amp; Method — Scaling Scenarios</title>
+<meta name="description" content="A repeatable method for production diagnosis questions: characterise, locate, hypothesise, verify, mitigate, fix — and the failure patterns that recur everywhere.">
+<meta name="keywords" content="production diagnosis method scaling scenarios interview troubleshooting characterise locate hypothesise verify mitigate percentiles USE method golden signals queueing latency saturation recurring failure patterns">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="35-scaling-scenarios/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Scaling Scenarios</h1>
+    <p class="subtitle">"Your API got ten times the traffic and it's falling over. What do you do?" These questions
+      test method, not memory — so this page is the method.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Characterise before diagnosing.</strong> What exactly is slow, for whom, since when?</li>
+      <li><strong>Percentiles, never averages.</strong> An average hides the tail users complain about.</li>
+      <li><strong>Separate mitigation from fix.</strong> Stop the bleeding, then find the cause.</li>
+      <li><strong>Does it scale with load?</strong> That one question splits queueing from a slow path.</li>
+      <li><strong>Measure before changing anything.</strong> Guessing under pressure makes it worse.</li>
+      <li><strong>State what you'd look at</strong> — naming the metric matters more than naming the cause.</li>
+      <li><strong>Say what you'd do differently next time</strong>, structurally.</li>
+    </ul>
+  </div>
+
+  <h2 id="what-they-test">What these questions actually test <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>They're checking</th><th>Not</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Do you have a method, or do you guess?</strong></td><td>Whether you name the right cause first</td></tr>
+        <tr><td><strong>Do you measure before acting?</strong></td><td>How many optimisations you can list</td></tr>
+        <tr><td><strong>Can you name the specific metric?</strong></td><td>Vague talk about "monitoring"</td></tr>
+        <tr><td><strong>Do you separate mitigation from root cause?</strong></td><td>Jumping straight to a rewrite</td></tr>
+        <tr><td><strong>Do you know the trade-offs of your fix?</strong></td><td>Presenting one option as obvious</td></tr>
+        <tr><td><strong>Have you actually done this?</strong></td><td>Textbook recall</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — a wrong hypothesis with the right method beats the reverse</div>
+    <p style="margin:0">Candidates often think the goal is to identify the cause quickly. It isn't. The interviewer
+      knows the answer already; what they're learning is <strong>how you'd behave during a real incident</strong>.
+      <br><br>
+      So "it's probably an N+1 query" as an opening is a weak answer even when it turns out to be right, because it's
+      a guess. And a real incident where you act on a guess costs you the time you spend on the wrong thing, plus the
+      risk of a change that makes it worse.
+      <br><br>
+      A strong answer sounds like: <em>"First I'd want to know whether it's all requests or a subset, and whether it
+        started at a deployment. Then I'd look at dependency duration in the telemetry to see whether the time is in
+        our code or downstream."</em>
+      <br><br>
+      That demonstrates the two things that actually matter: <strong>you narrow before you commit</strong>, and
+      <strong>you know which signal answers which question</strong>.
+      <br><br>
+      It also gives the interviewer something to engage with. They can say "the telemetry shows one slow SQL call",
+      and now you're having a real conversation rather than being marked against a checklist.</p>
+  </div>
+
+  <h2 id="method">The method <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — six steps, in this order"><code class="language-text">1  CHARACTERISE   What exactly is wrong? Which endpoints, which users, since when?
+                  All requests or a tail? Constant or load-dependent?
+
+2  LOCATE         Where is the time or the failure? In our code, a dependency,
+                  the platform, or queueing before we even start?
+
+3  HYPOTHESISE    Name a specific cause that would explain ALL the evidence,
+                  including anything that looks contradictory.
+
+4  VERIFY         Find the signal that confirms or kills it. Cheaply.
+                  If it takes an hour to check, find a cheaper test first.
+
+5  MITIGATE       Restore service. Scale out, disable a feature, cache, roll back.
+                  Explicitly a holding action - say so.
+
+6  FIX + PREVENT  Address the cause. Then make the class of problem
+                  detectable or impossible.</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The single most useful question: does it scale with load?</div>
+    <p style="margin:0">If you only get to ask one thing, ask this — it splits the space in half.
+      <br><br>
+      <strong>Latency rises with concurrency</strong> → something is <em>queueing</em>. A connection pool, a lock, a
+      thread pool, a CPU limit being throttled, a single-threaded consumer. The resource is finite and contended, and
+      adding load makes the wait longer.
+      <br><br>
+      <strong>Latency is constant regardless of load</strong> → a <em>slow path</em>. A missing index, an N+1, a slow
+      third-party call, an expensive serialisation. It was always this slow; you've only just noticed, or volume made
+      it matter.
+      <br><br>
+      Those need completely different responses. Scaling out helps the second and can <em>worsen</em> the first — more
+      instances competing for the same 100 database connections makes contention worse, not better.
+      <br><br>
+      Which is why "scale it out" as a first move is a red flag: <strong>it's the correct fix for exactly one of the
+      two shapes</strong>, and it's actively harmful for the other.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Percentiles, and why averages lie</div>
+    <p style="margin:0">A 200ms average can be 90% of requests at 50ms and 10% at 1.5 seconds. The 10% is what
+      generates complaints, and the average conceals it entirely.
+      <br><br>
+      So <strong>p50, p95 and p99</strong>. The gap between them is the information: p50 close to p95 means
+      everything is uniformly slow; p50 fast with p99 terrible means a subset of requests hits a different path — a
+      cache miss, a large tenant, a cold start.
+      <br><br>
+      Two related points worth having ready.
+      <br><br>
+      <strong>Averages of percentiles are meaningless.</strong> You can't average p95 across instances and get the
+      real p95, so a dashboard doing that is misleading — the underlying distributions have to be combined.
+      <br><br>
+      <strong>The tail is what users experience</strong>, because a single page load makes many requests. If each has
+      a 1% chance of being slow, a page making 100 calls is almost certainly slow. That's why p99 matters far more
+      than it intuitively should.</p>
+  </div>
+
+  <h2 id="signals">Which signal answers which question <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Look at</th></tr></thead>
+      <tbody>
+        <tr><td>Is it us or a dependency?</td><td><strong>Dependency duration</strong> vs total request duration</td></tr>
+        <tr><td>Is it one slow call or many fast ones?</td><td><strong>Dependency count per operation</strong> — finds N+1</td></tr>
+        <tr><td>Is it queueing?</td><td><strong>Thread pool queue length</strong>, connection pool waits</td></tr>
+        <tr><td>Is the container throttled?</td><td><strong>CPU throttled seconds</strong>, not CPU percent</td></tr>
+        <tr><td>Is it GC?</td><td><strong>Gen2 collections, pause time, allocation rate</strong></td></tr>
+        <tr><td>Is it one tenant?</td><td>Requests and errors <strong>grouped by tenant dimension</strong></td></tr>
+        <tr><td>Is it one instance?</td><td>Metrics <strong>split by instance</strong>, not aggregated</td></tr>
+        <tr><td>Did it start at a deploy?</td><td>Deployment markers against the metric timeline</td></tr>
+        <tr><td>Is the queue keeping up?</td><td><strong>Consumer lag / queue depth trend</strong>, not absolute depth</td></tr>
+        <tr><td>Is the database the limit?</td><td>DTU/RU consumption, wait statistics, blocking</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — aggregates hide the shapes that matter</div>
+    <p style="margin:0">Three of the rows above are the same point, and it's worth stating as a principle:
+      <strong>the aggregate is almost never the number you need.</strong>
+      <br><br>
+      <strong>Averaged across instances</strong>, one broken instance serving errors looks like a small error rate
+      rather than a third of users failing.
+      <br><br>
+      <strong>Averaged across partitions</strong>, one hot Event Hubs partition with growing lag disappears into
+      31 healthy ones.
+      <br><br>
+      <strong>Averaged across tenants</strong>, one customer whose data volume broke a query looks like mild
+      degradation.
+      <br><br>
+      In every case the aggregate is reassuring and wrong. So the diagnostic habit is to
+      <strong>split by dimension early</strong> — instance, partition, tenant, endpoint — because a problem confined
+      to one value of a dimension has a completely different cause from one spread across all of them.
+      <br><br>
+      Which is also the argument for
+      <a href="../24-azure/application-insights.html#opentelemetry">enriching telemetry with tenant id</a> before you
+      need it. You cannot retrospectively split by a dimension you never recorded.</p>
+  </div>
+
+  <h2 id="mitigate">Mitigation versus fix <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mitigation (minutes)</th><th>Fix (days)</th></tr></thead>
+      <tbody>
+        <tr><td>Roll back the deployment</td><td>Correct the change and re-release</td></tr>
+        <tr><td>Scale out or up</td><td>Remove the bottleneck</td></tr>
+        <tr><td>Disable the feature flag</td><td>Fix the feature</td></tr>
+        <tr><td>Add an index</td><td>Fix the query and the model</td></tr>
+        <tr><td>Increase a timeout or pool size</td><td>Stop holding the resource so long</td></tr>
+        <tr><td>Rate-limit the noisy caller</td><td>Per-tenant quotas and fair scheduling</td></tr>
+        <tr><td>Shed load — reject rather than queue</td><td>Capacity planning and autoscaling</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Say which one you're doing, and why</div>
+    <p style="margin:0">The strongest thing you can do in these answers is <strong>label your own actions</strong>:
+      "that's a mitigation, it doesn't fix the cause, and here's what I'd do afterwards."
+      <br><br>
+      It shows you know the difference, and it's what actually happens in incidents — you restore service first and
+      investigate properly afterwards, because a running system buys you the time to think.
+      <br><br>
+      The failure modes at either extreme:
+      <br><br>
+      <strong>Only mitigating.</strong> Scale up, move on, and it recurs at the next growth step — with the cost now
+      permanent. Enough of these and the system is expensive <em>and</em> fragile.
+      <br><br>
+      <strong>Only root-causing.</strong> Debugging carefully while users are down, when a rollback would have
+      restored service in two minutes. During an incident, <strong>restoring service beats understanding it.</strong>
+      <br><br>
+      One caution worth voicing: <strong>preserve the evidence before you mitigate</strong>. Capture a dump, grab the
+      logs, note the metrics — a restart or a scale-out often destroys exactly the state you need to diagnose it,
+      and then it recurs a week later with nothing to go on.</p>
+  </div>
+
+  <h2 id="patterns">Failure patterns that recur everywhere <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pattern</th><th>Shows up as</th><th>Appears in</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Hot key or hot partition</strong></td>
+          <td>One partition saturated, the rest idle. <strong>Adding capacity doesn't help</strong></td>
+          <td>Cosmos, DynamoDB, Kafka, Event Hubs, Redis, blob</td>
+        </tr>
+        <tr>
+          <td><strong>Queueing on a finite resource</strong></td>
+          <td>Latency scales with load; CPU looks fine</td>
+          <td>Connection pools, thread pool, locks, CPU limits</td>
+        </tr>
+        <tr>
+          <td><strong>Slow is worse than dead</strong></td>
+          <td>A slow dependency exhausts threads and cascades</td>
+          <td>HTTP calls, database, any synchronous dependency</td>
+        </tr>
+        <tr>
+          <td><strong>Thundering herd</strong></td>
+          <td>Everything retries or refreshes simultaneously</td>
+          <td>Cache expiry, restarts, retry storms, token refresh</td>
+        </tr>
+        <tr>
+          <td><strong>N+1</strong></td>
+          <td>Hundreds of fast calls; no single slow one</td>
+          <td>EF Core, REST fan-out, GraphQL resolvers</td>
+        </tr>
+        <tr>
+          <td><strong>Local state on multiple instances</strong></td>
+          <td>Works on one instance, breaks on three</td>
+          <td>Session, cache, rate limits, timers, file writes</td>
+        </tr>
+        <tr>
+          <td><strong>Unbounded growth</strong></td>
+          <td>Fine for months, then a cliff</td>
+          <td>Tables without archival, queues, logs, cache keys</td>
+        </tr>
+        <tr>
+          <td><strong>Retry amplification</strong></td>
+          <td>A struggling dependency receives more load</td>
+          <td>Any retry without backoff, jitter or a circuit breaker</td>
+        </tr>
+        <tr>
+          <td><strong>Noisy neighbour</strong></td>
+          <td>One tenant degrades everyone</td>
+          <td>Shared databases, shared clusters, shared pools</td>
+        </tr>
+        <tr>
+          <td><strong>Health check amplification</strong></td>
+          <td>A brief dependency blip removes every instance</td>
+          <td>Liveness probes, load balancer health checks</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — recognising the pattern is most of the answer</div>
+    <p style="margin:0">These ten patterns cover the large majority of production scaling problems, across every
+      technology in this handbook. That's the useful realisation: <strong>the same small set of physics keeps
+      reappearing in different clothing.</strong>
+      <br><br>
+      A hot partition in Cosmos DB, a hot key in Redis, a skewed partition key in Event Hubs and a sequential blob
+      name prefix are one problem. The API differs; the reasoning and the fix — increase key cardinality, because
+      adding capacity cannot help — are identical.
+      <br><br>
+      So when you meet an unfamiliar scenario, the productive move is to ask <strong>which pattern this
+      is</strong>, rather than reaching for technology-specific knowledge you may not have.
+      <br><br>
+      And it's genuinely persuasive in an interview to say it out loud: <em>"this looks like a hot partition —
+      one unit saturated while the others are idle, and I'd expect adding capacity not to help. Same shape as a hot
+      key in Redis."</em> That demonstrates transferable understanding rather than memorised cases, which is exactly
+      what distinguishes seven years of experience from one year repeated seven times.</p>
+  </div>
+
+  <h2 id="answering">How to structure the answer <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — a shape that works out loud"><code class="language-text">1  "First, what am I actually seeing?"
+      Name the two or three things you'd check to characterise it.
+      Ask the interviewer - they usually have the answer prepared.
+
+2  "That narrows it to X or Y."
+      Show the reasoning, not just the conclusion.
+
+3  "To tell them apart I'd look at <SPECIFIC METRIC>."
+      This is the line that scores. Name it precisely.
+
+4  "Assuming it's X, immediate mitigation is ..."
+      Label it as a holding action.
+
+5  "The real fix is ..."
+      With the trade-off stated honestly.
+
+6  "And to stop this class of problem recurring ..."
+      Detection, or a structural change that makes it impossible.</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Ask questions — the scenario is deliberately underspecified</div>
+    <p style="margin:0">"The API is slow" is not enough information to diagnose anything, and it's incomplete on
+      purpose. The interviewer is waiting to see whether you notice.
+      <br><br>
+      Good questions, roughly in order of value: <strong>all endpoints or specific ones? all users or one tenant?
+      when did it start, and did anything deploy? is it constant or load-dependent? what do the p95 and p99
+      look like?</strong>
+      <br><br>
+      Candidates skip this because it feels like stalling. It's the opposite — it's the single clearest signal that
+      you've done this for real, because nobody who has handled an incident starts by proposing fixes.
+      <br><br>
+      It also makes the rest of the conversation much better: once you know it started at 14:00 and only affects one
+      endpoint for one tenant, you're solving an actual problem rather than reciting a checklist.
+      <br><br>
+      And finish with prevention. <strong>"How would you have known sooner?"</strong> is frequently the real
+      question, and often unasked — an alert on the metric that would have caught it, or a structural change that
+      makes the failure impossible, is what separates a good answer from a complete one.</p>
+  </div>
+
+  <h2 id="in-this-section">In this section</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Scenarios</th></tr></thead>
+      <tbody>
+        <tr><td><a href="api.html">API &amp; Service Scaling</a></td><td>10× traffic, CPU spikes, memory growth, latency, pool exhaustion</td></tr>
+        <tr><td><a href="database.html">Database Scaling</a></td><td>Slow queries at scale, hot partitions, write-heavy load, batch, reporting</td></tr>
+        <tr><td><a href="distributed.html">Distributed Failure</a></td><td>Service down, duplicates, out-of-order, consumer lag, partial failure</td></tr>
+        <tr><td><a href="caching.html">Caching Failures</a></td><td>Stampede, invalidation, hot keys, Redis outage, correctness</td></tr>
+        <tr><td><a href="saas.html">Multi-Tenant Scaling</a></td><td>Noisy neighbour, isolation, onboarding a very large tenant</td></tr>
+        <tr><td><a href="cloud.html">Azure Scaling Scenarios</a></td><td>App Service, AKS, Functions, Event Hubs, Service Bus, SQL, Cosmos</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>These questions test method, not whether you name the cause first.</li>
+      <li>Characterise, locate, hypothesise, verify, mitigate, fix and prevent.</li>
+      <li>"Does it scale with load?" splits queueing from a slow path.</li>
+      <li>Scaling out helps a slow path and can worsen contention.</li>
+      <li>p50, p95, p99 — the gap between them is the information.</li>
+      <li>Name the specific metric; that's the line that scores.</li>
+      <li>Split by dimension early — aggregates hide instance, partition and tenant problems.</li>
+      <li>Label mitigations as mitigations, and preserve evidence before you restart anything.</li>
+      <li>Ten recurring patterns cover most real scaling failures.</li>
+      <li>Ask clarifying questions — the scenario is underspecified on purpose.</li>
+      <li>Finish with how you'd have detected it sooner.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Proposing a fix before characterising the problem.</strong></li>
+    <li><strong>"Scale it out"</strong> as the first move, when contention is the cause.</li>
+    <li><strong>Reasoning about averages</strong> instead of percentiles.</li>
+    <li><strong>Looking only at aggregates</strong>, so a single instance or tenant is invisible.</li>
+    <li><strong>Not asking a single clarifying question.</strong></li>
+    <li><strong>Naming a cause with no way to verify it.</strong></li>
+    <li><strong>Confusing mitigation with fix</strong>, or doing only one of them.</li>
+    <li><strong>Restarting or scaling before capturing evidence.</strong></li>
+    <li><strong>Adding retries</strong> to a struggling dependency without backoff.</li>
+    <li><strong>Ignoring prevention</strong>, so the same class recurs.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Walk me through how you'd approach a production performance problem. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd work through it in a fixed order, because the main risk in an incident is acting on a guess and
+          spending your time on the wrong thing — or making it worse."</p>
+        <p>"<strong>First, characterise it.</strong> 'The API is slow' isn't diagnosable, so I want to know: is it all
+          endpoints or specific ones? All users or one tenant? When did it start, and did anything deploy around
+          then? Is it constant, or does it get worse with load? And what do p95 and p99 look like, not the
+          average."</p>
+        <p>"That last distinction matters — a 200ms average can be 90% of requests at 50ms and 10% at a second and a
+          half, and the 10% is what people are complaining about. The gap between p50 and p99 tells me whether
+          everything is uniformly slow or a subset hits a different path."</p>
+        <p>"<strong>The single most useful question is whether latency scales with load.</strong> If it rises with
+          concurrency, something is <em>queueing</em> — a connection pool, a lock, the thread pool, a CPU limit being
+          throttled. If it's constant regardless of load, it's a <em>slow path</em> — a missing index, an N+1, a slow
+          third party."</p>
+        <p>"Those need opposite responses, which is why I wouldn't lead with 'scale it out'. Scaling helps a slow
+          path; with contention it can make things <em>worse</em>, because more instances compete for the same
+          finite database connections."</p>
+        <p>"<strong>Second, locate the time.</strong> I'd compare total request duration against dependency duration
+          in the telemetry. If dependencies account for most of it, the problem is downstream and I'd look at which
+          one. If they don't, it's in-process — CPU, serialisation, GC, or contention."</p>
+        <p>"I'd specifically check the <em>number</em> of dependency calls per operation, because an N+1 shows up as
+          hundreds of 2ms calls with nothing individually slow. No latency percentile reveals that; the dependency
+          count does."</p>
+        <p>"<strong>And I'd split by dimension early</strong> — by instance, and by tenant. If it's one instance, that's
+          a completely different problem from all of them: a bad node, a corrupted pool, an instance that's
+          GC-thrashing. If it's one tenant, it's usually data volume exposing a missing index. Aggregates hide both,
+          and they're reassuring while being wrong."</p>
+        <p>"<strong>Third, form a hypothesis that explains all the evidence</strong> — including anything that looks
+          contradictory, because that's usually the most informative part. Low CPU with high latency, for instance,
+          points at throttling or thread pool starvation rather than expensive work."</p>
+        <p>"<strong>Fourth, verify cheaply</strong> before committing. If confirming it takes an hour, I'd look for a
+          faster test first."</p>
+        <p>"<strong>Then mitigate, and I'd say explicitly that it's a mitigation.</strong> If it started at a deploy,
+          roll back — that's usually fastest and safest. Otherwise scale, disable a feature flag, or shed load. But
+          <strong>I'd capture evidence first</strong> — a dump, the logs, the metrics — because a restart destroys
+          exactly the state I need, and then it recurs next week with nothing to go on."</p>
+        <p>"<strong>Then the real fix</strong>, with the trade-off stated. And finally the part I think matters most:
+          <strong>how would we have known sooner?</strong> Usually an alert on the specific metric that moved first,
+          and where possible a structural change so the class of problem can't recur — a test that fails on an N+1, a
+          quota that stops one tenant affecting others."</p>
+        <p>"One framing I'd add: most of these turn out to be <strong>one of a small set of recurring
+          patterns</strong> — hot key, queueing on a finite resource, thundering herd, N+1, local state on multiple
+          instances, unbounded growth. Recognising which pattern it is gets you most of the way, and it transfers
+          across technologies. A hot partition in Cosmos, a hot key in Redis and a skewed Event Hubs partition key
+          are the same problem with different APIs — and in all three, adding capacity doesn't help."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you characterise before hypothesising?</li>
+        <li>Do you ask whether it scales with load?</li>
+        <li>Do you use percentiles and split by dimension?</li>
+        <li>Do you name specific metrics rather than "monitoring"?</li>
+        <li>Do you separate mitigation from fix, and preserve evidence?</li>
+        <li>Do you finish with detection and prevention?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> listing optimisations with no diagnosis.</li>
+        <li><span class="redflag">Red flag:</span> "scale it out" first.</li>
+        <li><span class="redflag">Red flag:</span> restarting immediately, destroying the evidence.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>CPU is at 30% and latency is terrible. What now?</li>
+          <li>It's one tenant only. What's your first thought?</li>
+          <li>How would you have detected this before users did?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

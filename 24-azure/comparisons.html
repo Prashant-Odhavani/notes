@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Service Comparisons</title>
+<meta name="description" content="Decision rules for choosing between Azure messaging, compute, storage and configuration services — with the distinctions interviewers actually probe.">
+<meta name="keywords" content="Service Bus vs Event Hubs vs Event Grid App Service vs Container Apps vs AKS vs Functions Azure storage comparison App Configuration vs Key Vault decision rules Azure service selection">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/comparisons.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Azure Service Comparisons</h1>
+    <p class="subtitle">If you read one page in this section, read this one. Choosing correctly between similar
+      services is what actually gets tested.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">The decision rules, in one place</div>
+    <ul>
+      <li><strong>Service Bus</strong> = a message must be <em>processed</em>. <strong>Event Hubs</strong> = a
+        high-volume <em>stream</em>. <strong>Event Grid</strong> = something <em>happened</em>.</li>
+      <li><strong>App Service</strong> for a web app. <strong>Container Apps</strong> for containers without a
+        cluster. <strong>AKS</strong> only when you need cluster control.</li>
+      <li><strong>Functions</strong> for event-driven and spiky; watch cold start.</li>
+      <li><strong>Blob</strong> for files, <strong>Table/Cosmos</strong> for structured, <strong>Queue</strong>
+        only if Service Bus is overkill.</li>
+      <li><strong>App Configuration</strong> for settings and flags; <strong>Key Vault</strong> for secrets —
+        and <strong>managed identity</strong> instead of secrets where possible.</li>
+      <li><strong>Redis</strong> to cache; <strong>Cosmos</strong> to store globally; <strong>SQL</strong> for
+        relational.</li>
+    </ul>
+  </div>
+
+  <h2 id="messaging">Messaging: the three-way distinction <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The framing that makes it obvious</span>
+    <p>These aren't the same service at different scales. They answer different questions.</p>
+    <p><strong>Service Bus</strong> — "this work must be done." <strong>Event Hubs</strong> — "here is a firehose
+      of data." <strong>Event Grid</strong> — "something happened, react if you care."</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th></th><th>Service Bus</th><th>Event Hubs</th><th>Event Grid</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Model</td><td><strong>Queue / topic</strong></td><td><strong>Partitioned log</strong></td><td><strong>Push notification</strong></td></tr>
+        <tr><td>Message is</td><td>A command — do this</td><td>A datum in a stream</td><td>An event — this occurred</td></tr>
+        <tr><td>After consumption</td><td><strong>Deleted</strong></td><td><strong>Retained</strong> (replayable)</td><td>Delivered, then gone</td></tr>
+        <tr><td>Delivery</td><td>Consumer <strong>pulls</strong></td><td>Consumer pulls</td><td><strong>Service pushes</strong></td></tr>
+        <tr><td>Per-message ops</td><td><strong>Yes</strong> — dead-letter, defer, schedule</td><td>No — offsets only</td><td>Retry, then dead-letter</td></tr>
+        <tr><td>Ordering</td><td>Sessions</td><td>Per partition</td><td><strong>None</strong></td></tr>
+        <tr><td>Throughput</td><td>High</td><td><strong>Very high</strong> — millions/sec</td><td>High</td></tr>
+        <tr><td>Replay</td><td>No</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Typical use</td><td>Order processing, invoicing</td><td>Telemetry, IoT, clickstream</td><td>Blob created, resource changed</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the questions that separate them</div>
+    <p style="margin:0"><strong>"Must every message be processed, or is it a stream where losing one is
+      acceptable?"</strong> Processing → Service Bus. Stream → Event Hubs.
+      <br><br>
+      <strong>"Do I need to dead-letter, defer or schedule an individual message?"</strong> Only Service Bus can.
+      Event Hubs tracks an offset, so acknowledging message 6 acknowledges 0–5 — you cannot skip one without
+      committing past it.
+      <br><br>
+      <strong>"Do several independent consumers need the same data, possibly replaying it?"</strong> Event Hubs.
+      Service Bus deletes on consumption.
+      <br><br>
+      <strong>"Am I reacting to Azure resource changes?"</strong> Event Grid — it's the only one with native
+      publishers for blob-created, resource-modified and similar platform events.
+      <br><br>
+      The mistake I'd flag: <strong>using Event Hubs for work distribution.</strong> It looks like a queue and
+      isn't. You'd have to build dead-lettering yourself, and a poison message blocks its partition indefinitely.
+      That's the same <a href="../22-kafka/index.html#not-a-queue">log-versus-queue distinction</a> as Kafka,
+      because Event Hubs <em>is</em> Kafka-compatible.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Event Grid is push, and that changes the design</div>
+    <p style="margin:0">Service Bus and Event Hubs are <strong>pull</strong> — your consumer asks for messages, so
+      it controls the rate.
+      <br><br>
+      Event Grid <strong>pushes</strong> to an HTTP endpoint, a Function, a queue. Which means you don't control
+      the arrival rate, so <strong>your handler must absorb bursts or you need a queue in front</strong>. And it
+      requires an endpoint reachable by Azure, plus subscription validation.
+      <br><br>
+      It also has <strong>no ordering guarantee at all</strong> — events can arrive out of order or more than
+      once, so handlers must be idempotent and order-independent.
+      <br><br>
+      The common production pattern is <strong>Event Grid to a Service Bus queue</strong>: Grid gives you the
+      platform event sources and fan-out filtering, the queue gives you buffering, ordering via sessions, and
+      per-message dead-lettering. Using both deliberately is a good answer.</p>
+  </div>
+
+  <h2 id="compute">Compute <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th></th><th>App Service</th><th>Container Apps</th><th>AKS</th><th>Functions</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Unit</td><td>Web app</td><td>Container</td><td>Container</td><td>Function</td></tr>
+        <tr><td>Scale to zero</td><td>No</td><td><strong>Yes</strong></td><td>No</td><td><strong>Yes</strong></td></tr>
+        <tr><td>Cluster to manage</td><td>No</td><td>No</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Upgrades</td><td>Platform</td><td>Platform</td><td><strong>Yours, every few months</strong></td><td>Platform</td></tr>
+        <tr><td>Cold start</td><td>No (always warm)</td><td>Yes, if scaled to zero</td><td>No</td><td><strong>Yes on Consumption</strong></td></tr>
+        <tr><td>Long-running work</td><td>Yes</td><td>Yes</td><td>Yes</td><td><strong>Limited</strong> — timeouts</td></tr>
+        <tr><td>Sidecars, DaemonSets</td><td>No</td><td>Sidecars only</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Cost when idle</td><td><strong>Full plan cost</strong></td><td>Near zero</td><td><strong>Full node cost</strong></td><td>Near zero</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The decision, in order</span>
+    <ol>
+      <li><strong>One web app or API, steady traffic?</strong> App Service. Slots, easy, nothing to manage.</li>
+      <li><strong>Event-driven, spiky, or glue?</strong> Functions — accepting cold start on Consumption.</li>
+      <li><strong>Several containerised services?</strong> Container Apps.</li>
+      <li><strong>Do you genuinely need cluster-level control?</strong> Only then, AKS.</li>
+    </ol>
+    <p>Notice that AKS is last and conditional. That ordering is the answer.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The Functions cold-start trade, stated properly</div>
+    <p style="margin:0">On the <strong>Consumption</strong> plan, an idle Function app is deallocated. The next
+      request pays a cold start — commonly hundreds of milliseconds to several seconds, worse for large
+      dependency graphs.
+      <br><br>
+      So Consumption is right for <strong>background and event-driven work</strong> where nobody is waiting: a
+      queue processor, a webhook receiver, a scheduled job. It's wrong for a <strong>latency-sensitive
+      user-facing API</strong>, where an occasional three-second response is unacceptable.
+      <br><br>
+      The <strong>Premium</strong> plan fixes it with pre-warmed instances and adds VNet integration and no
+      timeout limit — and it costs like an App Service plan, at which point the honest question is <em>what is
+      Functions buying you?</em> If the answer is "the bindings and the triggers", that's legitimate. If it's
+      "serverless", you've lost the property that made it serverless.
+      <br><br>
+      Being able to say "Premium removes the cold start and the cost advantage together" is the calibrated
+      answer.</p>
+  </div>
+
+  <h2 id="storage">Storage <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Service</th><th>For</th><th>Not for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Blob Storage</strong></td><td>Files, images, backups, documents, data-lake files</td><td>Anything you need to query by content</td></tr>
+        <tr><td><strong>Azure Files</strong></td><td>An SMB share — lift-and-shift, shared config</td><td>New cloud-native design</td></tr>
+        <tr><td><strong>Table Storage</strong></td><td>Cheap key-value at scale</td><td>Anything needing rich queries</td></tr>
+        <tr><td><strong>Queue Storage</strong></td><td>Very simple queueing, huge scale, low cost</td><td><strong>Anything needing sessions, dead-letter or scheduling</strong></td></tr>
+        <tr><td><strong>Azure SQL</strong></td><td>Relational data, transactions, ad-hoc queries</td><td>Multi-region writes; unstructured documents</td></tr>
+        <tr><td><strong>Cosmos DB</strong></td><td>Global distribution, guaranteed latency, elastic scale</td><td>Single-region CRUD — it's more expensive</td></tr>
+        <tr><td><strong>Redis</strong></td><td>Cache, locks, rate limits, leaderboards</td><td>A source of truth</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Queue Storage vs Service Bus — the distinction to know</div>
+    <p style="margin:0">Queue Storage is cheaper and scales enormously, and it's <strong>much less
+      capable</strong>. No topics, no sessions, no dead-letter queue, no scheduled delivery, no duplicate
+      detection, no transactions, and only at-least-once with a visibility timeout.
+      <br><br>
+      So the rule: <strong>Queue Storage when you need a simple buffer at very high volume and low cost.</strong>
+      Service Bus when you need any of the messaging <em>semantics</em> — which for most business workloads you
+      do, because dead-lettering alone is close to mandatory.
+      <br><br>
+      Choosing Queue Storage and then hand-building dead-lettering and scheduling is the failure mode. That work
+      is what you're paying Service Bus for.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Blob access tiers: the transaction-cost inversion</div>
+    <p style="margin:0">Hot, Cool, Cold and Archive get progressively cheaper to <em>store</em> and progressively
+      <strong>more expensive to access</strong>.
+      <br><br>
+      So moving frequently-read data to Cool to save money can <em>increase</em> the bill, because the transaction
+      and retrieval charges exceed the storage saving. And Archive requires a <strong>rehydration</strong> of hours
+      before you can read at all — it's genuinely offline.
+      <br><br>
+      Lifecycle management policies automate the transitions by age, which is the right mechanism. The judgement
+      is <em>when</em> — and it depends on access frequency, not just age.
+      <br><br>
+      This is the same shape as the general Azure cost trap: <strong>the obvious dimension is priced sensibly and
+      a second dimension isn't budgeted for.</strong></p>
+  </div>
+
+  <h2 id="config">Configuration and secrets <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>App Configuration</th><th>Key Vault</th><th>Managed Identity</th></tr></thead>
+      <tbody>
+        <tr><td>Holds</td><td>Settings, <strong>feature flags</strong></td><td>Secrets, certificates, keys</td><td><strong>Nothing — there's no secret</strong></td></tr>
+        <tr><td>Change without deploy</td><td><strong>Yes</strong></td><td>Yes</td><td>N/A</td></tr>
+        <tr><td>Rotation burden</td><td>N/A</td><td><strong>Yours</strong></td><td><strong>None</strong></td></tr>
+        <tr><td>Cost</td><td>Low</td><td>Per operation — <strong>cache the values</strong></td><td>Free</td></tr>
+        <tr><td>Use for</td><td>Non-secret config across services</td><td>Third-party API keys</td><td><strong>All Azure-to-Azure auth</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The ordering</span>
+    <p><strong>1. Managed identity</strong> wherever the target supports it — storage, Service Bus, SQL, Cosmos,
+      Key Vault, Event Hubs all do. No secret exists, so nothing can leak or needs rotating.</p>
+    <p><strong>2. Key Vault</strong> for secrets that genuinely can't be replaced by an identity — typically
+      third-party API keys.</p>
+    <p><strong>3. App Configuration</strong> for non-secret settings and feature flags, especially shared across
+      services.</p>
+    <p><strong>Never</strong> a connection string in <code>appsettings.json</code>.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two configuration traps</div>
+    <p style="margin:0"><strong>Key Vault charges per operation and adds latency.</strong> Reading a secret on
+      every request is slow and costly. The provider caches, and you must set a
+      <strong>refresh interval</strong> deliberately — too short and you pay, too long and a rotated secret isn't
+      picked up. Neither default is right for every case.
+      <br><br>
+      <strong>App Configuration doesn't refresh by itself.</strong> Registering the provider gets values at
+      startup; picking up changes requires configuring <strong>sentinel-key-based refresh</strong>. Teams
+      routinely believe they have dynamic configuration and discover on the first attempted change that a restart
+      is needed.
+      <br><br>
+      Both failures look like the feature working until you actually rely on it.</p>
+  </div>
+
+  <h2 id="observability">Observability <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>For</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Application Insights</strong></td><td>Application telemetry — requests, dependencies, exceptions, traces, custom events</td></tr>
+        <tr><td><strong>Log Analytics</strong></td><td>The underlying store and KQL query engine; platform and infrastructure logs</td></tr>
+        <tr><td><strong>Azure Monitor</strong></td><td>The umbrella — metrics, alerts, dashboards, autoscale rules</td></tr>
+        <tr><td><strong>OpenTelemetry</strong></td><td><strong>The instrumentation standard.</strong> Vendor-neutral, exports to App Insights</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — instrument with OpenTelemetry, export to App Insights</div>
+    <p style="margin:0">The older approach was the Application Insights SDK, which works and couples your
+      instrumentation to Azure.
+      <br><br>
+      <strong>OpenTelemetry is now the recommended path</strong>, including by Microsoft. You instrument once
+      against a vendor-neutral standard and export to App Insights — and if you later move to Grafana, Datadog or
+      anything else, you change the exporter rather than the instrumentation.
+      <br><br>
+      It also gives consistent tracing across services regardless of language, which matters in a polyglot
+      estate.
+      <br><br>
+      And it's the same instrumentation described in
+      <a href="../20-microservices/operations.html#tracing">microservices observability</a> — so the trace-id
+      propagation, baggage and sampling reasoning carries over directly.</p>
+  </div>
+
+  <h2 id="anti-patterns">Choices that are usually wrong <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Choice</th><th>Why it's usually wrong</th></tr></thead>
+      <tbody>
+        <tr><td><strong>AKS for three services</strong></td><td>Cluster operations exceed the benefit. Container Apps</td></tr>
+        <tr><td><strong>Event Hubs for work distribution</strong></td><td>No dead-lettering; a poison message blocks its partition</td></tr>
+        <tr><td><strong>Cosmos DB for single-region CRUD</strong></td><td>Substantially more expensive; you're paying for global distribution you don't use</td></tr>
+        <tr><td><strong>Functions Consumption for a user-facing API</strong></td><td>Cold start is user-visible latency</td></tr>
+        <tr><td><strong>Table Storage for anything queryable</strong></td><td>Partition and row key only. You'll outgrow it</td></tr>
+        <tr><td><strong>Queue Storage then hand-building dead-lettering</strong></td><td>That's what Service Bus is for</td></tr>
+        <tr><td><strong>Connection strings in app settings</strong></td><td>Managed identity removes the secret entirely</td></tr>
+        <tr><td><strong>Verbose logging with no sampling</strong></td><td>Ingestion can cost more than the compute</td></tr>
+        <tr><td><strong>Premium API Management for a small API</strong></td><td>Very expensive; Consumption or a simple gateway will do</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-must">The one that comes up most</h3>
+
+  <details class="qa">
+    <summary>Service Bus, Event Hubs or Event Grid — how do you choose? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They're often presented as three messaging services at different scales, and that framing is what makes
+          the choice confusing. <strong>They answer different questions.</strong>"</p>
+        <p>"<strong>Service Bus</strong> is for when a message must be <em>processed</em>. It's a queue or topic —
+          the message is delivered to a consumer, and once completed it's deleted. Critically it has
+          <strong>per-message operations</strong>: dead-letter this one, defer that one, schedule delivery for
+          later, detect duplicates. That's what you want for business work — placing an order, sending an invoice,
+          charging a card."</p>
+        <p>"<strong>Event Hubs</strong> is a high-volume partitioned <em>log</em>. Data is retained after
+          consumption, consumers track their own offset, so many independent consumers can read the same stream and
+          any of them can replay. That's telemetry, IoT, clickstream — millions of events a second where the value
+          is in the aggregate."</p>
+        <p>"<strong>Event Grid</strong> is for notifying that <em>something happened</em>, and it's the only one
+          that <strong>pushes</strong>. It has native publishers for Azure platform events — a blob was created, a
+          resource changed — and it fans out to subscribers with filtering."</p>
+        <p>"The questions I'd use to decide:"</p>
+        <p>"<strong>Must every message be processed, or is it a stream where losing one doesn't matter?</strong>
+          Processing means Service Bus."</p>
+        <p>"<strong>Do I need to dead-letter, defer or schedule an individual message?</strong> Only Service Bus
+          can. Event Hubs tracks an offset, which is a <em>position</em> — so acknowledging message 6 implicitly
+          acknowledges everything before it. You cannot skip a bad message without committing past it."</p>
+        <p>"<strong>Do several independent consumers need the same data, possibly replaying history?</strong>
+          Event Hubs, because Service Bus deletes on consumption."</p>
+        <p>"<strong>Am I reacting to Azure resource changes?</strong> Event Grid."</p>
+        <p>"The mistake I'd specifically call out is <strong>using Event Hubs for work distribution</strong>. It
+          looks like a queue and isn't — you'd hand-build dead-lettering, and an unhandled poison message blocks
+          its partition indefinitely because you can't commit past it without acknowledging it. It's exactly the
+          same log-versus-queue distinction as Kafka, which makes sense since Event Hubs is Kafka
+          protocol-compatible."</p>
+        <p>"Two things about Event Grid that change the design. It's <strong>push</strong>, so you don't control
+          the arrival rate — your handler has to absorb bursts. And it has <strong>no ordering guarantee at
+          all</strong>, and can deliver more than once, so handlers must be idempotent and order-independent."</p>
+        <p>"Which is why the common production pattern is <strong>Event Grid into a Service Bus queue</strong>:
+          Grid gives you the platform event sources and filtered fan-out, the queue gives you buffering, ordering
+          via sessions, and per-message dead-lettering. Using them together deliberately is usually better than
+          picking one and working around what it lacks."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know they solve different problems, not the same one at different scales?</li>
+        <li>Do you know Service Bus is the only one with per-message operations?</li>
+        <li>Do you know Event Hubs retains and replays?</li>
+        <li>Do you know Event Grid is push, unordered and at-least-once?</li>
+        <li>Do you know the Grid-to-queue pattern?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "Event Hubs for high volume, Service Bus for low" — the
+          distinction isn't volume.</li>
+        <li><span class="redflag">Red flag:</span> treating them as interchangeable.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that Event Grid pushes.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you dead-letter with Event Hubs?</li>
+          <li>How do Event Hubs consumer groups work?</li>
+          <li>What happens if an Event Grid subscriber is down?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

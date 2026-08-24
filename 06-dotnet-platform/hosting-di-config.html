@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hosting &amp; Dependency Injection — .NET Platform</title>
+<meta name="description" content="The generic host, DI lifetimes explained simply, captive dependencies, resolving scoped services in background work, and graceful shutdown.">
+<meta name="keywords" content="generic host dependency injection lifetimes singleton scoped transient captive dependency IServiceScopeFactory ObjectDisposedException graceful shutdown IHostedService keyed services">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="06-dotnet-platform/hosting-di-config.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Hosting &amp; Dependency Injection</h1>
+    <p class="subtitle">How a .NET app starts, how objects get created for you, and the lifetime mistake that
+      causes more production bugs than any other DI issue.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>The <strong>host</strong> owns the DI container, configuration, logging and the shutdown signal.
+        Same model for web apps and workers.</li>
+      <li><strong>Singleton</strong> — one per application. <strong>Scoped</strong> — one per request.
+        <strong>Transient</strong> — a new one every time it's injected.</li>
+      <li><strong>Captive dependency:</strong> a scoped service injected into a singleton is held for the
+        process lifetime. This is the bug.</li>
+      <li>In a <code>BackgroundService</code> you must create a scope <strong>yourself</strong> — there's no
+        request to give you one.</li>
+      <li>Singletons must be <strong>thread-safe</strong>. They're shared across every concurrent request by
+        definition.</li>
+      <li>Register in the direction of the dependency: infrastructure implements interfaces the application
+        owns.</li>
+    </ul>
+  </div>
+
+  <h2 id="the-host">The host <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>The host is the object that <strong>starts your app, holds everything it needs, and stops it
+      cleanly</strong>.</p>
+  </div>
+
+  <pre data-label="csharp — a complete .NET 6+ web app startup"><code class="language-csharp">var builder = WebApplication.CreateBuilder(args);
+
+// 1. Register what the app needs (the DI container)
+builder.Services.AddScoped&lt;IOrderRepository, SqlOrderRepository&gt;();
+builder.Services.AddSingleton&lt;IPriceCache, PriceCache&gt;();
+builder.Services.AddControllers();
+
+var app = builder.Build();
+
+// 2. Configure how requests flow through it
+app.UseAuthentication();
+app.MapControllers();
+
+app.Run();      // starts listening, and blocks until shutdown is signalled</code></pre>
+
+  <p>Four things the host gives you before you write any code:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Service</th><th>What you get</th></tr></thead>
+      <tbody>
+        <tr><td>DI container</td><td><code>builder.Services</code> — register types, get them injected</td></tr>
+        <tr><td>Configuration</td><td><code>builder.Configuration</code> — appsettings, env vars, secrets, layered</td></tr>
+        <tr><td>Logging</td><td><code>ILogger&lt;T&gt;</code> injectable anywhere, providers configurable</td></tr>
+        <tr><td>Lifetime management</td><td>Startup ordering, and a cancellation token when shutdown begins</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Same model for a worker</div>
+    <p style="margin:0">A background worker uses <code>Host.CreateApplicationBuilder(args)</code> instead of
+      <code>WebApplication.CreateBuilder</code>. Everything else — DI, configuration, logging — is identical.
+      That's why the same infrastructure registrations can be shared between an API and a worker in the same
+      solution.</p>
+  </div>
+
+  <h2 id="di-lifetimes">The three lifetimes <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lifetime</th><th>One instance per…</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Singleton</strong></td><td>Application</td><td>Caches, HTTP client factories, config snapshots, anything stateless and expensive to create</td></tr>
+        <tr><td><strong>Scoped</strong></td><td>Request (or explicit scope)</td><td><code>DbContext</code>, repositories, unit of work, anything carrying per-request state</td></tr>
+        <tr><td><strong>Transient</strong></td><td>Injection</td><td>Cheap, stateless helpers — validators, mappers</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>Singleton</strong> = the office coffee machine. One for the building, everyone shares it, and
+      it had better cope with several people at once.</p>
+    <p><strong>Scoped</strong> = your cup for this meeting. Yours for the duration, then washed up.</p>
+    <p><strong>Transient</strong> = a paper napkin. Take a new one whenever you need one.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The rule that decides it</span>
+    <p>Ask: <strong>"does this hold state that belongs to one request?"</strong></p>
+    <p>Yes → <strong>scoped</strong>. No, and it's expensive to create → <strong>singleton</strong>.
+      No, and it's cheap → <strong>transient</strong>.</p>
+  </div>
+
+  <h2 id="captive-dependency">The captive dependency bug <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A singleton is created <strong>once</strong>. So whatever it captures in its constructor, it holds
+      <strong>forever</strong>.</p>
+    <p>If that was a scoped service, you've just given a per-request object the lifetime of the process.</p>
+  </div>
+
+  <pre data-label="csharp — this compiles and starts fine, then breaks under load" class="code-bad"><code class="language-csharp">builder.Services.AddDbContext&lt;AppDbContext&gt;(...);        // SCOPED by default
+builder.Services.AddSingleton&lt;PriceCache&gt;();             // SINGLETON
+
+public class PriceCache
+{
+    private readonly AppDbContext _db;                   // captured on first creation
+
+    public PriceCache(AppDbContext db) =&gt; _db = db;      // held for the app's lifetime
+
+    public async Task&lt;decimal&gt; GetAsync(int sku) =&gt;
+        await _db.Prices.Where(p =&gt; p.Sku == sku).Select(p =&gt; p.Value).FirstAsync();
+}</code></pre>
+
+  <p><strong>What actually goes wrong</strong>, in the order you'll see it:</p>
+
+  <ol class="steps">
+    <li>The first request creates the singleton, which captures <em>that request's</em>
+      <code>DbContext</code>.</li>
+    <li>That request ends and its scope is disposed — including the context.</li>
+    <li>The next request uses the singleton, which uses the disposed context →
+      <code>ObjectDisposedException</code>.</li>
+    <li>Or, if it survives, the context accumulates every entity it ever tracked and never releases them —
+      a memory leak <em>and</em> stale data.</li>
+    <li>And because <code>DbContext</code> isn't thread-safe, concurrent requests through one instance give
+      you "a second operation was started on this context".</li>
+  </ol>
+
+  <pre data-label="csharp — fixed: create a scope per operation" class="code-good"><code class="language-csharp">public class PriceCache(IServiceScopeFactory scopeFactory)
+{
+    public async Task&lt;decimal&gt; GetAsync(int sku, CancellationToken ct)
+    {
+        using var scope = scopeFactory.CreateScope();          // a fresh scope
+        var db = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+
+        return await db.Prices
+            .Where(p =&gt; p.Sku == sku)
+            .Select(p =&gt; p.Value)
+            .FirstAsync(ct);
+    }                                                          // scope disposed here
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The container can catch this for you</div>
+    <p style="margin:0">Scope validation detects captive dependencies at startup and throws instead of
+      failing later. It's <strong>on by default in the Development environment</strong>, which is why this bug
+      usually escapes to production from a team that only tests in Release.
+      <br><br>
+      Turn it on everywhere:</p>
+    <pre data-label="csharp"><code class="language-csharp">builder.Host.UseDefaultServiceProvider(o =&gt;
+{
+    o.ValidateScopes = true;       // catch captive dependencies
+    o.ValidateOnBuild = true;      // catch missing registrations at startup, not first request
+});</code></pre>
+  </div>
+
+  <h3 id="what-can-inject-what">What can safely inject what</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Consumer ↓ / Dependency →</th><th>Singleton</th><th>Scoped</th><th>Transient</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Singleton</strong></td><td>✅ Fine</td><td>❌ <strong>Captive dependency</strong></td><td>⚠️ Becomes effectively a singleton</td></tr>
+        <tr><td><strong>Scoped</strong></td><td>✅ Fine</td><td>✅ Fine</td><td>⚠️ Lives as long as the scope</td></tr>
+        <tr><td><strong>Transient</strong></td><td>✅ Fine</td><td>✅ Fine</td><td>✅ Fine</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>A dependency is held for <strong>at least</strong> as long as the thing consuming it.</p>
+    <p>So you can always inject something <em>longer-lived</em> into something shorter-lived. Never the
+      reverse.</p>
+  </div>
+
+  <p>Note the transient row: a transient injected into a singleton is created once and held forever. It
+    isn't an error, but it isn't "transient" any more either — and if it holds a resource, that's a leak.</p>
+
+  <h2 id="background-services">Scoped services in background work <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>A <code>BackgroundService</code> is registered as a <strong>singleton</strong>. So it hits exactly the
+    problem above — and there's no request to give it a scope.</p>
+
+  <pre data-label="csharp — bad: singleton service, injected DbContext" class="code-bad"><code class="language-csharp">public class OrderProcessor(AppDbContext db) : BackgroundService   // WRONG
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var pending = await db.Orders.Where(o =&gt; !o.Processed).ToListAsync(ct);
+            // one context, held for days, tracking every entity it ever saw
+        }
+    }
+}</code></pre>
+
+  <pre data-label="csharp — correct: a scope per unit of work" class="code-good"><code class="language-csharp">public class OrderProcessor(IServiceScopeFactory scopeFactory, ILogger&lt;OrderProcessor&gt; log)
+    : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                // A fresh scope per iteration - fresh DbContext, released afterwards
+                using var scope = scopeFactory.CreateScope();
+                var db = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+
+                var pending = await db.Orders.Where(o =&gt; !o.Processed).Take(50).ToListAsync(ct);
+                foreach (var order in pending) { /* ... */ }
+                await db.SaveChangesAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;                            // normal shutdown, not an error
+            }
+            catch (Exception ex)
+            {
+                // Swallow-and-continue: an unhandled exception here kills the host
+                log.LogError(ex, "Order processing iteration failed");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(10), ct);
+        }
+    }
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — an unhandled exception stops the whole host</div>
+    <p style="margin:0">If <code>ExecuteAsync</code> throws, the host shuts down by default (since .NET 6).
+      Your API stops serving traffic because a background job failed once.
+      <br><br>
+      So the loop body needs its own try/catch that logs and continues. And note the separate catch for
+      <code>OperationCanceledException</code> — cancellation during shutdown is normal and shouldn't be
+      logged as an error.</p>
+  </div>
+
+  <h2 id="registration">Registration patterns <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — the forms you'll actually use"><code class="language-csharp">// Interface to implementation - the common case
+services.AddScoped&lt;IOrderRepository, SqlOrderRepository&gt;();
+
+// Concrete type only
+services.AddSingleton&lt;PriceCache&gt;();
+
+// Factory - when construction needs logic or config
+services.AddSingleton&lt;IPaymentGateway&gt;(sp =&gt;
+{
+    var options = sp.GetRequiredService&lt;IOptions&lt;PaymentOptions&gt;&gt;().Value;
+    return new StripeGateway(options.ApiKey);
+});
+
+// Many implementations of one interface - inject IEnumerable&lt;IShippingRate&gt;
+services.AddSingleton&lt;IShippingRate, StandardRate&gt;();
+services.AddSingleton&lt;IShippingRate, ExpressRate&gt;();
+
+// Keyed services (.NET 8+) - pick by key rather than by type
+services.AddKeyedScoped&lt;INotifier, EmailNotifier&gt;("email");
+services.AddKeyedScoped&lt;INotifier, SmsNotifier&gt;("sms");
+// consume with: [FromKeyedServices("email")] INotifier notifier</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>Behaviour if already registered</th></tr></thead>
+      <tbody>
+        <tr><td><code>Add*</code></td><td>Adds another. Resolving one type gets the <strong>last</strong> registered; resolving <code>IEnumerable&lt;T&gt;</code> gets all</td></tr>
+        <tr><td><code>TryAdd*</code></td><td>Only adds if nothing is registered for that type. Use this in library extension methods</td></tr>
+        <tr><td><code>Replace</code></td><td>Swaps the existing registration. Useful in tests</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Best practice for tests</div>
+    <p style="margin:0">Register the real thing in <code>Program.cs</code>, then use
+      <code>services.Replace(...)</code> or <code>RemoveAll</code> in your test host to swap in a fake. That
+      way your test exercises the real wiring, and you only substitute what you deliberately chose to. See
+      <a href="../17-testing/dotnet-practice.html">testing in .NET</a>.</p>
+  </div>
+
+  <h2 id="shutdown">Graceful shutdown <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>When the host is asked to stop — SIGTERM from Kubernetes, Ctrl+C, a deployment — it signals a
+      <strong>cancellation token</strong> and waits for in-flight work to finish.</p>
+    <p>If your code ignores that token, the platform eventually kills the process and the work is lost.</p>
+  </div>
+
+  <p>The sequence:</p>
+
+  <ol class="steps">
+    <li>The platform sends SIGTERM.</li>
+    <li>The host stops accepting new requests and triggers
+      <code>ApplicationStopping</code>.</li>
+    <li><code>StopAsync</code> is called on hosted services, and the <code>CancellationToken</code> passed to
+      <code>ExecuteAsync</code> is cancelled.</li>
+    <li>The host waits up to the <strong>shutdown timeout</strong> (default 30 seconds).</li>
+    <li>Anything still running is killed.</li>
+  </ol>
+
+  <pre data-label="csharp — set the timeout to match your platform"><code class="language-csharp">builder.Services.Configure&lt;HostOptions&gt;(o =&gt;
+{
+    o.ShutdownTimeout = TimeSpan.FromSeconds(25);
+});</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — Kubernetes will out-wait you, or won't</div>
+    <p style="margin:0">Kubernetes sends SIGTERM, waits <code>terminationGracePeriodSeconds</code> (default
+      30), then SIGKILL.
+      <br><br>
+      If your .NET shutdown timeout is <em>longer</em> than that grace period, Kubernetes kills you
+      mid-drain and you lose in-flight requests. Set the .NET timeout <strong>below</strong> the grace
+      period, and make sure long-running work checks the cancellation token frequently enough to actually
+      stop in time.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The host owns DI, configuration, logging and shutdown — for web apps and workers alike.</li>
+      <li>Singleton = per app, scoped = per request, transient = per injection.</li>
+      <li>You can inject longer-lived into shorter-lived, never the reverse.</li>
+      <li>Scoped into singleton = captive dependency. Enable <code>ValidateScopes</code> everywhere, not just
+        Development.</li>
+      <li><code>BackgroundService</code> is a singleton — create a scope per unit of work.</li>
+      <li>Catch exceptions inside a background loop, or one failure takes the host down.</li>
+      <li>Singletons must be thread-safe.</li>
+      <li>Keep the .NET shutdown timeout under the platform's grace period.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Injecting <code>DbContext</code> into a singleton</strong> — the captive dependency.</li>
+    <li><strong>Injecting <code>DbContext</code> into a <code>BackgroundService</code></strong> — same bug,
+      different disguise.</li>
+    <li><strong>A singleton holding mutable state</strong> with no synchronisation.</li>
+    <li><strong>Registering everything as transient</strong> "to be safe" — you lose caching and create
+      needless allocation.</li>
+    <li><strong>No try/catch in a background loop</strong>, so one transient failure stops the host.</li>
+    <li><strong>Injecting <code>IServiceProvider</code> everywhere</strong> — that's service location, and it
+      hides dependencies from the constructor.</li>
+    <li><strong>Not passing the shutdown token</strong> into long-running work, so it can't stop cleanly.</li>
+    <li><strong>Relying on Development-only scope validation</strong>, so the bug ships.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>Explain the DI lifetimes, and how you choose between them.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Singleton is one instance for the whole application. Scoped is one per request — or per explicit
+          scope. Transient is a new one every time it's injected."</p>
+        <p>"The way I decide is one question: does this hold state that belongs to a single request? If yes,
+          it's scoped — a <code>DbContext</code> is the obvious example, because it tracks the entities for
+          that unit of work. If no, and it's expensive to create or genuinely shared, singleton — a cache, or
+          something holding a pooled connection. If no and it's cheap, transient."</p>
+        <p>"In practice I lean towards scoped for anything touching data and singleton for infrastructure,
+          and I use transient less than people expect — most stateless helpers are fine as singletons."</p>
+        <p>"The important consequence is the direction of the dependency. Something is held for at least as
+          long as whatever consumes it, so you can inject longer-lived into shorter-lived but never the
+          reverse. Injecting a scoped service into a singleton means the singleton holds that instance
+          forever — which is the captive dependency problem, and it's the mistake I'd actually watch for in
+          review."</p>
+        <p>"And a singleton has to be thread-safe, because by definition it's shared across every concurrent
+          request."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you go beyond listing them to a decision rule?</li>
+        <li>Do you volunteer the captive dependency problem?</li>
+        <li>Do you mention thread safety?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens if you inject a scoped service into a singleton?</li>
+          <li>How do you use a <code>DbContext</code> in a background service?</li>
+          <li>Is a transient injected into a singleton still transient?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>You need a <code>DbContext</code> in a <code>BackgroundService</code>. How do you do it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"You can't just inject it, because a <code>BackgroundService</code> is registered as a singleton
+          and <code>DbContext</code> is scoped. That's a captive dependency."</p>
+        <p>"If you do it, the context lives for the lifetime of the service — days or weeks. It accumulates
+          every entity it has ever tracked, so memory grows and queries get slower. You get stale data
+          because the change tracker keeps returning cached instances. And it isn't thread-safe, so any
+          concurrency gives you 'a second operation was started on this context'."</p>
+        <p>"So instead I inject <code>IServiceScopeFactory</code>, and create a scope per unit of work —
+          usually per loop iteration or per message. Inside the scope I resolve the context, do the work, and
+          dispose the scope, which disposes the context. That mirrors what a web request does automatically."</p>
+        <p>"Two other things I'd get right in that loop. Wrap the body in a try/catch, because since .NET 6
+          an unhandled exception in <code>ExecuteAsync</code> shuts down the host — so a transient database
+          blip would take my API offline. And handle <code>OperationCanceledException</code> separately, so
+          normal shutdown doesn't get logged as an error and page someone."</p>
+        <p>"I'd also enable <code>ValidateScopes</code> outside Development. It's on by default in
+          Development only, which is exactly why this class of bug ships to production."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>BackgroundService</code> is a singleton?</li>
+        <li>Can you name the specific symptoms, not just "it's wrong"?</li>
+        <li>Bonus: the host-shutdown behaviour and scope validation.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "register the <code>DbContext</code> as a singleton" — makes it far worse.</li>
+        <li><span class="redflag">Red flag:</span> "inject <code>IServiceProvider</code>" without creating a scope.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where exactly does the scope boundary go — per iteration or per item?</li>
+          <li>How do you make the job stop cleanly on shutdown?</li>
+          <li>How would you make the same job safe to run on three instances?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Your API throws <code>ObjectDisposedException</code> intermittently after a few minutes of traffic. What would you look at? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That pattern — works at first, then fails intermittently under traffic — points strongly at a
+          <strong>lifetime mismatch</strong>. Something long-lived is holding something that got disposed."</p>
+        <p>"My first hypothesis is a captive dependency: a singleton that took a scoped service in its
+          constructor. It captures the first request's instance, that request ends, the scope disposes it, and
+          every subsequent use throws. The intermittency comes from it depending on which code path hits the
+          singleton."</p>
+        <p>"To confirm it quickly I'd enable <code>ValidateScopes</code> and <code>ValidateOnBuild</code> and
+          start the app. Scope validation throws at startup with the exact chain — 'cannot consume scoped
+          service X from singleton Y' — which usually identifies it in seconds. It's on by default in
+          Development, so if this reached production it's likely nobody ran with it enabled."</p>
+        <p>"If that comes up clean, the other candidates are: a <code>BackgroundService</code> injecting a
+          scoped service, which is the same bug in a different place; something capturing an
+          <code>HttpContext</code> or a scoped service in a closure and using it after the request ended —
+          fire-and-forget work is the classic; or a manually created scope disposed while an async operation
+          is still using it, which happens if you don't await inside the <code>using</code>."</p>
+        <p>"That last one is worth calling out because it's easy to write: if you create a scope, start an
+          async operation without awaiting it, and let the <code>using</code> block exit, the scope is
+          disposed while the work is still running."</p>
+        <p>"For prevention I'd turn on both validation flags in every environment, and treat the
+          exception type as a signal to check lifetimes first rather than adding a null check or a retry —
+          which is what people reach for and which hides the real problem."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you recognise the symptom pattern as a lifetime issue?</li>
+        <li>Do you know scope validation exists and that it's Development-only by default?</li>
+        <li>Can you list other realistic causes, including the async-scope one?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add a try/catch and retry."</li>
+        <li><span class="redflag">Red flag:</span> "register everything as transient."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why is scope validation off outside Development?</li>
+          <li>How do you do fire-and-forget work safely in ASP.NET Core?</li>
+          <li>What's the difference between this and "a second operation started on this context"?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

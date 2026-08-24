@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Senior-Level Questions — Final Interview Prep</title>
+<meta name="description" content="Questions that separate seven years of experience from one year repeated seven times — where the answer depends on having operated something.">
+<meta name="keywords" content="senior dotnet interview questions experience judgement trade-offs when not to what would you do differently technical debt disagreement mentoring production incidents architecture decisions">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="37-final-prep/senior-questions.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Senior-Level Questions</h1>
+    <p class="subtitle">These have no textbook answer. They're asking whether you've owned something long enough to
+      have learned what it costs.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="note senior">
+    <div class="note-title">What these questions are actually probing</div>
+    <p style="margin:0">A mid-level engineer can answer "how does X work?" as well as a senior one. The separator is
+      questions where <strong>the answer requires having lived with a decision</strong>.
+      <br><br>
+      Three shapes recur: <em>"when would you <strong>not</strong> use X?"</em>, <em>"what would you do differently
+      now?"</em>, and <em>"walk me through a time it went wrong."</em>
+      <br><br>
+      All three are unanswerable from documentation, which is exactly why they're asked. And all three reward the same
+      thing: <strong>naming a specific cost you paid.</strong>
+      <br><br>
+      The failure mode isn't ignorance — it's answering them abstractly. "It depends on the requirements" is true and
+      empty. A specific example, even a small one, is worth more than a general principle stated well.</p>
+  </div>
+
+  <h2 id="when-not">"When would you not use it?" <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>When would you <em>not</em> use microservices? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Most of the time, honestly — and I'd start from what they actually buy, because the case for them is
+          narrower than it's usually presented."</p>
+        <p>"<strong>Microservices have one primary benefit: independent deployability.</strong> Team A ships without
+          coordinating with team B. Everything else attributed to them is either achievable in a monolith or is a
+          liability: a monolith scales horizontally perfectly well, technology diversity is mostly a hiring problem,
+          and fault isolation is real but you've added network failures that didn't exist before."</p>
+        <p>"So I wouldn't use them when <strong>independent deployability isn't the bottleneck</strong>. A single team
+          of eight deploying together gains nothing and pays for network calls that fail, no transactions across
+          boundaries, distributed tracing, versioned contracts, and eventual consistency they now have to explain to
+          the business."</p>
+        <p>"Specifically I'd avoid them <strong>before the domain boundaries are understood</strong>. Getting a boundary
+          wrong in a monolith is a refactor; getting it wrong across services is a migration with data movement. And
+          you rarely know the right boundaries early — which is the strongest argument for waiting."</p>
+        <p>"<strong>What I'd do instead:</strong> a modular monolith with boundaries enforced mechanically — an
+          architecture test that fails the build if one module references another's internals. Then splitting later is
+          mechanical rather than archaeological, because the seams already exist and are already enforced."</p>
+        <p>"The failure mode I'd name is <strong>a distributed monolith</strong>: services that share a database, or
+          that can't be deployed independently because a change requires three of them to ship together. That's all the
+          cost with none of the benefit, and it's the most common outcome of splitting too early."</p>
+        <p>"If I'm asked when I <em>would</em>: several teams needing independent release cadence, a component with
+          genuinely different scaling characteristics — an ML inference service, say — or a regulatory requirement to
+          isolate a workload. Those are real."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you know the one real benefit, and that scalability isn't it?</li>
+        <li>Do you connect team structure to the decision?</li>
+        <li>Do you know a distributed monolith is worse than either?</li>
+        <li>Can you name when you <em>would</em>, so it isn't just contrarianism?</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you not use a message queue? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"When the caller <strong>needs the answer</strong> to continue. If the user is waiting on the result, a queue
+          just adds a hop and a polling mechanism — you've made it slower and given yourself two systems to
+          debug."</p>
+        <p>"Also when the operation must be <strong>strongly consistent with something else</strong>. If reserving
+          stock and creating an order must be atomic, putting a queue between them replaces a transaction with a saga:
+          compensation logic, eventual consistency, and partial-failure states. That's a lot of complexity for no
+          gain."</p>
+        <p>"And when <strong>ordering matters and the queue can't give it</strong> without serialising everything.
+          Getting ordered processing usually means one consumer per session or partition, at which point you've traded
+          the throughput you added the queue for."</p>
+        <p>"The cost I'd name from experience is <strong>debuggability</strong>. A synchronous call that fails gives you
+          a stack trace. An asynchronous flow that fails gives you a message somewhere, a consumer that may have
+          retried, and a dead-letter queue — and answering 'what happened to this request?' requires distributed
+          tracing you have to have set up in advance."</p>
+        <p>"Plus the operational surface: a dead-letter queue nobody monitors, consumer lag nobody alerts on, and
+          poison messages. Each is a thing you now have to run."</p>
+        <p>"<strong>Where a queue genuinely earns it:</strong> work that doesn't need a synchronous answer, load
+          levelling so a traffic spike grows a backlog instead of timing out, fan-out to several consumers, and
+          retry with durability for something that must not be lost. Those are strong reasons — I'd just want one of
+          them to be true rather than reaching for it by default."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you know async isn't automatically better?</li>
+        <li>Do you recognise that a queue between two things breaks their transaction?</li>
+        <li>Do you name the debuggability and operational cost?</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you not use event sourcing or CQRS? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd separate them first, because they're routinely conflated. <strong>CQRS is separating the read and write
+          models. Event sourcing is storing state as a sequence of events.</strong> You can do either without the
+          other, and CQRS is much cheaper."</p>
+        <p>"<strong>CQRS comes in levels.</strong> Separate models over one database is nearly free — often just
+          different classes for commands and queries, and I'd reach for it whenever reads and writes genuinely want
+          different shapes. A separate read store buys scale at the cost of eventual consistency, and that's where the
+          real decision is."</p>
+        <p>"So I'd skip CQRS when the read and write models are basically the same. Adding two models for a CRUD
+          screen is pure overhead."</p>
+        <p>"<strong>Event sourcing I'd avoid unless the history genuinely is the domain.</strong> It's a substantial
+          commitment: projections to build and rebuild, eventual consistency on every read, event schema evolution that
+          must stay readable for years, and a team that has to understand it. Onboarding cost is real — most developers
+          haven't worked with it."</p>
+        <p>"The specific trap: <strong>events are permanent</strong>. A poorly designed event is with you for the
+          lifetime of the system, and you can't migrate it the way you'd migrate a table. So you need to be good at
+          domain modelling <em>before</em> you start, which is a lot to ask early in a project."</p>
+        <p>"<strong>Where it's genuinely right:</strong> a regulated domain where you must reconstruct what you knew and
+          decided at a past moment, or a domain where the transitions themselves are the valuable data — claims
+          progression, trading, anything auditable."</p>
+        <p>"And the middle path I'd propose: <strong>event sourcing for one bounded context</strong> where it earns its
+          cost, not for the whole system. Or, cheaper still, bi-temporal versioned rows plus decision records — which
+          satisfies most audit requirements while staying queryable with plain SQL."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you know CQRS and event sourcing are different?</li>
+        <li>Do you know CQRS has cheap and expensive forms?</li>
+        <li>Do you raise the permanence of events and the onboarding cost?</li>
+        <li>Do you offer a proportionate middle path?</li>
+      </ul>
+    </div>
+  </details>
+
+  <h2 id="differently">"What would you do differently?" <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>Tell me about an architectural decision you regret. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer — the structure, with your own example</span>
+        <p>"The shape that works here is: <strong>the decision, why it was reasonable at the time, what it actually
+          cost, and what I'd do now.</strong> The middle part matters — a regret with no defensible original reasoning
+          reads as poor judgement rather than learning."</p>
+        <p>"Something like: <em>'We split a service earlier than we understood the domain. It seemed right because two
+          teams were working in the same codebase and stepping on each other.'</em>"</p>
+        <p>"<em>'What it cost: the boundary was wrong. Orders and inventory needed to be consistent, and we'd separated
+          them — so the core purchase flow became a saga with compensation. Every incident afterwards involved orders
+          in a half-completed state, and we spent months building tooling to inspect and repair them.'</em>"</p>
+        <p>"<em>'What I'd do now: keep them in one service and enforce module boundaries in the codebase instead — an
+          architecture test failing the build on cross-module references. That would have solved the actual problem,
+          which was teams colliding in shared code, without buying a distributed-systems problem.'</em>"</p>
+        <p>"<em>'The lesson I took: <strong>draw boundaries from what must be transactional together, not from team
+          structure.</strong> And the number of sagas in a design is a good signal that the boundaries are
+          wrong.'</em>"</p>
+        <p>"What makes this land is <strong>the specific cost</strong>. 'It was more complex' is vague. 'We spent months
+          building repair tooling for half-completed orders' is a fact, and it's the part that shows you lived with
+          it."</p>
+        <p>"I'd also be careful not to make it someone else's fault. Owning a decision that turned out badly is the
+          point of the question — blaming the previous team answers a different one, unflatteringly."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Can you criticise your own work without either defensiveness or excessive self-blame?</li>
+        <li>Was the original decision defensible? (If not, that's a different concern.)</li>
+        <li>Is the cost specific and quantified?</li>
+        <li>Did you extract a transferable principle?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Prepare two of these in advance</div>
+        <p style="margin:0">One technical, one about process or people. This question is asked in some form almost
+          every time, and improvising it produces either a non-answer ("I can't think of one") or an
+          over-disclosure.</p>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you decide what technical debt to pay down? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd frame it as <strong>interest rate rather than principal</strong>. Some debt costs you every single
+          change; some sits there costing nothing. The ugly module nobody touches is cheap debt — leaving it is a
+          rational decision, not neglect."</p>
+        <p>"So the things I'd prioritise are where the debt is <strong>compounding</strong>:"</p>
+        <p>"<strong>Anything that slows every change</strong> — a brittle test suite, a build that takes forty minutes,
+          a deployment that requires manual steps. That's a tax on all future work, so paying it down returns
+          continuously."</p>
+        <p>"<strong>Anything that risks an incident</strong> — no retry on a critical dependency, unbounded queries, a
+          missing index that will bite at the next growth step. That's debt with a tail risk rather than a
+          cost."</p>
+        <p>"<strong>Anything blocking work already planned.</strong> If the next quarter's roadmap runs through a
+          module, refactoring it becomes part of that work rather than a separate ask — which is also the easiest
+          version to get approved."</p>
+        <p>"And what I'd deliberately <em>not</em> prioritise: code that's ugly but stable and rarely touched, or
+          consistency for its own sake. Rewriting something that works to match a newer pattern is often the most
+          expensive form of debt paydown, because you take real regression risk for no functional gain."</p>
+        <p>"<strong>On getting it approved</strong> — which is usually the harder half — I'd express it in outcomes
+          rather than cleanliness. Not 'this code is bad' but 'this is why the last three estimates were wrong' or
+          'this is the third incident from the same cause'. Linking debt to something the business already
+          feels — velocity, incidents, on-call load — is what makes it fundable."</p>
+        <p>"And I'd prefer <strong>continuous small payments over a big-bang rewrite</strong>. Rewrites have a poor
+          record: they take longer than estimated, they reintroduce fixed bugs, and they stop feature work for months.
+          Improving the module you're already touching is lower-risk and doesn't need permission."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you prioritise by ongoing cost rather than by aesthetics?</li>
+        <li>Do you know some debt is correctly left alone?</li>
+        <li>Can you make the business case in business terms?</li>
+        <li>Are you appropriately sceptical of rewrites?</li>
+      </ul>
+    </div>
+  </details>
+
+  <h2 id="production">"Tell me about a time it went wrong" <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>Walk me through the worst production incident you've handled. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer — the structure</span>
+        <p>"I'd tell it in a fixed order, because the order is what demonstrates method:
+          <strong>impact, detection, diagnosis, mitigation, root cause, prevention.</strong>"</p>
+        <p>"<strong>Impact first</strong>, in user terms rather than technical ones. 'Checkout was failing for about
+          40% of customers for 25 minutes' rather than 'the pods were restarting'. That shows you think about
+          consequence before mechanism."</p>
+        <p>"<strong>Detection</strong> — and be honest here. If a customer told us before monitoring did, say so;
+          that's a finding, and admitting it is more credible than implying perfect observability."</p>
+        <p>"<strong>Diagnosis</strong>, including the wrong turn. 'We initially thought it was the database because
+          queries were timing out, then realised the queries were fine and requests were queueing before reaching
+          it.' Real diagnosis has a wrong turn in it, and including one makes the story believable."</p>
+        <p>"<strong>Mitigation, labelled as mitigation</strong> — 'we rolled back, which restored service in four
+          minutes; that didn't fix the cause'. And ideally: 'we captured a dump first, because a restart would have
+          destroyed the evidence and we'd have been guessing next time'."</p>
+        <p>"<strong>Root cause</strong>, with the actual mechanism. Not 'a bad deployment' but 'a sync-over-async call
+          added on a hot path, which held pool threads for the whole I/O — so under load requests queued and CPU stayed
+          low, which is why it looked like a database problem'."</p>
+        <p>"<strong>Prevention</strong>, and this is the part that separates answers. Two levels: the specific fix, and
+          the <em>structural</em> change so the class of problem can't recur. 'We fixed the call, and we enabled the
+          analyzer that fails the build on sync-over-async, and we added an alert on thread pool queue length.'"</p>
+        <p>"The habit I'd want to convey: <strong>a fix that relies on nobody making that mistake again isn't a
+          fix.</strong> And if the incident revealed a monitoring gap, the alert is as much a deliverable as the code
+          change."</p>
+        <p>"I'd also mention communication if it applied — who was updated and how often. At senior level, handling the
+          stakeholders during an incident is part of the job, and a lot of candidates omit it entirely."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Impact before mechanism?</li>
+        <li>Honest about detection and about wrong turns?</li>
+        <li>Mitigation distinguished from root cause?</li>
+        <li>Evidence preserved before restarting?</li>
+        <li>Prevention structural, not procedural?</li>
+        <li>Did you communicate with anyone?</li>
+      </ul>
+    </div>
+  </details>
+
+  <h2 id="judgement">Judgement under constraint <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <details class="qa">
+    <summary>You have two weeks and the "right" solution takes two months. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd want to know <strong>why two weeks</strong> — because the answer changes what's reasonable. A
+          regulatory deadline, a contractual commitment and 'someone picked a date' are three different situations, and
+          only the third is negotiable."</p>
+        <p>"Then I'd look for a <strong>smaller version of the right shape</strong> rather than a rushed version of the
+          full thing. Those are very different. Cutting scope keeps the design sound; cutting quality creates debt with
+          compounding interest."</p>
+        <p>"Concretely: can we ship for one customer segment, or one region, or with a manual step where the automation
+          would go? That's a real product in two weeks, with the architecture pointing the right way."</p>
+        <p>"What I'd protect even under pressure: <strong>anything expensive to change later.</strong> Data model,
+          public API contract, partition key, and anything touching money or personal data. Those are the decisions
+          you can't cheaply revisit, so they're the wrong place to save a week."</p>
+        <p>"What I'd happily compromise: internal code quality, some test coverage on stable paths, manual instead of
+          automated operations, a simpler UI, missing edge cases. All of those are cheap to improve later."</p>
+        <p>"And I'd be explicit about the trade-off <em>in writing</em>, not just verbally: what we're not doing, what it
+          will cost to add later, and the risks we're accepting. Partly so the decision is informed, and partly so
+          it's a shared decision rather than something engineering silently absorbed."</p>
+        <p>"The thing I'd push back on is <strong>a two-week solution presented as permanent</strong>. Temporary
+          solutions become permanent by default — so I'd want either scheduled follow-up work or an explicit
+          acknowledgement that this is what we're keeping, which changes what corners are acceptable."</p>
+        <p>"And I'd say what I wouldn't compromise at all: anything creating a <strong>security or data-integrity
+          risk</strong>. Shipping without tenant isolation, or with a race that double-charges customers, isn't a
+          faster version of the work — it's a different, worse outcome. That's the line I'd hold."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you interrogate the deadline?</li>
+        <li>Do you cut scope rather than quality?</li>
+        <li>Can you name what's expensive to change later?</li>
+        <li>Do you document the trade-off?</li>
+        <li>Do you have a line you won't cross?</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A colleague disagrees strongly with your design. How do you handle it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by trying to find the <strong>actual disagreement</strong>, because it's often not the one being
+          argued. Two people can agree on every technical fact and differ on which risk matters more, or on an
+          assumption neither has stated."</p>
+        <p>"So: <em>'what would have to be true for your approach to be clearly right?'</em> That usually surfaces the
+          real difference quickly — and often it's an assumption about volume, or team size, or how long the thing will
+          live."</p>
+        <p>"If we're weighing different risks, I'd try to make it <strong>empirical rather than rhetorical</strong>. Can
+          we prototype the uncertain part? Is there production data that settles it? Debates about performance are
+          particularly worth measuring rather than reasoning about, because intuition is unreliable there."</p>
+        <p>"If it genuinely can't be resolved, I'd look at <strong>which decision is easier to reverse</strong> — and
+          take the reversible one. That reframes the argument from 'who's right' to 'what's the cheapest way to find
+          out', which is a much more productive question."</p>
+        <p>"And I'd be genuinely open to being wrong. <strong>Changing my mind when shown a real problem is a positive
+          signal, not a concession</strong> — I'd rather be corrected in review than in production, and someone who
+          defends a position they can see is flawed is difficult to work with."</p>
+        <p>"If we still disagree and a decision is needed: <strong>disagree and commit.</strong> One of us decides — by
+          ownership, or escalation if it's significant — and then we both implement it properly. Half-hearted
+          implementation of a decision you lost is worse than either option, and it poisons the next
+          disagreement."</p>
+        <p>"I'd also record the reasoning — a short decision record with the options and why we chose. Partly so it can
+          be revisited when circumstances change, and partly so we don't relitigate it in six months having forgotten
+          the context."</p>
+        <p>"One thing I'd watch: <strong>seniority isn't an argument.</strong> If I'm the more senior person, winning
+          by position rather than reasoning costs me the next time someone has a better idea and doesn't raise
+          it."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you look for the underlying disagreement?</li>
+        <li>Do you try to make it empirical?</li>
+        <li>Do you use reversibility as a tie-breaker?</li>
+        <li>Can you commit to a decision you disagreed with?</li>
+        <li>Do you avoid winning by seniority?</li>
+      </ul>
+    </div>
+  </details>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>These questions probe whether you've lived with a decision — answer with specifics, not principles.</li>
+      <li>"When would you not use X?" is the most reliable senior question. Have answers ready.</li>
+      <li>Microservices: independent deployability is the one benefit; a distributed monolith is the worst outcome.</li>
+      <li>A queue between two things that must be atomic replaces a transaction with a saga.</li>
+      <li>CQRS and event sourcing are different, and CQRS has cheap and expensive forms.</li>
+      <li>Prepare two "what I'd do differently" stories — one technical, one about process.</li>
+      <li>A regret needs defensible original reasoning and a specific quantified cost.</li>
+      <li>Prioritise debt by interest rate, and express it in outcomes the business feels.</li>
+      <li>Incident story order: impact, detection, diagnosis, mitigation, root cause, prevention.</li>
+      <li>Include a wrong turn — real diagnosis has one.</li>
+      <li>Prevention must be structural; a fix relying on memory isn't a fix.</li>
+      <li>Under deadline pressure, cut scope not quality — and protect what's expensive to change.</li>
+      <li>Have a line you won't cross: security and data integrity.</li>
+      <li>Find the real disagreement, prefer the reversible option, then disagree and commit.</li>
+    </ul>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

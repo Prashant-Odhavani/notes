@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transactions, Write &amp; Read Concerns — MongoDB</title>
+<meta name="description" content="Replica sets and elections, the oplog, write and read concerns, read preference, causal consistency, and when transactions are the wrong answer.">
+<meta name="keywords" content="MongoDB replica set election oplog primary secondary write concern majority journal read concern local majority linearizable snapshot read preference secondaryPreferred causal consistency session transactions retryable writes rollback">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="13-mongodb/consistency.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Transactions, Write &amp; Read Concerns</h1>
+    <p class="subtitle">Where MongoDB asks you to make durability and consistency decisions that a relational
+      database makes for you.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>A replica set is one primary and several secondaries.</strong> All writes go to the primary.</li>
+      <li><strong>Single-document operations are always atomic</strong> — including updates to nested fields
+        and arrays.</li>
+      <li><strong>Write concern</strong> = how many nodes must acknowledge. <code>majority</code> is the
+        default since 5.0.</li>
+      <li><strong>Read concern</strong> = how up-to-date and how durable the data you read is.</li>
+      <li><strong>Read preference</strong> = which node you read from. Secondaries lag.</li>
+      <li><strong>Transactions exist</strong> (4.0 replica sets, 4.2 sharded) but are a design smell if you
+        need them often.</li>
+      <li><strong>Causal consistency</strong> via sessions is usually the right fix for read-your-own-writes.</li>
+    </ul>
+  </div>
+
+  <h2 id="replica-sets">Replica sets <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A replica set is a group of nodes holding the same data. <strong>One primary accepts all writes</strong>;
+      secondaries replicate from it by replaying its <strong>oplog</strong> — a capped collection of every
+      change.</p>
+    <p>If the primary becomes unreachable, the remaining nodes hold an <strong>election</strong> and one
+      secondary is promoted.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concept</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Primary</strong></td><td>The only node accepting writes. Reads go here by default</td></tr>
+        <tr><td><strong>Secondary</strong></td><td>Replays the oplog. Readable if you ask, and lags behind</td></tr>
+        <tr><td><strong>Oplog</strong></td><td>Capped collection of idempotent change records. Its size bounds how far behind a secondary can fall and still catch up</td></tr>
+        <tr><td><strong>Election</strong></td><td>Needs a majority of voting members. Typically completes in ~10–12 seconds</td></tr>
+        <tr><td><strong>Arbiter</strong></td><td>Votes but holds no data. <strong>Generally avoid</strong> — see below</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Odd numbers, and why arbiters are a trap</div>
+    <p style="margin:0">An election needs a <strong>strict majority</strong> of voting members, so a 3-node set
+      tolerates one failure and a 4-node set <em>still</em> only tolerates one — the fourth vote adds nothing
+      and adds cost. Always odd.
+      <br><br>
+      Arbiters look like a cheap way to make the count odd, and they undermine durability. With
+      <strong>Primary–Secondary–Arbiter</strong>, a <code>majority</code> write needs 2 of 3
+      acknowledgements — but the arbiter holds no data, so it can never acknowledge. That means every majority
+      write requires the single secondary. Lose it and writes stall entirely.
+      <br><br>
+      <strong>Use three data-bearing nodes.</strong> That's the answer whenever an interviewer offers you an
+      arbiter.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">During an election, writes fail</div>
+    <p style="margin:0">There is no primary for roughly 10–12 seconds, so writes are rejected and the driver
+      surfaces errors.
+      <br><br>
+      Which is why <strong>retryable writes</strong> exist and are on by default in modern drivers: the driver
+      retries a failed write once after a new primary is elected, using a transaction ID so a duplicate isn't
+      applied. That turns a failover from a burst of user-visible errors into a brief latency spike.
+      <br><br>
+      It only covers single-document writes, and it requires the operation to be retryable in the first place —
+      which is why unacknowledged writes can't use it.</p>
+  </div>
+
+  <h2 id="atomicity">Single-document atomicity <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="javascript — all of this is atomic, no transaction needed" class="code-good"><code class="language-javascript">db.order.updateOne(
+  { _id: orderId, status: "pending" },      // condition and update in one operation
+  {
+    $set:  { status: "paid", paidAt: new Date() },
+    $inc:  { version: 1 },
+    $push: { events: { type: "payment", at: new Date() } }
+  }
+);
+// Every field change here either all happens or none of it does.</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>A single document is the atomicity boundary.</strong></p>
+    <p>Everything inside one document — nested objects, arrays, counters — updates atomically. No transaction
+      required.</p>
+    <p>This is the strongest argument for embedding: <strong>if related data lives in one document, you get
+      transactional consistency for free.</strong> Which means a good schema removes most of the need for
+      transactions in the first place.</p>
+  </div>
+
+  <pre data-label="javascript — atomic conditional update: no read-modify-write" class="code-good"><code class="language-javascript">const result = db.inventory.updateOne(
+  { sku: sku, stock: { $gte: qty } },        // the check is part of the update
+  { $inc: { stock: -qty } }
+);
+
+if (result.modifiedCount === 0) throw new Error("Insufficient stock");</code></pre>
+
+  <p>Same pattern as the <a href="../10-sql/transactions.html#atomic-update">atomic SQL update</a> — putting the
+    condition in the operation removes the window a read-modify-write would leave open. It's the first thing to
+    reach for, before transactions.</p>
+
+  <h2 id="write-concern">Write concern <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th><code>w</code></th><th>Waits for</th><th>Risk</th></tr></thead>
+      <tbody>
+        <tr><td><code>0</code></td><td><strong>Nothing</strong> — fire and forget</td><td>You don't know if it worked. Can't be retried</td></tr>
+        <tr><td><code>1</code></td><td>The primary only</td><td><strong>Lost on failover</strong> if it hadn't replicated</td></tr>
+        <tr><td><code>"majority"</code> <em>(default 5.0+)</em></td><td>A majority of data-bearing nodes</td><td>Survives failover. Higher latency</td></tr>
+        <tr><td><code>&lt;n&gt;</code></td><td>n nodes</td><td>Rarely the right way to express intent</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — set it where it matters" class="code-good"><code class="language-csharp">// Money: durability over latency
+var payments = db.GetCollection&lt;Payment&gt;("payment")
+    .WithWriteConcern(WriteConcern.WMajority.With(journal: true));
+
+// Analytics events: throughput over durability
+var events = db.GetCollection&lt;Event&gt;("event")
+    .WithWriteConcern(new WriteConcern(1));</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why <code>majority</code> is what makes a write durable</div>
+    <p style="margin:0">With <code>w: 1</code> the primary acknowledges as soon as <em>it</em> has the write. If
+      that primary then fails before replicating, the new primary never saw it — and when the old node rejoins,
+      that write is <strong>rolled back</strong>. It was acknowledged to your application and then silently
+      disappeared.
+      <br><br>
+      <code>w: "majority"</code> means a majority of nodes have it, so any newly-elected primary must already
+      contain it — elections require a majority, and those nodes have the write.
+      <br><br>
+      That's the mechanism, and it's why the default changed in 5.0. The old "MongoDB loses writes" criticism
+      was about <code>w: 1</code> defaults, and it was fair at the time.
+      <br><br>
+      <code>journal: true</code> is a separate axis: it waits for the write-ahead log to be flushed to disk, so
+      it survives a process crash rather than just a failover.</p>
+  </div>
+
+  <h2 id="read-concern">Read concern <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>You see</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><code>"local"</code> <em>(default)</em></td><td>The node's latest data — <strong>may be rolled back later</strong></td><td>Most reads</td></tr>
+        <tr><td><code>"available"</code></td><td>Same, but no orphan filtering on shards</td><td>Lowest latency; can return orphaned documents</td></tr>
+        <tr><td><code>"majority"</code></td><td>Only data acknowledged by a majority — <strong>cannot be rolled back</strong></td><td>Reads you'll act on irreversibly</td></tr>
+        <tr><td><code>"linearizable"</code></td><td>Reflects all writes completed before it started</td><td>Rare. Primary only, and slow</td></tr>
+        <tr><td><code>"snapshot"</code></td><td>A consistent point-in-time view</td><td>Transactions, multi-collection consistency</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">The distinction that matters</span>
+    <p><code>local</code> can show you a write that later <strong>gets rolled back</strong> — because it was on
+      the primary but not replicated when that primary failed.</p>
+    <p>So if you read a value and then do something irreversible based on it — dispatch goods, charge a card,
+      call an external API — <code>readConcern: "majority"</code> is the right choice. Otherwise you can act on
+      data that ends up never having existed.</p>
+  </div>
+
+  <h2 id="read-preference">Read preference <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mode</th><th>Reads from</th></tr></thead>
+      <tbody>
+        <tr><td><code>primary</code> <em>(default)</em></td><td>Primary only. Fails if there isn't one</td></tr>
+        <tr><td><code>primaryPreferred</code></td><td>Primary, falling back to a secondary during failover</td></tr>
+        <tr><td><code>secondary</code></td><td>Secondaries only</td></tr>
+        <tr><td><code>secondaryPreferred</code></td><td>Secondaries, falling back to the primary</td></tr>
+        <tr><td><code>nearest</code></td><td>Lowest latency, primary or secondary</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Reading from secondaries is a correctness decision</div>
+    <p style="margin:0">Secondaries replay the oplog asynchronously, so they lag — usually milliseconds,
+      sometimes much more under write load or during index builds.
+      <br><br>
+      So the classic bug: user creates a document, gets redirected, the read hits a secondary that hasn't
+      replayed it yet, and they get a 404 on the thing they just made. Intermittent, environment-dependent,
+      and miserable to reproduce.
+      <br><br>
+      <strong>Never set <code>secondaryPreferred</code> globally.</strong> Set it per operation, on reads that
+      genuinely tolerate staleness: reports, exports, dashboards, search.
+      <br><br>
+      Same problem and same discipline as
+      <a href="../10-sql/scaling-operations.html#replication-lag">SQL read replicas</a> — route per query, never
+      per application.</p>
+  </div>
+
+  <h3 id="causal">Causal consistency — the better fix</h3>
+
+  <pre data-label="csharp — a session guarantees you see your own writes" class="code-good"><code class="language-csharp">using var session = await client.StartSessionAsync(new ClientSessionOptions
+{
+    CausalConsistency = true
+});
+
+await orders.InsertOneAsync(session, order);
+
+// Even reading from a secondary, this is guaranteed to reflect the insert above.
+// The driver passes the operation time; the secondary waits until it has caught up.
+var found = await orders.Find(session, o =&gt; o.Id == order.Id).FirstOrDefaultAsync();</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this is the answer to read-your-own-writes</div>
+    <p style="margin:0">A <strong>causally consistent session</strong> tracks the cluster time of your last
+      operation and sends it with subsequent reads. A secondary that hasn't reached that point
+      <em>waits</em> rather than returning stale data.
+      <br><br>
+      So you get read-your-own-writes <em>and</em> secondary reads, which the naive "just read from the
+      primary" answer gives up on.
+      <br><br>
+      The cost is latency when the secondary is behind — you wait instead of getting wrong data, which is
+      usually the right trade. Knowing this exists is a strong signal, because most people answer the
+      read-your-own-writes question with "read from the primary" and stop there.</p>
+  </div>
+
+  <h2 id="transactions">Multi-document transactions <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="csharp"><code class="language-csharp">using var session = await client.StartSessionAsync();
+
+await session.WithTransactionAsync(async (s, ct) =&gt;
+{
+    await accounts.UpdateOneAsync(s,
+        a =&gt; a.Id == fromId &amp;&amp; a.Balance &gt;= amount,
+        Builders&lt;Account&gt;.Update.Inc(a =&gt; a.Balance, -amount), cancellationToken: ct);
+
+    await accounts.UpdateOneAsync(s,
+        a =&gt; a.Id == toId,
+        Builders&lt;Account&gt;.Update.Inc(a =&gt; a.Balance, amount), cancellationToken: ct);
+
+    return true;
+}, cancellationToken: ct);
+// WithTransactionAsync retries on TransientTransactionError automatically.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Constraint</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>60-second default limit</strong></td><td><code>transactionLifetimeLimitSeconds</code>. A long transaction is aborted</td></tr>
+        <tr><td><strong>16 MB oplog entry limit</strong></td><td>A transaction's total changes must fit</td></tr>
+        <tr><td><strong>Performance cost</strong></td><td>Significantly slower than single-document operations</td></tr>
+        <tr><td><strong>Requires a replica set</strong></td><td>Not available on a standalone node — including some dev setups</td></tr>
+        <tr><td><strong>Retry required</strong></td><td><code>TransientTransactionError</code> must be retried; <code>WithTransaction</code> does it for you</td></tr>
+        <tr><td><strong>Sharded is slower still</strong></td><td>Two-phase commit across shards</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Needing transactions often means the schema is wrong</div>
+    <p style="margin:0">This is the answer interviewers are listening for, and it's genuinely the right framing.
+      <br><br>
+      MongoDB gives you atomicity <em>within a document</em> for free. If you frequently need to change two
+      documents atomically, ask whether they should be <strong>one document</strong>. An order and its lines
+      almost certainly should be — then "add a line and update the total" is one atomic
+      <code>updateOne</code>, not a transaction.
+      <br><br>
+      Transactions are a genuine escape hatch for cases where the data legitimately can't be co-located — an
+      account-to-account transfer between two independently-queried accounts is the textbook example, and it's
+      textbook precisely because it's one of the few that doesn't reduce to embedding.
+      <br><br>
+      So: <strong>use them, don't design around them.</strong> A codebase where most writes are transactional
+      is using MongoDB as a slow relational database.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The alternative for cross-document work</div>
+    <p style="margin:0">Where a transaction doesn't fit — spanning services, or exceeding 60 seconds — the
+      answer is the same as anywhere distributed: a <a href="../19-architecture/distributed-data.html#saga">saga</a>
+      with compensating actions, and idempotent operations so retries are safe.
+      <br><br>
+      <a href="scaling-operations.html#change-streams">Change streams</a> are how you trigger the next step
+      reliably, since they read the oplog rather than depending on the writer to publish anything.</p>
+  </div>
+
+  <h2 id="optimistic">Optimistic concurrency <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — version field as the guard" class="code-good"><code class="language-csharp">var result = await orders.UpdateOneAsync(
+    o =&gt; o.Id == id &amp;&amp; o.Version == expectedVersion,     // the guard
+    Builders&lt;Order&gt;.Update
+        .Set(o =&gt; o.Status, newStatus)
+        .Inc(o =&gt; o.Version, 1));
+
+if (result.MatchedCount == 0)
+    throw new ConcurrencyException("Modified by another user; reload and retry.");</code></pre>
+
+  <p>There's no built-in <code>rowversion</code> equivalent, so you maintain the version field yourself. The
+    pattern is otherwise identical to <a href="../11-ef-core/transactions-concurrency.html#optimistic">EF Core's
+    optimistic concurrency</a>, and the same rule applies: what to do on conflict is a domain decision, and a
+    silent retry reintroduces the lost update.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>One primary takes all writes; secondaries replay the oplog and lag.</li>
+      <li>Odd number of data-bearing nodes. Avoid arbiters — they can't acknowledge majority writes.</li>
+      <li>Single-document operations are fully atomic, including arrays and nested fields.</li>
+      <li>A good schema removes most of the need for transactions.</li>
+      <li><code>w: "majority"</code> is what makes a write survive failover; <code>w: 1</code> can be rolled
+        back.</li>
+      <li><code>journal: true</code> is a separate axis — surviving a crash, not a failover.</li>
+      <li><code>readConcern: "majority"</code> before acting irreversibly on a value.</li>
+      <li>Never set <code>secondaryPreferred</code> globally — route per operation.</li>
+      <li>Causally consistent sessions give read-your-own-writes from secondaries.</li>
+      <li>Transactions exist but are slow, time-limited, and usually a schema signal.</li>
+      <li>Optimistic concurrency is a manual version field.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>w: 1</code> for data that matters</strong>, losing writes on failover.</li>
+    <li><strong>An arbiter in a three-node set</strong>, so majority writes depend on one secondary.</li>
+    <li><strong>Even numbers of voting members.</strong></li>
+    <li><strong><code>secondaryPreferred</code> set globally</strong>, causing read-your-own-writes bugs.</li>
+    <li><strong>Transactions for work that should be one document.</strong></li>
+    <li><strong>Long-running transactions</strong> hitting the 60-second limit.</li>
+    <li><strong>No retry on <code>TransientTransactionError</code></strong> — use
+      <code>WithTransaction</code>.</li>
+    <li><strong>Read-modify-write</strong> where an atomic conditional update would work.</li>
+    <li><strong>No version field</strong>, so concurrent edits silently overwrite.</li>
+    <li><strong>Assuming reads reflect writes</strong> without a causal session.</li>
+    <li><strong>Developing against a standalone node</strong>, so transactions fail only in production.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What does write concern <code>majority</code> actually guarantee? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It guarantees the write has been acknowledged by a <strong>majority of data-bearing nodes</strong>,
+          which means it will survive a failover."</p>
+        <p>"The mechanism is what makes it interesting. With <code>w: 1</code>, the primary acknowledges as soon
+          as it has the write itself. If that primary then fails before replicating, the surviving nodes hold an
+          election — and the new primary never saw that write. When the old primary rejoins, the write is
+          <strong>rolled back</strong>. So your application was told the write succeeded, and it silently
+          ceased to exist."</p>
+        <p>"With <code>majority</code>, a majority of nodes have the write before it's acknowledged. Since an
+          election also requires a majority, any node that can become primary must already contain it. That's
+          why it's durable — the two majorities have to overlap."</p>
+        <p>"Worth noting this became the <strong>default in MongoDB 5.0</strong>. The old criticism that
+          'MongoDB loses writes' was about the <code>w: 1</code> default, and it was a fair criticism at the
+          time."</p>
+        <p>"<code>journal: true</code> is a separate and independent axis. That waits for the write-ahead log to
+          be flushed to disk, so the write survives a <em>process crash</em> rather than a failover. Majority
+          plus journal is the belt-and-braces setting for something like a payment."</p>
+        <p>"There's a trap worth mentioning: <strong>arbiters break this</strong>. In a
+          Primary–Secondary–Arbiter set, a majority is 2 of 3 — but the arbiter holds no data and can never
+          acknowledge a write. So every majority write depends on the single secondary, and if it goes down,
+          writes stall completely. The answer is three data-bearing nodes."</p>
+        <p>"On the trade-off: majority costs latency, because you're waiting for a network round trip to
+          another node. So I'd set it per collection rather than globally — majority plus journal for payments
+          and orders, <code>w: 1</code> for analytics events where throughput matters and losing a few on
+          failover is acceptable. Making that an explicit per-collection decision is the point."</p>
+        <p>"And there's a read-side counterpart people forget: <code>readConcern: "majority"</code>. The
+          default read concern is <code>local</code>, which can return a write that later gets rolled back. So
+          if I'm going to act irreversibly on a value I've read — dispatch goods, charge a card — I want
+          majority on the read too, not just the write."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the rollback mechanism, not just the definition?</li>
+        <li>Do you know majority and journal are different axes?</li>
+        <li>Do you know the arbiter trap?</li>
+        <li>Do you mention the read-concern counterpart?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens to the rolled-back write?</li>
+          <li>How long does an election take?</li>
+          <li>What are retryable writes?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>You need to transfer money between two accounts. Walk me through it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is the case where a MongoDB transaction is genuinely the right answer — and I'd say why,
+          because for most things it isn't."</p>
+        <p>"MongoDB gives atomicity within a single document for free. So my first question on any 'update two
+          things atomically' problem is whether they should be one document. Here they legitimately shouldn't:
+          two accounts are independent entities, queried and updated separately, and embedding one in the other
+          makes no sense. So this is one of the few textbook cases that doesn't reduce to better modelling."</p>
+        <p>"So: a <strong>multi-document transaction</strong>, using
+          <code>session.WithTransactionAsync</code> — which matters because it retries
+          <code>TransientTransactionError</code> automatically, and those <em>will</em> happen under
+          contention. Hand-rolling <code>startTransaction</code>/<code>commitTransaction</code> without retry
+          logic is a common mistake."</p>
+        <p>"Inside it, the debit must be a <strong>conditional update</strong>:
+          <code>{ _id: from, balance: { $gte: amount } }</code> with <code>$inc: { balance: -amount }</code>,
+          then check <code>modifiedCount</code>. If it's zero, there weren't sufficient funds and I abort. That
+          way the balance check and the decrement are one atomic operation rather than a read followed by a
+          write — no window for a concurrent transfer to slip through."</p>
+        <p>"<strong>Write concern <code>majority</code> with <code>journal: true</code></strong>. This is money:
+          I don't want a transfer acknowledged and then rolled back by a failover, or lost to a process crash."</p>
+        <p>"<strong>Read concern <code>snapshot</code></strong> inside the transaction, so both reads see a
+          consistent point in time."</p>
+        <p>"Then the parts that matter more than the transaction itself."</p>
+        <p>"<strong>Idempotency.</strong> The client may retry after a timeout without knowing whether the
+          first attempt succeeded — the ambiguous-timeout problem. So the transfer needs a client-supplied
+          idempotency key, recorded in a <code>transfer</code> collection with a unique index, inserted
+          <em>inside</em> the same transaction. A duplicate key means this transfer already happened and I
+          return the original result. Without that, a retry moves the money twice, and no amount of
+          transactional correctness prevents it."</p>
+        <p>"<strong>A ledger, not just balances.</strong> I'd write an immutable double-entry record of the
+          transfer in the same transaction rather than only mutating two balance fields. That gives auditability,
+          it's how you reconcile when something goes wrong, and it means the balance can be derived and checked
+          rather than trusted. For money that's not optional — and if the balance field is a computed
+          convenience over the ledger, a corrupted balance is recoverable."</p>
+        <p>"<strong>Keep it short.</strong> There's a 60-second transaction limit and the whole thing holds
+          locks, so no external calls, no notification sending inside it. Publishing 'transfer completed' goes
+          through a change stream or an outbox after commit."</p>
+        <p>"One thing I'd raise: <strong>if this is the core of the product, I'd question MongoDB for it.</strong>
+          A financial ledger with multi-entity invariants — balances must never go negative, debits must equal
+          credits — is what relational databases with constraints are genuinely better at. Mongo transactions
+          work, they're slower than single-document operations, and I'd lose the ability to enforce a
+          cross-document invariant declaratively. If money movement is one feature in a document-shaped system,
+          this design is fine. If it's the whole system, I'd want that conversation."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you use a conditional update rather than read-then-write?</li>
+        <li>Do you know <code>WithTransaction</code> handles retries?</li>
+        <li>Do you set write and read concern appropriately for money?</li>
+        <li>Do you raise idempotency — the thing transactions don't solve?</li>
+        <li>Do you suggest a ledger?</li>
+        <li>Are you willing to question the database choice?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> read balance, check in code, then write.</li>
+        <li><span class="redflag">Red flag:</span> no retry handling on transient errors.</li>
+        <li><span class="redflag">Red flag:</span> default write concern for a financial operation.</li>
+        <li><span class="redflag">Red flag:</span> no idempotency, so a client retry double-spends.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the two accounts are on different shards?</li>
+          <li>How do you reconcile if a balance drifts from the ledger?</li>
+          <li>What happens if the transaction exceeds 60 seconds?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

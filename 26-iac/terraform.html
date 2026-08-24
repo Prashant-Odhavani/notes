@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terraform — Infrastructure as Code</title>
+<meta name="description" content="Providers and version pinning, remote state and locking, modules, the plan/apply cycle, imports, and the operations that go wrong.">
+<meta name="keywords" content="Terraform providers version pinning lock file remote backend azurerm state locking modules variables outputs locals count for_each workspaces terraform plan apply import moved block lifecycle prevent_destroy taint state rm data sources OpenTofu">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="26-iac/terraform.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Terraform</h1>
+    <p class="subtitle">Powerful, cloud-agnostic, and the state file is yours to look after. Most Terraform problems
+      are state problems.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Pin provider and Terraform versions</strong>, and commit the lock file.</li>
+      <li><strong>Remote backend with locking</strong>, from day one. Never local state in a team.</li>
+      <li><strong><code>for_each</code> over <code>count</code></strong> — count re-indexes and destroys
+        resources.</li>
+      <li><strong>Modules are for reuse</strong>, not for organising a single deployment.</li>
+      <li><strong>Read the plan for <code>destroy</code> and <code>replace</code>.</strong></li>
+      <li><strong><code>moved</code> blocks</strong> to rename without destroying.</li>
+      <li><strong><code>import</code></strong> to bring existing resources under management.</li>
+      <li><strong>Separate state per environment</strong>, not workspaces, for production.</li>
+    </ul>
+  </div>
+
+  <h2 id="providers">Providers and versions <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="hcl — the block that prevents most surprises" class="code-good"><code class="language-hcl">terraform {
+  required_version = "~&gt; 1.9"          # allow 1.9.x, not 1.10
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~&gt; 4.0"                # allow 4.x, not 5.0
+    }
+    azuread = {
+      source  = "hashicorp/azuread"
+      version = "~&gt; 3.0"
+    }
+  }
+
+  # Remote state - see the next section
+  backend "azurerm" {
+    resource_group_name  = "rg-tfstate"
+    storage_account_name = "sttfstateprod"
+    container_name       = "tfstate"
+    key                  = "orders/prod.tfstate"
+    use_azuread_auth     = true          # no storage key needed
+  }
+}
+
+provider "azurerm" {
+  features {
+    resource_group {
+      # Refuse to delete a resource group that still contains resources
+      prevent_deletion_if_contains_resources = true
+    }
+  }
+  subscription_id = var.subscription_id   # be explicit; do not rely on CLI context
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Unpinned versions mean the same code produces different infrastructure</div>
+    <p style="margin:0">Without a version constraint, <code>terraform init</code> takes the latest provider. So a
+      pipeline run today and the same commit run next month can behave differently — new defaults, renamed
+      attributes, changed behaviour.
+      <br><br>
+      That breaks the core promise of IaC: <strong>the same definition producing the same result</strong>. And it
+      breaks it in the most annoying way — an unrelated deployment suddenly shows unexpected changes in the plan, and
+      nobody changed anything.
+      <br><br>
+      <strong>Pin with <code>~&gt;</code></strong> so patch and minor updates flow but a major version bump is
+      deliberate. Major provider versions do contain breaking changes — azurerm 4.0 changed several defaults and
+      required explicit subscription ids.
+      <br><br>
+      And <strong>commit <code>.terraform.lock.hcl</code></strong>. That pins the exact provider versions and their
+      checksums, so every machine and every pipeline run uses identical binaries. It's the same reasoning as
+      committing <code>packages.lock.json</code>, and it's frequently gitignored by mistake.
+      <br><br>
+      One more thing worth doing: <code>prevent_deletion_if_contains_resources</code>. It makes an accidental
+      resource-group deletion fail instead of quietly taking everything inside it — a very cheap safety net for the
+      single most destructive mistake available.</p>
+  </div>
+
+  <h2 id="state">Remote state and locking <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Requirement</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Remote backend</strong></td><td>Local state can't be shared, and is lost with the machine</td></tr>
+        <tr><td><strong>State locking</strong></td><td><strong>Two simultaneous applies corrupt state.</strong> The azurerm backend uses blob leases</td></tr>
+        <tr><td><strong>Versioning + soft delete</strong></td><td>Recovery when state is damaged</td></tr>
+        <tr><td><strong>Encryption at rest</strong></td><td>State contains secrets in plaintext</td></tr>
+        <tr><td><strong>Restricted access</strong></td><td>State read access is effectively read access to your secrets</td></tr>
+        <tr><td><strong>Separate state per environment</strong></td><td>A mistake in dev can't touch production</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">State holds secrets in plaintext</div>
+    <p style="margin:0">Anything Terraform knows is in the state file, unredacted. A generated password, a storage
+      account key it read to configure something, a connection string, a certificate.
+      <br><br>
+      Marking a variable <code>sensitive = true</code> only hides it from <em>console output</em>. It is still
+      plaintext in state.
+      <br><br>
+      So the state container needs to be treated as a credential store: <strong>encryption at rest, no public
+      access, RBAC limited to the pipeline identity</strong>, and diagnostic logging so you know who read it. Giving
+      every engineer read access to state is equivalent to giving them the secrets.
+      <br><br>
+      The better pattern is to <strong>not have Terraform generate or handle secrets at all</strong>. Create an empty
+      Key Vault secret, let the application or a separate process populate it, and have Terraform reference it rather
+      than know its value. And use <strong>managed identity</strong> wherever possible so there's no secret to
+      manage — which removes the problem rather than protecting against it.</p>
+  </div>
+
+  <h2 id="loops">count versus for_each <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="hcl — why for_each is almost always right" class="code-good"><code class="language-hcl"># count: resources are addressed by INDEX
+resource "azurerm_storage_account" "bad" {
+  count = length(var.names)             # [0] [1] [2]
+  name  = var.names[count.index]
+}
+# Remove the FIRST name from the list and Terraform sees:
+#   [0] name changes  -> REPLACE
+#   [1] name changes  -> REPLACE
+#   [2] no longer exists -> DESTROY
+# One removal destroys and recreates everything after it.
+
+
+# for_each: resources are addressed by KEY
+resource "azurerm_storage_account" "good" {
+  for_each = toset(var.names)           # ["alpha"] ["beta"] ["gamma"]
+  name     = each.value
+}
+# Remove "alpha" and Terraform sees:
+#   ["alpha"] destroyed
+#   ["beta"], ["gamma"] untouched
+
+
+# for_each over a map gives per-item configuration too
+resource "azurerm_linux_web_app" "apps" {
+  for_each = {
+    orders   = { sku = "P1v3", always_on = true  }
+    reports  = { sku = "S1",   always_on = false }
+  }
+
+  name                = "app-${each.key}-${var.environment}"
+  service_plan_id     = azurerm_service_plan.plans[each.key].id
+  site_config { always_on = each.value.always_on }
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — index-based addressing is the bug</div>
+    <p style="margin:0">This is the most commonly hit Terraform footgun, and explaining <em>why</em> is what
+      demonstrates understanding.
+      <br><br>
+      With <code>count</code>, a resource's identity in state is its <strong>position</strong>:
+      <code>module.x.resource[1]</code>. Remove an item from the middle of the list and everything after it shifts
+      down. Terraform compares state to configuration by address, sees different attributes at each address, and
+      concludes those resources must be <strong>replaced</strong>.
+      <br><br>
+      So removing one item from a list of ten can destroy and recreate nine resources. On storage accounts or
+      databases that's data loss, from what looked like a trivial change.
+      <br><br>
+      With <code>for_each</code>, identity is a <strong>stable key</strong>: <code>module.x.resource["beta"]</code>.
+      Removing "alpha" affects only "alpha".
+      <br><br>
+      So <strong><code>for_each</code> unless you specifically want N identical copies</strong> where position is
+      meaningless — and even then, keys are usually clearer.
+      <br><br>
+      The related trap: <code>for_each</code> keys must be known at plan time. Keying on a value computed from
+      another resource gives "Invalid for_each argument", and the fix is to key on something static — a name from a
+      variable — rather than a generated id.</p>
+  </div>
+
+  <h2 id="modules">Modules <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="hcl — a module boundary that's worth having" class="code-good"><code class="language-hcl">module "orders_api" {
+  source = "../../modules/web-app"      # or a registry / git ref with a version
+
+  name                = "orders-api"
+  environment         = var.environment
+  resource_group_name = azurerm_resource_group.main.name
+  location            = var.location
+
+  sku                 = var.app_sku
+  min_instances       = var.min_instances
+  key_vault_id        = azurerm_key_vault.main.id
+  app_settings        = { OrdersDb__Timeout = "30" }
+
+  tags = local.common_tags
+}
+
+# Consume outputs rather than reaching into the module's internals
+resource "azurerm_role_assignment" "orders_kv" {
+  scope                = azurerm_key_vault.main.id
+  role_definition_name = "Key Vault Secrets User"
+  principal_id         = module.orders_api.principal_id
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Modules for reuse, not for tidiness</div>
+    <p style="margin:0">The common mistake is wrapping every resource in a module because it feels organised. That
+      adds indirection with no benefit: every value must be threaded through variables and outputs, plans become
+      harder to read, and refactoring means moving state.
+      <br><br>
+      A module is worth creating when <strong>the same shape is deployed more than once</strong> — several
+      environments, several similar services, or a pattern your organisation wants to standardise (a web app that
+      always has diagnostics, managed identity and the right TLS settings).
+      <br><br>
+      For a single deployment, <strong>separate <code>.tf</code> files in one configuration</strong> gives you
+      organisation with none of the cost. Terraform concatenates them, so
+      <code>network.tf</code>, <code>compute.tf</code>, <code>data.tf</code> is a perfectly good structure.
+      <br><br>
+      When you do publish modules, <strong>version them</strong> and reference a version rather than a branch. A
+      module referenced by branch changes under consumers without warning, which is the same problem as an unpinned
+      provider.
+      <br><br>
+      And keep the interface narrow. A module with forty variables that pass straight through to the resource isn't
+      an abstraction — it's the resource with extra steps, and its consumers get no simplification at all.</p>
+  </div>
+
+  <h2 id="environments">Environments <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>How</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Directory per environment</strong></td>
+          <td><code>envs/dev</code>, <code>envs/prod</code>, each with its own backend key and tfvars</td>
+          <td><strong>The safe default for production</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Workspaces</strong></td>
+          <td>One configuration, <code>terraform workspace select prod</code></td>
+          <td>Convenient, <strong>risky</strong> — see below</td>
+        </tr>
+        <tr>
+          <td>Terragrunt or similar</td>
+          <td>A wrapper generating backend config per environment</td>
+          <td>Good at scale; another tool to learn</td>
+        </tr>
+        <tr>
+          <td>Separate repositories</td>
+          <td>Strong isolation</td>
+          <td>Configuration drifts between them over time</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Workspaces put production one forgotten command away</div>
+    <p style="margin:0">Workspaces share one configuration and one backend, distinguished by state key. Which means
+      <strong>the currently selected workspace is ambient state on your machine or your pipeline</strong>.
+      <br><br>
+      Forget to switch, run <code>apply</code>, and you've applied dev's intent to production. There's no
+      confirmation step that names the environment — the plan just shows changes, and they look plausible.
+      <br><br>
+      They also encourage conditionals — <code>count = terraform.workspace == "prod" ? 1 : 0</code> — which
+      accumulate until the configuration is hard to reason about and production's shape is only discoverable by
+      mentally evaluating expressions.
+      <br><br>
+      <strong>A directory per environment</strong> avoids both. The backend key is written down rather than
+      selected, so running in the wrong place requires being in the wrong directory — which is far more visible than
+      a forgotten workspace. Differences are expressed as explicit tfvars files, which are readable.
+      <br><br>
+      The cost is some duplication of root-module wiring, and that's what shared modules are for. It's a good trade:
+      <strong>duplication you can see beats cleverness you can't.</strong>
+      <br><br>
+      Workspaces are fine for genuinely ephemeral things — a per-pull-request environment — where the blast radius is
+      nil.</p>
+  </div>
+
+  <h2 id="operations">The operations that matter <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="bash — routine, and the ones you'll need under pressure"><code class="language-bash">terraform init -upgrade                    # providers per constraints; updates lock file
+terraform fmt -recursive                   # formatting, in CI as a check
+terraform validate                         # syntax and internal consistency
+
+terraform plan -out=tf.plan                # ALWAYS save the plan
+terraform show -json tf.plan | jq '...'    # machine-readable, for policy checks
+terraform apply tf.plan                    # apply exactly what was reviewed
+
+# Bring an existing resource under management (no changes made to it)
+terraform import azurerm_resource_group.main /subscriptions/.../resourceGroups/rg-prod
+
+# Rename or move a resource WITHOUT destroying it - use a moved block, not state mv
+# moved {
+#   from = azurerm_linux_web_app.api
+#   to   = module.orders_api.azurerm_linux_web_app.this
+# }
+
+terraform state list                       # what Terraform believes it owns
+terraform state show azurerm_key_vault.main
+terraform state rm azurerm_storage_account.old   # FORGET it - does not delete it
+
+terraform plan -refresh-only               # detect drift without proposing changes
+terraform force-unlock LOCK_ID             # only after confirming nothing is running</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — <code>apply</code> the saved plan, not a fresh one</div>
+    <p style="margin:0">Running <code>terraform apply</code> with no plan file makes Terraform compute a
+      <em>new</em> plan and apply that. Which means <strong>what gets applied may not be what was reviewed</strong> —
+      state can have changed, someone may have made a portal change, or another apply may have run in between.
+      <br><br>
+      Saving with <code>-out</code> and applying that file guarantees the reviewed operations are the executed
+      operations. If reality has moved, the apply <em>fails</em> rather than doing something different, which is
+      exactly the behaviour you want.
+      <br><br>
+      In a pipeline that maps naturally: <strong>plan on pull request, publish the plan as an artefact, apply that
+      artefact after approval.</strong> The approval then means something specific rather than "I approve of the
+      general idea."
+      <br><br>
+      Two related habits. <code>terraform show -json</code> makes the plan machine-readable, so a policy check can
+      <em>fail the build</em> on any <code>delete</code> action against a protected resource type — mechanical rather
+      than relying on a reviewer's attention. And <strong><code>moved</code> blocks instead of
+      <code>state mv</code></strong>: a refactor expressed in code, reviewed, and applied by the pipeline, rather
+      than someone running a state-mutating command by hand.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Three commands to be careful with</div>
+    <p style="margin:0"><strong><code>state rm</code></strong> makes Terraform forget a resource without deleting
+      it. Useful when handing ownership to another team, and dangerous because the resource now exists with nothing
+      managing it. Anything you remove should be recorded somewhere.
+      <br><br>
+      <strong><code>force-unlock</code></strong> breaks a state lock. Sometimes necessary after a pipeline is killed
+      mid-run — and if you use it while an apply is genuinely still running, you get concurrent writes and corrupted
+      state. Confirm nothing is running first, always.
+      <br><br>
+      <strong><code>-target</code></strong> applies to one resource. Occasionally the right tool for recovering from
+      a broken state, and it produces a partial apply where dependencies weren't evaluated. HashiCorp documents it as
+      exceptional use, and a plan that <em>needs</em> targeting usually indicates a dependency problem worth fixing
+      instead.
+      <br><br>
+      Worth knowing the pattern: <strong>these are all recovery tools</strong>. Reaching for them routinely means
+      something upstream — module structure, state layout, ownership boundaries — is wrong.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Data sources versus resources: who owns it</div>
+    <p style="margin:0">A <code>resource</code> is something Terraform creates and controls. A
+      <code>data</code> source is something it only reads.
+      <br><br>
+      That distinction is how you handle shared infrastructure. If a platform team owns the virtual network, your
+      configuration should reference it as a <strong>data source</strong> — you read its id and deploy into it,
+      without any ability to modify or destroy it.
+      <br><br>
+      Declaring it as a resource in two configurations is the real hazard: both believe they own it, and they
+      fight — each apply reverting the other's changes, with the resource flapping between two definitions.
+      <br><br>
+      So <strong>exactly one configuration owns each resource</strong>, and everyone else reads. Getting that
+      boundary explicit early avoids a class of problem that's very hard to untangle later.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">OpenTofu, briefly</div>
+    <p style="margin:0">Terraform's licence changed from MPL to BSL in 2023, which prompted a fork:
+      <strong>OpenTofu</strong>, under the Linux Foundation and MPL-licensed.
+      <br><br>
+      It's a drop-in replacement for practical purposes, and the ecosystems have started to diverge on newer
+      features.
+      <br><br>
+      Worth knowing exists because it may come up as a question about licensing awareness, and because some
+      organisations have adopted it specifically to avoid the BSL. It doesn't change anything about how you write
+      configuration.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Pin Terraform and provider versions with <code>~&gt;</code>; commit the lock file.</li>
+      <li>Remote backend with locking, versioning, encryption, restricted access.</li>
+      <li>State holds secrets in plaintext — <code>sensitive</code> only hides console output.</li>
+      <li>Prefer not having Terraform handle secrets at all.</li>
+      <li><code>for_each</code> over <code>count</code>: stable keys, not shifting indexes.</li>
+      <li><code>for_each</code> keys must be known at plan time.</li>
+      <li>Modules for repeated shapes; separate <code>.tf</code> files for organisation.</li>
+      <li>Version module references, and keep interfaces narrow.</li>
+      <li>Directory per environment, not workspaces, for production.</li>
+      <li>Save the plan and apply that file — not a fresh plan.</li>
+      <li>Policy-check the JSON plan so protected deletions fail the build.</li>
+      <li><code>moved</code> blocks in code rather than <code>state mv</code> by hand.</li>
+      <li><code>state rm</code>, <code>force-unlock</code> and <code>-target</code> are recovery tools.</li>
+      <li>One configuration owns each resource; everyone else uses data sources.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Unpinned provider versions</strong>, so the same commit behaves differently over time.</li>
+    <li><strong>Gitignoring the lock file.</strong></li>
+    <li><strong>Local state in a team</strong>, or a remote backend with no locking.</li>
+    <li><strong>Broad read access to state</strong>, which is read access to secrets.</li>
+    <li><strong><code>count</code> over a list</strong>, so removing an item recreates the rest.</li>
+    <li><strong>Everything wrapped in modules</strong> for a single deployment.</li>
+    <li><strong>Module references by branch</strong> rather than version.</li>
+    <li><strong>Workspaces for production</strong>, one forgotten switch from disaster.</li>
+    <li><strong><code>apply</code> without a saved plan</strong>, so the reviewed plan isn't what runs.</li>
+    <li><strong>Not reading the plan</strong> for destroy and replace.</li>
+    <li><strong><code>state mv</code> by hand</strong> instead of a reviewed <code>moved</code> block.</li>
+    <li><strong>Two configurations declaring the same resource</strong>, fighting over it.</li>
+    <li><strong>Routine use of <code>-target</code></strong> to work around dependency problems.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What is Terraform state, and how do you manage it for a team? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"State is <strong>Terraform's record of what it created and how</strong> — a mapping from the resources in
+          your configuration to the real resources in Azure, plus their last-known attributes."</p>
+        <p>"It needs that record to decide what to do. Without it, it can't distinguish 'this should be created' from
+          'this exists and I made it' from 'this exists and someone else owns it'. And it's how Terraform knows to
+          <em>delete</em> something you removed from the configuration — that's a capability plain scripts don't
+          have."</p>
+        <p>"For a team, the requirements are fairly firm."</p>
+        <p>"<strong>A remote backend</strong> — Azure Storage or Terraform Cloud. Local state can't be shared and is
+          lost with the machine, and 'the state is on Dave's laptop' is a genuine failure mode."</p>
+        <p>"<strong>State locking.</strong> Two applies at once produce a state file that matches neither reality nor
+          either intent, and that's harder to fix than either change. The azurerm backend uses blob leases, so it's
+          automatic once you're using it — which is one reason to prefer a proper backend over a plain file
+          share."</p>
+        <p>"<strong>Versioning and soft delete</strong> on the container, because state corruption happens and the
+          recovery path is a previous version."</p>
+        <p>"<strong>Restricted access</strong>, and this is the point people miss: <strong>state contains secrets in
+          plaintext.</strong> Any generated password, any key Terraform read, any connection string. Marking a
+          variable <code>sensitive</code> only hides it from console output — it's still plaintext in state. So read
+          access to state is effectively read access to those secrets, and it should be limited to the pipeline
+          identity rather than granted to everyone."</p>
+        <p>"Which leads to a design preference: <strong>try not to have Terraform handle secrets at all.</strong>
+          Create an empty Key Vault secret and let something else populate it, and use managed identity wherever
+          possible so there's no secret to store. That removes the problem instead of guarding it."</p>
+        <p>"<strong>Separate state per environment</strong>, so a mistake in dev cannot reach production. I'd do that
+          with a directory per environment and a distinct backend key, rather than workspaces — because a workspace is
+          ambient state, and forgetting to switch means applying dev's intent to production with nothing naming the
+          environment in the plan."</p>
+        <p>"And I'd scope state by <strong>blast radius and change frequency</strong>. One enormous state file means
+          every plan touches everything, plans get slow, and unrelated changes contend for the same lock.
+          Splitting — networking separately from applications, since networking changes rarely — limits what any one
+          apply can damage. The cost is cross-state references, which is what data sources or remote state outputs
+          are for."</p>
+        <p>"On failure recovery, the commands worth knowing are <code>terraform import</code> to bring an existing
+          resource under management, <code>state rm</code> to make Terraform forget one without deleting it, and
+          <code>force-unlock</code> for a stuck lock — with the caveat that using force-unlock while an apply is
+          genuinely running causes exactly the corruption you were avoiding."</p>
+        <p>"The framing I'd offer: <strong>the state file is production infrastructure.</strong> Losing it is a
+          serious incident — Terraform no longer knows anything it created, the next apply tries to recreate
+          everything, and recovery means importing resources by hand. It deserves backup, access control and
+          monitoring like anything else critical."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you explain why state is necessary at all?</li>
+        <li>Do you know locking prevents concurrent corruption?</li>
+        <li>Do you know state contains plaintext secrets?</li>
+        <li>Do you separate state per environment, and why not workspaces?</li>
+        <li>Do you think about blast radius when sizing state?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "it's a file that tracks resources" and nothing more.</li>
+        <li><span class="redflag">Red flag:</span> committing state to Git.</li>
+        <li><span class="redflag">Red flag:</span> unaware that secrets are in state.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens if you lose the state file?</li>
+          <li>How would you split one large state?</li>
+          <li>How do you reference a resource in another state?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A plan shows your production database will be destroyed and recreated. What now? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First: <strong>I don't apply it.</strong> And I'd say that plainly, because the correct first action is to
+          stop, not to investigate while the pipeline is waiting on an approval."</p>
+        <p>"Then I'd find out <em>which attribute</em> is forcing replacement. The plan tells you — Terraform
+          annotates the specific line with <code># forces replacement</code>. That one line is the whole
+          diagnosis."</p>
+        <p>"The usual causes, and they're all mundane:"</p>
+        <p>"<strong>A change to an immutable property.</strong> Some attributes can't be altered after creation — a
+          resource's name, its location, sometimes a SKU family or a network configuration. Azure has no update
+          operation for them, so the only way to reach the declared state is delete and create."</p>
+        <p>"<strong>A drifted value being corrected.</strong> Someone changed something in the portal that happens to
+          be immutable, so Terraform now sees a difference it can only resolve by replacing."</p>
+        <p>"<strong>A provider upgrade changing behaviour</strong> — a default that shifted, or an attribute that's
+          now handled differently. This is why pinning versions matters, and why a major provider bump gets its own
+          pull request rather than riding along with something else."</p>
+        <p>"<strong>A refactor.</strong> Renaming a resource or moving it into a module changes its
+          <em>address</em>, and Terraform reads that as 'the old one is gone, create a new one'. Nothing about the
+          infrastructure actually changed."</p>
+        <p>"<strong>What I'd do depends on which it is.</strong>"</p>
+        <p>"If it's a <strong>refactor</strong>, that's the easy one — a <code>moved</code> block tells Terraform the
+          resource's address changed without touching the resource. In older versions that was
+          <code>state mv</code>; the <code>moved</code> block is better because it's in code, reviewed, and applied by
+          the pipeline rather than run by hand."</p>
+        <p>"If it's <strong>drift</strong>, I'd decide which side is right. If the portal change was correct, bring it
+          into the configuration so the plan goes quiet. If it wasn't, then replacement might be genuinely
+          required — and that's a planned maintenance operation, not a deployment."</p>
+        <p>"If it's a <strong>genuinely immutable property that must change</strong>, then this is a migration, and
+          I'd treat it as one: provision the new resource alongside the old, migrate the data, verify, cut over, and
+          decommission afterwards. Never a single apply. That's usually
+          <code>create_before_destroy</code> in the lifecycle block, plus real steps for the data — and for a database
+          the data movement dominates the plan, not the Terraform."</p>
+        <p>"If it's a <strong>provider upgrade</strong>, I'd revert the upgrade, verify the plan is clean, then
+          upgrade separately and read the changelog. Isolating the variable is worth the extra cycle."</p>
+        <p>"Then the more important half: <strong>this shouldn't have been possible to apply by accident</strong>, so
+          I'd fix the guardrails."</p>
+        <p>"<strong><code>prevent_destroy</code> in a lifecycle block</strong> on the database. Then a plan that would
+          destroy it <em>errors</em> instead of proceeding. It's slightly inconvenient when you genuinely want to
+          replace something, and that inconvenience is the point."</p>
+        <p>"<strong>An Azure resource lock</strong> as a second layer, so even something outside Terraform can't
+          delete it."</p>
+        <p>"<strong>Automated plan inspection.</strong> <code>terraform show -json</code> makes the plan
+          machine-readable, so CI can fail the build on any <code>delete</code> action against a protected resource
+          type. That's mechanical rather than depending on a reviewer noticing — and a reviewer scanning a
+          200-line plan at 5pm will miss it."</p>
+        <p>"<strong>Plan output posted to the pull request</strong>, with a required check on destructive
+          operations. The plan is the review artefact, not the code diff — a one-line variable change can produce a
+          destroy, and nothing in the diff hints at it."</p>
+        <p>"And the structural point: <strong>state stored where it can't be corrupted, and backups verified</strong>,
+          because the mitigation of last resort for any destructive infrastructure change is a restore. If I can't
+          say confidently when the database was last successfully restored — not backed up, restored — then that's the
+          real finding here."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you stop rather than investigate mid-apply?</li>
+        <li>Do you know the plan names the forcing attribute?</li>
+        <li>Do you know <code>moved</code> blocks for refactors?</li>
+        <li>Do you treat a genuine replacement as a migration?</li>
+        <li>Do you add <code>prevent_destroy</code> and automated plan checks?</li>
+        <li>Do you mention verified restores?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> applying it because the plan said so.</li>
+        <li><span class="redflag">Red flag:</span> using <code>-target</code> to skip the database.</li>
+        <li><span class="redflag">Red flag:</span> fixing this instance with no guardrail added.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you migrate a database that genuinely must be replaced?</li>
+          <li>How do you enforce no-destroy in CI?</li>
+          <li>What does <code>create_before_destroy</code> do, and when does it not help?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

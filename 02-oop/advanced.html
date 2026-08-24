@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Advanced OOP &amp; Design Quality — Object-Oriented Programming</title>
+<meta name="description" content="Composition over inheritance, coupling and cohesion, immutability, object lifetime and Liskov substitution explained simply with C# examples.">
+<meta name="keywords" content="composition over inheritance aggregation association coupling cohesion immutability value object record object lifetime liskov substitution law of demeter anaemic domain model decorator">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="02-oop/advanced.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Advanced OOP &amp; Design Quality</h1>
+    <p class="subtitle">The layer past the four pillars: how objects relate, how designs rot, and what
+      makes code cheap to change.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>Inheritance is fixed at compile time and gives you everything. Composition is chosen at runtime
+        and gives you only what you asked for.</li>
+      <li><strong>Coupling</strong> = how much A must know about B. <strong>Cohesion</strong> = how related
+        the parts inside A are. Want: low coupling, high cohesion.</li>
+      <li>Liskov: a subclass must work anywhere the base works. No stricter inputs, no weaker guarantees,
+        no new exceptions.</li>
+      <li>Immutability kills a whole class of bugs — shared references, ordering bugs, thread safety.</li>
+      <li>Default immutable for <em>values</em>. Entities with a lifecycle stay mutable, but only through
+        methods that enforce the rules.</li>
+      <li>An <strong>anaemic domain model</strong> is fine for CRUD and a real problem for complex rules.
+        Know which one you're building.</li>
+    </ul>
+  </div>
+
+  <h2 id="composition">Composition over inheritance <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Inheritance</strong> = "my class <em>is</em> that thing, so it gets everything."</p>
+    <p><strong>Composition</strong> = "my class <em>has</em> that thing, and only uses what it needs."</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Inheritance is being born into a family — you get the whole surname, history and obligations, and you
+      can't pick which parts.</p>
+    <p>Composition is hiring specialists. You choose exactly who you need, you can swap them, and you can
+      hire two at once.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Use inheritance for <strong>"can be used instead of"</strong>. Use composition for
+      <strong>"reuses"</strong> or <strong>"varies"</strong>.</p>
+  </div>
+
+  <p>Everyone repeats the slogan. The reason behind it is what gets tested.</p>
+
+  <p><strong>Why inheritance is a heavy commitment:</strong></p>
+
+  <ul>
+    <li>You depend on the <em>whole</em> base class — public members, protected members, state, and its
+      unwritten behavioural rules.</li>
+    <li>That dependency is fixed at compile time. It can't vary per instance.</li>
+    <li>It's transitive. A change three levels up reaches you.</li>
+  </ul>
+
+  <p>That last point has a name: the <strong>fragile base class problem</strong>. A change that's correct in
+    isolation breaks subclasses that relied on the old behaviour — including behaviour nobody documented.</p>
+
+  <h3 id="comp-example">Watch inheritance fail</h3>
+
+  <p>Two report formats, two cross-cutting concerns. With inheritance:</p>
+
+  <pre data-label="csharp — bad: a class per combination" class="code-bad"><code class="language-csharp">public abstract class ReportGenerator             { public abstract byte[] Generate(); }
+public class PdfReport             : ReportGenerator { }
+public class CachedPdfReport       : PdfReport       { }   // caching
+public class LoggedPdfReport       : PdfReport       { }   // logging
+public class CachedLoggedPdfReport : CachedPdfReport { }   // both - logging duplicated
+public class ExcelReport           : ReportGenerator { }
+public class CachedExcelReport     : ExcelReport     { }   // caching duplicated</code></pre>
+
+  <p>Six classes already, with logging written twice and caching written twice. Add a third concern and
+    it's unmanageable.</p>
+
+  <p>The root error: you're using a <strong>single-axis</strong> mechanism to model
+    <strong>several independent axes</strong> (format × caching × logging).</p>
+
+  <h3 id="comp-fix">The composition version</h3>
+
+  <pre data-label="csharp — each concern written once" class="code-good"><code class="language-csharp">public interface IReportGenerator
+{
+    Task&lt;byte[]&gt; GenerateAsync(ReportRequest request, CancellationToken ct);
+}
+
+public sealed class PdfReportGenerator : IReportGenerator { /* just formatting */ }
+
+public sealed class CachingReportGenerator(IReportGenerator inner, IDistributedCache cache)
+    : IReportGenerator
+{
+    public async Task&lt;byte[]&gt; GenerateAsync(ReportRequest request, CancellationToken ct)
+    {
+        var key = request.CacheKey();
+        if (await cache.GetAsync(key, ct) is { } hit) return hit;
+
+        var bytes = await inner.GenerateAsync(request, ct);
+        await cache.SetAsync(key, bytes, ct);
+        return bytes;
+    }
+}</code></pre>
+
+  <p>Now caching exists once and wraps <em>anything</em> implementing the interface. Logging is another
+    wrapper. You compose them at registration:</p>
+
+  <pre data-label="csharp — composition happens in one place"><code class="language-csharp">services.AddScoped&lt;IReportGenerator&gt;(sp =&gt;
+    new LoggingReportGenerator(
+        new CachingReportGenerator(
+            new PdfReportGenerator(),
+            sp.GetRequiredService&lt;IDistributedCache&gt;()),
+        sp.GetRequiredService&lt;ILogger&lt;LoggingReportGenerator&gt;&gt;()));</code></pre>
+
+  <p>This is the <a href="../18-design-patterns/structural.html#decorator">Decorator pattern</a>, and it's
+    the best concrete answer to "give me an example of composition over inheritance".</p>
+
+  <p>You also get something inheritance can't give you: the composition is a <em>runtime</em> decision.
+    Caching in production, none in tests — no new classes.</p>
+
+  <div class="note compare">
+    <div class="note-title">Trade-off</div>
+    <p style="margin:0">Composition isn't free. More types, an extra frame in every stack trace, and the
+      wiring lives away from the logic. For a single implementation with no variation, a plain method or a
+      small base class is simpler and clearer.</p>
+  </div>
+
+  <h2 id="relationships">Association, aggregation, composition <span class="lvl lvl-b">🟢 Beginner</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <p>These come up in UML-flavoured questions. The thing that actually matters in code is
+    <strong>who owns the lifetime</strong>.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Relationship</th><th>Means</th><th>Lifetime</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td>Association</td><td>"uses" / "knows about"</td><td>Independent</td><td><code>Order.Customer</code> — the order didn't create the customer</td></tr>
+        <tr><td>Aggregation</td><td>"has-a", shared</td><td>Part outlives the whole</td><td><code>Team.Members</code> — deleting the team doesn't delete the people</td></tr>
+        <tr><td>Composition</td><td>"owns", exclusive</td><td>Part dies with the whole</td><td><code>Order.Lines</code> — a line means nothing without its order</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>This isn't academic. It maps directly onto
+    <a href="../19-architecture/ddd.html">aggregate design</a> and onto cascade-delete decisions in your
+    schema. If deleting the parent should delete the child, that's composition — and the child probably
+    shouldn't be reachable from elsewhere in the system.</p>
+
+  <h2 id="coupling-cohesion">Coupling and cohesion <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Coupling</strong> is <em>between</em> classes: how much A has to know about B.</p>
+    <p><strong>Cohesion</strong> is <em>inside</em> one class: how well its parts belong together.</p>
+    <p>You want <strong>low coupling, high cohesion</strong>.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Cohesion is how tidy one drawer is — a drawer of only cutlery is cohesive; the "junk drawer" isn't.</p>
+    <p>Coupling is how many drawers you must open to make one cup of tea. If it's five, something is wrong
+      with the kitchen.</p>
+  </div>
+
+  <h3 id="coupling">Coupling — worst to best</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Looks like</th><th>Why it hurts</th></tr></thead>
+      <tbody>
+        <tr><td>Content</td><td>One module reaches into another's internals</td><td>Nothing is safe to refactor</td></tr>
+        <tr><td>Common</td><td>Shared mutable static state</td><td>Invisible dependencies, order-dependent bugs, untestable</td></tr>
+        <tr><td>Control</td><td>Passing a flag that switches behaviour: <code>Process(order, isRush: true)</code></td><td>Caller must know the callee's branches. Usually two methods in disguise</td></tr>
+        <tr><td>Stamp</td><td>Passing a whole object when two fields would do</td><td>Couples you to a type you didn't need; harder to test</td></tr>
+        <tr><td>Data</td><td>Passing exactly what's needed</td><td>Fine — this is normal collaboration</td></tr>
+        <tr><td>Message</td><td>Talking via events, no direct reference</td><td>Loosest — but you pay in indirection and eventual consistency</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Two things worth saying in an interview:</p>
+
+  <ul>
+    <li><strong>Coupling isn't the enemy.</strong> A system with zero coupling does nothing. The goal is that
+      dependencies point at stable things, not volatile ones.</li>
+    <li><strong>"Loosely coupled" ≠ "has interfaces".</strong> If <code>IOrderService</code> has twelve
+      methods and one implementation, you haven't reduced coupling. You've added a file.</li>
+  </ul>
+
+  <h3 id="cohesion">Cohesion</h3>
+
+  <p>Cohesion asks whether the things inside a class belong together. Easy test:</p>
+
+  <blockquote>Do the methods use the same fields?</blockquote>
+
+  <p>If methods 1–4 touch fields A and B, and methods 5–9 touch C and D, that's two classes sharing a name.</p>
+
+  <p>The weakest form you'll meet constantly is the <code>Helpers</code> / <code>Utils</code> /
+    <code>Common</code> class. Its members share nothing but a namespace. It attracts more unrelated code
+    over time, everything ends up depending on it, and it becomes the hardest file in the codebase to change.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Connect cohesion to <strong>rate of change</strong>: things that change together
+      should live together. That's the real content of <a href="../03-solid/index.html#srp">SRP</a>, and it's
+      a much more useful test than "does this class do one thing" — which is unfalsifiable, because "one
+      thing" can be defined at any size you like.</p>
+  </div>
+
+  <h2 id="lsp">Liskov substitution, practically <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p>Formally: a subtype must be usable anywhere the base type is expected. In practice, three rules cover
+    almost every real violation:</p>
+
+  <ol class="steps">
+    <li><strong>Don't make the inputs stricter.</strong> If the base accepts any positive quantity, an
+      override that rejects over 100 breaks callers.</li>
+    <li><strong>Don't weaken the guarantees.</strong> If the base promises a saved entity has an ID, an
+      override that sometimes doesn't assign one breaks callers.</li>
+    <li><strong>Don't add new failure modes.</strong> Throwing <code>NotSupportedException</code> from an
+      inherited method is the obvious one.</li>
+  </ol>
+
+  <pre data-label="csharp — compiles fine, fails in production" class="code-bad"><code class="language-csharp">public class FileStorage
+{
+    // Contract: returns the stored file's URI. Throws only on IO failure.
+    public virtual Task&lt;Uri&gt; SaveAsync(Stream content, string name) =&gt; ...;
+}
+
+public class ReadOnlyArchiveStorage : FileStorage
+{
+    public override Task&lt;Uri&gt; SaveAsync(Stream content, string name)
+        =&gt; throw new NotSupportedException("Archive storage is read-only.");
+}</code></pre>
+
+  <p>Now correct code written against <code>FileStorage</code> blows up for one subtype — and only when
+    configuration happens to point at it.</p>
+
+  <p><strong>The fix is to stop pretending.</strong> Split the interface:</p>
+
+  <pre data-label="csharp — the compiler now prevents the mistake" class="code-good"><code class="language-csharp">public interface IReadableStorage { Task&lt;Stream&gt; ReadAsync(string name, CancellationToken ct); }
+public interface IWritableStorage { Task&lt;Uri&gt; SaveAsync(Stream content, string name, CancellationToken ct); }
+
+// The archive implements only IReadableStorage.
+// Code that needs to write can only be handed something that can write.</code></pre>
+
+  <p>That's Interface Segregation solving a Liskov problem. Worth pointing out in an interview — it shows
+    the SOLID principles interlock instead of being a list.</p>
+
+  <div class="note warn">
+    <div class="note-title">How to spot LSP violations in review</div>
+    <p style="margin:0">Look for <code>if (x is SomeSubclass)</code> at call sites, or a try/catch around a
+      polymorphic call. If callers have to know which concrete type they're holding, the abstraction has
+      stopped abstracting.</p>
+  </div>
+
+  <h2 id="immutability">Immutability <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="oneline"><b>One line:</b> if it can't change after construction, a whole category of bugs
+    becomes impossible.</div>
+
+  <p>What you get:</p>
+
+  <ul>
+    <li>No aliasing surprises — nobody can change your object behind your back.</li>
+    <li>No temporal coupling — no "you must call Initialize() first".</li>
+    <li>Thread-safe for free, no locking.</li>
+    <li>Validate once in the constructor, and an invalid instance can't exist anywhere.</li>
+  </ul>
+
+  <pre data-label="csharp — a value object as an immutable record"><code class="language-csharp">public readonly record struct Money(decimal Amount, string Currency)
+{
+    public Money
+    {
+        if (Amount &lt; 0) throw new ArgumentOutOfRangeException(nameof(Amount));
+        if (Currency?.Length != 3) throw new ArgumentException("ISO 4217 code required");
+    }
+
+    public Money Add(Money other)
+    {
+        if (other.Currency != Currency)
+            throw new InvalidOperationException($"Cannot add {other.Currency} to {Currency}.");
+        return this with { Amount = Amount + other.Amount };
+    }
+}</code></pre>
+
+  <p>Three things doing real work here:</p>
+
+  <ul>
+    <li>Validation in the constructor → an invalid <code>Money</code> can't exist.</li>
+    <li>Records give <strong>value equality</strong> free — two instances of 10 GBP are interchangeable,
+      which is exactly right for a value.</li>
+    <li>Currency mismatch is caught by the type, not by a caller remembering. That bug otherwise reaches
+      production as a silently wrong total.</li>
+  </ul>
+
+  <div class="note compare">
+    <div class="note-title">Trade-off</div>
+    <p style="margin:0">Every "change" allocates a new object. Trivial for small values —
+      <code>readonly record struct</code> avoids the heap entirely. It can matter for large graphs mutated
+      in a loop; there, use a mutable builder locally and freeze at the end. Entities with a real lifecycle
+      normally stay mutable, but only through methods that enforce the rules.</p>
+  </div>
+
+  <h2 id="lifetime">Object lifetime <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>The GC handles memory. What you have to think about is <em>how long an object should be useful</em> —
+    which in ASP.NET Core is the DI lifetime question.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lifetime</th><th>Means</th><th>The danger</th></tr></thead>
+      <tbody>
+        <tr><td>Transient</td><td>New instance every time it's resolved</td><td>Expensive if construction is costly</td></tr>
+        <tr><td>Scoped</td><td>One per request</td><td>Injecting it into a singleton captures it forever — the <strong>captive dependency</strong> bug</td></tr>
+        <tr><td>Singleton</td><td>One per application</td><td>Must be thread-safe. Must not hold per-request state</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Objects owning scarce resources — file handles, sockets, DB connections — need
+    <code>IDisposable</code> and <code>using</code>, because the GC gives you no timing guarantee. Details in
+    <a href="../05-csharp-advanced/memory-gc.html">memory &amp; GC</a> and
+    <a href="../06-dotnet-platform/hosting-di-config.html">DI lifetimes</a>.</p>
+
+  <h2 id="demeter">Law of Demeter <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <pre data-label="csharp — train wreck vs asking the object"><code class="language-csharp">// Coupled to Order, Customer, Address AND Country - four types in one line.
+var rate = TaxTable.For(order.Customer.Address.Country.Code);
+
+// The order answers a question about itself.
+var rate = order.TaxRate();</code></pre>
+
+  <p>The first version breaks if any link in the chain changes — including one becoming nullable.</p>
+
+  <p>The related smell is <strong>feature envy</strong>: a method that mostly manipulates another object's
+    data probably belongs on that object.</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Applying Demeter mechanically by adding wrappers like
+      <code>order.GetCustomerAddressCountryCode()</code>. That just moves the coupling and adds noise.
+      Move the <em>behaviour</em>, not the getters. (And note: LINQ and fluent APIs aren't violations —
+      they operate on values from the same object, not navigation through unrelated types.)</p>
+  </div>
+
+  <h2 id="anaemic">The anaemic domain model debate <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>Anaemic = entities are property bags, all the logic sits in service classes. Very common in .NET,
+    partly because ORMs and serializers push you that way.</p>
+
+  <p><strong>The honest position:</strong> it's a trade-off, not a universal error.</p>
+
+  <div class="vs-grid">
+    <div class="good">
+      <span class="vs-label">Anaemic is fine when</span>
+      <p>The logic is validation and mapping. CRUD apps, internal tools, reporting. A rich domain model
+        there is ceremony with no payoff.</p>
+    </div>
+    <div class="bad">
+      <span class="vs-label">Anaemic hurts when</span>
+      <p>There are real invariants and state machines — pricing, entitlements, policies, order lifecycles.
+        Rules get scattered, implemented three ways, and the entity can always be made invalid.</p>
+    </div>
+  </div>
+
+  <p>The tell that you chose wrong: services called <code>OrderManager</code> full of
+    <code>if (order.Status == ...)</code> checks repeated across files — and bugs whose fix is always
+    "we forgot to check X in this one path".</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Inheritance for substitutability; composition for reuse and variation.</li>
+      <li>The decorator example is the strongest concrete answer for "composition over inheritance".</li>
+      <li>Coupling should point at stable things. Interfaces alone don't reduce coupling.</li>
+      <li>Cohesion test: do the methods use the same fields? Change-together = live-together.</li>
+      <li>LSP violations announce themselves as type checks and try/catch at call sites.</li>
+      <li>Immutable for values, mutable-but-guarded for entities.</li>
+      <li>Anaemic models are a real choice — judge by how many invariants exist.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Deep hierarchies built for reuse.</strong> Understanding one method means opening five files.</li>
+    <li><strong><code>Utils</code> / <code>Helpers</code> classes.</strong> Zero cohesion, maximum inbound coupling.</li>
+    <li><strong>Boolean flag parameters</strong> that switch behaviour. Two well-named methods are almost always better.</li>
+    <li><strong>Passing whole entities</strong> to methods that need one field, coupling unrelated modules to your model.</li>
+    <li><strong>Shared mutable state across threads</strong> with no synchronisation — see <a href="../05-csharp-advanced/concurrency.html">concurrency</a>.</li>
+    <li><strong>An interface per class</strong>, reflexively, with no second implementation.</li>
+    <li><strong>Overriding <code>Equals</code> without <code>GetHashCode</code></strong>, so objects vanish from dictionaries.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>Why prefer composition over inheritance? Give a concrete example.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Because inheritance couples you to the whole base type, permanently, along one axis. Composition
+          lets you depend on only what you need and vary it at runtime."</p>
+        <p>"The failure I've actually hit is the combinatorial one. You have report formats — PDF, Excel, CSV
+          — and cross-cutting concerns like caching, logging and authorisation. With inheritance you get a
+          class per combination, and each concern gets implemented more than once, because a class can only
+          have one base."</p>
+        <p>"With composition each concern is a decorator implementing the same interface and wrapping an
+          inner instance. Caching is written once. They compose in any order at registration. And I can vary
+          it per environment — caching in production, none in tests — with no new types."</p>
+        <p>"The other reason is the fragile base class problem. Changing a base can break subclasses in ways
+          the compiler can't catch, because subclasses depend on implicit behaviour — what order methods call
+          each other in, what state is valid when a protected member runs. Composition has no hidden
+          contract; you only depend on the published interface."</p>
+        <p>"I wouldn't state it as absolute, though. Inheritance is right when you need real substitutability,
+          when a framework requires it, or for template method where a base owns the algorithm. My rule is:
+          inheritance for 'can be used instead of', composition for 'reuses' or 'varies'."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you give a concrete example rather than the slogan?</li>
+        <li>Do you know the fragile base class problem by mechanism?</li>
+        <li>Do you still know when inheritance is right?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "inheritance is bad" with no counter-case.</li>
+        <li><span class="redflag">Red flag:</span> "composition is more flexible" with no example of that mattering.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you register a decorator chain in the built-in .NET DI container?</li>
+          <li>What's the downside of five decorators wrapping one service?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is tight coupling, and how would you find it in a codebase you just joined?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Tight coupling means one component depends on another's details, so changing one forces changing
+          the other. The versions that hurt most are depending on concrete types you can't substitute,
+          shared mutable static state, and reaching through object graphs into things you were never given."</p>
+        <p>"Joining a codebase, the fastest signal is the tests. If a unit test needs a database or fifteen
+          lines of mock setup to construct one class, that class is tightly coupled — the test is telling
+          you what the real dependencies are."</p>
+        <p>"Other quick tells: static access to <code>DateTime.Now</code> or a service locator, because those
+          are dependencies that don't appear in any signature. Constructors with more than about five
+          parameters, which usually means several responsibilities. And long navigation chains."</p>
+        <p>"For fixing it I'd be strategic rather than exhaustive. Coupling only costs you where change
+          happens, so I'd look at which files change most and which areas generate defects, and start there.
+          The first moves are usually safe and mechanical: inject hidden dependencies, replace static state
+          with an abstraction, pass the data a method needs instead of whole objects."</p>
+        <p>"I'd also avoid over-correcting. Adding an interface for everything isn't decoupling. If there's
+          one implementation and no seam anyone needs, you've added indirection without removing a
+          dependency. My test is whether the abstraction lets something actually vary — a second
+          implementation, a simpler test double, or a boundary you want to defend."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you diagnose from evidence, or assert principles?</li>
+        <li>Do you prioritise by change frequency?</li>
+        <li>Do you know interfaces aren't automatically decoupling?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you make <code>DateTime.Now</code> testable without an interface for everything?</li>
+          <li>Is a shared DTO between two services coupling? Does it matter?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you make a type immutable, and when would you not?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I default to immutable for anything value-like — money, date ranges, addresses, IDs, config,
+          DTOs, anything crossing a thread boundary."</p>
+        <p>"The reasons are concrete. Nobody can change it underneath me, which removes a whole class of
+          aliasing bugs. It's thread-safe with no locking. It can be cached and shared safely. And
+          validating in the constructor means an invalid instance can't exist anywhere, so I check once
+          instead of defensively everywhere."</p>
+        <p>"Where I wouldn't is entities with identity and a lifecycle. An Order exists over time and moves
+          through states. Making a new object per change means updating every reference, and it fights the
+          ORM, which tracks identity and mutation. There I'd keep it mutable but only through methods that
+          enforce the rules."</p>
+        <p>"I'd also skip it where the cost is real — building a large structure in a loop, or a hot path
+          where per-iteration allocation shows up in a profile. The answer there is a mutable builder that
+          produces an immutable result, or <code>readonly record struct</code> for small values so there's
+          no heap allocation at all."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you name the specific bug classes it removes?</li>
+        <li>Do you know its cost and the builder escape hatch?</li>
+        <li>Do you distinguish values from entities?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does <code>with</code> actually do — deep or shallow copy?</li>
+          <li>Is a record with a <code>List&lt;T&gt;</code> property immutable?</li>
+          <li>Why does <code>readonly record struct</code> matter for performance?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Is an anaemic domain model an anti-pattern? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It depends on how much behaviour the domain actually has, and I'd push back on treating it as
+          universally wrong."</p>
+        <p>"For a system whose logic is validation, mapping and CRUD — a lot of internal tooling is like
+          this — entities as data plus straightforward services is simpler and maps cleanly onto the ORM
+          and the API contracts. Forcing a rich domain model there adds ceremony with no benefit."</p>
+        <p>"Where it genuinely breaks down is systems with real invariants and state transitions — pricing,
+          entitlements, insurance policies, order lifecycles. Then the rules live in services, so the same
+          rule ends up written three ways with subtle differences, and the entity can always be put into an
+          invalid state because nothing owns its consistency. The bugs have a recognisable shape: 'we forgot
+          to check the status in this one path'."</p>
+        <p>"So the question I ask is: are there rules that must hold no matter which code path touches this?
+          If yes, they belong on the object, because that's the only place they can't be bypassed. And it's
+          not binary — most real systems are anaemic in the CRUD areas and rich in the two or three places
+          where the actual complexity lives. That's a reasonable outcome, not an inconsistency to fix."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you hold nuanced positions, or repeat received opinions?</li>
+        <li>Can you name the specific failure mode instead of saying "it's not OO"?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "yes, always, you should use DDD" — dogma with no cost analysis.</li>
+        <li><span class="redflag">Red flag:</span> not knowing the term.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you keep a rich domain model working with EF Core?</li>
+          <li>Where does validation live — the entity, the request model, or both?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

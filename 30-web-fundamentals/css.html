@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSS — Web Fundamentals</title>
+<meta name="description" content="Box model, flexbox and grid, specificity and the cascade, stacking contexts, responsive design, and what causes layout thrashing.">
+<meta name="keywords" content="CSS box model box-sizing flexbox grid specificity cascade inheritance BEM CSS variables custom properties media query mobile first z-index stacking context position sticky transform animation performance">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="30-web-fundamentals/css.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>CSS</h1>
+    <p class="subtitle">Nobody expects you to recall every property. They expect you to know which layout system
+      to reach for and why your <code>z-index</code> isn't working.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong><code>box-sizing: border-box</code></strong> — set it globally and stop fighting the box
+        model.</li>
+      <li><strong>Flexbox for one dimension, Grid for two.</strong> That's the whole decision.</li>
+      <li><strong>Specificity:</strong> inline &gt; id &gt; class &gt; element. <code>!important</code> beats
+        all of it and is a smell.</li>
+      <li><strong><code>z-index</code> only works on positioned elements</strong>, and only within its stacking
+        context.</li>
+      <li><strong>Mobile-first with <code>min-width</code></strong> queries.</li>
+      <li><strong>Animate <code>transform</code> and <code>opacity</code></strong> — everything else costs
+        layout or paint.</li>
+      <li><strong>Custom properties are runtime values</strong>, unlike Sass variables.</li>
+    </ul>
+  </div>
+
+  <h2 id="box-model">The box model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="css — the one rule to set on every project" class="code-good"><code class="language-css">*, *::before, *::after {
+  box-sizing: border-box;
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>content-box</code> (default)</th><th><code>border-box</code></th></tr></thead>
+      <tbody>
+        <tr><td><code>width: 200px</code> means</td><td>The <strong>content</strong> is 200px</td><td>The <strong>whole box</strong> is 200px</td></tr>
+        <tr><td>Plus 20px padding</td><td>Total becomes <strong>240px</strong></td><td>Still 200px; content shrinks</td></tr>
+        <tr><td>Plus a 2px border</td><td>Total becomes <strong>244px</strong></td><td>Still 200px</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Why this matters</span>
+    <p>With the default <code>content-box</code>, two elements at <code>width: 50%</code> with any padding
+      <strong>no longer fit side by side</strong> — the padding pushes the total over 100%.</p>
+    <p><code>border-box</code> makes width mean what you'd expect, so layouts compose predictably. It's the
+      first thing in nearly every CSS reset for exactly this reason.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Margin collapse — the other box-model surprise</div>
+    <p style="margin:0">Adjacent vertical margins <strong>collapse to the larger of the two</strong>, not the
+      sum. A 20px bottom margin next to a 30px top margin gives 30px of space, not 50px.
+      <br><br>
+      Worse, a parent with no padding or border collapses with its first and last child's margins, so a child's
+      top margin can appear to push the <em>parent</em> down.
+      <br><br>
+      Horizontal margins never collapse. Flex and grid items don't collapse either — which is one reason
+      <code>gap</code> in a flex or grid container is more predictable than margins for spacing.</p>
+  </div>
+
+  <h2 id="layout">Flexbox or Grid <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The decision in one line</span>
+    <p><strong>Flexbox lays out along one axis. Grid lays out along two.</strong></p>
+    <p>A toolbar, a nav row, centring something, a stack of cards that wrap — <strong>flex</strong>.</p>
+    <p>A page layout with rows <em>and</em> columns that need to align both ways — <strong>grid</strong>.</p>
+  </div>
+
+  <pre data-label="css — flexbox: distribute along one axis"><code class="language-css">.toolbar {
+  display: flex;
+  align-items: center;        /* cross axis  - vertical here */
+  justify-content: space-between;  /* main axis - horizontal here */
+  gap: 12px;                  /* replaces margin hacks entirely */
+  flex-wrap: wrap;            /* allow wrapping on narrow screens */
+}
+
+.toolbar .spacer { flex: 1; }   /* grow to fill remaining space */</code></pre>
+
+  <pre data-label="css — grid: two-dimensional, named areas"><code class="language-css">.page {
+  display: grid;
+  grid-template-columns: 240px 1fr;      /* sidebar + fluid content */
+  grid-template-rows: auto 1fr auto;
+  grid-template-areas:
+    "header  header"
+    "sidebar main"
+    "footer  footer";
+  min-height: 100vh;
+  gap: 16px;
+}
+.page > header  { grid-area: header; }
+.page > nav     { grid-area: sidebar; }
+.page > main    { grid-area: main; }</code></pre>
+
+  <pre data-label="css — responsive cards with no media query at all" class="code-good"><code class="language-css">.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+/* Fits as many 280px-minimum columns as will fit, then wraps.
+   Adapts at every width without a single breakpoint. */</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The <code>auto-fill</code> / <code>minmax</code> pattern is worth memorising</div>
+    <p style="margin:0">That single declaration replaces a stack of media queries for card grids, and it responds
+      to the <em>container</em> rather than the viewport width when combined with container queries.
+      <br><br>
+      <code>auto-fill</code> keeps empty tracks; <code>auto-fit</code> collapses them, so a single card
+      stretches to full width with <code>auto-fit</code> and stays 280px with <code>auto-fill</code>. That's the
+      difference people trip over.
+      <br><br>
+      Mentioning this is a good practical signal, because it shows you write modern CSS rather than
+      media-query-per-breakpoint CSS.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Centring, which used to be the joke</div>
+    <pre data-label="css"><code class="language-css">/* Both axes, two lines */
+.parent { display: grid; place-items: center; }
+
+/* Or with flex */
+.parent { display: flex; align-items: center; justify-content: center; }</code></pre>
+    <p style="margin:0">Worth knowing because interviewers occasionally ask it as a warm-up, and because the old
+      answers — absolute positioning with negative margins, table-cell hacks — still appear in legacy
+      stylesheets you'll have to maintain.</p>
+  </div>
+
+  <h2 id="specificity">The cascade and specificity <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Selector</th><th>Specificity</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td>Inline style</td><td><strong>1,0,0,0</strong></td><td><code>style="color: red"</code></td></tr>
+        <tr><td>ID</td><td>0,1,0,0</td><td><code>#header</code></td></tr>
+        <tr><td>Class, attribute, pseudo-class</td><td>0,0,1,0</td><td><code>.btn</code>, <code>[disabled]</code>, <code>:hover</code></td></tr>
+        <tr><td>Element, pseudo-element</td><td>0,0,0,1</td><td><code>div</code>, <code>::before</code></td></tr>
+        <tr><td><code>*</code>, combinators</td><td>0,0,0,0</td><td><code>*</code>, <code>&gt;</code>, <code>+</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">The resolution order</span>
+    <ol>
+      <li><strong><code>!important</code></strong> wins over everything normal.</li>
+      <li>Otherwise, <strong>higher specificity</strong> wins.</li>
+      <li>On a tie, <strong>whichever comes later</strong> in the stylesheet wins.</li>
+    </ol>
+    <p>Note that <code>0,1,0,0</code> beats <code>0,0,9,0</code> — one ID outranks any number of classes.
+      Specificity doesn't carry.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Why <code>!important</code> is a genuine problem, not a style preference</div>
+    <p style="margin:0">It doesn't just win — it <strong>removes your ability to override later</strong>. The
+      only way to beat an <code>!important</code> is another <code>!important</code> with higher specificity, so
+      one use tends to breed more.
+      <br><br>
+      The typical trajectory: someone adds it to fix a specificity conflict, the next person can't override it
+      so adds their own, and within a year the stylesheet has hundreds and normal cascade rules no longer
+      predict anything.
+      <br><br>
+      The legitimate uses are narrow: overriding a third-party stylesheet you don't control, and utility classes
+      that are meant to be unconditional. Everything else is a signal that selectors have grown too specific —
+      and the fix is <em>lowering</em> specificity elsewhere, not raising it here.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Modern tools for managing specificity</div>
+    <p style="margin:0"><code>:where()</code> has <strong>zero specificity</strong>, so
+      <code>:where(.a, .b) p</code> matches the same elements as <code>.a p, .b p</code> but is trivially
+      overridable. Ideal for base and reset styles.
+      <br><br>
+      <code>:is()</code> matches the same way but takes the specificity of its most specific argument.
+      <br><br>
+      <strong>Cascade layers</strong> (<code>@layer</code>) let you declare precedence explicitly — reset, then
+      base, then components, then utilities — so a low-specificity utility can still beat a high-specificity
+      component selector. That's a much better tool than <code>!important</code> for the problem it usually
+      solves.</p>
+  </div>
+
+  <h2 id="stacking">Why <code>z-index</code> isn't working <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The two reasons, and it's almost always one of them</span>
+    <ol>
+      <li><strong><code>z-index</code> only applies to positioned elements</strong> — anything except
+        <code>position: static</code>, plus flex and grid items.</li>
+      <li><strong>It's only compared within the same stacking context.</strong> A child can never escape its
+        parent's context, no matter how large its <code>z-index</code>.</li>
+    </ol>
+  </div>
+
+  <pre data-label="css — the classic confusion" class="code-bad"><code class="language-css">.modal-overlay { position: fixed; z-index: 9999; }
+
+.header {
+  position: relative;
+  z-index: 10;
+  transform: translateZ(0);   /* creates a stacking context! */
+}
+.header .dropdown { position: absolute; z-index: 99999; }
+
+/* The dropdown can NEVER appear above the modal.
+   It's trapped inside .header's stacking context, which sits at z-index 10.
+   99999 only competes with siblings INSIDE .header. */</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>These create a stacking context</th></tr></thead>
+      <tbody>
+        <tr><td><code>position: relative/absolute</code> with a <code>z-index</code> other than <code>auto</code></td></tr>
+        <tr><td><code>position: fixed</code> or <code>sticky</code> — always</td></tr>
+        <tr><td><strong><code>transform</code>, <code>filter</code>, <code>perspective</code></strong> — any non-<code>none</code> value</td></tr>
+        <tr><td><code>opacity</code> less than 1</td></tr>
+        <tr><td><code>will-change</code>, <code>contain: paint</code>, <code>isolation: isolate</code></td></tr>
+        <tr><td>Flex or grid items with a <code>z-index</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the transform/opacity surprise</div>
+    <p style="margin:0">The non-obvious entries are <strong><code>transform</code> and
+      <code>opacity</code></strong>. Adding a hover animation or a fade to a container silently creates a
+      stacking context, and suddenly a dropdown that worked stops escaping it.
+      <br><br>
+      That's a genuinely baffling bug — a change that looks purely visual breaks layering elsewhere — and
+      knowing the cause immediately is a strong practical signal.
+      <br><br>
+      The structural fix for overlays is to <strong>not nest them</strong>: render modals, tooltips and dropdowns
+      at the document root via a portal, which every framework provides. Then there's no ancestor context to
+      escape. Trying to win with bigger numbers is the wrong approach — it can't work.
+      <br><br>
+      And keep <code>z-index</code> values to a small documented scale — 10, 20, 30 — rather than 9999.
+      Escalating numbers is a symptom of not understanding contexts.</p>
+  </div>
+
+  <h2 id="responsive">Responsive design <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="css — mobile-first" class="code-good"><code class="language-css">/* Base: the narrowest case, no media query */
+.container { padding: 16px; }
+
+/* Then progressively enhance upward */
+@media (min-width: 768px)  { .container { padding: 24px; } }
+@media (min-width: 1200px) { .container { padding: 32px; max-width: 1200px; } }</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why mobile-first rather than desktop-first</div>
+    <p style="margin:0">With <code>min-width</code> queries, the base styles are the simplest case and each
+      breakpoint <em>adds</em>. With <code>max-width</code> you're overriding downward, which means more
+      declarations and more specificity conflicts.
+      <br><br>
+      It also fails better: an unsupported or unmatched query leaves you with the mobile layout, which is usable
+      on any screen. Desktop-first leaves a mobile user with a desktop layout, which isn't.
+      <br><br>
+      Practical point: <strong>choose breakpoints from where your content breaks</strong>, not from device
+      names. Chasing specific phone widths is a losing game.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Modern responsive tools worth knowing</div>
+    <p style="margin:0"><strong><code>clamp()</code></strong> for fluid values without breakpoints:
+      <code>font-size: clamp(1rem, 2.5vw, 1.5rem)</code> — a minimum, a preferred scaling value, and a
+      maximum.
+      <br><br>
+      <strong>Container queries</strong> (<code>@container</code>) respond to the <em>parent's</em> width rather
+      than the viewport's. That's the genuinely significant addition, because a card component can adapt based on
+      the space it's actually given — so the same component works in a sidebar and in a full-width area without
+      knowing where it is. Media queries never solved that.
+      <br><br>
+      <strong><code>dvh</code></strong> instead of <code>vh</code> on mobile, because <code>100vh</code> includes
+      the area behind the browser's collapsing address bar and causes the classic "content cut off at the bottom"
+      bug on iOS.</p>
+  </div>
+
+  <h2 id="variables">Custom properties <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="css — runtime values, not compile-time" class="code-good"><code class="language-css">:root {
+  --color-primary: #2563eb;
+  --spacing: 8px;
+}
+
+.card { padding: calc(var(--spacing) * 2); border-color: var(--color-primary); }
+
+/* Overridable per scope - impossible with Sass variables */
+.card--danger { --color-primary: #dc2626; }
+
+/* And changeable at runtime */
+@media (prefers-color-scheme: dark) {
+  :root { --color-primary: #60a5fa; }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>CSS custom property</th><th>Sass variable</th></tr></thead>
+      <tbody>
+        <tr><td>Exists at</td><td><strong>Runtime</strong></td><td>Compile time only</td></tr>
+        <tr><td>Inherits</td><td><strong>Yes</strong>, down the tree</td><td>No — lexical scope</td></tr>
+        <tr><td>Changeable from JS</td><td><strong>Yes</strong> — <code>setProperty</code></td><td>No</td></tr>
+        <tr><td>Overridable per selector</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Usable in media query conditions</td><td>No</td><td>Yes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The practical consequence</div>
+    <p style="margin:0">Custom properties inherit and cascade, which makes <strong>theming</strong> genuinely
+      easy — redefine a handful of variables on <code>:root</code> or on a container, and everything inside
+      updates, including at runtime with no rebuild.
+      <br><br>
+      That's why dark mode is now a few variable overrides rather than a parallel stylesheet.
+      <br><br>
+      They're not a replacement for Sass variables in every case — you still can't use a custom property inside
+      a media query condition — but for anything that might vary per component or per theme, they're the right
+      tool.</p>
+  </div>
+
+  <h2 id="performance">CSS performance <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Changing this</th><th>Triggers</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><code>width</code>, <code>height</code>, <code>top</code>, <code>margin</code></td><td><strong>Layout → paint → composite</strong></td><td>Most expensive</td></tr>
+        <tr><td><code>color</code>, <code>background</code>, <code>box-shadow</code></td><td>Paint → composite</td><td>Moderate</td></tr>
+        <tr><td><strong><code>transform</code>, <code>opacity</code></strong></td><td><strong>Composite only</strong></td><td><strong>Cheapest — GPU</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="css — animate the cheap properties" class="code-good"><code class="language-css">/* Stutters - reflows the whole document on every frame */
+.bad { transition: left 200ms; }
+
+/* Smooth - composited, no layout */
+.good { transition: transform 200ms; }
+.good:hover { transform: translateX(10px); }</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Layout thrashing — the JavaScript side of this</div>
+    <pre data-label="javascript" class="code-bad"><code class="language-javascript">// Forces a synchronous layout on EVERY iteration
+items.forEach(el =&gt; {
+  el.style.height = el.offsetHeight + 10 + 'px';   // read, then write, then read...
+});</code></pre>
+    <pre data-label="javascript — batch reads, then writes" class="code-good"><code class="language-javascript">const heights = items.map(el =&gt; el.offsetHeight);        // all reads
+items.forEach((el, i) =&gt; el.style.height = heights[i] + 10 + 'px');  // all writes</code></pre>
+    <p style="margin:0">Reading a layout property such as <code>offsetHeight</code>,
+      <code>getBoundingClientRect</code> or <code>scrollTop</code> forces the browser to flush pending style
+      changes and recalculate layout <em>synchronously</em>.
+      <br><br>
+      Interleaving reads and writes means that happens on every iteration. Batching gives you one layout
+      pass.
+      <br><br>
+      This is one of the most common causes of janky scroll and resize handlers, and it's invisible in the CSS —
+      you have to look at the JavaScript.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title"><code>will-change</code> is not a general speed-up</div>
+    <p style="margin:0">It hints that a property will animate, so the browser can promote the element to its own
+      layer in advance.
+      <br><br>
+      Applied broadly it <strong>hurts</strong> — each layer consumes memory, and too many layers slow
+      compositing down. It also creates a stacking context, which can break <code>z-index</code> as above.
+      <br><br>
+      Use it on the specific element about to animate, ideally added just before and removed after. Adding
+      <code>will-change: transform</code> to everything is a recognisable sign of cargo-culted optimisation.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li><code>box-sizing: border-box</code> globally, always.</li>
+      <li>Margins collapse vertically; <code>gap</code> in flex/grid is more predictable.</li>
+      <li>Flex for one axis, Grid for two. <code>auto-fill</code>/<code>minmax</code> replaces card
+        breakpoints.</li>
+      <li>One ID beats any number of classes. <code>!important</code> removes your ability to override.</li>
+      <li><code>:where()</code> and <code>@layer</code> are the modern answers to specificity wars.</li>
+      <li><code>z-index</code> needs positioning and only competes within its stacking context.</li>
+      <li><code>transform</code> and <code>opacity</code> create stacking contexts — the surprising cause of
+        layering bugs.</li>
+      <li>Portal overlays to the root rather than fighting with numbers.</li>
+      <li>Mobile-first <code>min-width</code>; breakpoints from content, not devices.</li>
+      <li>Custom properties are runtime and inherit; Sass variables are compile-time.</li>
+      <li>Animate <code>transform</code>/<code>opacity</code>; batch DOM reads before writes.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Not setting <code>border-box</code></strong>, then fighting percentage widths.</li>
+    <li><strong><code>!important</code> to win a specificity fight.</strong></li>
+    <li><strong>Escalating <code>z-index</code> values</strong> instead of understanding stacking contexts.</li>
+    <li><strong>Grid for a single-axis layout</strong>, or flex for a genuine two-axis one.</li>
+    <li><strong>Desktop-first <code>max-width</code> queries.</strong></li>
+    <li><strong>Breakpoints named after devices.</strong></li>
+    <li><strong>Animating <code>left</code>, <code>width</code> or <code>margin</code>.</strong></li>
+    <li><strong>Interleaved DOM reads and writes.</strong></li>
+    <li><strong><code>will-change</code> applied broadly.</strong></li>
+    <li><strong><code>100vh</code> on mobile</strong>, causing cut-off content.</li>
+    <li><strong>Deeply nested selectors</strong> that are impossible to override.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>My <code>z-index: 9999</code> isn't working. Why? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Almost certainly one of two things, and the second is the interesting one."</p>
+        <p>"<strong>The element isn't positioned.</strong> <code>z-index</code> has no effect on
+          <code>position: static</code>, which is the default. It needs <code>relative</code>,
+          <code>absolute</code>, <code>fixed</code> or <code>sticky</code> — or to be a flex or grid item. So
+          the property is simply being ignored."</p>
+        <p>"<strong>Or it's trapped in a stacking context.</strong> This is the usual cause when the value looks
+          absurdly high. <code>z-index</code> is only compared against <em>siblings within the same stacking
+          context</em>. If an ancestor creates a context, the child can never escape it — a child with
+          <code>z-index: 99999</code> inside a parent at <code>z-index: 10</code> still sits at the parent's
+          level relative to everything outside. The big number only competes inside that box."</p>
+        <p>"The part that catches people is <strong>what creates a stacking context</strong>. Obviously
+          <code>position: fixed</code> and <code>sticky</code> do. But so do <strong><code>transform</code>,
+          <code>filter</code>, <code>opacity</code> below 1, <code>will-change</code>, and
+          <code>contain</code></strong>."</p>
+        <p>"That produces genuinely confusing bugs: someone adds a hover animation or a fade transition to a
+          header — a purely visual change — and a dropdown inside it stops appearing above the page content.
+          Nothing about the dropdown changed. The <code>transform</code> created a context around it."</p>
+        <p>"To diagnose, I'd walk up the DOM in DevTools looking at computed styles for any of those properties
+          on ancestors. That finds it quickly once you know what you're looking for."</p>
+        <p>"The fix depends on which it is. If the element just isn't positioned, add
+          <code>position: relative</code>. If it's a stacking context problem, then <strong>increasing the
+          number cannot work</strong> — the structural answer is to render the overlay outside the offending
+          ancestor. Every framework has a portal mechanism for exactly this: React's
+          <code>createPortal</code>, Angular's CDK overlay. Render modals, tooltips and dropdowns at the document
+          root and there's no ancestor context to escape."</p>
+        <p>"I'd also push back on <code>9999</code> generally. Escalating values are a symptom of not
+          understanding contexts, and they make the layering unpredictable for the next person. I'd use a small
+          documented scale — 10 for dropdowns, 20 for sticky headers, 30 for modals — defined as custom
+          properties so it's visible in one place."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>z-index</code> needs positioning?</li>
+        <li>Do you understand stacking contexts and containment?</li>
+        <li>Do you know <code>transform</code> and <code>opacity</code> create them?</li>
+        <li>Do you reach for portals rather than bigger numbers?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "try a higher number."</li>
+        <li><span class="redflag">Red flag:</span> no mention of stacking contexts.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does a portal solve it?</li>
+          <li>What's <code>isolation: isolate</code> for?</li>
+          <li>How would you structure z-index across a design system?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Flexbox or Grid — how do you choose? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The short version: <strong>Flexbox is one-dimensional, Grid is two-dimensional.</strong> Flex lays
+          items out along a single axis and lets them wrap; Grid defines rows <em>and</em> columns that align in
+          both directions."</p>
+        <p>"So a toolbar, a nav bar, a row of buttons, centring something, or a form row — Flexbox. It's also
+          better when the item sizes should be driven by their content, because <code>flex-grow</code> and
+          <code>flex-basis</code> distribute available space based on what's there."</p>
+        <p>"A page shell with a header, sidebar, main area and footer — Grid, because those need to align across
+          both axes. <code>grid-template-areas</code> makes that layout readable in the CSS itself, which is a
+          real maintainability benefit."</p>
+        <p>"The useful way I'd frame the distinction: <strong>Grid is layout-first, Flex is
+          content-first.</strong> With Grid you define the structure and place items into it. With Flex the
+          items' own sizes determine the outcome."</p>
+        <p>"And they compose — Grid for the page skeleton, Flex inside individual cells for the local
+          arrangement. That's the normal shape of a real layout, not an either/or choice."</p>
+        <p>"One specific pattern I'd reach for: <code>grid-template-columns: repeat(auto-fill, minmax(280px,
+          1fr))</code> for a card grid. That fits as many columns of at least 280px as will fit and wraps
+          automatically — replacing three or four media queries with one line. <code>auto-fit</code> collapses
+          empty tracks so a single card stretches full width; <code>auto-fill</code> keeps them so it stays
+          280px. That distinction catches people out."</p>
+        <p>"Practical note on spacing: <strong><code>gap</code> works in both</strong> and is much better than
+          margins, because you don't need <code>:last-child</code> exceptions and flex/grid items don't have
+          margin collapse to reason about."</p>
+        <p>"On support — both are universally available now. Grid's <code>subgrid</code> is the only piece
+          that's relatively recent, so if I needed nested alignment across a parent grid I'd check that
+          specifically. Otherwise there's no compatibility reason to prefer one."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the one-axis versus two-axis distinction?</li>
+        <li>Do you know they compose rather than compete?</li>
+        <li>Do you know a modern responsive pattern?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does <code>flex: 1</code> expand to?</li>
+          <li>What's the difference between <code>auto-fill</code> and <code>auto-fit</code>?</li>
+          <li>What are container queries for?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Tools for Engineers — AI-Assisted Development</title>
+<meta name="description" content="Where AI assistance genuinely helps, where it fails, how to review generated code, and how to talk about it credibly in an interview.">
+<meta name="keywords" content="AI assisted development Claude Code Copilot Cursor code review of generated code prompting for engineers context window agents verification hallucination security of AI code productivity claims team practice">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="33-ai-tools/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>AI Tools for Engineers</h1>
+    <p class="subtitle">Interviewers now ask about this. The answer that lands is specific about where it helps,
+      honest about where it doesn't, and clear that you own the output.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>You own the code you commit</strong>, regardless of what produced it.</li>
+      <li><strong>Strongest at well-specified, verifiable work</strong> — tests, migrations, boilerplate.</li>
+      <li><strong>Weakest where correctness depends on context it can't see</strong> — your domain, your
+        constraints.</li>
+      <li><strong>Confident and wrong is the failure mode</strong>, not confused and wrong.</li>
+      <li><strong>Context is the main lever.</strong> Vague prompt, generic answer.</li>
+      <li><strong>Review generated code harder</strong>, not less — you didn't build a mental model writing
+        it.</li>
+      <li><strong>Never paste secrets or customer data</strong> into a tool.</li>
+      <li><strong>Verification has to be independent</strong> of the thing that generated the code.</li>
+    </ul>
+  </div>
+
+  <h2 id="where">Where it genuinely helps <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Task</th><th>Why it works well</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Unit and integration tests for existing code</strong></td><td>The specification is the code; the test either passes or fails</td></tr>
+        <tr><td><strong>Boilerplate</strong> — DTOs, mappers, validators, configuration</td><td>Mechanical, high volume, easy to check</td></tr>
+        <tr><td><strong>Mechanical refactors across many files</strong></td><td>Repetitive, and the compiler verifies most of it</td></tr>
+        <tr><td><strong>Explaining unfamiliar code</strong></td><td>Faster than reading it cold; you verify against the source</td></tr>
+        <tr><td><strong>A first draft of something you'll rewrite</strong></td><td>Beats a blank file; you're going to review it anyway</td></tr>
+        <tr><td><strong>Regex, SQL, KQL, YAML syntax</strong></td><td>Fiddly, easily tested, quick to check</td></tr>
+        <tr><td><strong>Migration scaffolding</strong></td><td>You review the generated SQL regardless</td></tr>
+        <tr><td><strong>Rubber-ducking a design</strong></td><td>Surfaces considerations you'd otherwise reach later</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the pattern is "verifiable output", not "easy task"</div>
+    <p style="margin:0">The useful predictor isn't difficulty. It's <strong>whether you can cheaply tell if the
+      output is right</strong>.
+      <br><br>
+      A complex EF Core query is a good candidate despite being hard, because you can read the generated SQL and
+      check the execution plan. A three-line business rule is a poor candidate despite being trivial, because
+      whether it's correct depends on domain knowledge the tool doesn't have — and it will produce something
+      plausible either way.
+      <br><br>
+      That reframes the question. Not "is this too hard for AI?" but <strong>"if this is subtly wrong, will I find
+      out?"</strong> If the answer is a compiler error, a failing test or a readable diff, generation is low-risk. If
+      the answer is "a customer notices in three weeks", it isn't.
+      <br><br>
+      Which is also why <strong>test generation is the highest-value use</strong> and needs a caveat: tests
+      generated <em>from</em> the implementation encode what the code does, including its bugs. They're excellent for
+      covering edge cases you hadn't considered, and they don't verify intent. So generate tests from the
+      requirement where you can, and always read what the test actually asserts.</p>
+  </div>
+
+  <h2 id="where-not">Where it fails <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Failure</th><th>What it looks like</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Invented APIs</strong></td><td>A method that doesn't exist, or a parameter from a different version</td></tr>
+        <tr><td><strong>Version drift</strong></td><td>Patterns from .NET Framework or old EF Core applied to current code</td></tr>
+        <tr><td><strong>Plausible-but-wrong concurrency</strong></td><td>Code that looks right and races under load</td></tr>
+        <tr><td><strong>Missing your constraints</strong></td><td>Ignores the multi-tenant filter, the audit requirement, the rate limit</td></tr>
+        <tr><td><strong>Local optimum</strong></td><td>Solves the immediate ask, worsens the design</td></tr>
+        <tr><td><strong>Confident wrongness</strong></td><td><strong>No signal that it's uncertain</strong></td></tr>
+        <tr><td><strong>Silent scope creep</strong></td><td>Changes more than you asked, in ways the diff hides</td></tr>
+        <tr><td><strong>Security defaults</strong></td><td>String-concatenated SQL, disabled validation, over-broad CORS</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Confident wrongness is the real risk, not obvious errors</div>
+    <p style="margin:0">Obviously broken output is harmless — it doesn't compile, or it's clearly nonsense, and you
+      discard it. The dangerous output is <strong>code that looks exactly like what a competent developer would
+      write and is subtly wrong.</strong>
+      <br><br>
+      Concurrency is the canonical example. A cache-aside implementation with a check-then-act race, a
+      <code>Lazy&lt;T&gt;</code> without the right thread-safety mode, an <code>async void</code> in a hot path. All
+      look idiomatic. All fail under load rather than in review.
+      <br><br>
+      Multi-tenancy is another. A repository method missing the tenant filter reads perfectly and returns another
+      customer's data. Nothing about the code signals a problem.
+      <br><br>
+      What makes this worse than a human writing the same bug is <strong>the absence of a confidence signal</strong>.
+      A colleague uncertain about a concurrency detail says so, or leaves a comment, or asks. Generated code arrives
+      uniformly assured whether it's correct or invented.
+      <br><br>
+      So the mitigation isn't "trust it less" in general — it's knowing <strong>which categories to distrust
+      specifically</strong>: concurrency, security boundaries, anything involving your domain invariants, and
+      anything where a recent API changed. Those get read line by line regardless of how good they look.</p>
+  </div>
+
+  <h2 id="context">Context is the lever <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Give it</th><th>Instead of</th></tr></thead>
+      <tbody>
+        <tr><td><strong>The relevant existing code</strong></td><td>A description of it</td></tr>
+        <tr><td><strong>The actual error and stack trace</strong></td><td>"it doesn't work"</td></tr>
+        <tr><td><strong>Your constraints</strong> — version, conventions, what not to change</td><td>Hoping it guesses</td></tr>
+        <tr><td><strong>An example of the pattern you use</strong></td><td>Naming the pattern</td></tr>
+        <tr><td><strong>The test that must pass</strong></td><td>Describing the behaviour</td></tr>
+        <tr><td><strong>A narrow, specific task</strong></td><td>"refactor this service"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Project-level instructions are worth more than better prompts</div>
+    <p style="margin:0">Most tools support a persistent instructions file — <code>CLAUDE.md</code>, Cursor rules,
+      Copilot instructions. That's where the durable leverage is, because it applies to every request without
+      restating it.
+      <br><br>
+      Worth putting in it: the <strong>target framework and language version</strong> (so you stop getting .NET
+      Framework patterns), your <strong>architectural conventions</strong> (where handlers live, how errors are
+      returned, which result type you use), <strong>hard constraints</strong> (every query filters by tenant; no raw
+      SQL; async all the way), and the <strong>commands to build and test</strong> so a tool can verify its own
+      work.
+      <br><br>
+      That last one is the highest-value line in the file. A tool that can run your tests can catch its own
+      mistakes before you see them, which changes the review burden materially.
+      <br><br>
+      Keep it short and factual. A long document of aspirations is less useful than ten specific rules — and if a
+      rule is important enough to state, it's usually worth enforcing with an analyzer or a test as well, so it holds
+      regardless.</p>
+  </div>
+
+  <h2 id="review">Reviewing generated code <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Check</th><th>Because</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Do these APIs exist, with these signatures?</strong></td><td>Invented members are common</td></tr>
+        <tr><td><strong>Is this right for our version?</strong></td><td>Training data spans many versions</td></tr>
+        <tr><td><strong>What happens under concurrency?</strong></td><td>The most common subtle failure</td></tr>
+        <tr><td><strong>Are our invariants preserved?</strong> Tenant filter, authorisation, audit</td><td>It can't know them unless told</td></tr>
+        <tr><td><strong>What did it change that I didn't ask for?</strong></td><td>Scope creep hides in a large diff</td></tr>
+        <tr><td><strong>Are the error paths real?</strong></td><td>Swallowed exceptions and empty catches</td></tr>
+        <tr><td><strong>Does it match how we do this elsewhere?</strong></td><td>Consistency is a maintenance property</td></tr>
+        <tr><td><strong>Do the tests assert anything meaningful?</strong></td><td>Tests that pass regardless are worse than none</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — generated code needs <em>more</em> review, and here's the mechanism</div>
+    <p style="margin:0">The instinct is that reviewing generated code is the same as reviewing a colleague's. It's
+      harder, for a specific reason.
+      <br><br>
+      When you write code yourself, you build a mental model as you go — you considered the null case, you thought
+      about what happens on retry, you know why the lock is where it is. Reviewing your own work, you're checking
+      against a model you already hold.
+      <br><br>
+      <strong>With generated code you have no such model.</strong> You're reading plausible code without the
+      reasoning that produced it, so it's easy to accept structure you'd have questioned had you been building
+      it.
+      <br><br>
+      There's a second effect worth naming: <strong>accepted code is harder to question than proposed code</strong>.
+      Once it's in the file and compiling, the bar to rewrite it feels higher than the bar to write it differently in
+      the first place. That's an anchoring effect and it's why "it works, ship it" is a stronger pull with generated
+      code.
+      <br><br>
+      The practical response is to <strong>verify independently of the generator</strong>. Read the generated SQL
+      rather than trusting the LINQ. Run the test and check it fails when you break the implementation — a test that
+      passes both ways asserts nothing. Check the API against real documentation, not against a confident
+      description of it.
+      <br><br>
+      And the honest test: <strong>could you explain every line to a colleague, and would you defend it in review?
+      </strong> If not, you don't understand it well enough to be accountable for it — and you will be.</p>
+  </div>
+
+  <h2 id="security">What not to paste <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Never</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Credentials, connection strings, keys</strong></td><td>Rotating is the only remedy afterwards</td></tr>
+        <tr><td><strong>Customer or personal data</strong></td><td>A data-protection issue and possibly a notifiable breach</td></tr>
+        <tr><td><strong>Production data in bug reports</strong></td><td>Redact or synthesise instead</td></tr>
+        <tr><td><strong>Proprietary code, where policy forbids it</strong></td><td>Know your organisation's actual position</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Know your organisation's policy, and treat generated code as code</div>
+    <p style="margin:0">Organisations vary enormously — some run approved enterprise tooling with contractual
+      guarantees about training and retention; others prohibit external tools for proprietary code entirely. In an
+      interview, <strong>saying you'd check the policy before using a tool on their codebase</strong> is a better
+      answer than either enthusiasm or blanket refusal.
+      <br><br>
+      Two other things worth having a position on.
+      <br><br>
+      <strong>Licensing.</strong> Generated code can resemble training data. For most everyday code that's not a
+      practical concern, and it's worth knowing the tools have filters for verbatim matches, and that your
+      organisation may have a view on it. Don't overstate the risk; don't pretend it's zero.
+      <br><br>
+      <strong>Generated code is still code.</strong> It goes through the same review, the same analyzers, the same
+      dependency scanning, the same tests. Which means the safeguards that matter are the ones you already have — and
+      it's an argument for having them be <em>structural</em>: an analyzer that rejects string-concatenated SQL
+      catches it whoever wrote it. That's more reliable than a reviewer noticing.</p>
+  </div>
+
+  <h2 id="team">Team practice <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Practice</th><th>Reason</th></tr></thead>
+      <tbody>
+        <tr><td><strong>The author is accountable, always</strong></td><td>"The AI wrote it" is not a defence in review</td></tr>
+        <tr><td><strong>Same review standard, applied harder</strong></td><td>No mental model from writing it</td></tr>
+        <tr><td><strong>Shared project instructions in the repository</strong></td><td>Consistent output, versioned with the code</td></tr>
+        <tr><td><strong>Analyzers and tests as the real guardrail</strong></td><td>Enforcement that doesn't depend on attention</td></tr>
+        <tr><td><strong>Be careful with juniors</strong></td><td>Fluent output can substitute for learning</td></tr>
+        <tr><td><strong>Don't measure lines of code</strong></td><td>It rewards volume, which is the wrong thing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the honest position on productivity</div>
+    <p style="margin:0">The claims range from "no real effect" to "ten times faster". Both are unhelpful, and the
+      calibrated view is more specific.
+      <br><br>
+      It's <strong>genuinely large on well-specified mechanical work</strong>: a set of DTOs and mappers, tests for
+      existing code, a repetitive refactor across thirty files, a Bicep template you'd otherwise write from
+      documentation.
+      <br><br>
+      It's <strong>modest or negative on work where the difficulty is understanding</strong> — a subtle bug in
+      unfamiliar code, a design decision with real trade-offs, anything depending on constraints not written down
+      anywhere. There, the time goes into comprehension, and generated code can actively cost you by producing a
+      plausible answer that sends you down the wrong path.
+      <br><br>
+      There's also a cost that doesn't show up in a velocity metric: <strong>reviewing code you didn't write is
+      slower than reviewing code you did</strong>, and if the review is skipped the cost simply moves to
+      production.
+      <br><br>
+      Which is why <strong>lines of code is the wrong measure</strong> — it rewards generating more, and more code
+      is a liability. The measures that matter are unchanged: does it work, is it maintainable, did it reach
+      production without incident.
+      <br><br>
+      Saying that plainly reads as more credible than either enthusiasm or dismissal, because it shows you've
+      actually used the tools on real work rather than formed a position about them.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>You own what you commit — the tool is not accountable.</li>
+      <li>The predictor is verifiability, not difficulty: "if this is wrong, will I find out?"</li>
+      <li>Strongest on tests, boilerplate, mechanical refactors, syntax, explanation.</li>
+      <li>Weakest on domain rules, concurrency, and anything version-sensitive.</li>
+      <li>Confident wrongness with no uncertainty signal is the real risk.</li>
+      <li>Tests generated from the implementation encode its bugs.</li>
+      <li>Context is the lever; project instruction files beat better prompts.</li>
+      <li>Include the build and test commands so the tool can check itself.</li>
+      <li>Generated code needs more review — you have no mental model of it.</li>
+      <li>Verify independently: read the SQL, break the implementation and confirm the test fails.</li>
+      <li>Never paste secrets or customer data; know the organisation's policy.</li>
+      <li>Analyzers and tests are the guardrail that doesn't depend on attention.</li>
+      <li>Don't measure lines of code — more code is a liability.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Committing code you couldn't explain in review.</strong></li>
+    <li><strong>Accepting a large diff</strong> without checking what else changed.</li>
+    <li><strong>Trusting generated tests</strong> without confirming they fail when the code breaks.</li>
+    <li><strong>Not stating the framework version</strong>, then getting outdated patterns.</li>
+    <li><strong>Assuming an API exists</strong> because it was named confidently.</li>
+    <li><strong>Skipping concurrency review</strong> because the code looks idiomatic.</li>
+    <li><strong>Losing a domain invariant</strong> — the tenant filter, the audit write.</li>
+    <li><strong>Pasting a connection string or customer record</strong> into a tool.</li>
+    <li><strong>Using it to avoid understanding</strong> rather than to go faster.</li>
+    <li><strong>Relying on prompts instead of a project instructions file.</strong></li>
+    <li><strong>Blaming the tool</strong> for a defect you shipped.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How do you use AI tools in your work? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I use them daily, and I'd describe it as <strong>a fast draft plus my judgement</strong> rather than
+          delegation. The line I hold is that <strong>I own what I commit</strong> — if it's wrong in production
+          that's on me, not the tool."</p>
+        <p>"The way I decide what to use it for isn't difficulty, it's <strong>verifiability</strong>: if this comes
+          back subtly wrong, will I find out cheaply?"</p>
+        <p>"<strong>Where the answer is yes</strong>, I use it heavily. Tests for existing code — including edge cases
+          I hadn't considered. Boilerplate: DTOs, mappers, validators, Bicep templates. Mechanical refactors across
+          many files, where the compiler verifies most of it. Fiddly syntax — regex, a KQL query, a Dockerfile.
+          And explaining unfamiliar code, which I then check against the source."</p>
+        <p>"A complex EF Core query is a good example of hard-but-verifiable: I can read the generated SQL and look
+          at the execution plan, so a wrong answer surfaces immediately."</p>
+        <p>"<strong>Where the answer is no, I'm much more careful.</strong> Business rules, where correctness depends
+          on domain knowledge the tool doesn't have. Concurrency, where wrong code looks idiomatic and fails under
+          load. Anything touching a security boundary or a multi-tenant filter — a repository method missing the
+          tenant filter reads perfectly and returns another customer's data."</p>
+        <p>"The specific thing I watch for is <strong>confident wrongness</strong>. A colleague unsure about a
+          concurrency detail tells you, or leaves a comment. Generated code arrives uniformly assured whether it's
+          right or invented. So there's no signal to calibrate against, and I have to supply the scepticism
+          myself."</p>
+        <p>"On making it useful: <strong>context matters more than prompt wording</strong>. I give it the actual
+          code, the real error and stack trace, the framework version, and an example of the pattern we use. And
+          I keep a <strong>project instructions file in the repository</strong> — target framework, our conventions,
+          hard rules like 'every query filters by tenant', and the commands to build and test."</p>
+        <p>"That last part is the highest-value line, because a tool that can run the tests catches its own mistakes
+          before I see them."</p>
+        <p>"On review, I'd say something slightly counterintuitive: <strong>I review generated code harder than my
+          own.</strong> When I write something I build a mental model as I go — I considered the null case, I know why
+          the lock is there. With generated code I have none of that, so I'm reading plausible code without the
+          reasoning behind it, and it's easy to accept structure I'd have questioned while building it."</p>
+        <p>"So I verify <em>independently of the generator</em>: read the SQL rather than trusting the LINQ, and
+          check a generated test actually fails when I break the implementation — because a test that passes either
+          way asserts nothing."</p>
+        <p>"My honest position on productivity: <strong>large on well-specified mechanical work, modest or negative
+          where the difficulty is understanding.</strong> On a subtle bug in unfamiliar code it can cost me time by
+          producing a plausible answer that sends me down the wrong path. That's worth being clear about rather than
+          claiming a uniform multiplier."</p>
+        <p>"And I'd check the organisation's policy before pointing any tool at their codebase — I'd never paste
+          credentials or customer data, and I know positions differ on proprietary code."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you take ownership rather than deferring to the tool?</li>
+        <li>Can you distinguish where it helps from where it doesn't, with reasons?</li>
+        <li>Do you know confident wrongness is the failure mode?</li>
+        <li>Do you review generated code more carefully, and can you say why?</li>
+        <li>Are you calibrated about productivity rather than evangelical?</li>
+        <li>Do you raise data handling and policy?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "it writes most of my code" with no review process.</li>
+        <li><span class="redflag">Red flag:</span> refusing to use them, with no reasoning.</li>
+        <li><span class="redflag">Red flag:</span> claiming a large uniform productivity gain.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Tell me about a time it gave you something wrong.</li>
+          <li>How do you stop juniors using it instead of learning?</li>
+          <li>What's in your project instructions file?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A junior's pull request is mostly generated and they can't explain it. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd separate the <strong>code</strong> from the <strong>capability</strong>, because they need different
+          responses and conflating them is how this goes badly."</p>
+        <p>"<strong>On the pull request</strong>, my position is simple and it isn't about AI:
+          <strong>if you can't explain it, it isn't ready</strong>. That's true of code copied from Stack Overflow, or
+          from another part of the codebase, or generated. The standard is that the author understands what they're
+          asking me to be responsible for maintaining."</p>
+        <p>"So I wouldn't reject it — I'd go through it with them. Pick the parts that matter and ask what they do:
+          'what happens if two requests hit this at once?', 'why is the lock here?', 'what does this return when the
+          list is empty?'. That's a normal review conversation, and it usually surfaces the real problems
+          quickly — because the questions you'd naturally ask are exactly the ones generated code tends to get
+          wrong."</p>
+        <p>"I'd be careful about tone. <strong>The tool isn't the problem</strong> — plenty of good engineers use it
+          heavily, including me. The problem is shipping something you can't stand behind, and framing it as 'you
+          used AI' rather than 'you can't explain this' teaches the wrong lesson and makes them hide it next
+          time."</p>
+        <p>"<strong>On the capability</strong>, this is the part I'd actually worry about. There's a real risk that
+          fluent output <strong>substitutes for the struggle that builds understanding</strong>. Debugging something
+          hard, being stuck, reading the framework source — that's how you develop the judgement to know when
+          generated code is wrong. Skip it and you're permanently dependent on something that's confidently wrong
+          part of the time."</p>
+        <p>"So I'd talk about <em>how</em> to use it rather than whether. Something like: use it to
+          <strong>explain</strong> things and to <strong>check</strong> your work freely — that accelerates learning.
+          Be more cautious about using it to <strong>produce</strong> code in areas you're still learning, because
+          you can't yet evaluate the output. And always read what it gives you well enough to modify it, not just
+          well enough to run it."</p>
+        <p>"I'd also make it concrete with an example. Show them a case where it produces something plausible and
+          wrong — a cache-aside implementation with a check-then-act race is ideal, because it looks completely
+          idiomatic and fails under load. That lands better than a general warning, because it demonstrates that
+          'looks right' and 'is right' are genuinely different."</p>
+        <p>"<strong>Then the systemic part</strong>, which is where I'd put most of the effort: if a reviewer's
+          attention is the only thing catching this, we'll miss it. So I'd want the guardrails to be
+          <strong>structural</strong>."</p>
+        <p>"Analyzers that reject string-concatenated SQL. An architecture test that fails if a repository method
+          doesn't apply the tenant filter. Mutation testing, so a test suite that asserts nothing shows up as a
+          number rather than as a reviewer's hunch. Those catch the problem regardless of who or what wrote the
+          code — which is the same principle as branch protection over asking people not to force-push."</p>
+        <p>"And a <strong>project instructions file</strong> in the repository encoding our conventions and
+          constraints, so the tool's default output is closer to correct for everyone. That's a cheap fix that
+          improves the baseline rather than relying on each person prompting well."</p>
+        <p>"The framing I'd land on: <strong>the review standard hasn't changed, and the way it gets violated
+          has.</strong> It used to be someone not thinking carefully. Now it can be someone accepting something that
+          reads better than their own work would. Same bar, different failure mode — and the response is better
+          automated enforcement plus honest conversations, not a policy about tools."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you hold the same standard without making it about the tool?</li>
+        <li>Do you coach rather than reject?</li>
+        <li>Do you distinguish learning uses from producing uses?</li>
+        <li>Do you make it concrete with a real failure mode?</li>
+        <li>Do you push toward structural enforcement over reviewer attention?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> banning AI tools.</li>
+        <li><span class="redflag">Red flag:</span> approving it because it works.</li>
+        <li><span class="redflag">Red flag:</span> making it about the tool rather than accountability.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which guardrails would you add first?</li>
+          <li>How do you tell a good use from a bad one in review?</li>
+          <li>Would your answer differ for a senior engineer?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

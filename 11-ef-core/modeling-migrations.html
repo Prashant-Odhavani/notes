@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modelling &amp; Migrations — EF Core</title>
+<meta name="description" content="Fluent API vs attributes, relationships, owned and complex types, value converters, and how to deploy migrations without downtime.">
+<meta name="keywords" content="EF Core fluent API data annotations OnModelCreating relationships one to many many to many owned types complex types value converter shadow property migrations Add-Migration Update-Database idempotent script expand contract zero downtime backward compatible migration">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="11-ef-core/modeling-migrations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Modelling &amp; Migrations</h1>
+    <p class="subtitle">Mapping your classes to tables, and changing the schema on a running system without
+      taking it down.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Fluent API for anything non-trivial.</strong> Attributes put persistence concerns in your
+        domain classes.</li>
+      <li><strong>Owned types</strong> map a value object into the parent's table. <strong>Complex types</strong>
+        (EF Core 8+) do it properly — no identity, no tracking.</li>
+      <li><strong>Value converters</strong> map a domain type to a column — strongly-typed IDs, enums as
+        strings.</li>
+      <li><strong>Never edit an applied migration.</strong> Add a new one.</li>
+      <li><strong>Don't run <code>Update-Database</code> in production.</strong> Generate an idempotent script
+        and review it.</li>
+      <li><strong>Expand/contract</strong> is the pattern for zero-downtime schema change: add, backfill,
+        switch, remove — across separate deployments.</li>
+      <li><strong>Every migration must work with both the old and new application version</strong>, because
+        both run at once during a rolling deploy.</li>
+    </ul>
+  </div>
+
+  <h2 id="fluent-vs-attributes">Fluent API vs attributes <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — attributes: concise, but persistence leaks into the domain" class="code-bad"><code class="language-csharp">public class Order
+{
+    public int Id { get; set; }
+
+    [Required, MaxLength(50)]
+    [Column("order_number", TypeName = "varchar(50)")]
+    public string OrderNumber { get; set; } = null!;
+
+    [Precision(19, 4)]
+    public decimal Total { get; set; }
+}</code></pre>
+
+  <pre data-label="csharp — fluent: the domain class stays clean" class="code-good"><code class="language-csharp">// Domain: no persistence knowledge at all
+public class Order
+{
+    public int Id { get; set; }
+    public string OrderNumber { get; set; } = null!;
+    public decimal Total { get; set; }
+}
+
+// Configuration: one file per entity
+public class OrderConfiguration : IEntityTypeConfiguration&lt;Order&gt;
+{
+    public void Configure(EntityTypeBuilder&lt;Order&gt; b)
+    {
+        b.ToTable("Order");
+        b.HasKey(o =&gt; o.Id);
+
+        b.Property(o =&gt; o.OrderNumber)
+            .HasColumnName("order_number")
+            .HasColumnType("varchar(50)")
+            .IsRequired();
+
+        b.Property(o =&gt; o.Total).HasPrecision(19, 4);
+
+        b.HasIndex(o =&gt; o.OrderNumber).IsUnique();
+    }
+}
+
+// Registered once
+protected override void OnModelCreating(ModelBuilder b)
+    =&gt; b.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Attributes</th><th>Fluent API</th></tr></thead>
+      <tbody>
+        <tr><td>Coverage</td><td>A subset of options</td><td><strong>Everything</strong></td></tr>
+        <tr><td>Domain purity</td><td>Persistence concerns in domain classes</td><td><strong>Fully separated</strong></td></tr>
+        <tr><td>Discoverability</td><td>Next to the property</td><td>In a configuration file</td></tr>
+        <tr><td>Precedence</td><td>Loses to fluent</td><td><strong>Wins</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The practical position</span>
+    <p><strong>Fluent API, in one <code>IEntityTypeConfiguration</code> per entity.</strong></p>
+    <p>Attributes are fine for genuinely universal things like <code>[Key]</code> on a conventionally-named
+      property. But mixing both means two places to look, and fluent silently overrides attributes — so the
+      attribute you're reading may not be in effect.</p>
+    <p>The separate-file approach also keeps <code>OnModelCreating</code> from becoming a 900-line method,
+      which is where this ends up otherwise.</p>
+  </div>
+
+  <h2 id="relationships">Relationships <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — one-to-many, configured explicitly" class="code-good"><code class="language-csharp">b.HasMany(o =&gt; o.Lines)
+ .WithOne(l =&gt; l.Order)
+ .HasForeignKey(l =&gt; l.OrderId)
+ .OnDelete(DeleteBehavior.Cascade);      // true ownership: lines die with the order
+
+b.HasOne(o =&gt; o.Customer)
+ .WithMany(c =&gt; c.Orders)
+ .HasForeignKey(o =&gt; o.CustomerId)
+ .OnDelete(DeleteBehavior.Restrict);     // don't let a customer delete take orders with it</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th><code>DeleteBehavior</code></th><th>Effect</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><code>Cascade</code></td><td>Deletes dependents</td><td>Genuine composition — order lines</td></tr>
+        <tr><td><code>Restrict</code></td><td>Throws if dependents exist</td><td><strong>Default choice</strong> for associations</td></tr>
+        <tr><td><code>SetNull</code></td><td>Nulls the FK</td><td>Optional relationships</td></tr>
+        <tr><td><code>ClientCascade</code></td><td>EF cascades in memory; no database cascade</td><td>SQL Server multiple-cascade-path errors</td></tr>
+        <tr><td><code>NoAction</code></td><td>No FK enforcement of deletes</td><td>Rarely what you want</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Cascade defaults bite twice</div>
+    <p style="margin:0">EF Core defaults to <strong>cascade delete for required relationships</strong>. So
+      deleting a customer can silently take every order with it — see
+      <a href="../10-sql/fundamentals.html#foreign-key-actions">cascade chains</a> for why that's worse than it
+      sounds.
+      <br><br>
+      Separately, EF cascades <strong>tracked</strong> entities in memory even when the database wouldn't. So
+      loading a parent with its children and then removing the parent can delete children the database FK would
+      have protected. Configure delete behaviour explicitly rather than relying on the convention.</p>
+  </div>
+
+  <h3 id="many-to-many">Many-to-many</h3>
+
+  <pre data-label="csharp — EF Core 5+ needs no join entity"><code class="language-csharp">public class Product { public List&lt;Category&gt; Categories { get; set; } = []; }
+public class Category { public List&lt;Product&gt; Products { get; set; } = []; }
+
+b.Entity&lt;Product&gt;()
+ .HasMany(p =&gt; p.Categories)
+ .WithMany(c =&gt; c.Products)
+ .UsingEntity("ProductCategory");         // EF creates and manages the join table</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">When you still need an explicit join entity</div>
+    <p style="margin:0">The moment the relationship itself has data — when it was added, by whom, a sort order,
+      a soft-delete flag.
+      <br><br>
+      That's a signal the join isn't really a join: it's an entity in its own right. Model it explicitly with
+      two one-to-many relationships, and name it something meaningful
+      (<code>ProductCategoryAssignment</code>) rather than a concatenation.</p>
+  </div>
+
+  <h2 id="owned-complex">Owned and complex types <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A value object — <code>Money</code>, <code>Address</code>, <code>DateRange</code> — has no identity of
+      its own. It's just a bundle of values that belongs to something else.</p>
+    <p>You want it as a class in your domain, and as columns in the owner's table.</p>
+  </div>
+
+  <pre data-label="csharp — complex type (EF Core 8+): the right tool" class="code-good"><code class="language-csharp">public record Address(string Line1, string City, string PostCode, string Country);
+
+public class Customer
+{
+    public int Id { get; set; }
+    public Address Billing  { get; set; } = null!;
+    public Address Shipping { get; set; } = null!;
+}
+
+b.ComplexProperty(c =&gt; c.Billing,  a =&gt; a.IsRequired());
+b.ComplexProperty(c =&gt; c.Shipping, a =&gt; a.IsRequired());
+
+// Columns: Billing_Line1, Billing_City, ... Shipping_Line1, ...</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Owned type</th><th>Complex type (EF Core 8+)</th></tr></thead>
+      <tbody>
+        <tr><td>Has an identity</td><td>Yes — a hidden key</td><td><strong>No</strong></td></tr>
+        <tr><td>Tracked separately</td><td>Yes</td><td>No — part of the owner</td></tr>
+        <tr><td>Can be null</td><td>Yes</td><td>Yes (EF Core 9+)</td></tr>
+        <tr><td>Collections of them</td><td>Yes — separate table</td><td>Not yet</td></tr>
+        <tr><td>Shared instance</td><td>Throws — one owner only</td><td><strong>Allowed</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why complex types were added</div>
+    <p style="margin:0">Owned types were EF's stand-in for value objects, and they leaked: an owned instance has
+      a hidden identity, so <strong>assigning the same <code>Address</code> object to both
+      <code>Billing</code> and <code>Shipping</code> throws</strong> — "the instance of entity type cannot be
+      tracked because another instance with the same key is already being tracked".
+      <br><br>
+      That's nonsense for a value object. The whole point of one is that two equal values are
+      interchangeable.
+      <br><br>
+      Complex types fixed it by having genuinely no identity. Knowing <em>why</em> they exist is a much better
+      answer than knowing they exist — it shows you've hit the owned-type limitation in real code.</p>
+  </div>
+
+  <h2 id="converters">Value converters <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="csharp — strongly-typed IDs" class="code-good"><code class="language-csharp">public readonly record struct OrderId(int Value);
+
+b.Property(o =&gt; o.Id)
+ .HasConversion(id =&gt; id.Value, value =&gt; new OrderId(value));</code></pre>
+
+  <pre data-label="csharp — enums as strings, not ordinals" class="code-good"><code class="language-csharp">b.Property(o =&gt; o.Status).HasConversion&lt;string&gt;().HasMaxLength(30);</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Store enums as strings, or pin the ordinals</div>
+    <p style="margin:0">By default EF stores an enum as its <strong>integer ordinal</strong>. Reorder the enum
+      members — or insert one in the middle — and every existing row now means something different. Nothing
+      errors. <code>Cancelled</code> becomes <code>Shipped</code>.
+      <br><br>
+      Two safe options: <code>HasConversion&lt;string&gt;()</code>, which is self-describing in the database
+      and survives reordering; or explicit values (<code>Open = 1, Paid = 2</code>) that you never change.
+      <br><br>
+      Strings cost a little space and are slightly slower to index. Worth it — this is the same trap covered in
+      <a href="../01-csharp-fundamentals/type-system.html#enums">the enum section</a>, and it causes silent data
+      corruption rather than a visible failure.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Converters break translation</div>
+    <p style="margin:0">EF can't translate operations it can't express on the converted column. An
+      enum-as-string converter means <code>Where(o =&gt; o.Status &gt; OrderStatus.Open)</code> becomes a string
+      comparison — <em>alphabetical</em>, not ordinal — which is silently wrong rather than an error.
+      <br><br>
+      Comparisons and range queries on converted properties need thinking about. Equality is always fine.</p>
+  </div>
+
+  <h2 id="migrations">Migrations <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="bash — the commands"><code class="language-bash">dotnet ef migrations add AddOrderStatus
+dotnet ef migrations remove              # only if NOT applied anywhere
+dotnet ef database update                # dev only
+dotnet ef migrations script --idempotent --output migrate.sql
+dotnet ef migrations bundle               # self-contained executable for CI/CD</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rule</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Never edit an applied migration</strong></td>
+          <td>Environments that already ran it won't re-run it. They'd silently diverge</td>
+        </tr>
+        <tr>
+          <td><strong>Always read the generated migration</strong></td>
+          <td>EF sometimes generates a destructive operation — a drop-and-recreate where you expected a rename</td>
+        </tr>
+        <tr>
+          <td><strong>Never <code>Update-Database</code> in production</strong></td>
+          <td>No review step, no rollback plan, and it needs schema-modify rights from the app</td>
+        </tr>
+        <tr>
+          <td><strong>One logical change per migration</strong></td>
+          <td>Reviewable, and you can deploy them independently</td>
+        </tr>
+        <tr>
+          <td><strong>Commit the snapshot file</strong></td>
+          <td>The model snapshot is how EF diffs. Merge conflicts there are real and must be resolved properly</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The rename that deletes your data</div>
+    <p style="margin:0">Rename a property and EF often generates <code>DropColumn</code> followed by
+      <code>AddColumn</code> — because it diffs the model, and it can't tell a rename from "one column gone,
+      another arrived".
+      <br><br>
+      That compiles, runs, reports success, and <strong>silently discards every value in that column</strong>.
+      <br><br>
+      Fix it by editing the migration to use <code>migrationBuilder.RenameColumn(...)</code> before applying
+      it anywhere. This is the single strongest argument for reading every generated migration — the destructive
+      version looks exactly as normal as the safe one.</p>
+  </div>
+
+  <h3 id="applying">Applying migrations in production</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Assessment</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Idempotent SQL script</strong>, reviewed and applied by the pipeline</td>
+          <td><strong>Best default.</strong> Reviewable, auditable, works with existing DBA processes</td>
+        </tr>
+        <tr>
+          <td><strong>Migration bundle</strong> — a self-contained executable</td>
+          <td>Good for containerised pipelines. No SDK needed on the runner</td>
+        </tr>
+        <tr>
+          <td><strong><code>Migrate()</code> at startup</strong></td>
+          <td>Fine for a single-instance internal app. <strong>Dangerous when scaled out</strong> — several
+              instances race, and the app needs DDL permissions permanently</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Why startup migration breaks at scale</div>
+    <p style="margin:0">Three replicas starting simultaneously all call <code>Migrate()</code>. EF takes a lock
+      on the history table, so they mostly serialise — but on a slow migration the others hit their startup
+      timeout and the orchestrator restarts them mid-migration.
+      <br><br>
+      It also means the application's connection needs permission to alter the schema forever, which is a
+      standing privilege you don't want. And there's no review gate: a migration that drops a column ships
+      the moment the pod starts.
+      <br><br>
+      Run migrations as a separate, ordered pipeline step. In Kubernetes that's an init container or a Job that
+      must complete before the rollout.</p>
+  </div>
+
+  <h2 id="zero-downtime">Zero-downtime schema change <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The constraint that drives everything</span>
+    <p>During a rolling deploy, <strong>the old and new application versions run at the same time</strong>,
+      against the same database.</p>
+    <p>So every migration must be compatible with <em>both</em>. That single requirement is what makes schema
+      change hard, and it's what most people miss.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Operation</th><th>Safe?</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Add a nullable column</td><td>✅</td><td>Old code ignores it</td></tr>
+        <tr><td>Add a column with a default</td><td>✅</td><td>Old inserts get the default</td></tr>
+        <tr><td>Add a table or index</td><td>✅</td><td>Use <code>ONLINE = ON</code> for large tables</td></tr>
+        <tr><td>Add a <code>NOT NULL</code> column, no default</td><td>❌</td><td>Old code's inserts fail immediately</td></tr>
+        <tr><td>Drop or rename a column</td><td>❌</td><td>Old code still selects it</td></tr>
+        <tr><td>Narrow a type or tighten a constraint</td><td>❌</td><td>Old code can write values that now violate it</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="expand-contract">Expand / contract</h3>
+
+  <ol class="steps">
+    <li><strong>Expand.</strong> Add the new nullable column. Deploy. Nothing reads it yet.</li>
+    <li><strong>Dual write.</strong> Deploy code writing both old and new, still reading old.</li>
+    <li><strong>Backfill.</strong> Populate the new column in batches for existing rows.</li>
+    <li><strong>Switch reads.</strong> Deploy code reading the new column. Verify.</li>
+    <li><strong>Stop writing the old.</strong> Deploy.</li>
+    <li><strong>Contract.</strong> Drop the old column — in a later release, once you're confident.</li>
+  </ol>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>A rename becomes six deployments.</strong> That's not over-engineering — it's what
+      "no downtime" costs.</p>
+    <p>Each step is independently safe and independently revertible. At no point are the two application
+      versions incompatible with the schema.</p>
+    <p>The trap is compressing steps to save time. Doing 1 and 2 together is usually fine; doing 5 and 6
+      together means you can't roll back the previous release.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The backfill detail people get wrong</div>
+    <p style="margin:0">A single <code>UPDATE</code> over 50 million rows takes a table lock via
+      <a href="../10-sql/transactions.html#escalation">lock escalation</a> and blocks the application for the
+      duration.
+      <br><br>
+      Backfill in batches of a few thousand, each its own transaction, with a small delay between them. Slower
+      in wall-clock time, invisible to users — and resumable if it's interrupted, which a single giant
+      statement is not.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Fluent API in per-entity configuration files. Don't mix with attributes.</li>
+      <li>Configure delete behaviour explicitly — EF defaults to cascade on required relationships.</li>
+      <li>Skip navigations for plain many-to-many; an explicit entity once the join carries data.</li>
+      <li>Complex types over owned types for value objects — owned types have a hidden identity.</li>
+      <li>Store enums as strings, or pin explicit ordinal values forever.</li>
+      <li>Value converters break comparisons and range translation.</li>
+      <li>Read every generated migration — renames become drop-and-add and lose data.</li>
+      <li>Never edit an applied migration; add a new one.</li>
+      <li>Idempotent scripts or bundles in the pipeline, not <code>Migrate()</code> at startup.</li>
+      <li>Expand/contract, because old and new code run simultaneously during a rolling deploy.</li>
+      <li>Backfill in batches.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Mixing attributes and fluent config</strong>, so the effective setting isn't where you're
+      looking.</li>
+    <li><strong>Relying on default cascade behaviour.</strong></li>
+    <li><strong>Enums as ordinals</strong>, then reordering the enum.</li>
+    <li><strong>Editing an applied migration</strong> and diverging environments.</li>
+    <li><strong>Not reading generated migrations</strong>, shipping a data-destroying rename.</li>
+    <li><strong><code>Migrate()</code> at startup on a scaled-out app.</strong></li>
+    <li><strong>Adding a <code>NOT NULL</code> column with no default</strong> during a rolling deploy.</li>
+    <li><strong>Dropping a column in the same release that stops using it.</strong></li>
+    <li><strong>Backfilling with one huge <code>UPDATE</code>.</strong></li>
+    <li><strong>Not committing the model snapshot</strong>, or resolving its merge conflicts by picking one
+      side.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How do you manage EF Core migrations across environments? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Migrations live in source control alongside the code that needs them, and I'd apply them through
+          the pipeline rather than from a developer machine or at application startup."</p>
+        <p>"In <strong>development</strong>, <code>dotnet ef database update</code> is fine. I'd always read
+          the generated migration before committing it, though — EF diffs the model, so it can't tell a
+          <em>rename</em> from 'one column disappeared and another appeared'. It generates
+          <code>DropColumn</code> then <code>AddColumn</code>, which runs successfully and silently discards
+          every value in that column. That one has bitten enough people that reading the migration is
+          non-negotiable for me."</p>
+        <p>"For <strong>production</strong>, I'd generate an <strong>idempotent SQL script</strong> —
+          <code>dotnet ef migrations script --idempotent</code>. It has guards so it only applies what's
+          missing, it can be reviewed like any other change, it fits whatever DBA process already exists, and
+          it's auditable afterwards. Migration bundles are a good alternative in containerised pipelines since
+          the runner doesn't need the SDK."</p>
+        <p>"I'd specifically avoid <code>Migrate()</code> at startup for anything scaled out. Three replicas
+          starting together all try to migrate; EF locks the history table so they mostly serialise, but on a
+          slow migration the others hit their startup probe timeout and get restarted mid-migration. It also
+          means the app's own credentials need DDL permissions permanently, and there's no review gate — a
+          migration that drops a column ships the instant a pod starts."</p>
+        <p>"So it becomes a separate ordered pipeline step: in Kubernetes, a Job or init container that must
+          complete before the rollout proceeds."</p>
+        <p>"Two team practices that matter as much as the mechanics. <strong>Never edit an applied
+          migration</strong> — environments that already ran it won't re-run it, so they diverge silently; add
+          a new migration instead. And <strong>the model snapshot file is part of the migration</strong>, so
+          merge conflicts in it have to be resolved properly rather than by picking a side, or the next
+          generated diff will be wrong."</p>
+        <p>"I'd also keep migrations small — one logical change each. Easier to review, and they can be
+          deployed independently, which matters a lot for the expand/contract sequence."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know why startup migration is a problem at scale?</li>
+        <li>Do you know about the rename data-loss trap?</li>
+        <li>Do you treat migrations as reviewable artefacts?</li>
+        <li>Do you know about the snapshot file?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you roll back a migration?</li>
+          <li>What does <code>--idempotent</code> actually generate?</li>
+          <li>Two developers add migrations on separate branches. What happens?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>You need to rename a column on a table with 50 million rows, with no downtime. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The constraint that drives the whole answer is that during a rolling deploy <strong>the old and new
+          application versions are both running against the same database</strong>. So every intermediate state
+          has to work for both. That's what makes this six deployments rather than one."</p>
+        <p>"I'd use <strong>expand/contract</strong>:"</p>
+        <p>"<strong>1. Expand.</strong> Add the new column as nullable. Deploy. Old code ignores it, new code
+          doesn't use it yet — completely safe, and revertible for free."</p>
+        <p>"<strong>2. Dual write.</strong> Deploy code that writes both columns and still reads the old one.
+          Now every new or updated row has both values."</p>
+        <p>"<strong>3. Backfill.</strong> Populate the new column for existing rows. Critically, <strong>in
+          batches</strong> — a few thousand rows per transaction with a short delay between. A single
+          <code>UPDATE</code> over 50 million rows crosses the lock escalation threshold, takes a table lock,
+          and blocks the application for however long it runs. Batching also makes it resumable, which a single
+          statement isn't. I'd track progress so I can restart where it stopped."</p>
+        <p>"<strong>4. Verify, then switch reads.</strong> Confirm no rows are left unpopulated, then deploy
+          code that reads the new column. This is the deployment I'd watch most closely, and it's still
+          revertible because the old column is intact and being maintained."</p>
+        <p>"<strong>5. Stop writing the old column.</strong> Deploy."</p>
+        <p>"<strong>6. Contract.</strong> Drop the old column — in a <em>later</em> release, once we're
+          confident and past the point of wanting to roll back."</p>
+        <p>"On the EF side specifically: I'd hand-write the migration for step 1 rather than let EF diff a
+          renamed property, because that produces <code>DropColumn</code> plus <code>AddColumn</code> and
+          destroys the data. And for a genuine in-place rename where downtime <em>is</em> acceptable, EF has
+          <code>RenameColumn</code>, which is a metadata operation — worth knowing so you don't over-engineer
+          when a maintenance window exists."</p>
+        <p>"The thing I'd push back on is compressing the steps. Combining 1 and 2 is usually fine. Combining 5
+          and 6 means you cannot roll back the previous release, because the old code would reference a column
+          that no longer exists — you've traded a deployment for losing your escape route."</p>
+        <p>"And I'd ask the framing question first: <strong>is the rename worth six deployments?</strong>
+          Sometimes it is — a genuinely misleading column name causes bugs. Sometimes the honest answer is to
+          leave the column named as it is and map it in the fluent configuration with
+          <code>HasColumnName</code>, so the domain model reads correctly and the database keeps its history.
+          That's one line instead of a multi-week sequence, and proposing it is often the more senior
+          answer."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know old and new code run simultaneously?</li>
+        <li>Do you know the expand/contract sequence?</li>
+        <li>Do you batch the backfill, and know why?</li>
+        <li>Do you keep rollback available at each step?</li>
+        <li>Do you consider whether it's worth doing at all?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a single <code>RenameColumn</code> migration with no
+          consideration of running instances.</li>
+        <li><span class="redflag">Red flag:</span> one big <code>UPDATE</code> to backfill.</li>
+        <li><span class="redflag">Red flag:</span> dropping the old column in the same release.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you verify the backfill completed correctly?</li>
+          <li>What if the column is in a unique index?</li>
+          <li>How does this change if you also need to change the type?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

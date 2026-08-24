@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTP &amp; Web API Design — Overview</title>
+<meta name="description" content="Why the protocol matters for API design, how this section differs from the ASP.NET Core section, and what to prioritise.">
+<meta name="keywords" content="http web api design rest protocol status codes caching oauth idempotency interview overview">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="08-http-web-apis/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>HTTP &amp; Web API Design</h1>
+    <p class="subtitle">The previous section was <em>how to build it in ASP.NET Core</em>. This one is
+      <em>what to build</em> — the protocol, the contract, and the standards.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>HTTP methods have <strong>defined semantics</strong> — safe, idempotent, cacheable. Breaking them
+        breaks proxies and clients.</li>
+      <li>Status codes are a <strong>contract</strong>. Clients branch on them, so changing one is a breaking
+        change.</li>
+      <li><strong>REST</strong> is a set of constraints, not "JSON over HTTP". Most APIs called REST aren't,
+        and that's usually fine.</li>
+      <li><strong>OAuth 2.0</strong> is delegated authorization. <strong>OIDC</strong> adds identity on top.
+        They're different jobs.</li>
+      <li><strong>Idempotency keys</strong> are what make retries safe. Without them, a timeout is a coin
+        flip.</li>
+      <li>Design for the client you have, not the purity of the model.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-separate">Why this is separate from ASP.NET Core <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><a href="../07-aspnet-core/index.html">Section 07</a> answered "how do I make this work in the
+      framework?"</p>
+    <p>This section answers "what <em>should</em> the API look like, and why?" — which is framework-agnostic
+      and the part interviewers probe at senior level.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Which section</th></tr></thead>
+      <tbody>
+        <tr><td>How do I configure JWT bearer auth?</td><td><a href="../07-aspnet-core/security.html">07 — ASP.NET Core</a></td></tr>
+        <tr><td>What <em>is</em> OAuth 2.0, and which flow do I use?</td><td><a href="auth-security.html">08 — this section</a></td></tr>
+        <tr><td>How do I write a global exception handler?</td><td><a href="../07-aspnet-core/api-lifecycle.html">07</a></td></tr>
+        <tr><td>Should this be a 400, 409 or 422?</td><td><a href="http-protocol.html">08</a></td></tr>
+        <tr><td>How do I add rate limiting middleware?</td><td><a href="../07-aspnet-core/performance-resilience.html">07</a></td></tr>
+        <tr><td>What headers should a throttled response carry?</td><td><a href="reliability.html">08</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="why-protocol-matters">Why the protocol details matter <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>It's tempting to treat HTTP as a dumb pipe for JSON. The problem is that a lot of infrastructure
+    <em>relies</em> on the semantics:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>If you…</th><th>Then…</th></tr></thead>
+      <tbody>
+        <tr><td>Use <code>GET</code> to change state</td><td>A crawler, a browser prefetch, or a proxy can trigger it. And it may be cached</td></tr>
+        <tr><td>Use <code>POST</code> where <code>PUT</code> belongs</td><td>Clients can't safely retry, because <code>POST</code> isn't idempotent</td></tr>
+        <tr><td>Return 200 with an error in the body</td><td>Monitoring shows a healthy API while every request fails</td></tr>
+        <tr><td>Return 500 for a validation error</td><td>Clients retry it, and your alerts fire on user mistakes</td></tr>
+        <tr><td>Omit cache headers</td><td>Every client re-fetches unchanged data on every request</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>HTTP semantics are a <strong>contract with infrastructure you don't control</strong> — browsers,
+      proxies, CDNs, load balancers, client SDKs.</p>
+    <p>Break the contract and things go wrong in places you can't see or debug.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Being able to say <em>why</em> a rule exists rather than just following it.
+      <br><br>
+      "<code>PUT</code> must be idempotent so a client that times out can safely retry — and that's exactly
+      the case where you don't know whether the first attempt succeeded" is a much stronger answer than
+      "<code>PUT</code> is for updates".</p>
+  </div>
+
+  <h2 id="contents">Section contents</h2>
+  <div class="card-grid" data-section-index></div>
+
+  <div class="note info">
+    <div class="note-title">Where this sits in the learning path</div>
+    <p style="margin:0">This closes <strong>Part 2</strong> along with
+      <a href="../09-dotnet-framework/index.html">.NET Framework &amp; modernization</a>.
+      <br><br>
+      Next is <strong>Part 3 — Data Access &amp; Databases</strong>, starting with
+      <a href="../10-sql/index.html">SQL</a> and then <a href="../11-ef-core/index.html">EF Core</a>.
+      <br><br>
+      Some material here connects forward: idempotency keys and retry behaviour are developed further in
+      <a href="../19-architecture/distributed-data.html">distributed data</a>, and API design shows up again
+      in <a href="../36-system-design/rest-api-scale.html">system design</a>.</p>
+  </div>
+
+  <h2 id="priorities">What to prioritise</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Priority</th><th>Topic</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><a href="http-protocol.html">Methods, status codes, idempotency</a></td><td>Asked in almost every API interview</td></tr>
+        <tr><td>2</td><td><a href="auth-security.html">OAuth 2.0 and OIDC</a></td><td>Universally relevant, and widely half-understood</td></tr>
+        <tr><td>3</td><td><a href="reliability.html">Idempotency keys, retries, timeouts</a></td><td>Where senior answers separate from junior ones</td></tr>
+        <tr><td>4</td><td><a href="rest-design.html">Pagination, filtering, versioning</a></td><td>Practical design questions</td></tr>
+        <tr><td>5</td><td><a href="http-protocol.html#caching">Caching and ETags</a></td><td>Often forgotten, cheap to get right</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="interview-questions">Warm-up interview question</h2>
+
+  <details class="qa">
+    <summary>What makes a good API? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start with <strong>predictability</strong>. If a client learns one endpoint, they should be
+          able to guess the others — same naming, same pagination, same error shape, same auth. Consistency
+          matters more than any individual design choice, because it's what lets someone use the API without
+          reading all the docs."</p>
+        <p>"Then <strong>correct HTTP semantics</strong>, because infrastructure depends on them.
+          <code>GET</code> doesn't change state so it's safe to cache and retry. <code>PUT</code> and
+          <code>DELETE</code> are idempotent so clients can retry after a timeout. Status codes are accurate,
+          so monitoring and client logic both work."</p>
+        <p>"Then <strong>useful errors</strong>. A stable machine-readable error type the client can branch
+          on, a human-readable message, and a correlation ID they can quote in a support ticket. Not a 500
+          with a stack trace, and not a 200 with <code>{ "success": false }</code>."</p>
+        <p>"And <strong>evolvability</strong> — designed so most changes are additive. Optional new fields,
+          enums as strings, tolerant readers. Because the alternative is versioning, and every version is
+          code you maintain forever."</p>
+        <p>"The thing I'd add that people miss: a good API is designed for <strong>the client you actually
+          have</strong>. A chatty resource-per-entity design is elegant and terrible for a mobile app on a
+          slow network. If the client needs one call to render a screen, give them an endpoint that does
+          that — even if it's less 'pure'. Purity that costs the consumer twelve round trips isn't good
+          design."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you think about the consumer, or just the model?</li>
+        <li>Do you know why HTTP semantics matter?</li>
+        <li>Do you consider evolution, not just the first version?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> reciting REST constraints with no mention of the consumer.</li>
+        <li><span class="redflag">Red flag:</span> "it should be RESTful" as the whole answer.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle a mobile client that needs fewer round trips?</li>
+          <li>What's the difference between 400 and 422?</li>
+          <li>How would you let clients retry safely?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

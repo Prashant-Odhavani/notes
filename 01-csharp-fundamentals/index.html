@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C# Fundamentals — Overview</title>
+<meta name="description" content="Where to start as a .NET developer: the C# type system and language features that every later topic depends on, and how C# is interviewed.">
+<meta name="keywords" content="csharp fundamentals interview type system value reference types language features generics delegates learning path dotnet developer">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="01-csharp-fundamentals/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>C# Fundamentals</h1>
+    <p class="subtitle">The start of the path. Everything later in this handbook — EF Core, ASP.NET Core,
+      async, architecture — rests on the ideas in this section.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>C# has two families of type: <strong>value types</strong> (copied) and <strong>reference
+        types</strong> (shared). Almost every "why did that change?" bug traces back here.</li>
+      <li><strong>Stack vs heap</strong> is an implementation detail, but interviewers ask it — and it
+        explains boxing, which explains a whole class of performance problems.</li>
+      <li><strong>Generics</strong> exist so you can write code once without giving up type safety or
+        boxing everything.</li>
+      <li><strong>Delegates</strong> are "a variable that holds a method". Events, LINQ and callbacks are
+        all built on them.</li>
+      <li><code>struct</code> vs <code>class</code>, <code>record</code> vs <code>class</code>, and
+        <code>string</code> being immutable are the three questions that come up most.</li>
+      <li>Nullable reference types turn "it might be null" from a runtime surprise into a compiler warning.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-start-here">Why this section comes first <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>It's tempting to skip straight to ASP.NET Core or EF Core. Interviews punish that, because the hard
+    questions in those areas are really C# questions in disguise:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>The question they ask</th><th>What it's actually testing</th></tr></thead>
+      <tbody>
+        <tr><td>"Why did modifying this list inside the method change the caller's list?"</td><td>Reference types</td></tr>
+        <tr><td>"Why is this loop allocating so much?"</td><td>Boxing, or closures capturing variables</td></tr>
+        <tr><td>"Why does <code>.Result</code> deadlock in ASP.NET?"</td><td>How async is compiled</td></tr>
+        <tr><td>"Why are two of these objects 'equal' but not the same?"</td><td>Value vs reference equality</td></tr>
+        <tr><td>"Why is this EF query running in memory?"</td><td>Expression trees vs delegates</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Most senior .NET interview questions are <strong>framework questions with a C# answer</strong>.</p>
+    <p>Getting the language right first makes every later section easier — and it's the cheapest way to
+      sound genuinely experienced.</p>
+  </div>
+
+  <h2 id="what-is-csharp">C# and .NET — two different things <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>People use these interchangeably in conversation, but the distinction matters and interviewers
+    occasionally check it.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Thing</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td><strong>C#</strong></td><td>The language. Syntax and rules. Compiled by Roslyn.</td></tr>
+        <tr><td><strong>IL</strong> (Intermediate Language)</td><td>What C# compiles <em>to</em>. Not machine code yet.</td></tr>
+        <tr><td><strong>CLR</strong> (Common Language Runtime)</td><td>The runtime that executes IL — JIT compilation, garbage collection, type safety.</td></tr>
+        <tr><td><strong>BCL</strong> / Base Class Library</td><td>The built-in types: <code>string</code>, <code>List&lt;T&gt;</code>, <code>HttpClient</code>.</td></tr>
+        <tr><td><strong>.NET</strong></td><td>The whole platform: runtime + libraries + SDK + tooling.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>C# is the language you write. IL is the sheet music. The CLR is the orchestra that plays it.</p>
+    <p>Which is why F# and VB.NET also run on .NET — different languages, same sheet music format.</p>
+  </div>
+
+  <p>The runtime side — JIT, AOT, target frameworks, the SDK — is covered in
+    <a href="../06-dotnet-platform/index.html">.NET Platform Fundamentals</a>. This section is the language.</p>
+
+  <h2 id="contents">What's in this section</h2>
+
+  <div class="card-grid" data-section-index></div>
+
+  <div class="note info">
+    <div class="note-title">Where this sits in the learning path</div>
+    <p style="margin:0">This is the beginning — nothing comes before it. Next is
+      <a href="../02-oop/index.html">OOP</a>, which uses the classes and interfaces introduced here, then
+      <a href="../03-solid/index.html">SOLID</a> and <a href="../04-linq/index.html">LINQ</a>.
+      <br><br>
+      The genuinely hard C# topics — <strong>garbage collection, async/await and concurrency</strong> — are
+      deliberately held back to <a href="../05-csharp-advanced/index.html">section 05</a>, after you've met
+      LINQ and delegates, because they build on both.</p>
+  </div>
+
+  <h2 id="how-interviewed">How C# is interviewed <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Four levels, and they escalate quickly:</p>
+
+  <ol class="steps">
+    <li><strong>Definitions.</strong> "What's the difference between a class and a struct?" Screening only.</li>
+    <li><strong>Consequences.</strong> "So what happens if I put a struct in a <code>List</code> and modify
+      it?" This is where most candidates stop being able to answer.</li>
+    <li><strong>Read this code.</strong> A snippet with a subtle bug — a captured loop variable, a boxed
+      comparison, a mutable struct. You explain what it prints and why.</li>
+    <li><strong>Design.</strong> "Model money in C#." Tests whether you reach for a record struct, whether
+      you validate in the constructor, whether you think about equality.</li>
+  </ol>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Answer level 1 in one sentence, then <em>volunteer</em> level 2 without being asked.
+      <br><br>
+      "A struct is a value type, so it's copied on assignment — which means if you store one in a collection
+      and modify what you read out, you're modifying a copy. That's the bug people hit."
+      <br><br>
+      That single move — definition plus the consequence — is the clearest way to signal you've used this in
+      anger rather than read it.</p>
+  </div>
+
+  <h2 id="priorities">What to prioritise</h2>
+
+  <p>If you have limited time, in this order:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Priority</th><th>Topic</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><a href="type-system.html">Value vs reference types, boxing, equality</a></td><td>Asked in virtually every C# interview, and explains real bugs</td></tr>
+        <tr><td>2</td><td><a href="language-features.html">Generics and delegates</a></td><td>LINQ, DI and events are unreadable without them</td></tr>
+        <tr><td>3</td><td><a href="type-system.html#records">Records, immutability, <code>string</code></a></td><td>Modern C# design questions land here</td></tr>
+        <tr><td>4</td><td><a href="language-features.html#pattern-matching">Pattern matching, iterators</a></td><td>Shows you write current C#, not C# 5</td></tr>
+        <tr><td>5</td><td><a href="modern-csharp.html">Version history</a></td><td>Useful context; rarely asked directly</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="interview-questions">Warm-up interview questions</h2>
+
+  <details class="qa">
+    <summary>How would you describe your level of C# knowledge?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd describe it in terms of what I can reason about rather than years. I'm comfortable with the
+          type system — value versus reference semantics, where boxing happens, how equality works — and
+          with generics, delegates and expression trees, which matter because they're what LINQ and DI are
+          built on."</p>
+        <p>"The areas I've had to understand properly because they caused real problems are async and
+          memory. Knowing why <code>.Result</code> deadlocks, what <code>ConfigureAwait</code> actually
+          does, and why a long-lived object holding a short-lived one is a leak — those came from debugging,
+          not reading."</p>
+        <p>"Where I'd say I'm still deliberately learning is the very low-level performance work —
+          <code>Span&lt;T&gt;</code>, stack allocation, source generators. I know when to reach for them and
+          I've used them in a hot path, but I wouldn't claim to be the person who writes the allocation-free
+          parser."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you self-assess honestly? Overclaiming is the fastest way to fail the follow-up.</li>
+        <li>Do you know which parts of the language actually matter in production?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "expert" or "10 out of 10" — the next question will disprove it.</li>
+        <li><span class="redflag">Red flag:</span> listing years of experience instead of capabilities.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Tell me about a C#-specific bug you had to debug.</li>
+          <li>What's a C# feature you avoid, and why?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What's a C# feature you think is overused?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A few, but the one I'd pick is <code>var</code> for non-obvious types. <code>var</code> is
+          great when the right-hand side names the type — <code>var order = new Order()</code>. It's bad
+          when it hides it: <code>var result = _service.Process(input)</code> tells the reader nothing, and
+          in a review I can't tell whether that's a <code>Task</code>, an <code>IEnumerable</code> or a
+          tuple."</p>
+        <p>"The other one is exceptions for control flow. Throwing for an expected business outcome — a
+          declined payment, a validation failure — is both slow and misleading. Exceptions should mean
+          something genuinely exceptional; expected outcomes are better as a result type."</p>
+        <p>"And I'd add <code>dynamic</code>. It exists for real interop reasons, but every use throws away
+          the compiler's help, which is the main thing C# gives you over a dynamic language."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have opinions formed by experience rather than by tutorials?</li>
+        <li>Can you criticise something without being dogmatic?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you return a "declined payment" without throwing?</li>
+          <li>When is <code>dynamic</code> genuinely the right answer?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

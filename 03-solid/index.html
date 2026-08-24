@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SOLID Principles In Depth</title>
+<meta name="description" content="SOLID explained simply for C# developers: what problem each principle solves, an analogy for each, small before-and-after examples, and when not to apply them.">
+<meta name="keywords" content="SOLID single responsibility open closed liskov substitution interface segregation dependency inversion csharp examples simple explanation analogy mental model over-engineering dependency injection">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="03-solid/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>SOLID Principles</h1>
+    <p class="subtitle">Five habits that make C# code cheaper to change. Each one solves a specific,
+      recognisable pain — this page leads with that pain, not the definition.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision — the five in one line each</div>
+    <ul>
+      <li><strong>S</strong>ingle Responsibility — <em>one reason to change.</em> Don't let unrelated jobs
+        share a class.</li>
+      <li><strong>O</strong>pen/Closed — <em>add, don't edit.</em> New behaviour should mean a new class,
+        not a change to a tested one.</li>
+      <li><strong>L</strong>iskov Substitution — <em>a subclass must not surprise you.</em> It has to work
+        anywhere the base works.</li>
+      <li><strong>I</strong>nterface Segregation — <em>don't force people to depend on what they don't
+        use.</em> Small interfaces beat big ones.</li>
+      <li><strong>D</strong>ependency Inversion — <em>depend on abstractions, and own them.</em> Your
+        business logic shouldn't know about SQL Server.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-solid">Before the definitions: what problem is this solving? <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>Think about the last time a change was painful. It usually looked like one of these:</p>
+
+  <ul>
+    <li>You edited one class and something unrelated broke.</li>
+    <li>Adding a new payment provider meant touching seven files.</li>
+    <li>You couldn't write a unit test without spinning up a database.</li>
+    <li>A subclass threw an exception from a method it inherited.</li>
+    <li>You changed an interface and broke five classes that didn't care about the change.</li>
+  </ul>
+
+  <p>Those five pains are, in order, exactly what SRP, OCP, DIP, LSP and ISP address.</p>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>SOLID is five answers to one question: <strong>"who depends on whom, and what breaks when this
+      changes?"</strong></p>
+    <p>That's it. Everything else is detail.</p>
+  </div>
+
+  <p>They're <strong>habits, not laws</strong>. Each one has a cost, and a codebase that maximises all five
+    is usually over-abstracted and unpleasant to read. Knowing when <em>not</em> to apply them matters just
+    as much — there's a section on that at the end.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">In an interview, say where each principle earns its keep <em>and</em> where it
+      doesn't. SRP and DIP pay off almost everywhere. OCP pays when variation is real and recurring. ISP
+      matters mainly at published boundaries. LSP isn't a design lever at all — it's a rule you must not
+      break.</p>
+  </div>
+
+  <h2 id="srp">S — Single Responsibility <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A class should have <strong>one reason to change</strong>.</p>
+    <p>Not "one method". Not "one thing" — that's too vague to be useful. One <em>reason</em>, meaning one
+      group of people who ask for changes to it.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A restaurant doesn't have one person who cooks, takes payments and designs the menu. Not because
+      it's impossible — because every time the menu changes, you'd risk breaking the kitchen.</p>
+    <p>Same code, same logic: separate the jobs that <em>change for different reasons</em>.</p>
+  </div>
+
+  <h3 id="srp-problem">The problem</h3>
+
+  <pre data-label="csharp — bad: three different teams edit this one file" class="code-bad"><code class="language-csharp">public class InvoiceService
+{
+    public decimal CalculateTotal(Invoice invoice)   // Finance owns this rule
+    {
+        var subtotal = invoice.Lines.Sum(l =&gt; l.Quantity * l.UnitPrice);
+        return subtotal + (subtotal * 0.20m);
+    }
+
+    public void Save(Invoice invoice)                // The platform team owns this
+    {
+        using var conn = new SqlConnection(_connectionString);
+        conn.Execute("INSERT INTO Invoices ...", invoice);
+    }
+
+    public string RenderHtml(Invoice invoice)        // Marketing owns this
+        =&gt; $"&lt;h1&gt;Invoice {invoice.Number}&lt;/h1&gt;";
+}</code></pre>
+
+  <p>Ask yourself: <em>who asks for changes to this file?</em> Three different groups. And that causes four
+    concrete problems:</p>
+
+  <ol class="steps">
+    <li>A VAT change, a database change and a template restyle all touch the same file.</li>
+    <li>They conflict in source control.</li>
+    <li>Each change risks breaking the other two.</li>
+    <li>You can't unit test the VAT rule without a database connection.</li>
+  </ol>
+
+  <h3 id="srp-fix">The fix</h3>
+
+  <pre data-label="csharp — split by who asks for the change" class="code-good"><code class="language-csharp">// Finance rules. Pure logic, fast tests, no infrastructure.
+public sealed class InvoiceCalculator(ITaxPolicy taxPolicy)
+{
+    public Money CalculateTotal(Invoice invoice) { /* ... */ }
+}
+
+// Changes when storage changes.
+public sealed class InvoiceRepository(AppDbContext db) : IInvoiceRepository { /* ... */ }
+
+// Changes when the template changes.
+public sealed class InvoiceHtmlRenderer(ITemplateEngine templates) : IInvoiceRenderer { /* ... */ }</code></pre>
+
+  <p>Now a VAT change touches one small class with fast tests, and nothing else.</p>
+
+  <div class="remember">
+    <span class="r-label">How to remember SRP</span>
+    <p>Ask: <strong>"who would ask me to change this?"</strong></p>
+    <p>Two different answers means two classes.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake — going too far</div>
+    <p style="margin:0">Reading "one responsibility" as "one method per class". You end up with
+      <code>OrderValidator</code>, <code>OrderValidatorFactory</code> and
+      <code>OrderValidationResultMapper</code> — ten files where three would do, and following one request
+      means opening all of them.
+      <br><br>
+      <strong>The test isn't method count.</strong> If the same person requests every change to five
+      classes, they were probably one class.</p>
+  </div>
+
+  <h2 id="ocp">O — Open/Closed <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Add new behaviour by adding code, not by editing code that already works.</strong></p>
+    <p>"Open" for extension, "closed" for modification.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A power strip. You add a new device by plugging it in — you don't rewire the strip.</p>
+    <p>The socket is the abstraction. Each device is a new implementation.</p>
+  </div>
+
+  <h3 id="ocp-problem">The problem</h3>
+
+  <pre data-label="csharp — bad: every new shipping option means editing this method" class="code-bad"><code class="language-csharp">public decimal CalculateShipping(Order order)
+{
+    switch (order.ShippingMethod)
+    {
+        case ShippingMethod.Standard: return 4.99m;
+        case ShippingMethod.Express:  return 12.99m;
+        case ShippingMethod.NextDay:  return 24.99m;
+        default: throw new ArgumentOutOfRangeException();
+    }
+}</code></pre>
+
+  <p>Here's the part that actually hurts. It isn't this one switch — it's that switches on the same enum
+    <strong>multiply</strong>. You'll find another in the UI, one in reporting, one in the invoice printer.</p>
+
+  <p>Add "Locker delivery" and the compiler won't tell you which of the seven you missed. One of them
+    silently falls into <code>default</code> in production.</p>
+
+  <h3 id="ocp-fix">The fix</h3>
+
+  <pre data-label="csharp — new behaviour = new class, nothing else changes" class="code-good"><code class="language-csharp">public interface IShippingRate
+{
+    ShippingMethod Method { get; }
+    Money RateFor(Order order);
+}
+
+public sealed class NextDayRate : IShippingRate
+{
+    public ShippingMethod Method =&gt; ShippingMethod.NextDay;
+    public Money RateFor(Order order) =&gt; new(24.99m, "GBP");
+}
+
+public sealed class ShippingCalculator(IEnumerable&lt;IShippingRate&gt; rates)
+{
+    public Money For(Order order) =&gt;
+        rates.FirstOrDefault(r =&gt; r.Method == order.ShippingMethod)?.RateFor(order)
+        ?? throw new ShippingUnavailableException(order.ShippingMethod);
+}</code></pre>
+
+  <p>Adding locker delivery is now one new class plus one registration line. No existing file changes.</p>
+
+  <div class="note compare">
+    <div class="note-title">Trade-off — be honest about this one</div>
+    <p style="margin:0">The switch is <strong>easier to read</strong>. All the rates are in one place.
+      The polymorphic version scatters them across files and you need to understand DI registration.
+      <br><br>
+      So OCP is worth it when the set genuinely grows <em>and</em> each variant has real logic. It's not
+      worth it for three constants.
+      <br><br>
+      Also: modern C# switch expressions over a sealed hierarchy give you <strong>exhaustiveness
+      warnings</strong> — the compiler <em>does</em> tell you about the missed case. That weakens the classic
+      argument quite a bit.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to remember OCP</span>
+    <p>Use the <strong>rule of three</strong>. The first time you write the branch, write it. The third time
+      you're editing the same switch to add a case — refactor to polymorphism.</p>
+    <p>Three edits is evidence. One is a guess.</p>
+  </div>
+
+  <h2 id="lsp">L — Liskov Substitution <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>If code works with the base class, it must still work when you hand it a subclass.</strong></p>
+    <p>A subclass is allowed to do more. It is not allowed to do <em>less</em>, or to break a promise the
+      base class made.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A rental car agency promises "a car with four wheels and a steering wheel". If they hand you a
+      go-kart, it technically has wheels — but every assumption you made (motorway, passengers, boot space)
+      just broke.</p>
+    <p>The go-kart <em>is</em> a vehicle. It is not a valid <em>substitute</em> for a car.</p>
+  </div>
+
+  <h3 id="lsp-rules">Three rules cover almost every real violation</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rule</th><th>What a violation looks like</th></tr></thead>
+      <tbody>
+        <tr><td>Don't make the inputs stricter</td><td>Base accepts any positive amount; the override rejects anything over 1000</td></tr>
+        <tr><td>Don't weaken the guarantees</td><td>Base promises a saved entity has an ID; the override sometimes leaves it null</td></tr>
+        <tr><td>Don't add new failures</td><td>The override throws <code>NotSupportedException</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="lsp-problem">The problem</h3>
+
+  <pre data-label="csharp — compiles perfectly, crashes at runtime" class="code-bad"><code class="language-csharp">public class Employee
+{
+    public virtual decimal CalculateBonus(decimal salary) =&gt; salary * 0.10m;
+}
+
+public class Contractor : Employee
+{
+    // Contractors get no bonus - so this "override" breaks the base's promise.
+    public override decimal CalculateBonus(decimal salary)
+        =&gt; throw new InvalidOperationException("Contractors get no bonus.");
+}</code></pre>
+
+  <pre data-label="csharp — perfectly reasonable code that now blows up" class="code-bad"><code class="language-csharp">var totalBonuses = employees.Sum(e =&gt; e.CalculateBonus(e.Salary));</code></pre>
+
+  <p>Nothing is wrong with that <code>Sum</code>. It was written against <code>Employee</code>'s contract,
+    which says <em>"this returns a number"</em>. The subclass broke that contract.</p>
+
+  <h3 id="lsp-fix">Two ways to fix it</h3>
+
+  <pre data-label="csharp — option 1: make it a legitimate value" class="code-good"><code class="language-csharp">public override decimal CalculateBonus(decimal salary) =&gt; 0m;</code></pre>
+
+  <p>Simple, and correct if "no bonus" really does mean zero.</p>
+
+  <pre data-label="csharp — option 2: say it in the type system" class="code-good"><code class="language-csharp">public interface IBonusEligible { Money CalculateBonus(); }
+
+public sealed class PermanentEmployee : Worker, IBonusEligible { /* ... */ }
+public sealed class Contractor        : Worker { }   // simply doesn't implement it
+
+var totalBonuses = workers.OfType&lt;IBonusEligible&gt;().Sum(w =&gt; w.CalculateBonus().Amount);</code></pre>
+
+  <p>Option 2 is stronger: the runtime crash becomes <strong>impossible to write</strong>. Code that needs a
+    bonus can only be handed something that has one.</p>
+
+  <p>Notice that fixing an LSP problem here meant splitting an interface — which is ISP. The principles
+    interlock; that's a good thing to point out in an interview.</p>
+
+  <div class="remember">
+    <span class="r-label">How to spot LSP violations in review</span>
+    <p>Look for <code>if (x is SomeSubclass)</code> at call sites, or a try/catch around a polymorphic call.</p>
+    <p>If callers have to know which concrete type they're holding, the abstraction has stopped abstracting.</p>
+  </div>
+
+  <h2 id="isp">I — Interface Segregation <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Don't force a class to depend on methods it never calls.</strong></p>
+    <p>Several small, focused interfaces beat one big general-purpose one.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A TV remote with 60 buttons where you only ever use 5. Every extra button is something you have to
+      look past, and every redesign risks moving the ones you actually need.</p>
+  </div>
+
+  <h3 id="isp-problem">The problem</h3>
+
+  <pre data-label="csharp — bad: one interface serving four unrelated clients" class="code-bad"><code class="language-csharp">public interface IUserService
+{
+    Task&lt;User&gt; GetAsync(Guid id);
+    Task&lt;User&gt; CreateAsync(CreateUser cmd);
+    Task DeleteAsync(Guid id);
+    Task&lt;byte[]&gt; ExportAllAsync();            // only the admin job needs this
+    Task ImportAsync(Stream csv);             // only the migration tool needs this
+    Task&lt;bool&gt; ValidatePasswordAsync(Guid id, string password);
+}</code></pre>
+
+  <p>What this actually costs you:</p>
+
+  <ul>
+    <li>The login controller depends on six members and uses <strong>one</strong>.</li>
+    <li>Every test double has to stub all six.</li>
+    <li>A read-only implementation has to throw from <code>ImportAsync</code> — so a bad interface just
+      created an LSP violation.</li>
+  </ul>
+
+  <h3 id="isp-fix">The fix</h3>
+
+  <pre data-label="csharp — split by what each client actually needs" class="code-good"><code class="language-csharp">public interface IUserReader        { Task&lt;User?&gt; GetAsync(Guid id, CancellationToken ct); }
+public interface IUserWriter        { Task&lt;User&gt; CreateAsync(CreateUser cmd, CancellationToken ct); }
+public interface IUserAuthenticator { Task&lt;bool&gt; ValidatePasswordAsync(Guid id, string pw, CancellationToken ct); }
+
+// One class can still implement all three. That's fine.
+public sealed class UserService : IUserReader, IUserWriter, IUserAuthenticator { /* ... */ }</code></pre>
+
+  <div class="remember">
+    <span class="r-label">The bit people get wrong</span>
+    <p>ISP is about the <strong>consumer's</strong> view, not the implementer's.</p>
+    <p>One class implementing four interfaces is completely fine. What matters is that the login controller
+      only depends on the one method it uses.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Taking it to one method per interface, everywhere. You get dozens of tiny interfaces
+      and a DI registration file nobody can read. Segregate where clients genuinely differ — especially at
+      boundaries other teams consume — and leave cohesive interfaces alone.</p>
+  </div>
+
+  <h2 id="dip">D — Dependency Inversion <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Your business logic should not know about SQL Server, SMTP or HTTP.</strong></p>
+    <p>It depends on an interface it owns; the infrastructure implements that interface.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A wall socket. Your laptop doesn't know or care whether the electricity comes from a coal plant, a
+      wind farm or a generator. It depends on the <em>socket shape</em> — and the power station is the one
+      that had to conform to it.</p>
+    <p>That last part is the "inversion": <strong>the consumer defines the plug, not the supplier.</strong></p>
+  </div>
+
+  <h3 id="dip-problem">The problem</h3>
+
+  <pre data-label="csharp — bad: business logic nailed to infrastructure" class="code-bad"><code class="language-csharp">public class OrderProcessor
+{
+    public void Process(Order order)
+    {
+        using var conn = new SqlConnection("Server=prod;...");    // knows the database
+        conn.Execute("INSERT INTO Orders ...", order);
+
+        var client = new SmtpClient("smtp.company.com");          // knows the mail server
+        client.Send(new MailMessage(/* ... */));
+
+        File.AppendAllText(@"C:\logs\orders.txt", "...");         // knows the disk
+    }
+}</code></pre>
+
+  <p>You cannot unit test this at all. Running the test would send a real email to a real customer.</p>
+
+  <h3 id="dip-fix">The fix</h3>
+
+  <pre data-label="csharp — the core declares what it needs" class="code-good"><code class="language-csharp">// Defined in the APPLICATION layer, in domain language.
+public interface IOrderRepository    { Task AddAsync(Order order, CancellationToken ct); }
+public interface INotificationSender { Task OrderReceivedAsync(Order order, CancellationToken ct); }
+
+public sealed class OrderProcessor(
+    IOrderRepository orders,
+    INotificationSender notifications,
+    ILogger&lt;OrderProcessor&gt; log)
+{
+    public async Task ProcessAsync(Order order, CancellationToken ct)
+    {
+        await orders.AddAsync(order, ct);
+        await notifications.OrderReceivedAsync(order, ct);
+        log.LogInformation("Processed order {OrderId}", order.Id);
+    }
+}</code></pre>
+
+  <pre data-label="csharp — infrastructure conforms to the core, not the other way round" class="code-good"><code class="language-csharp">// This project references the application project. Never the reverse.
+public sealed class SqlOrderRepository(AppDbContext db) : IOrderRepository { /* ... */ }</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this — the one detail that matters</span>
+    <p><strong>The interface must live with the caller, not the implementer.</strong></p>
+    <p><code>IOrderRepository</code> belongs in the Application project. <code>SqlOrderRepository</code>
+      belongs in Infrastructure, and Infrastructure references Application. That flip is the whole point.</p>
+  </div>
+
+  <h3 id="dip-vs-di">DIP vs DI vs IoC — three terms people mix up</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Term</th><th>What it actually is</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Dependency Inversion</strong></td><td>A design <em>principle</em>: which way dependencies point, and who owns the interface</td><td>The core defines <code>IOrderRepository</code></td></tr>
+        <tr><td><strong>Inversion of Control</strong></td><td>A general <em>idea</em>: the framework calls you, not the other way round</td><td>ASP.NET Core calls your controller</td></tr>
+        <tr><td><strong>Dependency Injection</strong></td><td>A <em>technique</em>: pass dependencies in, usually via the constructor</td><td><code>OrderProcessor(IOrderRepository orders)</code></td></tr>
+        <tr><td><strong>DI container</strong></td><td>A <em>tool</em> that automates the injection</td><td><code>services.AddScoped&lt;...&gt;()</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Why the distinction is practical, not pedantic</div>
+    <p style="margin:0">You can use a DI container everywhere and <em>still</em> fail DIP.
+      <br><br>
+      If <code>IOrderRepository</code> is defined in the Infrastructure project and the Application project
+      references Infrastructure to get it, the dependency still points from policy to detail. You have
+      injection without inversion — and your core still can't be compiled or tested without a database.</p>
+  </div>
+
+  <h2 id="together">How the five fit together <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Principle</th><th>Main benefit</th><th>Cost when overdone</th><th>Where it pays most</th></tr></thead>
+      <tbody>
+        <tr><td>SRP</td><td>Change stays local; testable</td><td>Class explosion, logic scattered</td><td>Separating domain rules from infrastructure</td></tr>
+        <tr><td>OCP</td><td>Add features without editing tested code</td><td>Indirection for variation that never arrives</td><td>Growing families: payment methods, exporters</td></tr>
+        <tr><td>LSP</td><td>Polymorphism you can trust</td><td>Rarely overdone — it's a constraint, not a lever</td><td>Any inheritance or shared interface</td></tr>
+        <tr><td>ISP</td><td>Clients insulated from unrelated change</td><td>Interface soup, unreadable DI setup</td><td>Published contracts, cross-team boundaries</td></tr>
+        <tr><td>DIP</td><td>Testable core, swappable infrastructure</td><td>Interfaces with one implementation forever</td><td>Every boundary to I/O, time, external systems</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">One sentence that connects them</span>
+    <p>SRP decides <em>where the boundaries go</em>. DIP decides <em>which way they point</em>. ISP keeps
+      them <em>small</em>. LSP keeps implementations <em>honest</em>. OCP is <em>what you get</em> in return.</p>
+  </div>
+
+  <h2 id="over-application">When NOT to apply SOLID</h2>
+
+  <ul>
+    <li><strong>Scripts, migrations, one-off tools.</strong> Code you'll delete next month doesn't need
+      extension points.</li>
+    <li><strong>Genuinely stable behaviour.</strong> If a rule hasn't changed in three years, an abstraction
+      to make it changeable is speculative.</li>
+    <li><strong>Plain CRUD.</strong> A controller reading and writing a record doesn't need a service, a
+      repository interface, a mapper and a factory.</li>
+    <li><strong>Before you know what varies.</strong> The first implementation can't tell you the axis of
+      variation, so the abstraction you invent is usually the wrong shape.</li>
+  </ul>
+
+  <div class="note danger">
+    <div class="note-title">Production trap</div>
+    <p style="margin:0">The expensive SOLID failure isn't violating the principles. It's applying them
+      mechanically until every action sits behind three interfaces, stack traces are meaningless, and
+      finding where something happens means chasing DI registrations across four projects.
+      <br><br>
+      That codebase isn't "clean" — it traded one difficulty for a worse one. <strong>Optimise for the
+      person reading it next.</strong></p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li><strong>SRP:</strong> split by <em>who asks for the change</em>, not by method count.</li>
+      <li><strong>OCP:</strong> refactor on the third edit of the same switch, not the first.</li>
+      <li><strong>LSP:</strong> the tell is type checks and try/catch at call sites.</li>
+      <li><strong>ISP:</strong> judge from the consumer's side; one class can implement many interfaces.</li>
+      <li><strong>DIP:</strong> the interface lives with the caller — otherwise it's DI without inversion.</li>
+      <li>A wrong abstraction costs more than duplication. Duplicate twice, extract on the third.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>Explain the Single Responsibility Principle with a real example.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A class should have one reason to change. The framing I find most useful is: it should be
+          answerable to a single group of people who request changes. Otherwise 'one responsibility' is
+          unfalsifiable, because you can define it at any size."</p>
+        <p>"The example I've hit repeatedly is an invoice service that calculates totals, saves to the
+          database and renders an HTML template. Three different groups drive changes there — finance
+          changes VAT, the platform team changes storage, marketing changes the template."</p>
+        <p>"So they all edit the same file, they conflict in source control, each change risks the others,
+          and you can't test the VAT rule without a database. Splitting it into a calculator with no
+          infrastructure, a repository and a renderer means a VAT change touches one small class with fast
+          tests."</p>
+        <p>"Where I'm careful is not reading it as 'one method per class'. I've seen codebases with
+          <code>OrderValidator</code>, <code>OrderValidatorFactory</code> and
+          <code>OrderValidationResultMapper</code> where following one request means opening ten files.
+          That's worse. My test is whether the same person requests all the changes."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you define "responsibility" in a way that's actually decidable?</li>
+        <li>Do you recognise the over-application failure mode?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Does a controller that validates, calls a service and maps a response violate SRP?</li>
+          <li>How does SRP relate to cohesion?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How do you achieve Open/Closed in C#? Is a switch statement always a violation?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The usual mechanism is polymorphism — define an abstraction for what varies, implement it per
+          variant, and let the caller resolve implementations instead of branching. In .NET that often means
+          registering several implementations and injecting <code>IEnumerable&lt;T&gt;</code>, so adding a
+          variant is a new class plus a registration."</p>
+        <p>"But a switch isn't automatically a violation. The problem with switches isn't the syntax, it's
+          duplication. When the same enum is switched on in seven places, adding a value means finding all
+          seven and the compiler won't tell you which you missed. If there's exactly one switch, close to
+          the type it belongs to, and the set is stable — I'd leave it. It reads better."</p>
+        <p>"Modern C# also changes the calculus. A switch expression over a sealed hierarchy gives you
+          exhaustiveness warnings, so the compiler <em>does</em> tell you. That weakens the classic argument
+          quite a bit."</p>
+        <p>"My practical trigger is the rule of three. First time I write the branch. By the third time I'm
+          editing the same switch for a new case, that's real evidence of a growing family, and I refactor.
+          Doing it earlier is guessing at an axis of variation I haven't observed yet."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the mechanisms — and can you defend <em>not</em> applying them?</li>
+        <li>Do you know modern language features change classic OO advice?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "switch statements are always bad, use polymorphism."</li>
+        <li><span class="redflag">Red flag:</span> claiming OCP means never editing existing code — impossible in practice.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you register and select among many implementations in ASP.NET Core DI?</li>
+          <li>Does adding a case to a switch expression over a sealed hierarchy break OCP?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Give an example of a Liskov violation you've seen, and how you'd fix it.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The clearest one was a storage abstraction with a <code>SaveAsync</code> method, and a read-only
+          archive implementation that threw <code>NotSupportedException</code> from it. Everything compiled.
+          It worked until a code path that legitimately saved files got pointed at archive storage by
+          configuration."</p>
+        <p>"The tell was already visible before the incident. Call sites had started doing
+          <code>if (storage is not ReadOnlyArchiveStorage)</code>, and one had a try/catch around the save.
+          Whenever callers need to know which implementation they're holding, the abstraction has stopped
+          abstracting."</p>
+        <p>"The fix was to split the interface — readable and writable — with the archive implementing only
+          the readable one. That moves the error from runtime to compile time: code that needs to write can
+          only be given something that can write, so the bad configuration becomes impossible to express."</p>
+        <p>"There's a subtler variety too — not throwing, but weakening a guarantee. A repository documented
+          as returning a persisted entity with an ID, and a caching implementation returning a stale copy
+          without one. Nothing throws, you just get a null reference somewhere far away. Those argue for
+          contract tests that every implementation has to pass."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you recognise LSP violations from symptoms, not theory?</li>
+        <li>Do you know contract tests as a mitigation?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you write a contract test suite all implementations must pass?</li>
+          <li>Is returning null instead of throwing a Liskov violation?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Are dependency inversion, dependency injection and IoC the same thing? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"No, and it's worth being precise because they get used interchangeably."</p>
+        <p>"Dependency inversion is a design principle about which way dependencies point — high-level policy
+          shouldn't depend on low-level detail, and crucially the abstraction is owned by the high-level
+          module. Inversion of control is broader: the framework calls your code rather than the other way
+          round. Dependency injection is one technique for supplying dependencies, usually via the
+          constructor. A container just automates that."</p>
+        <p>"The reason it's practical rather than pedantic: you can use a container everywhere and still fail
+          DIP. If <code>IOrderRepository</code> lives in the infrastructure project and the application
+          references it, the dependency still points from policy to detail. You have injection without
+          inversion, and your core still can't be tested without infrastructure."</p>
+        <p>"The inversion happens when the interface lives with the consumer and the implementer depends on
+          it. That's exactly what makes Clean and Hexagonal architectures work — the dependency arrow points
+          inward regardless of which way control flows at runtime."</p>
+        <p>"And I'd add: not every dependency deserves an abstraction. Depending directly on
+          <code>List&lt;T&gt;</code> or a JSON serializer is fine. I invert at boundaries where I need
+          substitutability — I/O, time, randomness, external services, anything that makes tests slow or
+          non-deterministic."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Conceptual precision — this question is designed to separate memorisation from understanding.</li>
+        <li>Do you know <em>where</em> interfaces should live? That's the operative part of DIP.</li>
+        <li>Do you know when not to abstract?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "DIP means using a DI container."</li>
+        <li><span class="redflag">Red flag:</span> "always program to an interface" with no discussion of ownership or cost.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which project should <code>IOrderRepository</code> live in, and why?</li>
+          <li>How do you handle something the domain needs that's inherently infrastructural, like the current time?</li>
+          <li>When is a concrete dependency acceptable?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A colleague says the codebase should follow SOLID everywhere. How do you respond?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd agree with the intent and push back on 'everywhere'. The principles exist to make change
+          cheap, so the question for any specific case is whether it makes change cheaper <em>here</em>.
+          Sometimes it demonstrably doesn't."</p>
+        <p>"An interface with one implementation that will never have another adds a file, an indirection in
+          every stack trace, and a registration to maintain — in exchange for flexibility nobody uses."</p>
+        <p>"The concrete cost is legibility. In a heavily abstracted codebase, answering 'what happens when
+          this endpoint is called?' means chasing registrations across projects. Everyone pays that, every
+          time. The benefit only arrives if the variation actually materialises. So it's a bet: how likely
+          is this to vary, and what does it cost me until then?"</p>
+        <p>"What I'd advocate is applying them where evidence supports it. DIP at I/O boundaries almost
+          always pays. SRP between domain rules and infrastructure almost always pays. OCP pays when I've
+          edited the same switch three times — observed variation, not predicted. LSP isn't optional,
+          because breaking it produces real bugs."</p>
+        <p>"The framing that usually lands is: duplicate twice, abstract on the third. A wrong abstraction
+          is more expensive than duplication, because it's harder to remove and everything gets built on
+          top of it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you hold a nuanced position under mild social pressure?</li>
+        <li>Can you articulate the cost of abstraction concretely?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where would you draw the line on a greenfield service?</li>
+          <li>How do you retrofit DIP into a codebase full of static dependencies?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

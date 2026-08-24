@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Tenant Scaling — Scaling Scenarios</title>
+<meta name="description" content="Noisy neighbours, a tenant hundreds of times larger than the rest, isolation failures, per-tenant cost and migrating a tenant to its own infrastructure.">
+<meta name="keywords" content="multi-tenant scaling noisy neighbour tenant isolation large tenant onboarding per tenant quota fair scheduling shared database pool tenant migration cost per tenant tenant sharding bulkhead per tenant rate limiting">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="35-scaling-scenarios/saas.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Multi-Tenant Scaling</h1>
+    <p class="subtitle">Shared infrastructure means one customer's behaviour is everyone's problem. Most of these
+      scenarios are about containing that.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Noisy neighbour is the defining problem</strong> of shared infrastructure.</li>
+      <li><strong>Per-tenant quotas, not a global limit.</strong> A global limit lets one tenant consume it all.</li>
+      <li><strong>Tenant dimension on every metric</strong>, or you cannot diagnose anything.</li>
+      <li><strong>Tenant size distribution is always skewed.</strong> Design for the largest, not the median.</li>
+      <li><strong>A very large tenant is a hot partition.</strong> Same physics, same non-fix.</li>
+      <li><strong>Isolation must be structural</strong> — enforced by the framework, not by remembering.</li>
+      <li><strong>Know your cost per tenant</strong>, or a customer can be unprofitable invisibly.</li>
+      <li><strong>Plan the escape hatch:</strong> moving one tenant to dedicated infrastructure.</li>
+    </ul>
+  </div>
+
+  <h2 id="noisy">Scenario: one tenant is degrading everyone <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Where it bites</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Database</strong></td><td>Their queries consume DTUs/RUs, evict the buffer pool, hold locks</td></tr>
+        <tr><td><strong>Connection pool</strong></td><td>Their concurrency exhausts connections everyone shares</td></tr>
+        <tr><td><strong>Thread pool</strong></td><td>Their long requests occupy threads</td></tr>
+        <tr><td><strong>Queue</strong></td><td>Their 100,000 messages sit ahead of everyone else's</td></tr>
+        <tr><td><strong>Cache</strong></td><td>Their working set evicts everyone else's entries</td></tr>
+        <tr><td><strong>Rate limit</strong></td><td>A global limit means they consume the whole allowance</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A global rate limit doesn't protect anyone from a noisy neighbour</div>
+    <p style="margin:0">The instinct is to add a rate limit. A <em>global</em> one makes it worse: if the limit is
+      10,000 requests a minute and one tenant sends 9,500, everyone else shares the remaining 500 — and now they're
+      being throttled <strong>because of someone else's behaviour</strong>.
+      <br><br>
+      So the limit has to be <strong>per tenant</strong>, keyed on the tenant id from the validated token, not from a
+      header the caller controls. Then a tenant hitting their ceiling gets 429s and nobody else is affected. That
+      turns a shared-fate problem into a contained one.
+      <br><br>
+      Two implementation details that matter. It must be <strong>distributed</strong> — Redis-backed — because a
+      per-instance limiter multiplies as you scale out, so a 1,000-per-minute limit becomes 5,000 across five
+      instances. And <strong>return <code>Retry-After</code></strong>, so a well-behaved client backs off rather than
+      retrying immediately and making it worse.
+      <br><br>
+      Beyond rate limiting, the same "per tenant, not global" logic applies to every shared resource:
+      <strong>concurrency limits per tenant</strong> (a bulkhead), <strong>queue partitioning or separate queues</strong>
+      so one tenant's backlog doesn't delay others, and <strong>cache quotas</strong> so one working set can't evict
+      everyone.
+      <br><br>
+      The framing worth stating: <strong>fairness has to be designed in.</strong> Shared infrastructure defaults to
+      first-come-first-served, which under load means whoever generates the most load wins.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">You cannot diagnose this without a tenant dimension</div>
+    <p style="margin:0">The first question in any multi-tenant incident is <em>"is this one customer or
+      everyone?"</em> — and the answer determines everything that follows.
+      <br><br>
+      If telemetry isn't <a href="../24-azure/application-insights.html#opentelemetry">enriched with tenant id</a>,
+      that question is unanswerable. You end up correlating support tickets against timestamps, which is slow and
+      unreliable.
+      <br><br>
+      So: tenant id on every request, dependency, exception and log entry, added once by a telemetry initialiser
+      rather than per log statement. Then requests by tenant, p95 by tenant and errors by tenant are queries rather
+      than investigations.
+      <br><br>
+      For the database specifically, you want to attribute consumption too. Cosmos DB reports RU charge per request,
+      so aggregating by tenant is straightforward. For SQL, Query Store plus a tenant identifier in the query context
+      or application name gets you most of the way.
+      <br><br>
+      <strong>Do this before you need it.</strong> You cannot retrospectively split by a dimension you never
+      recorded — which is precisely what you'll want during the first serious incident.</p>
+  </div>
+
+  <h2 id="large-tenant">Scenario: onboarding a tenant 100× the size of the others <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What breaks</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Queries that were fast</strong></td><td>A scan over their data is 100× the work</td></tr>
+        <tr><td><strong>Pagination</strong></td><td><code>OFFSET</code> deep into a large set is expensive</td></tr>
+        <tr><td><strong>A partition key of tenant id</strong></td><td><strong>They exceed one physical partition's limits</strong></td></tr>
+        <tr><td><strong>Exports and reports</strong></td><td>What took 10 seconds takes 20 minutes and times out</td></tr>
+        <tr><td><strong>In-memory operations</strong></td><td>Loading "all their records" now exhausts memory</td></tr>
+        <tr><td><strong>Nightly batch jobs</strong></td><td>No longer fit in the window</td></tr>
+        <tr><td><strong>Cache</strong></td><td>Their working set evicts every other tenant's</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — a very large tenant is a hot partition</div>
+    <p style="margin:0">If the partition key is tenant id, then <strong>all of that tenant's data and traffic is on
+      one physical partition</strong>, bounded by that partition's throughput and storage limits. In Cosmos DB that's
+      a hard ceiling, and in DynamoDB the same.
+      <br><br>
+      Which means it's the <a href="database.html#hot-partition">hot partition problem</a> again — and so is the
+      non-fix: <strong>adding throughput doesn't help</strong>, because their key still maps to one partition, which
+      now gets a smaller share of a larger total.
+      <br><br>
+      The options, and they're the same shape as always:
+      <br><br>
+      <strong>Hierarchical partition keys</strong> in Cosmos — tenant, then a subkey — so a single tenant can span
+      physical partitions while queries scoped to that tenant remain efficient. This is exactly what the feature is
+      for.
+      <br><br>
+      <strong>A synthetic subkey</strong> for the same effect where hierarchical keys aren't available, at the cost of
+      fanning reads across buckets.
+      <br><br>
+      <strong>Move them to dedicated infrastructure.</strong> Often the right answer, and worth stating without
+      embarrassment: a customer a hundred times larger than the median has genuinely different requirements, and
+      forcing the shared model to serve both extremes usually degrades it for everyone. They can also typically pay
+      for it.
+      <br><br>
+      What matters most is knowing this <em>before</em> onboarding. <strong>"How much data will they have, and what's
+      our current largest?"</strong> is a question the sales conversation should trigger, because the answer may be a
+      quarter of engineering work rather than a configuration change.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Assumptions that only hold for small tenants</div>
+    <p style="margin:0">The pattern to watch for is code that works because the data is small, with nothing marking
+      it as an assumption.
+      <br><br>
+      <strong>Loading a full collection into memory</strong> — "get all users for the tenant" — is fine at 50 and
+      fatal at 500,000. Especially in a <code>foreach</code> that then queries per item.
+      <br><br>
+      <strong><code>OFFSET</code>-based pagination</strong> degrades linearly with depth: page 10,000 means the
+      database counts through everything before it. Keyset pagination is constant-cost and the fix is
+      straightforward, but it changes the API contract, so it's better done early.
+      <br><br>
+      <strong>Synchronous export.</strong> A CSV generated in-request works until it takes longer than the request
+      timeout — then it fails for exactly the customers who most want it. Large exports belong in a background job
+      with a download link.
+      <br><br>
+      <strong>Unbounded queries with no maximum page size</strong>, which is fine until someone requests
+      <code>pageSize=100000</code>.
+      <br><br>
+      The useful review question: <strong>"what happens if this tenant has a million rows?"</strong> Asking it
+      routinely is cheaper than discovering the answer during onboarding — and a load test with a deliberately
+      oversized synthetic tenant catches most of it mechanically.</p>
+  </div>
+
+  <h2 id="isolation">Scenario: an isolation failure <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Structural defence</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A query missing the tenant filter</strong></td><td>Global query filters + an architecture test</td></tr>
+        <tr><td><strong><code>IgnoreQueryFilters()</code> used somewhere</strong></td><td>Allow-list it; fail the build elsewhere</td></tr>
+        <tr><td><strong>Raw SQL bypassing filters</strong></td><td>Review, and keep raw SQL rare and reviewed</td></tr>
+        <tr><td><strong>A cache key without the tenant</strong></td><td>A key-builder that always includes it</td></tr>
+        <tr><td><strong>Tenant context with the wrong lifetime</strong></td><td>Scoped, never static or singleton-captured</td></tr>
+        <tr><td><strong>An id from the request body, not the token</strong></td><td>Resolve tenant from the validated token only</td></tr>
+        <tr><td><strong>A background job with no tenant context</strong></td><td>Carry tenant explicitly in the message</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Isolation must be enforced by construction, not by discipline</div>
+    <p style="margin:0">Every place a developer <em>could forget</em> the tenant filter is a latent data breach. So
+      the design goal is to reduce the number of places where forgetting is possible to as near zero as the framework
+      allows.
+      <br><br>
+      <strong>EF Core global query filters</strong> are the main tool: applied at the model level, so every query for
+      that entity carries the filter automatically. Correct by default, and forgetting requires actively calling
+      <code>IgnoreQueryFilters()</code>.
+      <br><br>
+      Two traps specific to that mechanism, both worth knowing:
+      <br><br>
+      <strong>The model is cached.</strong> If a filter captures the tenant id <em>by value</em> when the model is
+      built, one tenant's id is baked into the cached model and used for everyone. The filter must read from a scoped
+      service at query time — and this bug is severe, silent, and passes every single-tenant test.
+      <br><br>
+      <strong>Filters don't apply to raw SQL</strong> or to <code>ExecuteUpdate</code>/<code>ExecuteDelete</code>, so
+      those need the filter written explicitly and deserve heightened review.
+      <br><br>
+      Beyond the ORM: <strong>resolve tenant only from the validated token</strong>, never from a header or body — a
+      client-supplied tenant id is an authorisation bypass waiting to happen. Keep <strong>tenant context
+      scoped</strong>, because a static or singleton-captured value leaks across requests intermittently and
+      under load, which is the hardest version of this bug to find.
+      <br><br>
+      And <strong>test it</strong>: write as tenant A, read as tenant B, assert nothing comes back. Plus an
+      architecture test asserting <code>IgnoreQueryFilters</code> appears nowhere outside an allow-list. Those two
+      cover most of the realistic failures mechanically, which is the only enforcement that scales.</p>
+  </div>
+
+  <h2 id="cost">Scenario: a tenant is unprofitable <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Attribute</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Requests and compute</strong></td><td>Request count and duration by tenant dimension</td></tr>
+        <tr><td><strong>Database</strong></td><td>RU charge per request (Cosmos); Query Store attribution (SQL)</td></tr>
+        <tr><td><strong>Storage</strong></td><td>Row or document counts and blob usage per tenant</td></tr>
+        <tr><td><strong>Messaging</strong></td><td>Messages published and consumed per tenant</td></tr>
+        <tr><td><strong>Egress</strong></td><td>Response bytes per tenant — often the surprise</td></tr>
+        <tr><td><strong>Support</strong></td><td>Not infrastructure, and frequently the largest cost</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Cost per tenant is a product decision that needs engineering data</div>
+    <p style="margin:0">In a shared system, cost is a single bill and it hides everything. So a customer paying £200 a
+      month can be costing £2,000 in RUs and egress, and nobody knows — because the bill only shows a total.
+      <br><br>
+      Attribution changes what the business can do: price by usage, introduce fair-use limits, decide whether an
+      expensive customer is strategic or should be repriced. All of which need per-tenant numbers, and none of which
+      engineering can decide alone.
+      <br><br>
+      The pragmatic approach is <strong>proportional attribution</strong> rather than exact accounting: allocate
+      shared cost by each tenant's share of requests, RUs and storage. That's approximate and entirely adequate for
+      spotting the outliers, which is what you actually want. Exact per-tenant cost accounting is a large project with
+      diminishing returns.
+      <br><br>
+      Two things worth flagging as commonly missed: <strong>egress</strong>, which is easy to overlook and can dominate
+      for a tenant downloading large exports, and <strong>the cost of a heavy tenant on
+      <em>everyone else's</em> experience</strong> — which doesn't show up as cost at all, but as p95 latency for other
+      customers. That's a real cost paid in churn rather than in cloud spend.
+      <br><br>
+      And the same data supports capacity planning: knowing cost per tenant means you can forecast what the next
+      hundred customers will cost, rather than discovering it.</p>
+  </div>
+
+  <h2 id="migration">Scenario: moving one tenant to dedicated infrastructure <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="text — the shape of a low-risk tenant migration"><code class="language-text">1  PROVISION       new database/container, same schema, same code version
+
+2  BACKFILL        copy their data. Read-only source ideally, or accept a
+                   catch-up phase. Verify counts and checksums.
+
+3  DUAL-WRITE      writes go to both. Reads still from the old.
+     or CDC/change feed replicating old -> new continuously
+
+4  VERIFY          compare. Not just counts - sample records field by field.
+                   Let it run long enough to catch drift.
+
+5  CUT OVER        brief write pause for that tenant only, final catch-up,
+                   flip their routing. Other tenants unaffected throughout.
+
+6  SOAK            keep the old data read-only for days. Rollback = flip back.
+
+7  DECOMMISSION    only after the soak. Deleting early removes your rollback.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — routing indirection is what makes this possible at all</div>
+    <p style="margin:0">The migration above only works if <strong>the application can already route a tenant to
+      different infrastructure</strong>. If the connection string is a single configuration value, there is no
+      migration path — you'd be changing everyone's.
+      <br><br>
+      So the enabling design is <strong>a tenant catalogue</strong>: a lookup from tenant id to its connection string,
+      storage account and configuration, resolved per request. Once that exists, moving a tenant is a row change plus
+      a data copy. Without it, it's a re-architecture.
+      <br><br>
+      That's worth building <em>before</em> you need it, and it's cheap to add early. It also gives you per-tenant
+      configuration, staged rollouts by tenant, and the ability to place tenants in different regions for data
+      residency — all valuable independently.
+      <br><br>
+      Two specifics on the migration itself. <strong>A brief write pause for one tenant is usually acceptable</strong>
+      — a maintenance window for one customer is a very different conversation from downtime for everyone, which is
+      the main advantage of per-tenant migration over a big-bang move.
+      <br><br>
+      And <strong>verify by sampling records, not just counting them.</strong> Matching row counts with mismatched
+      field values is the failure that gets discovered weeks later, and by then the old data is gone. Keep the source
+      read-only through a soak period so rollback stays available — the same
+      <a href="../26-iac/index.html#immutability">overlap-don't-cut-over</a> principle as credential rotation and
+      schema change.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Noisy neighbour is the defining problem; fairness must be designed in.</li>
+      <li>A global rate limit lets one tenant consume everyone's allowance.</li>
+      <li>Per-tenant limits, distributed, keyed on the token's tenant id, with <code>Retry-After</code>.</li>
+      <li>Apply "per tenant, not global" to concurrency, queues and cache too.</li>
+      <li>Tenant dimension on all telemetry, added before you need it.</li>
+      <li>Tenant size is always skewed — design for the largest, not the median.</li>
+      <li>A very large tenant is a hot partition; capacity doesn't fix it.</li>
+      <li>Hierarchical partition keys, a synthetic subkey, or dedicated infrastructure.</li>
+      <li>Watch for assumptions that only hold at small scale: in-memory loads, OFFSET, sync export.</li>
+      <li>Isolation enforced by construction — global filters, plus tests for bypasses.</li>
+      <li>The EF Core model cache will bake one tenant's id into the filter if captured by value.</li>
+      <li>Resolve tenant from the validated token only.</li>
+      <li>Attribute cost per tenant proportionally; don't forget egress.</li>
+      <li>A tenant catalogue is what makes per-tenant migration possible.</li>
+      <li>Verify by sampling fields, and soak before decommissioning.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>A global rate limit</strong> instead of per-tenant.</li>
+    <li><strong>Per-instance rate limiting</strong>, so limits multiply on scale-out.</li>
+    <li><strong>No tenant dimension in telemetry</strong>, making diagnosis impossible.</li>
+    <li><strong>Designing for the median tenant</strong> and being surprised by the largest.</li>
+    <li><strong>Adding throughput for a large tenant</strong> on a tenant-keyed partition.</li>
+    <li><strong>Loading a tenant's full collection into memory.</strong></li>
+    <li><strong><code>OFFSET</code> pagination</strong> that degrades for large tenants.</li>
+    <li><strong>Synchronous exports</strong> that time out for the biggest customers.</li>
+    <li><strong>Tenant id from a header or request body</strong> rather than the token.</li>
+    <li><strong>Tenant context in a static or singleton</strong>, leaking across requests.</li>
+    <li><strong>A query filter capturing tenant id by value</strong>, baked into the cached model.</li>
+    <li><strong>A shared queue</strong>, so one tenant's backlog delays everyone.</li>
+    <li><strong>No cost visibility per tenant.</strong></li>
+    <li><strong>No routing indirection</strong>, so no tenant can ever be moved.</li>
+    <li><strong>Deleting source data immediately</strong> after a migration.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>One tenant's usage is making the platform slow for everyone. What do you do? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd work in three phases: <strong>confirm it's actually one tenant, contain it, then fix the fairness
+          problem structurally.</strong>"</p>
+        <p>"<strong>First, confirm and quantify.</strong> I'd look at requests, p95 latency and RU or DTU consumption
+          <em>grouped by tenant</em>. That immediately tells me whether it's one tenant, and which resource they're
+          consuming — because the fix differs completely depending on whether it's database throughput, connections,
+          queue depth or cache."</p>
+        <p>"That query is only possible if telemetry carries a tenant dimension. If it doesn't, that's my first
+          finding, because otherwise I'm correlating support tickets against timestamps — and I'd want the enrichment
+          added regardless of how this incident resolves."</p>
+        <p>"<strong>Then work out what they're doing</strong>, because the response depends on it. Legitimate growth
+          is a capacity and pricing conversation. A misconfigured integration polling every second is a conversation
+          with them. An expensive query pattern — an unbounded report, a missing filter — might be something we can
+          optimise on their behalf."</p>
+        <p>"<strong>Containment</strong>, and this is where the important design point sits.
+          <strong>Per-tenant rate limiting</strong> — not a global limit, because a global limit makes it
+          <em>worse</em>: if the cap is 10,000 a minute and they use 9,500, everyone else shares 500 and is being
+          throttled for someone else's behaviour."</p>
+        <p>"So limits keyed on the tenant id from the validated token, enforced in a distributed store rather than
+          per instance — because a per-instance limiter multiplies as you scale out, so a 1,000-per-minute limit
+          becomes 5,000 across five instances. And returning <code>Retry-After</code>, so a well-behaved client
+          backs off instead of retrying immediately."</p>
+        <p>"Alongside that, a <strong>concurrency limit per tenant</strong> — a bulkhead — so they can only ever
+          occupy a slice of the thread and connection pools rather than all of it. That contains the blast radius
+          structurally rather than depending on a threshold being tuned correctly."</p>
+        <p>"<strong>If it's queue-based work</strong>, a shared queue means their 100,000 messages sit ahead of
+          everyone else's, so other tenants wait behind them. The fix is per-tenant queues, or a scheduler that
+          round-robins across tenants rather than processing strictly in order — fair scheduling rather than
+          first-come-first-served."</p>
+        <p>"<strong>If it's the database</strong>, and they're genuinely large, the deeper problem may be that the
+          partition key is tenant id — in which case all their traffic is on one physical partition and
+          <strong>adding throughput doesn't help</strong>, because their key still maps to one place. That's the hot
+          partition problem, and the answers are hierarchical partition keys, a synthetic subkey, or moving them
+          out."</p>
+        <p>"<strong>Which brings up the escape hatch.</strong> If one tenant is a hundred times the median, forcing
+          the shared model to serve both extremes usually degrades it for everyone. Moving them to dedicated
+          infrastructure is often the right engineering answer, and they can typically pay for it — so it's a
+          commercial option as well as a technical one."</p>
+        <p>"That's only possible if the application can route a tenant to different infrastructure — a
+          <strong>tenant catalogue</strong> mapping tenant to connection string and configuration. If the connection
+          string is a single config value, there's no migration path at all. Worth building early, and it's cheap
+          then."</p>
+        <p>"<strong>On prevention</strong>, the framing I'd offer: <strong>shared infrastructure defaults to
+          first-come-first-served, which under load means whoever generates the most load wins.</strong> Fairness has
+          to be designed in — per-tenant quotas, per-tenant concurrency, fair queue scheduling — and alerting per
+          tenant so a change in one customer's behaviour is visible before it's everyone's problem."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you confirm with per-tenant data before acting?</li>
+        <li>Do you know a global rate limit makes it worse?</li>
+        <li>Do you know per-instance limits multiply?</li>
+        <li>Do you apply fairness to queues and concurrency, not just requests?</li>
+        <li>Do you recognise a large tenant as a hot partition?</li>
+        <li>Do you raise dedicated infrastructure and the routing prerequisite?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add a rate limit" with no per-tenant keying.</li>
+        <li><span class="redflag">Red flag:</span> scaling up as the whole answer.</li>
+        <li><span class="redflag">Red flag:</span> no way to identify which tenant.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you implement a distributed per-tenant limit?</li>
+          <li>How do you schedule a queue fairly across tenants?</li>
+          <li>How would you move that tenant out with no downtime for others?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Sales has signed a customer with 200× your largest tenant's data. What do you check? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd treat this as a project rather than an onboarding, and the first thing I'd do is
+          <strong>build a synthetic tenant at that scale in a test environment</strong> and run the real workload
+          against it. Reasoning about which things break is much less reliable than measuring."</p>
+        <p>"<strong>The hard limits first</strong>, because those aren't optimisations — they're blockers."</p>
+        <p>"<strong>If the partition key is tenant id, they may exceed a single physical partition.</strong> In Cosmos
+          DB that's a hard storage and throughput ceiling per partition, and adding RUs doesn't help because their key
+          still maps to one partition. That's the first thing I'd check, because if it's a problem the answer is
+          either hierarchical partition keys or dedicated infrastructure, and both are significant work."</p>
+        <p>"<strong>Then the assumptions that only hold at small scale.</strong> These are the ones that pass every
+          test and fail on the day."</p>
+        <p>"<strong>Anything loading a full collection into memory.</strong> 'Get all users for the tenant' is fine at
+          50 and fatal at 500,000 — especially inside a loop that then queries per item."</p>
+        <p>"<strong><code>OFFSET</code>-based pagination</strong>, which degrades linearly with depth: page 10,000
+          means counting through everything before it. Keyset pagination is constant-cost, and it changes the API
+          contract, so it's better done before onboarding than after."</p>
+        <p>"<strong>Synchronous exports and reports.</strong> A CSV generated in-request works until it exceeds the
+          request timeout — and then it fails for exactly the customer who most wants it. Those need to become
+          background jobs with a download link."</p>
+        <p>"<strong>Queries that scan.</strong> A missing index that costs 20ms on 50,000 rows costs seconds on ten
+          million. The query didn't change; the data did. So I'd review the plans for their access patterns
+          specifically, at their volume."</p>
+        <p>"<strong>Batch jobs and their windows.</strong> A nightly job that takes twenty minutes today may not fit
+          in the window with 200× the data, and it may hold locks long enough to affect other tenants."</p>
+        <p>"<strong>Cache behaviour.</strong> Their working set may evict every other tenant's entries, so everyone
+          else's hit rate collapses. That's a noisy-neighbour effect that shows up as other customers getting slower,
+          which is easy to misattribute."</p>
+        <p>"<strong>The onboarding itself</strong> is its own risk. Importing their initial data is a bulk load that
+          can saturate the database and degrade everyone — so it needs to be throttled, batched, run off-peak, and
+          ideally against a replica or a staged path rather than the live transactional load."</p>
+        <p>"<strong>Then the honest conversation.</strong> My recommendation might well be
+          <strong>dedicated infrastructure for them</strong> — their own database, possibly their own deployment. Not
+          as a failure of the shared design, but because a customer 200× the median has genuinely different
+          requirements, and forcing one model to serve both extremes usually degrades it for the other 500
+          customers."</p>
+        <p>"That needs a <strong>tenant catalogue</strong> — routing tenant to connection string and configuration per
+          request. If we don't have that, adding it is a prerequisite and I'd say so, because without it there's no
+          way to place a tenant anywhere different."</p>
+        <p>"<strong>And I'd give the business real numbers</strong> rather than a yes or no: what it costs to serve
+          them on shared infrastructure, what it costs dedicated, what engineering work each path needs and how long.
+          Then the commercial decision is informed — including the option of pricing it appropriately, which is often
+          the answer for a customer of that size."</p>
+        <p>"The thing I'd want to avoid is the failure mode where nobody asks until go-live. <strong>'How much data
+          will they have, and what's our current largest?' should be a standard question during the sales
+          process</strong>, because the answer is sometimes a quarter of engineering work rather than a configuration
+          change."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you test at scale rather than reason about it?</li>
+        <li>Do you check hard partition limits first?</li>
+        <li>Can you name the small-scale assumptions that break?</li>
+        <li>Do you consider the onboarding load itself?</li>
+        <li>Do you consider effects on other tenants, including cache eviction?</li>
+        <li>Do you engage with the commercial side and the routing prerequisite?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "we'll scale up when needed."</li>
+        <li><span class="redflag">Red flag:</span> only considering database size.</li>
+        <li><span class="redflag">Red flag:</span> refusing the customer outright.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you run the initial data import safely?</li>
+          <li>What would you change about pagination, and why now?</li>
+          <li>How do you decide shared versus dedicated?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indexing — SQL</title>
+<meta name="description" content="How indexes actually work, clustered vs non-clustered, composite column order, covering indexes, SARGability, and why your index isn't being used.">
+<meta name="keywords" content="clustered index nonclustered B-tree seek scan key lookup covering index INCLUDE composite column order SARGable filtered index fill factor fragmentation missing index index maintenance selectivity">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/indexing.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Indexing</h1>
+    <p class="subtitle">The single highest-leverage database skill. Most "the database is slow" problems are
+      an index problem, and most index problems are a column-order problem.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>An index is a sorted copy of some columns</strong> plus a pointer back to the row. That one
+        sentence explains almost everything else.</li>
+      <li><strong>The clustered index <em>is</em> the table</strong> — one per table. Non-clustered indexes are
+        separate structures that point back to it.</li>
+      <li><strong>Column order in a composite index is everything.</strong> Equality columns first, then the
+        range column, then sorting.</li>
+      <li><strong>A covering index</strong> answers the query entirely from the index — no lookup back to the
+        table.</li>
+      <li><strong>Wrapping a column in a function kills the seek.</strong> That's the SARGability rule.</li>
+      <li><strong>Every index slows writes</strong> and takes space. They're not free.</li>
+      <li><strong><code>SELECT *</code> defeats covering indexes</strong> — that's the real cost of it.</li>
+    </ul>
+  </div>
+
+  <h2 id="how-indexes-work">What an index actually is <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A phone book sorted by surname. Finding "Patel" takes seconds — you jump to P, then narrow down.</p>
+    <p>Now find everyone with the phone number 555-0142. You read <strong>the entire book</strong>, because
+      it isn't sorted that way.</p>
+    <p>That's a seek versus a scan. Both search the same data; one uses the ordering and one can't.</p>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An index is a <strong>separate, sorted structure</strong> containing the indexed columns plus a pointer
+      back to the full row.</p>
+    <p>It's a B-tree, so lookups are logarithmic — a few page reads instead of millions. On a table with 10
+      million rows, that's roughly 3–4 reads instead of ~40,000.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Operation</th><th>What it means</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Index seek</strong></td><td>Navigate the B-tree to the exact rows</td><td>Logarithmic. What you want</td></tr>
+        <tr><td><strong>Index scan</strong></td><td>Read the whole index</td><td>Linear, but narrower than the table</td></tr>
+        <tr><td><strong>Table / clustered index scan</strong></td><td>Read every row</td><td>Linear over the full table. Usually the problem</td></tr>
+        <tr><td><strong>Key lookup</strong></td><td>Found it in a non-clustered index, now fetch remaining columns</td><td><strong>Per row.</strong> Cheap once, expensive 100,000 times</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">A scan isn't always bad</div>
+    <p style="margin:0">If a query returns most of the table, scanning is <em>cheaper</em> than seeking —
+      seeking 800,000 times plus 800,000 lookups is worse than reading the table once.
+      <br><br>
+      That's why the optimiser sometimes ignores your index, and it's a legitimate decision. A scan is only a
+      problem when you expected a small result set and got a full read.</p>
+  </div>
+
+  <h2 id="clustered-vs-nonclustered">Clustered vs non-clustered <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Clustered</th><th>Non-clustered</th></tr></thead>
+      <tbody>
+        <tr><td>What it is</td><td><strong>The table itself</strong>, stored in key order</td><td>A separate sorted copy of chosen columns</td></tr>
+        <tr><td>How many</td><td><strong>One</strong> per table</td><td>Many (SQL Server allows 999)</td></tr>
+        <tr><td>Leaf level holds</td><td>The full row</td><td>Index key + the clustering key as the pointer</td></tr>
+        <tr><td>Extra lookup?</td><td>No — the data is there</td><td>Yes, unless the index covers the query</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>The clustered index is not a pointer to the data. It IS the data.</strong></p>
+    <p>Which is why there's only one — a table can only be physically sorted one way.</p>
+    <p>Every non-clustered index stores the clustering key as its pointer. So a wide clustered key makes
+      <em>every other index</em> on that table bigger.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why clustering key width matters</div>
+    <p style="margin:0">Cluster on a <code>uniqueidentifier</code> (16 bytes) instead of an <code>int</code>
+      (4 bytes) and every non-clustered index row carries 12 extra bytes.
+      <br><br>
+      Ten indexes on a 50-million-row table: that's roughly 6 GB of pure overhead, which means more pages,
+      more I/O, and less of the useful data fitting in memory.
+      <br><br>
+      "The clustering key is in every index" is the fact that makes this a senior-level answer rather than a
+      definition.</p>
+  </div>
+
+  <h3 id="clustering-key-choice">What to cluster on</h3>
+
+  <ul>
+    <li><strong>Narrow</strong> — it's duplicated into every other index.</li>
+    <li><strong>Increasing</strong> — appends avoid page splits.</li>
+    <li><strong>Unique</strong> — otherwise SQL Server silently adds a 4-byte uniquifier.</li>
+    <li><strong>Static</strong> — updating a clustering key physically moves the row <em>and</em> updates
+      every non-clustered index.</li>
+  </ul>
+
+  <p>An <code>int IDENTITY</code> satisfies all four, which is why it's the default answer. See
+    <a href="fundamentals.html#guids">the GUID discussion</a> for when the identity column and the primary key
+    should be different columns.</p>
+
+  <h2 id="column-order">Composite index column order <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A phone book sorted by <strong>(LastName, FirstName)</strong>.</p>
+    <p>"Find Patel, Anita" — instant. "Find all the Patels" — instant, they're together.</p>
+    <p>"Find everyone called Anita" — <strong>useless</strong>. You read the whole book, because Anitas are
+      scattered across every surname.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>A composite index can only be seeked on a <strong>left-to-right prefix</strong> of its columns.</p>
+    <p><code>(A, B, C)</code> supports queries on <code>A</code>, <code>(A,B)</code>, <code>(A,B,C)</code>.</p>
+    <p>It does <strong>not</strong> support a seek on <code>B</code> alone, or <code>C</code> alone.</p>
+  </div>
+
+  <h3 id="order-rule">The ordering rule</h3>
+
+  <ol class="steps">
+    <li><strong>Equality columns first</strong> — anything compared with <code>=</code>.</li>
+    <li><strong>Then the range column</strong> — <code>&gt;</code>, <code>&lt;</code>,
+      <code>BETWEEN</code>, <code>LIKE 'x%'</code>. <em>Only one</em> range column can be used efficiently.</li>
+    <li><strong>Then <code>ORDER BY</code> columns</strong>, so sorting is free.</li>
+    <li><strong>Then everything else as <code>INCLUDE</code></strong> — not key columns.</li>
+  </ol>
+
+  <pre data-label="sql — the query we're indexing for"><code class="language-sql">SELECT OrderId, Total, CreatedUtc
+FROM   dbo.[Order]
+WHERE  CustomerId = @customerId          -- equality
+  AND  Status     = 'Shipped'            -- equality
+  AND  CreatedUtc &gt;= @from               -- range
+ORDER BY CreatedUtc DESC;</code></pre>
+
+  <pre data-label="sql — wrong order: range column too early" class="code-bad"><code class="language-sql">CREATE INDEX IX_Order_Bad
+    ON dbo.[Order](CreatedUtc, CustomerId, Status);</code></pre>
+
+  <p>Once the seek hits the range on <code>CreatedUtc</code>, the rows are ordered by date — so
+    <code>CustomerId</code> and <code>Status</code> are scattered inside that date range. SQL Server seeks to
+    the date range, then <em>scans and filters</em>. On a wide date range, that's most of the index.</p>
+
+  <pre data-label="sql — right order" class="code-good"><code class="language-sql">CREATE INDEX IX_Order_Customer_Status_Created
+    ON dbo.[Order](CustomerId, Status, CreatedUtc DESC)
+    INCLUDE (Total);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Part</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>CustomerId, Status</code></td><td>Both equality — they narrow to a small contiguous block</td></tr>
+        <tr><td><code>CreatedUtc DESC</code></td><td>Range <em>and</em> the sort. Inside the block, rows are already in the requested order — no sort operator at all</td></tr>
+        <tr><td><code>INCLUDE (Total)</code></td><td>Needed in the output, never filtered on. Included = no key-lookup, without widening the tree</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The trick with <code>ORDER BY</code></div>
+    <p style="margin:0">Matching the index order to the <code>ORDER BY</code> removes the <strong>sort
+      operator</strong> entirely. That's not a small win: sorts need a memory grant, and if the estimate is
+      too low the sort <em>spills to disk</em> — often the difference between 50ms and 5 seconds.
+      <br><br>
+      In an execution plan, a <code>Sort</code> with a spill warning is one of the most reliable signals that
+      an index is missing.</p>
+  </div>
+
+  <h3 id="selectivity">Selectivity, and where it doesn't apply</h3>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Selectivity</strong> is how much a column narrows the result. <code>CustomerId</code> is highly
+      selective; <code>IsActive</code> with two values is not.</p>
+    <p>Among <em>equality</em> columns, put the most selective first — it narrows fastest.</p>
+    <p>But this rule <strong>never overrides</strong> the equality-before-range rule. Query shape beats
+      selectivity every time.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two composite-index traps</div>
+    <p style="margin:0"><strong>1. A skipped column breaks the seek.</strong> With
+      <code>(A, B, C)</code>, a query filtering on <code>A</code> and <code>C</code> can seek on
+      <code>A</code> only, then filter <code>C</code> by scanning. Usable, but far from a full seek.
+      <br><br>
+      <strong>2. <code>IN</code> is a set of equalities, not a range.</strong>
+      <code>Status IN ('New','Paid')</code> still seeks — SQL Server does one seek per value. So
+      <code>IN</code> doesn't force the column later in the key, which surprises people.</p>
+  </div>
+
+  <h2 id="covering">Covering indexes and <code>INCLUDE</code> <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A <strong>covering index</strong> contains every column the query needs — filters, joins,
+      <code>ORDER BY</code> and output.</p>
+    <p>SQL Server answers the query from the index alone and never touches the table. In the plan you'll see
+      no <strong>Key Lookup</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Key columns</th><th><code>INCLUDE</code> columns</th></tr></thead>
+      <tbody>
+        <tr><td>Stored in</td><td>Every level of the B-tree</td><td><strong>Leaf level only</strong></td></tr>
+        <tr><td>Can seek/filter on</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Can sort by</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Size impact</td><td>Widens the whole tree</td><td>Only the leaves</td></tr>
+        <tr><td>Use for</td><td><code>WHERE</code>, <code>JOIN</code>, <code>ORDER BY</code></td><td><code>SELECT</code> output columns</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Key columns are for <em>finding</em>. <code>INCLUDE</code> columns are for <em>returning</em>.</strong></p>
+    <p>If you filter or sort by it, it's a key. If you only display it, include it.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">This is the real cost of <code>SELECT *</code></div>
+    <p style="margin:0">A carefully covering index stops covering the moment someone adds a column to the
+      <code>SELECT</code> list — and <code>SELECT *</code> guarantees it never covers anything.
+      <br><br>
+      So the plan silently changes from a clean seek to a seek plus a key lookup per row. Nothing errors.
+      Nothing warns you. The query is just 50× slower under load.
+      <br><br>
+      That's a much better answer to "why avoid <code>SELECT *</code>?" than "it returns extra data".</p>
+  </div>
+
+  <h2 id="sargable">SARGability — why your index isn't used <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>SARGable means "Search ARGument able" — the predicate can use an index seek.</p>
+    <p>The rule is one sentence: <strong>if the indexed column is wrapped in anything, the seek is gone.</strong></p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Why, intuitively</span>
+    <p>The index is sorted by the column's <em>actual value</em>. Ask for
+      <code>YEAR(CreatedUtc) = 2024</code> and the database can't jump anywhere — it has to compute
+      <code>YEAR()</code> for every row to find out which qualify.</p>
+    <p>The phone book is sorted by surname. "Everyone whose surname has 6 letters" means reading all of it.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Not SARGable ❌</th><th>SARGable ✅</th></tr></thead>
+      <tbody>
+        <tr><td><code>WHERE YEAR(CreatedUtc) = 2024</code></td><td><code>WHERE CreatedUtc &gt;= '2024-01-01' AND CreatedUtc &lt; '2025-01-01'</code></td></tr>
+        <tr><td><code>WHERE UPPER(Email) = @e</code></td><td><code>WHERE Email = @e</code> — collation already handles case</td></tr>
+        <tr><td><code>WHERE Name LIKE '%smith%'</code></td><td><code>WHERE Name LIKE 'smith%'</code> — leading wildcard can't seek</td></tr>
+        <tr><td><code>WHERE Total * 1.2 &gt; 100</code></td><td><code>WHERE Total &gt; 100 / 1.2</code></td></tr>
+        <tr><td><code>WHERE ISNULL(Status,'New') = 'New'</code></td><td><code>WHERE Status = 'New' OR Status IS NULL</code></td></tr>
+        <tr><td><code>WHERE CAST(Id AS varchar) = @id</code></td><td><code>WHERE Id = @id</code> with a typed parameter</td></tr>
+        <tr><td><code>WHERE DATEDIFF(day, CreatedUtc, GETDATE()) &lt;= 7</code></td><td><code>WHERE CreatedUtc &gt;= DATEADD(day, -7, GETDATE())</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The pattern</span>
+    <p><strong>Transform the parameter, never the column.</strong></p>
+    <p>Every fix in that table is the same move: get the function off the left-hand side.</p>
+  </div>
+
+  <h3 id="implicit-conversion">Implicit conversion — the invisible one <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <pre data-label="csharp — looks fine, isn't" class="code-bad"><code class="language-csharp">// Column is varchar(50). The parameter defaults to nvarchar.
+cmd.Parameters.AddWithValue("@sku", sku);</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">What happens</span>
+    <p><code>nvarchar</code> has higher datatype precedence than <code>varchar</code>, so SQL Server converts
+      <strong>the column</strong>, not the parameter — <code>CONVERT(nvarchar, Sku) = @sku</code>.</p>
+    <p>Which is a function on the column. The index seek is gone, on every row.</p>
+  </div>
+
+  <pre data-label="csharp — specify the type" class="code-good"><code class="language-csharp">cmd.Parameters.Add("@sku", SqlDbType.VarChar, 50).Value = sku;</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Why this one is so common</div>
+    <p style="margin:0"><code>AddWithValue</code> infers the type from the .NET value, and a .NET
+      <code>string</code> becomes <code>nvarchar</code>. So <strong>every <code>varchar</code> column queried
+      through <code>AddWithValue</code> loses its index seek</strong>.
+      <br><br>
+      It's invisible in the SQL and invisible in the C#. The only visible sign is a
+      <code>CONVERT_IMPLICIT</code> in the execution plan, plus a warning on the SELECT operator.
+      <br><br>
+      This is a genuinely good answer to "tell me about a performance problem you found", because it's real,
+      widespread, and the fix is one line.</p>
+  </div>
+
+  <h3 id="or-problem">The <code>OR</code> problem</h3>
+
+  <pre data-label="sql — OR across different columns" class="code-bad"><code class="language-sql">SELECT * FROM Customer WHERE Email = @e OR Phone = @p;</code></pre>
+
+  <p>No single index covers both sides, so SQL Server often scans. Two indexes plus a
+    <code>UNION</code> usually beats it, because each half can seek:</p>
+
+  <pre data-label="sql" class="code-good"><code class="language-sql">SELECT * FROM Customer WHERE Email = @e
+UNION
+SELECT * FROM Customer WHERE Phone = @p;</code></pre>
+
+  <h2 id="specialised">Filtered and other specialised indexes <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="sql — filtered index" class="code-good"><code class="language-sql">-- 50 million orders; 40,000 are pending. Index only those.
+CREATE INDEX IX_Order_Pending
+    ON dbo.[Order](CreatedUtc)
+    INCLUDE (CustomerId, Total)
+    WHERE Status = 'Pending';</code></pre>
+
+  <p>Tiny index, fits in memory, cheap to maintain — because rows leave the index when their status changes.
+    Ideal for queue-like tables where you only ever query the active subset.</p>
+
+  <div class="note warn">
+    <div class="note-title">Filtered index gotcha</div>
+    <p style="margin:0">The query's predicate must <strong>provably</strong> imply the filter. A literal
+      <code>WHERE Status = 'Pending'</code> works. A <em>parameter</em>
+      <code>WHERE Status = @status</code> generally will not use it, because the value isn't known at
+      compile time.
+      <br><br>
+      That surprises people who add a filtered index and see no improvement. Options are <code>OPTION
+      (RECOMPILE)</code>, or a dedicated query with the literal.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Filtered</strong></td><td>Queries always touching a small subset</td></tr>
+        <tr><td><strong>Columnstore</strong></td><td>Analytical aggregation over millions of rows. Huge compression; poor for single-row lookups</td></tr>
+        <tr><td><strong>Full-text</strong></td><td>Word search in large text — what <code>LIKE '%x%'</code> can't do</td></tr>
+        <tr><td><strong>Unique</strong></td><td>Enforcing a rule <em>and</em> giving the optimiser a guarantee it can use</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="cost">Indexes are not free <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cost</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Write amplification</strong></td><td>Every <code>INSERT</code> writes to the table <em>and</em> every index. 10 indexes = 11 writes</td></tr>
+        <tr><td><strong>Update cost</strong></td><td>An <code>UPDATE</code> only touches indexes containing that column — so narrow indexes are cheaper</td></tr>
+        <tr><td><strong>Storage</strong></td><td>Indexes routinely exceed the size of the table</td></tr>
+        <tr><td><strong>Memory</strong></td><td>Index pages compete with data pages for buffer pool. Bloat pushes useful data out</td></tr>
+        <tr><td><strong>Locking</strong></td><td>More structures to lock during writes; more deadlock surface</td></tr>
+        <tr><td><strong>Maintenance</strong></td><td>Rebuilds, statistics updates, longer backups</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — duplicate and unused indexes</div>
+    <p style="margin:0">The most common real-world index problem isn't a missing index. It's
+      <strong>fifteen overlapping indexes</strong> added over five years by different people, several of which
+      are prefixes of each other and some of which no query has used since 2021.
+      <br><br>
+      <code>(CustomerId)</code> is entirely redundant if <code>(CustomerId, Status)</code> exists — the second
+      serves every query the first would. Drop it.
+      <br><br>
+      <code>sys.dm_db_index_usage_stats</code> shows reads vs writes per index. An index with 0 seeks and 2
+      million updates is pure cost. Removing indexes is often a bigger win than adding them, and proposing
+      that is a strong senior signal.</p>
+  </div>
+
+  <h3 id="missing-index-dmv">Missing-index suggestions — use with care</h3>
+
+  <pre data-label="sql — what SQL Server thinks it wants"><code class="language-sql">SELECT
+    d.statement,
+    d.equality_columns,
+    d.inequality_columns,
+    d.included_columns,
+    s.user_seeks,
+    s.avg_user_impact
+FROM sys.dm_db_missing_index_details d
+JOIN sys.dm_db_missing_index_groups  g ON g.index_handle = d.index_handle
+JOIN sys.dm_db_missing_index_group_stats s ON s.group_handle = g.index_group_handle
+ORDER BY s.avg_user_impact * s.user_seeks DESC;</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Don't apply these blindly</div>
+    <p style="margin:0">The DMV suggests an index per query in isolation. It doesn't know about your other
+      indexes, doesn't consider write cost, doesn't consolidate, and often over-includes columns.
+      <br><br>
+      Apply 12 suggestions verbatim and you'll get 12 overlapping indexes and slower writes. Treat them as
+      <strong>evidence about which queries are struggling</strong>, then design a smaller consolidated set
+      yourself.
+      <br><br>
+      Also: the counters reset on restart, so a low count may just mean a recent failover.</p>
+  </div>
+
+  <h2 id="fragmentation">Fragmentation and fill factor <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Fragmentation</strong> is when the logical order of index pages no longer matches their
+      physical order, usually caused by page splits.</p>
+    <p><strong>Fill factor</strong> leaves free space on each page so inserts have room, reducing splits — at
+      the cost of a larger index.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Fragmentation</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td>&lt; 10%</td><td>Nothing</td></tr>
+        <tr><td>10–30%</td><td><code>REORGANIZE</code> — online, resumable, no big log growth</td></tr>
+        <tr><td>&gt; 30%</td><td><code>REBUILD</code> — faster result, also refreshes statistics</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Modern nuance worth mentioning</div>
+    <p style="margin:0">Fragmentation matters much less on SSDs and cloud storage than it did on spinning
+      disks — random reads are no longer catastrophically slower than sequential.
+      <br><br>
+      <strong>Out-of-date statistics are usually the bigger problem.</strong> A nightly rebuild of every index
+      is often wasted I/O and log volume; updating statistics is cheaper and fixes more.
+      <br><br>
+      Saying that shows you've operated a database rather than just read the maintenance checklist.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>An index is a sorted copy plus a pointer. Everything follows from that.</li>
+      <li>The clustered index is the table. Its key is duplicated into every non-clustered index — keep it
+        narrow.</li>
+      <li>Composite indexes seek on a left-to-right prefix only.</li>
+      <li>Order: equality, then range, then <code>ORDER BY</code>, then <code>INCLUDE</code>.</li>
+      <li>Matching the index to <code>ORDER BY</code> removes the sort — and sorts spill to disk.</li>
+      <li>Covering = no key lookup. <code>SELECT *</code> is what destroys it.</li>
+      <li>Function on the column = no seek. Transform the parameter instead.</li>
+      <li><code>AddWithValue</code> on a <code>varchar</code> column causes implicit conversion and kills the
+        seek.</li>
+      <li>Every index taxes writes. Duplicate and unused indexes are usually the bigger problem.</li>
+      <li>Statistics matter more than fragmentation on modern storage.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Indexing every column separately</strong> instead of designing composite indexes for real
+      queries.</li>
+    <li><strong>Range column first</strong> in a composite index.</li>
+    <li><strong>Putting output columns in the key</strong> instead of <code>INCLUDE</code>, widening the whole
+      tree.</li>
+    <li><strong><code>SELECT *</code></strong>, silently breaking covering indexes.</li>
+    <li><strong><code>YEAR(col) =</code></strong> and friends, then wondering why the index is unused.</li>
+    <li><strong><code>AddWithValue</code></strong> against <code>varchar</code> columns.</li>
+    <li><strong>Applying every missing-index suggestion</strong> verbatim.</li>
+    <li><strong>Never dropping anything</strong> — accumulating overlapping indexes for years.</li>
+    <li><strong>Nightly full rebuilds</strong> when a statistics update would do.</li>
+    <li><strong>Assuming a scan is always wrong</strong> — for large result sets it's correct.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>Clustered vs non-clustered index? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The clustered index <em>is</em> the table — the rows are physically stored in that key order. So
+          you get exactly one per table, because data can only be sorted one way."</p>
+        <p>"A non-clustered index is a separate structure holding the indexed columns in sorted order, plus a
+          pointer back to the row. In SQL Server that pointer is the <strong>clustering key</strong>."</p>
+        <p>"That last detail has a consequence people miss: <strong>the clustering key is stored in every
+          non-clustered index</strong>. So if you cluster on a 16-byte GUID rather than a 4-byte int, every
+          other index on the table carries 12 extra bytes per row. On a 50-million-row table with ten indexes
+          that's several gigabytes of pure overhead — more pages, more I/O, and less useful data fitting in
+          memory."</p>
+        <p>"The practical implication when reading a plan: if a non-clustered index doesn't contain every
+          column the query needs, you get a <strong>key lookup</strong> back to the clustered index —
+          per row. Cheap for ten rows, catastrophic for a hundred thousand. Fixing that is what covering
+          indexes are for."</p>
+        <p>"So when choosing a clustering key I want narrow, increasing, unique and static. An
+          <code>int IDENTITY</code> hits all four — narrow so indexes stay small, increasing so inserts append
+          instead of splitting pages, unique so SQL Server doesn't add a hidden uniquifier, and static because
+          changing a clustering key physically moves the row and updates every index pointing at it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the clustered index <em>is</em> the data?</li>
+        <li>Do you know the clustering key lives in every other index?</li>
+        <li>Can you connect it to key lookups in a plan?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's a key lookup and how do you eliminate it?</li>
+          <li>What happens if the clustering key isn't unique?</li>
+          <li>Can a primary key be non-clustered?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Given a query with two equality filters, a date range and an ORDER BY, what index would you create? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd order the columns: equality first, then the range, then the sort, then include the output
+          columns."</p>
+        <p>"So for <code>WHERE CustomerId = @c AND Status = @s AND CreatedUtc &gt;= @from ORDER BY CreatedUtc
+          DESC</code>, returning <code>Total</code>, I'd create
+          <code>(CustomerId, Status, CreatedUtc DESC) INCLUDE (Total)</code>."</p>
+        <p>"The reasoning: the two equality columns narrow to a small contiguous block of the index. Inside
+          that block, rows are ordered by <code>CreatedUtc</code>, so the range is a contiguous slice —
+          <em>and</em> it's already in the order the query wants, so there's no sort operator at all."</p>
+        <p>"That sort matters more than it sounds. Sorts need a memory grant, and if the estimate is too low
+          the sort spills to disk — that's frequently the difference between 50 milliseconds and five
+          seconds."</p>
+        <p>"<code>Total</code> goes in <code>INCLUDE</code> rather than the key because I never filter or sort
+          by it, I just return it. <code>INCLUDE</code> columns live only at the leaf level, so I get a
+          covering index — no key lookups — without widening the whole B-tree."</p>
+        <p>"The mistake I'd specifically avoid is putting <code>CreatedUtc</code> first. Once you seek on a
+          range, everything after it in the key is scattered within that range — so SQL Server would seek the
+          date range and then scan and filter for customer and status. On a wide date range that's most of
+          the index."</p>
+        <p>"Two caveats. Only <strong>one</strong> range column can be used efficiently, so if there were a
+          second range predicate I'd have to pick which one the index serves. And I'd check whether an
+          existing index already covers this — if <code>(CustomerId, Status)</code> exists, I'd extend it
+          rather than add a fourth overlapping index, because every index taxes writes."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the equality-then-range-then-sort ordering, and why?</li>
+        <li>Do you know why range-first is worse — mechanically?</li>
+        <li>Do you distinguish key from <code>INCLUDE</code>?</li>
+        <li>Do you consider extending an existing index instead of adding one?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> one index per column.</li>
+        <li><span class="redflag">Red flag:</span> "put the most selective column first" applied
+          mechanically, ignoring query shape.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if there were two range predicates?</li>
+          <li>How would you verify the sort disappeared?</li>
+          <li>What if the <code>ORDER BY</code> were ascending?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>A query has the right index but the plan shows a scan. Why? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd work through a short list, roughly in order of how often it's the answer."</p>
+        <p>"<strong>One — the predicate isn't SARGable.</strong> If the column is wrapped in a function, the
+          seek is impossible. <code>YEAR(CreatedUtc) = 2024</code>, <code>UPPER(Email) = @e</code>,
+          <code>LIKE '%text%'</code>, <code>DATEDIFF(day, CreatedUtc, GETDATE()) &lt;= 7</code>. The index is
+          sorted by the actual value, so the database has to compute the function for every row to find out
+          which qualify. The fix is always the same move — transform the parameter, not the column."</p>
+        <p>"<strong>Two — implicit conversion</strong>, and this is the one that's invisible. If the column is
+          <code>varchar</code> and the parameter arrives as <code>nvarchar</code>, then because
+          <code>nvarchar</code> has higher datatype precedence SQL Server converts <em>the column</em>, not
+          the parameter. That's a function on the column, so the seek is gone. In .NET this happens
+          automatically with <code>AddWithValue</code>, because a .NET string becomes <code>nvarchar</code>.
+          You spot it as <code>CONVERT_IMPLICIT</code> in the plan and a warning on the SELECT operator."</p>
+        <p>"<strong>Three — the optimiser is right.</strong> If the query returns a large fraction of the
+          table, a scan genuinely is cheaper than millions of seeks plus lookups. That's not a bug."</p>
+        <p>"<strong>Four — stale statistics.</strong> If it thinks 10 rows match and actually 2 million do, it
+          picks a plan for the wrong shape. I'd compare estimated versus actual row counts in the plan; a
+          large gap points straight at statistics. <code>UPDATE STATISTICS</code> and retry."</p>
+        <p>"<strong>Five — column order.</strong> The index might exist but be unusable for this query. If it's
+          <code>(A, B, C)</code> and I'm filtering on <code>B</code> alone, there's no seekable prefix."</p>
+        <p>"<strong>Six — parameter sniffing.</strong> The cached plan was compiled for a very different
+          parameter value. Same SQL, wildly different performance depending on input. That's where
+          <code>OPTION (RECOMPILE)</code> or <code>OPTIMIZE FOR UNKNOWN</code> come in."</p>
+        <p>"Practically I'd get the actual execution plan first, not the estimated one, and look at three
+          things: estimated vs actual rows, any <code>CONVERT_IMPLICIT</code>, and warnings on the SELECT
+          operator. That usually identifies it within a minute."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have a systematic list, or do you guess?</li>
+        <li>Do you know about implicit conversion? That's the discriminating one.</li>
+        <li>Do you accept that a scan is sometimes correct?</li>
+        <li>Do you read actual vs estimated rows?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you fix the implicit conversion in EF Core?</li>
+          <li>What exactly is parameter sniffing?</li>
+          <li>How do you make <code>LIKE '%text%'</code> fast?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A table has 15 indexes and writes are slow. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is common, and the answer is usually to <strong>remove</strong> indexes rather than tune
+          anything."</p>
+        <p>"First I'd get the evidence: <code>sys.dm_db_index_usage_stats</code> gives seeks, scans and lookups
+          against updates for each index. An index with zero seeks and two million updates is pure cost —
+          it's slowing every write and helping nothing. One caveat: those counters reset when the instance
+          restarts, so I'd check uptime before concluding an index is unused, and ideally sample over a period
+          long enough to include monthly reporting jobs."</p>
+        <p>"Then I'd look for <strong>redundancy</strong>. If <code>(CustomerId, Status)</code> exists, then a
+          separate <code>(CustomerId)</code> index is entirely redundant — the composite serves every query
+          the single-column one would, because a composite index seeks on any left-to-right prefix. That
+          pattern is everywhere in codebases that have had missing-index suggestions applied over the years."</p>
+        <p>"Then <strong>consolidation</strong>. <code>(A, B)</code> and <code>(A, B, C)</code> — keep the
+          wider one. <code>(A, B) INCLUDE (X)</code> and <code>(A, B) INCLUDE (Y)</code> — merge into one with
+          both includes."</p>
+        <p>"On the write cost itself, worth being precise: an <code>INSERT</code> touches the table plus every
+          index, so 15 indexes means 16 writes. But an <code>UPDATE</code> only touches indexes that contain
+          the updated column — which is another argument for narrow keys and against putting volatile columns
+          in lots of indexes."</p>
+        <p>"How I'd actually ship it: I wouldn't drop nine indexes on a Friday. I'd disable rather than drop
+          first, so re-enabling is quick if something regresses; verify over a full business cycle including
+          month-end reporting; then drop. And I'd script the definitions before touching anything so recreating
+          is trivial."</p>
+        <p>"The root cause is usually worth naming too — 15 indexes generally means someone applied every
+          missing-index DMV suggestion verbatim. Those suggestions look at one query in isolation and ignore
+          write cost and existing indexes entirely, so I'd treat them as evidence about which queries are
+          struggling, not as a list to execute."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you think of removing indexes as a valid fix?</li>
+        <li>Do you know the prefix rule well enough to spot redundancy?</li>
+        <li>Do you use evidence rather than opinion?</li>
+        <li>Do you have a safe rollout — disable before drop?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> only talking about adding indexes.</li>
+        <li><span class="redflag">Red flag:</span> dropping based on one day's DMV data.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you know an index isn't needed for a quarterly report?</li>
+          <li>Difference between disabling and dropping an index?</li>
+          <li>Would you ever have 15 legitimate indexes?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

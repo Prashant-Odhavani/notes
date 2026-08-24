@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Functions — Azure</title>
+<meta name="description" content="Triggers and bindings, hosting plans and cold start, the isolated worker model, scaling behaviour and Durable Functions.">
+<meta name="keywords" content="Azure Functions trigger binding consumption premium flex plan cold start isolated worker model in-process durable functions orchestration fan out scaling controller idempotency timeout">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/functions.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Azure Functions</h1>
+    <p class="subtitle">Excellent for event-driven work, and the hosting plan decision is where most of the real
+      trade-offs live.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>A trigger starts the function; bindings move data in and out</strong> declaratively.</li>
+      <li><strong>Consumption scales to zero and has cold start.</strong> That's the whole trade.</li>
+      <li><strong>Use the isolated worker model</strong> — in-process is legacy.</li>
+      <li><strong>Consumption has a hard timeout</strong> (10 minutes max). Premium and Flex don't.</li>
+      <li><strong>Functions retry, so handlers must be idempotent.</strong></li>
+      <li><strong>Durable Functions</strong> for orchestration, fan-out and human-in-the-loop waits.</li>
+      <li><strong>Orchestrator code must be deterministic</strong> — it replays.</li>
+    </ul>
+  </div>
+
+  <h2 id="triggers-bindings">Triggers and bindings <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The distinction</span>
+    <p>A <strong>trigger</strong> is what causes the function to run — exactly one per function.</p>
+    <p>A <strong>binding</strong> is declarative data movement: input bindings fetch something before your code
+      runs, output bindings write something after. Any number, both optional.</p>
+  </div>
+
+  <pre data-label="csharp — isolated worker model, .NET 8+" class="code-good"><code class="language-csharp">public class OrderFunctions(ILogger&lt;OrderFunctions&gt; logger)
+{
+    [Function(nameof(ProcessOrder))]
+    [ServiceBusOutput("notifications", Connection = "ServiceBus")]   // output binding
+    public async Task&lt;string&gt; ProcessOrder(
+        [ServiceBusTrigger("orders", Connection = "ServiceBus")]      // trigger
+        Order order,
+        FunctionContext context)
+    {
+        logger.LogInformation("Processing {OrderId}", order.Id);
+        await _handler.HandleAsync(order, context.CancellationToken);
+
+        // The return value is written to the output binding
+        return JsonSerializer.Serialize(new OrderProcessed(order.Id));
+    }
+
+    [Function(nameof(HttpCreateOrder))]
+    public async Task&lt;HttpResponseData&gt; HttpCreateOrder(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "orders")]
+        HttpRequestData req)
+    {
+        var order = await req.ReadFromJsonAsync&lt;CreateOrder&gt;();
+        // ...
+        var response = req.CreateResponse(HttpStatusCode.Created);
+        return response;
+    }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Trigger</th><th>Fires on</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><strong>HTTP</strong></td><td>A request</td><td>Cold start is user-visible</td></tr>
+        <tr><td><strong>Timer</strong></td><td>A CRON schedule</td><td><strong>Singleton by default</strong> — one instance runs it</td></tr>
+        <tr><td><strong>Service Bus</strong></td><td>A queue or subscription message</td><td>Completion and dead-lettering handled for you</td></tr>
+        <tr><td><strong>Event Hubs</strong></td><td>A batch of events</td><td>Checkpointing handled; batch by default</td></tr>
+        <tr><td><strong>Blob</strong></td><td>A blob created or updated</td><td><strong>Polling-based and can be slow</strong> — prefer Event Grid</td></tr>
+        <tr><td><strong>Event Grid</strong></td><td>A pushed event</td><td>Near-immediate, unlike blob polling</td></tr>
+        <tr><td><strong>Cosmos DB</strong></td><td>Change feed</td><td>Lease container required</td></tr>
+        <tr><td><strong>Durable</strong></td><td>Orchestration and activity</td><td>See below</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The blob trigger is slower than people expect</div>
+    <p style="margin:0">On Consumption, the classic blob trigger works by <strong>scanning the container's
+      logs</strong>, and the delay can be up to ten minutes. It's also unreliable at high volume and can miss
+      blobs.
+      <br><br>
+      That surprises teams building "upload a file and process it immediately" — it isn't immediate.
+      <br><br>
+      The fix is <strong>Event Grid</strong>: configure the storage account to publish blob-created events, and
+      trigger the function from Event Grid instead. That's push-based and near-instant. Event-Grid-based blob
+      triggers are now the recommended approach and there's a dedicated
+      <code>[BlobTrigger(Source = BlobTriggerSource.EventGrid)]</code> form.
+      <br><br>
+      Knowing this specific limitation is a good practical signal, because the naive approach appears to work in
+      testing with a handful of files.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — bindings trade testability for brevity</div>
+    <p style="margin:0">Output bindings are genuinely convenient: return a value and it lands in a queue, a blob or
+      Cosmos with no client code, no connection management and no retry handling to write.
+      <br><br>
+      The cost is <strong>testability and control</strong>. A function whose output is a binding can't be unit
+      tested without the Functions host, and you can't easily add retry policies, custom serialisation, or
+      conditional logic about <em>whether</em> to write.
+      <br><br>
+      So my rule: <strong>bindings for the trigger and simple pass-through outputs; inject a client for anything
+      with logic.</strong> If the decision about what to publish depends on the result of the work, that belongs in
+      code with an injected <code>ServiceBusClient</code> — which is also then testable with a fake.
+      <br><br>
+      That's a more calibrated answer than either "bindings are great" or "always inject clients".</p>
+  </div>
+
+  <h2 id="plans">Hosting plans <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th></th><th>Consumption</th><th>Flex Consumption</th><th>Premium</th><th>App Service</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Scale to zero</td><td><strong>Yes</strong></td><td><strong>Yes</strong></td><td>No (min instances)</td><td>No</td></tr>
+        <tr><td>Cold start</td><td><strong>Yes</strong></td><td>Reduced; always-ready instances available</td><td><strong>No</strong> (pre-warmed)</td><td>No</td></tr>
+        <tr><td>Max duration</td><td><strong>10 min</strong></td><td>Unlimited (HTTP still capped)</td><td>Unlimited</td><td>Unlimited</td></tr>
+        <tr><td>VNet integration</td><td>No</td><td><strong>Yes</strong></td><td><strong>Yes</strong></td><td>Yes</td></tr>
+        <tr><td>Billing</td><td>Executions + GB-s</td><td>Executions + GB-s, per-instance concurrency</td><td><strong>Per instance/hour</strong></td><td>Plan cost</td></tr>
+        <tr><td>Cost when idle</td><td><strong>~Zero</strong></td><td><strong>~Zero</strong></td><td>Full</td><td>Full</td></tr>
+        <tr><td>Best for</td><td>Spiky background work</td><td><strong>The modern default</strong></td><td>Latency-sensitive, long-running, VNet</td><td>Reusing an existing plan</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Cold start: what it is and when it matters</div>
+    <p style="margin:0">On Consumption, an idle function app is <strong>deallocated entirely</strong>. The next
+      request has to allocate an instance, load the runtime, load your assemblies and run startup — commonly
+      hundreds of milliseconds to several seconds, and worse with a large dependency graph.
+      <br><br>
+      So the rule is about <strong>who is waiting</strong>. For a queue processor, a webhook receiver or a
+      scheduled job, nobody is — a two-second cold start is invisible. For a user-facing HTTP API it's a visible
+      latency spike, intermittently, which is much worse than being uniformly slower.
+      <br><br>
+      What makes it worse: large assemblies, heavy DI graphs built at startup, and reading configuration or
+      secrets during initialisation.
+      <br><br>
+      What helps: <strong>ReadyToRun compilation</strong>, trimming dependencies, deferring expensive
+      initialisation out of the startup path, and keeping the app small. What helps most is
+      <strong>always-ready instances on Flex</strong> or <strong>pre-warmed instances on Premium</strong> — at
+      which point you're paying for idle capacity, which is exactly what Consumption avoided.
+      <br><br>
+      That trade is the honest answer: <strong>Premium removes the cold start and the cost advantage
+      together.</strong></p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Flex Consumption is now the sensible default</div>
+    <p style="margin:0">Flex Consumption keeps scale-to-zero billing while adding the things Consumption
+      lacked: <strong>VNet integration</strong>, configurable <strong>per-instance concurrency</strong>, larger
+      instance sizes, and <strong>always-ready instances</strong> to eliminate cold start on the paths that need
+      it.
+      <br><br>
+      That combination previously forced you onto Premium — you wanted VNet or no cold start, and had to accept
+      paying for idle instances for everything.
+      <br><br>
+      With Flex you can keep most functions scaling to zero and mark specific ones always-ready. So the decision
+      becomes per-function rather than per-app.
+      <br><br>
+      Worth knowing because a lot of material still presents it as a binary Consumption-versus-Premium choice, and
+      "I'd use Flex Consumption with always-ready instances for the HTTP-triggered functions" is a current,
+      specific answer.</p>
+  </div>
+
+  <h2 id="isolated">The isolated worker model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>In-process (legacy)</th><th>Isolated worker</th></tr></thead>
+      <tbody>
+        <tr><td>Runs</td><td>In the host process</td><td><strong>A separate process</strong></td></tr>
+        <tr><td>.NET version</td><td><strong>Tied to the host's version</strong></td><td>Independent of the host</td></tr>
+        <tr><td>Dependency conflicts</td><td><strong>Possible with host assemblies</strong></td><td>None</td></tr>
+        <tr><td>Middleware</td><td>No</td><td><strong>Yes</strong></td></tr>
+        <tr><td>Startup</td><td><code>FunctionsStartup</code></td><td><code>Program.cs</code>, like ASP.NET Core</td></tr>
+        <tr><td>Status</td><td><strong>Support ended</strong></td><td><strong>The only forward path</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why isolation was the right architectural change</div>
+    <p style="margin:0">In-process functions ran inside the Functions host, sharing its runtime and assemblies. That
+      caused two persistent problems.
+      <br><br>
+      <strong>Version coupling.</strong> You could only target the .NET version the host supported, so adopting a
+      new .NET release meant waiting for the Functions host to support it.
+      <br><br>
+      <strong>Assembly conflicts.</strong> If the host loaded a different version of a library you also used —
+      <code>Newtonsoft.Json</code> was the classic — you got runtime binding failures that were miserable to
+      diagnose.
+      <br><br>
+      The isolated model runs your code in <strong>its own process</strong> communicating with the host over gRPC.
+      So you choose your .NET version, there are no shared assemblies, and startup looks like a normal
+      <code>Program.cs</code> with familiar DI and middleware.
+      <br><br>
+      The cost is a small amount of serialisation overhead across the process boundary, and slightly worse cold
+      start. That's a good trade for the decoupling, and it's why in-process support has ended — this is the only
+      model going forward.</p>
+  </div>
+
+  <pre data-label="csharp — startup looks like ASP.NET Core" class="code-good"><code class="language-csharp">var builder = FunctionsApplication.CreateBuilder(args);
+
+builder.ConfigureFunctionsWebApplication();
+
+// Normal DI, and managed identity rather than connection strings
+builder.Services.AddSingleton(new BlobServiceClient(
+    new Uri(builder.Configuration["StorageUri"]!), new DefaultAzureCredential()));
+
+builder.Services.AddScoped&lt;IOrderHandler, OrderHandler&gt;();
+
+// OpenTelemetry, exporting to Application Insights
+builder.Services.AddApplicationInsightsTelemetryWorkerService();
+builder.ConfigureFunctionsApplicationInsights();
+
+builder.Build().Run();</code></pre>
+
+  <h2 id="scaling">How scaling actually works <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Trigger</th><th>Scales on</th></tr></thead>
+      <tbody>
+        <tr><td><strong>HTTP</strong></td><td>Request rate and instance concurrency</td></tr>
+        <tr><td><strong>Service Bus</strong></td><td>Queue depth and message age</td></tr>
+        <tr><td><strong>Event Hubs</strong></td><td><strong>Partition count</strong> — a hard ceiling</td></tr>
+        <tr><td><strong>Timer</strong></td><td>Doesn't scale — one execution</td></tr>
+        <tr><td><strong>Cosmos change feed</strong></td><td>Physical partition count</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Event Hubs and Cosmos triggers are capped by partition count</div>
+    <p style="margin:0">For queue-based triggers the scale controller adds instances based on backlog, so throughput
+      scales with load.
+      <br><br>
+      For <strong>partitioned</strong> sources it doesn't work that way. A partition is assigned to exactly one
+      instance to preserve ordering — so with four Event Hubs partitions you get at most four concurrently
+      processing instances, however large the backlog.
+      <br><br>
+      Which means a Functions app falling behind on an Event Hub <strong>cannot be fixed by scaling</strong>. The
+      options are making the function faster, increasing batch size, or adding partitions — and adding partitions
+      changes key-to-partition mapping, so it breaks ordering for existing keys.
+      <br><br>
+      Same constraint as <a href="../22-kafka/fundamentals.html#consumer-groups">Kafka consumer groups</a>,
+      because it's the same underlying model. Knowing that scaling has a structural ceiling here is the
+      distinguishing detail.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Functions retry, so idempotency is mandatory</div>
+    <p style="margin:0">Most triggers retry on failure. A Service Bus trigger abandons the message so it's
+      redelivered; a Cosmos trigger reprocesses from the last checkpoint; a timer trigger can run twice if an
+      instance is replaced mid-execution.
+      <br><br>
+      So <strong>at-least-once execution is the default</strong>, and a handler with side effects will produce
+      duplicates.
+      <br><br>
+      Practically: dedupe on a message id or a business key, recorded <strong>in the same transaction as the
+      work</strong>. If the record commits separately, a crash between them marks the message processed when it
+      wasn't — turning duplicate execution into lost work.
+      <br><br>
+      And note the <strong>timer trigger is a singleton by default</strong> — the host uses a blob lease to ensure
+      one instance runs it. That's usually what you want, and it's the lease that provides it, so it's worth
+      knowing it exists rather than assuming the platform guarantees single execution by magic.</p>
+  </div>
+
+  <h2 id="durable">Durable Functions <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What it adds</span>
+    <p>Ordinary functions are stateless and short-lived. <strong>Durable Functions adds stateful
+      orchestration</strong> — a workflow that can span hours or months, survive restarts, fan out and fan in, and
+      wait for external events.</p>
+    <p>The orchestrator's state is persisted after each step, so it resumes rather than restarting.</p>
+  </div>
+
+  <pre data-label="csharp — fan-out / fan-in" class="code-good"><code class="language-csharp">[Function(nameof(ProcessBatchOrchestrator))]
+public async Task&lt;BatchResult&gt; ProcessBatchOrchestrator(
+    [OrchestrationTrigger] TaskOrchestrationContext context)
+{
+    var batch = context.GetInput&lt;Batch&gt;()!;
+
+    // Fan out - these run in parallel across instances
+    var tasks = batch.Items
+        .Select(item =&gt; context.CallActivityAsync&lt;ItemResult&gt;(nameof(ProcessItem), item))
+        .ToList();
+
+    var results = await Task.WhenAll(tasks);          // fan in
+
+    // Wait for a human, for up to 3 days - the orchestrator is not running
+    // or being billed while it waits
+    var approval = await context.WaitForExternalEvent&lt;bool&gt;(
+        "Approval", TimeSpan.FromDays(3));
+
+    if (!approval) await context.CallActivityAsync(nameof(RejectBatch), batch.Id);
+
+    return new BatchResult(results);
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pattern</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Function chaining</strong></td><td>Sequential steps where each needs the previous result</td></tr>
+        <tr><td><strong>Fan-out / fan-in</strong></td><td>Parallel work then aggregate — the most common</td></tr>
+        <tr><td><strong>Async HTTP</strong></td><td>Long operations with a status endpoint to poll</td></tr>
+        <tr><td><strong>Monitor</strong></td><td>Recurring polling with a flexible interval</td></tr>
+        <tr><td><strong>Human interaction</strong></td><td>Wait for approval, with a timeout</td></tr>
+        <tr><td><strong>Aggregator (entities)</strong></td><td>Stateful accumulation over many events</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Orchestrator code must be deterministic — it replays</div>
+    <p style="margin:0">This is the constraint that catches everyone, and the reason matters.
+      <br><br>
+      Durable achieves durability by <strong>replaying the orchestrator from the beginning</strong> each time it
+      resumes, using an event-sourced history to short-circuit work that already completed. So the orchestrator
+      function body runs many times, and it must take the <strong>same path every time</strong>.
+      <br><br>
+      Which forbids:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong><code>DateTime.UtcNow</code></strong> — use <code>context.CurrentUtcDateTime</code></li>
+      <li><strong><code>Guid.NewGuid()</code></strong> — use <code>context.NewGuid()</code></li>
+      <li><strong>Random</strong>, and anything environment-dependent</li>
+      <li><strong>I/O of any kind</strong> — no HTTP, no database. That belongs in an <em>activity</em></li>
+      <li><strong><code>Task.Delay</code></strong> — use <code>context.CreateTimer</code></li>
+      <li><strong>Non-durable async</strong> — only await Durable APIs</li>
+    </ul>
+    <p style="margin:8px 0 0">Break determinism and you get baffling behaviour: an orchestration taking a different
+      branch on replay, activities running twice, or a
+      <code>NonDeterministicOrchestrationException</code>.
+      <br><br>
+      <strong>The mental model: the orchestrator decides <em>what</em> to do; activities do it.</strong> All I/O,
+      all non-determinism and all real work goes in activities. There's an analyser that catches most
+      violations — enable it.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Where Durable genuinely wins</div>
+    <p style="margin:0">The case that's hard to build otherwise is <strong>waiting</strong>. An orchestration can
+      wait three days for an approval, and while waiting it isn't running and isn't billed — the state is
+      persisted and it resumes on the event.
+      <br><br>
+      Building that yourself means a workflow table, a polling job, timeout handling and resumption logic. Durable
+      makes it one <code>await</code>.
+      <br><br>
+      It's also the natural fit for a <a href="../20-microservices/data-consistency.html#saga">saga</a>: the
+      orchestrator is the coordinator, activities are the steps, and compensation is just more activity calls in a
+      <code>catch</code>. And the state persistence — which is the part teams most often get wrong when
+      hand-rolling a saga — comes free.
+      <br><br>
+      The honest costs: the determinism constraint is a real learning curve, debugging a replayed orchestration is
+      unintuitive, and the history in Table Storage needs purging or it grows indefinitely.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>One trigger per function; bindings are declarative data movement.</li>
+      <li>Bindings cost testability — inject a client when there's logic about what to write.</li>
+      <li>The blob trigger polls and can lag ten minutes; use Event Grid instead.</li>
+      <li>Consumption trades cold start for scale-to-zero. Flex Consumption is now the sensible default.</li>
+      <li>Premium removes cold start and the cost advantage together.</li>
+      <li>Use the isolated worker model — in-process is end-of-life.</li>
+      <li>Event Hubs and Cosmos triggers are capped by partition count, so scaling has a ceiling.</li>
+      <li>Execution is at-least-once — dedupe in the same transaction as the work.</li>
+      <li>Timer triggers are singletons via a blob lease.</li>
+      <li>Durable orchestrators <strong>replay</strong>, so they must be deterministic — no I/O, no
+        <code>DateTime.UtcNow</code>, no <code>NewGuid</code>.</li>
+      <li>Durable's real advantage is waiting without running or being billed.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Consumption plan for a latency-sensitive HTTP API</strong>, exposing cold start to users.</li>
+    <li><strong>Long-running work on Consumption</strong>, hitting the 10-minute timeout.</li>
+    <li><strong>Blob trigger</strong> where near-immediate processing was expected.</li>
+    <li><strong>In-process model</strong> for new work.</li>
+    <li><strong>Scaling out to fix Event Hubs lag</strong>, when partition count is the ceiling.</li>
+    <li><strong>Non-idempotent handlers</strong>, so retries duplicate side effects.</li>
+    <li><strong>I/O in a Durable orchestrator.</strong></li>
+    <li><strong><code>DateTime.UtcNow</code> or <code>Guid.NewGuid()</code> in an orchestrator.</strong></li>
+    <li><strong>Never purging Durable history</strong>, so Table Storage grows without limit.</li>
+    <li><strong>Heavy startup work</strong>, making cold start worse.</li>
+    <li><strong>Connection strings in app settings</strong> rather than managed identity.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Which Functions hosting plan would you choose? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It depends on <strong>whether anyone is waiting</strong>, how long the work takes, and whether I need
+          VNet access."</p>
+        <p>"The core trade is <strong>cold start versus paying for idle</strong>. On Consumption an idle function
+          app is deallocated entirely, so the next request pays to allocate an instance, load the runtime and load
+          my assemblies — commonly hundreds of milliseconds to several seconds, worse with a big dependency
+          graph."</p>
+        <p>"So for <strong>background and event-driven work</strong> — a queue processor, a webhook receiver, a
+          scheduled job — Consumption is ideal. Nobody is waiting, so a two-second cold start is invisible, and I
+          pay essentially nothing when idle."</p>
+        <p>"For a <strong>user-facing HTTP API</strong> it's the wrong choice, because cold start becomes an
+          intermittent latency spike — which is worse than being uniformly slower, since it's unpredictable."</p>
+        <p>"My current default though would be <strong>Flex Consumption</strong>, because it changed this
+          decision. It keeps scale-to-zero billing while adding VNet integration, configurable per-instance
+          concurrency, and <strong>always-ready instances</strong> to remove cold start on specific
+          functions."</p>
+        <p>"Previously wanting either VNet or no cold start forced you onto Premium, which meant paying for idle
+          instances across the whole app. With Flex the decision becomes per-function: most scale to zero, and the
+          HTTP-triggered ones get always-ready instances."</p>
+        <p>"<strong>Premium</strong> I'd choose for pre-warmed instances plus unlimited duration and full VNet
+          support — and I'd be honest that it <strong>removes the cold start and the cost advantage
+          together</strong>. It's billed per instance-hour like an App Service plan. At that point the question is
+          what Functions is buying: if the answer is the triggers and bindings, that's legitimate; if it's
+          'serverless', you've lost the property that made it serverless."</p>
+        <p>"The other hard constraint worth naming: <strong>Consumption has a 10-minute maximum
+          duration</strong>. So anything long-running either needs Premium or Flex, or — better — should be
+          restructured. A function processing 10,000 records in one execution is fragile regardless of the
+          timeout; I'd rather fan out to one execution per record, or use Durable Functions for the
+          orchestration."</p>
+        <p>"And if I already have an App Service plan with spare capacity, running Functions on it is a reasonable
+          way to avoid a second bill — accepting that it doesn't scale independently."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you frame it as cold start versus idle cost?</li>
+        <li>Do you know the 10-minute Consumption timeout?</li>
+        <li>Do you know Flex Consumption exists and what it changes?</li>
+        <li>Do you recognise Premium removes both cold start and the cost benefit?</li>
+        <li>Do you question long-running functions rather than just picking a bigger plan?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What actually causes a cold start, and how do you reduce it?</li>
+          <li>How would you handle a 30-minute job?</li>
+          <li>How does Functions decide to scale out?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Why must a Durable Functions orchestrator be deterministic? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Because of <strong>how Durable achieves durability</strong> — and once you know the mechanism the
+          constraint stops feeling arbitrary."</p>
+        <p>"An orchestration can span hours or months and must survive process restarts. Durable doesn't keep the
+          orchestrator running and waiting. Instead, when it hits an <code>await</code>, it
+          <strong>unloads</strong> — and when the awaited work completes, it <strong>replays the orchestrator
+          function from the very beginning</strong>."</p>
+        <p>"During replay it uses an event-sourced history to short-circuit anything already done: it reaches
+          <code>CallActivityAsync</code>, sees in the history that this activity already returned a value, and
+          hands back the recorded result without re-executing it. It carries on replaying until it reaches work
+          that hasn't happened yet, and then actually does it."</p>
+        <p>"So the orchestrator body runs many times, and it must take the <strong>same path every time</strong> —
+          otherwise the history no longer lines up with the code's decisions."</p>
+        <p>"Which forbids anything non-deterministic. <code>DateTime.UtcNow</code> returns a different value on
+          each replay, so a branch on it can go a different way — you use
+          <code>context.CurrentUtcDateTime</code>, which returns the value recorded in the history.
+          <code>Guid.NewGuid()</code> likewise, so <code>context.NewGuid()</code>. No <code>Random</code>, nothing
+          environment-dependent."</p>
+        <p>"And <strong>no I/O at all</strong> — no HTTP calls, no database access. Partly because it's
+          non-deterministic, partly because it would re-execute on every replay. All of that goes in
+          <strong>activities</strong>, which run once and have their results recorded."</p>
+        <p>"Also no <code>Task.Delay</code> — use <code>context.CreateTimer</code>, which is durable, so the
+          orchestrator genuinely isn't running or being billed while it waits. And only await Durable APIs, because
+          awaiting an arbitrary task breaks the replay model."</p>
+        <p>"The mental model I'd give: <strong>the orchestrator decides <em>what</em> to do; activities do
+          it.</strong> The orchestrator is pure coordination logic."</p>
+        <p>"What happens if you break it is genuinely confusing — an orchestration taking a different branch on
+          replay, activities appearing to run twice, or a
+          <code>NonDeterministicOrchestrationException</code> that points at a line which looks fine. So I'd
+          enable the <strong>Durable analyser</strong>, which catches most violations at build time."</p>
+        <p>"One consequence worth knowing: <strong>you can't safely change orchestrator code while
+          orchestrations are in flight</strong>, because an in-progress instance will replay against the new code
+          with old history. The mitigation is versioning — deploy a new orchestrator name and let existing
+          instances drain on the old one."</p>
+        <p>"And the payoff for accepting all this: the orchestration survives restarts and deployments, and it can
+          wait days for a human approval without consuming resources. Building that by hand means a workflow
+          table, a polling job, timeout handling and resumption logic — Durable makes it one
+          <code>await</code>."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the replay mechanism, not just the rule?</li>
+        <li>Can you list what's forbidden and the Durable alternatives?</li>
+        <li>Do you know the orchestrator/activity division of responsibility?</li>
+        <li>Do you know about versioning in-flight orchestrations?</li>
+        <li>Can you state what the constraint buys you?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "because the docs say so" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> putting HTTP calls in an orchestrator.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that the body runs repeatedly.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you implement a saga with Durable?</li>
+          <li>How do you debug a replayed orchestration?</li>
+          <li>What happens to the history data over time?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

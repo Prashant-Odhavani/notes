@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage Accounts — Azure</title>
+<meta name="description" content="Blob, Queue and Table storage, access tiers, redundancy options, SAS tokens, lifecycle management and the performance limits that matter.">
+<meta name="keywords" content="Azure Storage blob queue table access tiers hot cool cold archive redundancy LRS ZRS GRS RA-GRS SAS token user delegation lifecycle management ETag optimistic concurrency block blob append blob soft delete immutability">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/storage.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Storage Accounts</h1>
+    <p class="subtitle">Cheap, durable and easy to misconfigure. The interesting decisions are redundancy, tiers
+      and how you hand out access.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Blob for files, Queue for simple messaging, Table for cheap key-value.</strong></li>
+      <li><strong>Tiers trade storage cost against read cost.</strong> Archive needs rehydration.</li>
+      <li><strong>Redundancy: LRS → ZRS → GRS.</strong> Zone, then region.</li>
+      <li><strong>Geo-redundant replication is asynchronous</strong> — failover can lose recent writes.</li>
+      <li><strong>SAS tokens for direct client access</strong>, so files never pass through your API.</li>
+      <li><strong>User delegation SAS over account key SAS</strong> — revocable, and no key involved.</li>
+      <li><strong>Lifecycle rules move and delete data automatically</strong>; that's your cost control.</li>
+      <li><strong>ETags give you optimistic concurrency</strong> on blobs.</li>
+    </ul>
+  </div>
+
+  <h2 id="services">The four services <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Service</th><th>Use for</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Blob</strong></td>
+          <td>Files, images, backups, logs, data lake, static sites</td>
+          <td>Three blob types with different rules</td>
+        </tr>
+        <tr>
+          <td><strong>Queue</strong></td>
+          <td>Simple messaging, very cheap, 500 TB of backlog</td>
+          <td><strong>No topics, no sessions, no transactions</strong>. 64 KB messages</td>
+        </tr>
+        <tr>
+          <td><strong>Table</strong></td>
+          <td>Cheap key-value at scale</td>
+          <td><strong>Query only by partition + row key</strong>. Cosmos DB is the richer option</td>
+        </tr>
+        <tr>
+          <td><strong>Files</strong></td>
+          <td>SMB or NFS share — a lift-and-shift for legacy file access</td>
+          <td>Slower and pricier than blob; use blob if the app can change</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Blob type</th><th>For</th><th>Property</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Block blob</strong></td><td>Almost everything</td><td>Uploaded as blocks, then committed. <strong>The default</strong></td></tr>
+        <tr><td><strong>Append blob</strong></td><td>Logs and audit trails</td><td><strong>Append-only.</strong> Concurrent writers are safe</td></tr>
+        <tr><td><strong>Page blob</strong></td><td>VM disks</td><td>Random read/write. You rarely use these directly</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Storage Queues versus Service Bus</div>
+    <p style="margin:0">Storage Queues are much cheaper and genuinely fine for simple work distribution — a
+      background job list, thumbnail generation, deferred emails.
+      <br><br>
+      What you don't get: <strong>topics and subscriptions, sessions for ordering, duplicate detection,
+      transactions, and a real dead-letter queue.</strong> Messages are 64 KB, and there's no publish-subscribe at
+      all.
+      <br><br>
+      Poison-message handling is manual: you read <code>DequeueCount</code> yourself and move the message somewhere
+      after N attempts. Service Bus does that for you.
+      <br><br>
+      The reasonable rule: <strong>Storage Queues until you need a Service Bus feature</strong>, and be honest that
+      you probably will. Migrating later is a code change in producers and consumers, so if the design already
+      implies pub/sub or ordering, start with <a href="service-bus.html">Service Bus</a>.
+      <br><br>
+      The one thing Storage Queues do better: a <strong>very large backlog</strong>, up to the account limit. If you
+      might accumulate tens of millions of messages, that's a real advantage.</p>
+  </div>
+
+  <h2 id="tiers">Access tiers <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tier</th><th>Storage cost</th><th>Access cost</th><th>Minimum stay</th><th>Retrieval</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Hot</strong></td><td>Highest</td><td>Lowest</td><td>None</td><td>Immediate</td></tr>
+        <tr><td><strong>Cool</strong></td><td>Lower</td><td>Higher</td><td>30 days</td><td>Immediate</td></tr>
+        <tr><td><strong>Cold</strong></td><td>Lower still</td><td>Higher still</td><td>90 days</td><td>Immediate</td></tr>
+        <tr><td><strong>Archive</strong></td><td>Lowest</td><td>Highest</td><td>180 days</td><td><strong>Hours — rehydration required</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two traps in the tier table</div>
+    <p style="margin:0"><strong>Archive is not readable.</strong> You cannot read an archived blob at all — you must
+      <em>rehydrate</em> it to Hot or Cool first, which takes up to 15 hours at standard priority (high priority is
+      typically under an hour, and costs more).
+      <br><br>
+      So Archive is for data you're keeping for compliance, not data you might need on a Tuesday. If a user could
+      plausibly request it and expect a response, Archive is the wrong tier.
+      <br><br>
+      <strong>Early deletion charges.</strong> Each tier has a minimum retention — 30, 90 and 180 days. Delete or
+      move a blob before that and you're billed as though it stayed for the full period.
+      <br><br>
+      Which means a lifecycle rule that moves data to Archive after 30 days and deletes it after 60 costs
+      <em>more</em> than leaving it in Cool, because you pay the full 180 days of Archive anyway plus the transition
+      operations. Genuinely counterintuitive, and a real source of unexpected bills.
+      <br><br>
+      Model it before assuming a colder tier is cheaper. <strong>Cheaper storage plus expensive access can total
+      more than expensive storage plus cheap access</strong> — it depends entirely on the read pattern.</p>
+  </div>
+
+  <pre data-label="json — a lifecycle rule that reflects real access patterns"><code class="language-json">{
+  "rules": [{
+    "name": "logs-tiering",
+    "enabled": true,
+    "type": "Lifecycle",
+    "definition": {
+      "filters": { "blobTypes": ["blockBlob"], "prefixMatch": ["logs/"] },
+      "actions": {
+        "baseBlob": {
+          "tierToCool":    { "daysAfterModificationGreaterThan": 30 },
+          "tierToArchive": { "daysAfterModificationGreaterThan": 180 },
+          "delete":        { "daysAfterModificationGreaterThan": 2555 }
+        },
+        "snapshot":       { "delete": { "daysAfterCreationGreaterThan": 90 } },
+        "version":        { "delete": { "daysAfterCreationGreaterThan": 90 } }
+      }
+    }
+  }]
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — snapshots and versions are the hidden cost</div>
+    <p style="margin:0">If versioning or soft delete is enabled, <strong>every overwrite creates a retained
+      version</strong> — and those versions are billed like any other blob.
+      <br><br>
+      A file overwritten hourly for a year is 8,760 stored copies. Nobody notices until the storage bill is
+      inexplicably large relative to the visible data, and the portal's blob list doesn't show versions by default,
+      so the data appears to be a fraction of what you're paying for.
+      <br><br>
+      So lifecycle rules must cover <strong>snapshots and versions explicitly</strong>, not just base blobs. That's
+      the part usually left out, and it's the part that accumulates.
+      <br><br>
+      Versioning and soft delete are still worth having — they're your protection against accidental deletion and
+      ransomware. Just bound their retention deliberately rather than leaving it unlimited.</p>
+  </div>
+
+  <h2 id="redundancy">Redundancy <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>Protects against</th><th>Copies</th><th>Read from secondary</th></tr></thead>
+      <tbody>
+        <tr><td><strong>LRS</strong></td><td>Disk and rack failure</td><td>3, one datacentre</td><td>—</td></tr>
+        <tr><td><strong>ZRS</strong></td><td><strong>Losing a whole availability zone</strong></td><td>3, across zones</td><td>—</td></tr>
+        <tr><td><strong>GRS</strong></td><td><strong>Losing a region</strong></td><td>3 local + 3 in the paired region</td><td>No</td></tr>
+        <tr><td><strong>GZRS</strong></td><td>Zone <em>and</em> region</td><td>3 zonal + 3 paired</td><td>No</td></tr>
+        <tr><td><strong>RA-GRS / RA-GZRS</strong></td><td>Same, plus read access</td><td>Same</td><td><strong>Yes, read-only</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Geo-replication is asynchronous, so failover can lose data</div>
+    <p style="margin:0">This is the detail that matters and the one most often missed. Writes are committed locally
+      and replicated to the paired region <strong>afterwards</strong>.
+      <br><br>
+      So there's a replication lag, and if the primary region is lost, <strong>anything not yet replicated is
+      gone</strong>. The metric is <em>Last Sync Time</em>, and it's the honest measure of your recovery point
+      objective — usually minutes, but not zero and not guaranteed.
+      <br><br>
+      Two consequences worth stating:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>GRS is not a zero-data-loss guarantee.</strong> If your requirement is zero loss, storage
+        redundancy alone doesn't provide it.</li>
+      <li><strong>Without the RA- prefix, the secondary is invisible.</strong> You cannot read it, and the data is
+        only accessible after a failover — which historically was Microsoft-initiated, though customer-managed
+        failover is now available. Teams have assumed GRS meant they could read from the second region; it
+        doesn't.</li>
+    </ul>
+    <p style="margin:8px 0 0">And note the direction of the tiering choice: <strong>ZRS protects against the more
+      likely failure</strong>. A zone outage is far more common than losing an entire region, and ZRS is
+      synchronous — no data loss. So <strong>ZRS or GZRS</strong> is usually the better default than plain GRS.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Redundancy is not backup</div>
+    <p style="margin:0">Every redundancy option replicates <em>faithfully</em>. If you delete a blob, or encrypt it
+      with ransomware, or a bug overwrites it, that change is replicated to every copy.
+      <br><br>
+      Redundancy protects against <strong>infrastructure failure</strong>. It does nothing about mistakes or
+      malice.
+      <br><br>
+      For those you need <strong>soft delete</strong> (a recovery window for deleted blobs and containers),
+      <strong>versioning</strong> (previous contents of overwritten blobs), and for regulated or ransomware-sensitive
+      data, <strong>immutability policies</strong> — a time-based legal hold that even an account owner cannot
+      delete within the retention window.
+      <br><br>
+      That last one is the genuine ransomware defence, because it's the only option an attacker with full
+      credentials can't undo. Worth knowing as the answer to "how do you protect backups from a compromised
+      admin?"</p>
+  </div>
+
+  <h2 id="access">Access: SAS, keys and identity <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>Use for</th><th>Risk</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Managed identity + RBAC</strong></td>
+          <td><strong>Your own services.</strong> The default</td>
+          <td>None — no credential exists</td>
+        </tr>
+        <tr>
+          <td><strong>User delegation SAS</strong></td>
+          <td><strong>Giving a client temporary direct access</strong></td>
+          <td>Low — signed by an Entra token, revocable</td>
+        </tr>
+        <tr>
+          <td><strong>Service SAS with a stored policy</strong></td>
+          <td>When you need revocability without Entra</td>
+          <td>Moderate — tied to the account key</td>
+        </tr>
+        <tr>
+          <td><strong>Ad-hoc service SAS</strong></td>
+          <td>Quick one-offs</td>
+          <td><strong>High — cannot be revoked before expiry</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Account key</strong></td>
+          <td>Nothing, ideally</td>
+          <td><strong>Full control of the account.</strong> Disable key access entirely if you can</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — a user delegation SAS for a direct upload" class="code-good"><code class="language-csharp">// The client uploads straight to storage. The file never passes through your API.
+public async Task&lt;Uri&gt; CreateUploadUrlAsync(string blobName, CancellationToken ct)
+{
+    // A user delegation key is signed by Entra ID - no account key involved
+    var delegationKey = await _blobService.GetUserDelegationKeyAsync(
+        startsOn: DateTimeOffset.UtcNow.AddMinutes(-5),   // clock skew allowance
+        expiresOn: DateTimeOffset.UtcNow.AddMinutes(15),  // short: it only needs to start an upload
+        cancellationToken: ct);
+
+    var sas = new BlobSasBuilder
+    {
+        BlobContainerName = "uploads",
+        BlobName          = blobName,
+        Resource          = "b",
+        ExpiresOn         = DateTimeOffset.UtcNow.AddMinutes(15),
+        // Write only. No read, no delete, no list.
+        Protocol          = SasProtocol.Https,
+    };
+    sas.SetPermissions(BlobSasPermissions.Write);
+
+    // Optional but strong: restrict to the caller's IP range
+    // sas.IPRange = new SasIPRange(callerIp, callerIp);
+
+    var uri = new UriBuilder(_blobService.Uri)
+    {
+        Path  = $"uploads/{blobName}",
+        Query = sas.ToSasQueryParameters(delegationKey, _blobService.AccountName).ToString()
+    };
+    return uri.Uri;
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — user delegation SAS, and why revocability is the point</div>
+    <p style="margin:0">A SAS signed with the <strong>account key</strong> has a problem that isn't obvious until
+      you need to fix it: <strong>you cannot revoke it.</strong> Once issued, it's valid until it expires. If a
+      token leaks — logged by a proxy, pasted into a support ticket, sitting in browser history — the only remedy is
+      <em>rotating the account key</em>, which invalidates every other SAS and breaks anything using that key.
+      <br><br>
+      A <strong>user delegation SAS</strong> is signed by an Entra-issued delegation key instead. That makes it
+      revocable — revoke the delegation key and every SAS derived from it stops working immediately — and it means
+      <strong>no account key is involved at all</strong>, so you can disable key access on the account entirely.
+      <br><br>
+      It also carries the identity of the principal that created it, so storage logs show <em>who</em> issued the
+      access rather than "someone with the key."
+      <br><br>
+      Beyond that, the discipline: <strong>short expiry, narrowest permission, HTTPS only</strong>, and an IP range
+      where you know it. A write-only SAS valid for 15 minutes is a very different risk from a read-write SAS valid
+      for a year — and the year-long one is what you find in codebases.
+      <br><br>
+      Also worth saying: <strong>a SAS in a URL is in logs.</strong> Proxies, CDNs, browser history and referrer
+      headers all capture query strings, which is another argument for short expiry.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Why direct upload matters architecturally</div>
+    <p style="margin:0">Routing file uploads through your API means the file consumes your bandwidth, your memory,
+      your request timeout and your instance count. A 2 GB upload occupies a web instance for its whole duration,
+      and concurrent large uploads will exhaust the app before storage notices anything.
+      <br><br>
+      With a SAS, the client uploads <strong>directly to storage</strong>, which is built for exactly that and
+      scales independently. Your API only issues a short-lived URL — a fast, cheap call.
+      <br><br>
+      The same pattern in reverse for downloads: issue a read SAS rather than streaming bytes through the API.
+      <br><br>
+      The follow-up you should be ready for: <strong>how do you know the upload happened, and validate it?</strong>
+      The answer is <a href="event-grid.html">Event Grid</a> — subscribe to <code>BlobCreated</code> and validate,
+      scan or process there. The client never tells you it finished; storage does.</p>
+  </div>
+
+  <h2 id="concurrency">Concurrency and consistency <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — optimistic concurrency with an ETag" class="code-good"><code class="language-csharp">// Read, including the ETag
+var response = await blob.DownloadContentAsync(cancellationToken: ct);
+var etag = response.Value.Details.ETag;
+
+var updated = Modify(response.Value.Content);
+
+try
+{
+    // Write only if nobody else changed it since we read
+    await blob.UploadAsync(updated, new BlobUploadOptions
+    {
+        Conditions = new BlobRequestConditions { IfMatch = etag }
+    }, ct);
+}
+catch (RequestFailedException ex) when (ex.Status == 412)
+{
+    // Precondition failed - someone else wrote first. Re-read and retry.
+}
+
+// Create-only, never overwrite: the atomic "claim this name" primitive
+await blob.UploadAsync(content, new BlobUploadOptions
+{
+    Conditions = new BlobRequestConditions { IfNoneMatch = ETag.All }
+}, ct);   // 409 if it already exists</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the same conditional-write primitive as every other store</div>
+    <p style="margin:0"><code>IfMatch</code> with an ETag is optimistic concurrency:
+      <em>write only if unchanged</em>. <code>IfNoneMatch = ETag.All</code> is
+      <em>write only if absent</em> — an atomic claim.
+      <br><br>
+      That second one is the useful primitive, because it gives you a <strong>distributed lock or a
+      leader election</strong> with no extra service: whoever creates the blob wins, everyone else gets 409. Blob
+      leases build on the same idea with an expiry, which is how the Event Hubs processor and many Functions
+      singletons coordinate.
+      <br><br>
+      And it's the same shape you've already seen: DynamoDB's condition expressions, Cosmos DB's <code>_etag</code>,
+      Redis's <code>SET NX</code>, SQL's <code>rowversion</code>. <strong>Every store gives you one atomic
+      conditional write, and every correct distributed coordination pattern is built on it.</strong>
+      <br><br>
+      Recognising that as one idea rather than five APIs is what the question is usually testing. And the corollary
+      is just as important: <strong>read-then-write without a condition is a race</strong>, in every one of these
+      stores.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Blob operations are strongly consistent; listing is not the same thing</div>
+    <p style="margin:0">A successful write is immediately visible to a subsequent read of that blob. Blob storage is
+      strongly consistent per blob, which is worth knowing because people assume eventual consistency by default in
+      cloud storage — that was S3's historical behaviour, not Azure's.
+      <br><br>
+      What's <em>not</em> immediate is <strong>listing and metadata-driven views</strong>: the blob index, and
+      Data Lake directory semantics, can lag slightly.
+      <br><br>
+      So "write then read the blob" is safe. "Write then immediately list the container and expect to see it" is
+      less reliable, and a workflow built on listing to discover new files is both slower and racier than reacting
+      to an Event Grid notification.</p>
+  </div>
+
+  <h2 id="limits">Limits worth remembering <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Limit</th><th>Value</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td>Account ingress / egress</td><td>Tens of Gbps</td><td><strong>A per-account ceiling</strong>, shared by everything in it</td></tr>
+        <tr><td>Requests per account</td><td>~20,000/sec</td><td>Exceeding it returns 503 with <code>ServerBusy</code></td></tr>
+        <tr><td>Requests per blob or partition</td><td>Far lower</td><td><strong>One hot blob throttles</strong> regardless of account headroom</td></tr>
+        <tr><td>Block blob size</td><td>~190 TB</td><td>Effectively unlimited</td></tr>
+        <tr><td>Storage Queue message</td><td>64 KB</td><td>Store the payload in blob, queue a pointer</td></tr>
+        <tr><td>Containers per account</td><td>Unlimited</td><td>Structure freely</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The per-blob limit is the one that surprises people</div>
+    <p style="margin:0">Account-level throughput is generous, so teams reason "we're nowhere near the limit" and
+      still get throttled.
+      <br><br>
+      The reason is that limits also apply <strong>per blob and per partition</strong>, at a much lower level. A
+      single configuration file read by 5,000 instances on startup, or one blob every client polls, will throttle
+      while the account is almost idle.
+      <br><br>
+      Same shape as a hot partition everywhere else: <strong>the aggregate limit isn't the one you hit</strong>.
+      <br><br>
+      Fixes, in order: <strong>cache it</strong> (a config blob should be read once, not per request), put a
+      <strong>CDN</strong> in front of anything widely read, or <strong>spread the reads across copies</strong> if
+      it genuinely must be that hot.
+      <br><br>
+      And the naming detail: blob names are partitioned by prefix, so <em>sequential</em> names like a timestamp
+      prefix concentrate writes on one partition range. A high-ingest workload wants a
+      <strong>high-cardinality prefix</strong> — hash first, then the readable part — which is the same advice as
+      for any range-partitioned store.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Blob for files, Queue for cheap simple messaging, Table for cheap key-value.</li>
+      <li>Storage Queues lack topics, sessions, transactions and a real DLQ.</li>
+      <li>Archive isn't readable — rehydration takes hours.</li>
+      <li>Minimum retention periods mean a colder tier can cost more.</li>
+      <li>Lifecycle rules must cover snapshots and versions, or they accumulate silently.</li>
+      <li>ZRS protects against the more likely failure and is synchronous.</li>
+      <li>Geo-replication is asynchronous — failover can lose recent writes.</li>
+      <li>Without RA-, you can't read the secondary.</li>
+      <li>Redundancy is not backup: soft delete, versioning, immutability.</li>
+      <li>Managed identity for your services; user delegation SAS for clients.</li>
+      <li>Account-key SAS cannot be revoked without rotating the key.</li>
+      <li>Direct upload via SAS keeps large files out of your API.</li>
+      <li>ETag conditions give optimistic concurrency and an atomic claim.</li>
+      <li>Per-blob limits throttle long before account limits.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Uploading files through the API</strong> instead of a SAS direct to storage.</li>
+    <li><strong>Long-lived account-key SAS tokens</strong> that can't be revoked.</li>
+    <li><strong>Account keys in configuration</strong> instead of managed identity.</li>
+    <li><strong>A read-write SAS</strong> where write-only was needed.</li>
+    <li><strong>Archiving data that might be requested</strong>, then discovering rehydration takes hours.</li>
+    <li><strong>Lifecycle rules that ignore versions and snapshots.</strong></li>
+    <li><strong>Assuming GRS means zero data loss</strong>, or that the secondary is readable.</li>
+    <li><strong>Treating redundancy as backup.</strong></li>
+    <li><strong>Read-then-write with no ETag condition.</strong></li>
+    <li><strong>One hot blob</strong>, throttled while the account is idle.</li>
+    <li><strong>Sequential blob name prefixes</strong> on a high-ingest workload.</li>
+    <li><strong>Listing a container to find new files</strong> instead of reacting to events.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Users need to upload large files. Design it. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The key decision is that <strong>the file must not pass through my API</strong>. The client uploads
+          directly to blob storage using a short-lived SAS URL that the API issues."</p>
+        <p>"The reason is resource consumption. Routing a 2 GB upload through the API means it occupies a web
+          instance for the entire duration — bandwidth, memory, request timeout, a thread. A handful of concurrent
+          large uploads exhausts the app while storage sits idle. And you'd be scaling web instances to handle byte
+          shuffling, which is the wrong thing to scale."</p>
+        <p>"With direct upload, the API call is just 'give me a URL' — fast and cheap — and storage handles the bytes,
+          which is what it's built for."</p>
+        <p>"The flow is: client asks for an upload URL, API authorises the request and decides the blob name, API
+          returns a <strong>user delegation SAS</strong> with <strong>write-only</strong> permission and a short
+          expiry, client uploads directly. For very large files the SDK does chunked block upload with retries and
+          resume, which I'd get for free rather than implement."</p>
+        <p>"On the SAS specifically, I'd use a <strong>user delegation SAS</strong> rather than one signed with the
+          account key. Two reasons. It's <strong>revocable</strong> — an account-key SAS is valid until it expires
+          and the only way to kill it is rotating the key, which breaks everything else using that key. And it
+          involves <strong>no account key at all</strong>, so key access can be disabled on the account
+          entirely."</p>
+        <p>"Scoping: <strong>write permission only</strong>, no read, no delete, no list. Expiry in minutes, not
+          days — it only needs to start an upload. HTTPS only. IP-restricted if I know the caller's range. And the
+          <em>API</em> chooses the blob name, never the client, so a client can't overwrite someone else's file or
+          escape the container with a path."</p>
+        <p>"Then the important part: <strong>how do I know the upload finished?</strong> The client telling me isn't
+          reliable — it can crash, or lie. So I'd use <strong>Event Grid</strong> on the storage account,
+          subscribing to <code>BlobCreated</code>, which triggers a function to validate and process."</p>
+        <p>"That's where I'd do content-type verification, virus scanning, thumbnailing, and updating the database
+          record to mark the upload complete. It's authoritative because storage is reporting it, not the
+          client."</p>
+        <p>"I'd note that Event Grid is at-least-once and unordered, so that handler needs to be idempotent — using
+          the event id — and I'd configure a dead-letter container, since dead-lettering is off by default and
+          failed events are otherwise silently discarded."</p>
+        <p>"A couple of things I'd add for completeness. <strong>Uploads land in a quarantine container</strong> and
+          only move to the real one after validation, so unvalidated content is never servable. A
+          <strong>lifecycle rule deletes abandoned uploads</strong> after a few days, because clients get URLs and
+          never use them and those blobs accumulate. And downloads work the same way in reverse — a read SAS rather
+          than streaming through the API, with a CDN in front if the content is widely read."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you keep large files out of the application tier?</li>
+        <li>Do you know user delegation SAS and why revocability matters?</li>
+        <li>Do you scope permission and expiry tightly?</li>
+        <li>Do you use Event Grid rather than trusting the client's completion signal?</li>
+        <li>Do you handle abandoned uploads and quarantine?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> posting the file to an API endpoint.</li>
+        <li><span class="redflag">Red flag:</span> a long-lived read-write SAS.</li>
+        <li><span class="redflag">Red flag:</span> trusting the client to confirm completion.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you stop a client uploading to another user's path?</li>
+          <li>How do you scan for malware before the file is servable?</li>
+          <li>What if the upload fails halfway?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Which redundancy option would you choose, and what does it not protect you from? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My default would be <strong>ZRS</strong>, or <strong>GZRS</strong> if the data justifies regional
+          protection — and I'd explain why in terms of which failures are actually likely."</p>
+        <p>"<strong>LRS</strong> keeps three copies in one datacentre. It survives disk and rack failure, which is
+          the common hardware case, and it's the cheapest. Fine for data you can regenerate — caches, intermediate
+          processing output, transient files."</p>
+        <p>"<strong>ZRS</strong> spreads copies across availability zones, so it survives an entire zone going down.
+          That's the failure that <em>actually happens</em> — a datacentre losing power or cooling — far more often
+          than a whole region being lost. And crucially it's <strong>synchronous</strong>, so there's no data loss
+          when a zone fails."</p>
+        <p>"So the reasoning I'd give: ZRS protects against the more probable failure, with no recovery-point
+          penalty, for a modest premium. That's a better default than jumping to geo-redundancy."</p>
+        <p>"<strong>GRS and GZRS</strong> add the paired region. Worth it for data you can't recreate — customer
+          documents, financial records, backups. And here's the part I'd make sure to state:
+          <strong>geo-replication is asynchronous.</strong>"</p>
+        <p>"So writes commit locally and replicate afterwards. If the primary region is lost, anything not yet
+          replicated is gone. The <em>Last Sync Time</em> metric is the honest measure of the recovery point —
+          usually minutes, but not zero and not contractually guaranteed. <strong>GRS is not a zero-data-loss
+          solution</strong>, and if that's the requirement, storage redundancy alone doesn't deliver it."</p>
+        <p>"I'd also flag that plain GRS <strong>doesn't let you read the secondary</strong>. That needs the
+          <strong>RA-</strong> variants. Teams have assumed GRS meant they could serve reads from a second region
+          and discovered otherwise during a drill. And even with RA-GRS, the secondary is read-only and lagging, so
+          it's suitable for reporting or degraded read-only operation — not a hot standby you can write to."</p>
+        <p>"Now the more important half of the question — <strong>what redundancy doesn't protect against.</strong>"</p>
+        <p>"<strong>Redundancy is not backup.</strong> Every option replicates faithfully. If someone deletes a
+          container, or ransomware encrypts your blobs, or a deployment bug overwrites files, that change is
+          replicated to all six copies, cheerfully and immediately. Redundancy addresses infrastructure failure and
+          nothing else."</p>
+        <p>"So for the failures that are actually more likely — human error and malice — I'd want three separate
+          things:"</p>
+        <p>"<strong>Soft delete</strong> for blobs and containers, giving a recovery window after deletion.
+          Container-level soft delete matters as much as blob-level, because deleting a container is the more
+          destructive mistake."</p>
+        <p>"<strong>Versioning</strong>, so an overwrite doesn't destroy the previous content. With retention bounded
+          by a lifecycle rule, because otherwise versions accumulate and you're paying for thousands of copies of a
+          frequently-overwritten file — that's a real and commonly missed cost."</p>
+        <p>"<strong>Immutability policies</strong> for anything regulated or ransomware-sensitive — a time-based
+          retention policy that <em>even an account owner cannot delete</em> within the window. That's the only one
+          an attacker with full credentials can't undo, so it's the genuine ransomware answer, and it's what I'd
+          point to for 'how do you protect backups from a compromised administrator?'"</p>
+        <p>"And I'd separate <strong>account-level protection from cross-account protection</strong>. If the whole
+          subscription is compromised, everything in it is at risk. For genuinely critical data, a copy in a
+          different subscription with different credentials — or object replication to a locked-down account — is the
+          real isolation. Redundancy within one account never gives you that."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reason about which failures are likely, not just tiers?</li>
+        <li>Do you know geo-replication is asynchronous?</li>
+        <li>Do you know the secondary isn't readable without RA-?</li>
+        <li>Do you separate redundancy from backup?</li>
+        <li>Do you know immutability is the ransomware answer?</li>
+        <li>Do you raise cross-account isolation?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "GRS, because more copies is better."</li>
+        <li><span class="redflag">Red flag:</span> treating geo-redundancy as backup.</li>
+        <li><span class="redflag">Red flag:</span> assuming failover is lossless.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you test a regional failover?</li>
+          <li>What's your RPO with GRS, and how do you measure it?</li>
+          <li>How do you stop versioning inflating the bill?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

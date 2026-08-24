@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kubernetes</title>
+<meta name="description" content="Pods, Deployments, Services, Ingress, ConfigMaps and Secrets, StatefulSets, Jobs and autoscaling — the primitives and what each one actually guarantees.">
+<meta name="keywords" content="Kubernetes pods deployments replicasets services ClusterIP NodePort LoadBalancer ingress gateway api ConfigMap Secret StatefulSet DaemonSet Job CronJob HPA namespaces labels selectors rolling update kubectl">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="25-docker-kubernetes/kubernetes.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Kubernetes</h1>
+    <p class="subtitle">A control loop that moves actual state toward declared state. Every primitive below is a
+      different kind of declaration.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Pod</strong> — one or more containers sharing a network and lifecycle. <strong>Disposable.</strong></li>
+      <li><strong>Deployment</strong> — "keep N pods of this spec running", plus rolling updates.</li>
+      <li><strong>Service</strong> — a stable name and IP in front of a changing set of pods.</li>
+      <li><strong>Ingress</strong> — HTTP routing from outside into Services.</li>
+      <li><strong>Labels and selectors are the glue.</strong> Nothing references pods by name.</li>
+      <li><strong>Secrets are base64, not encrypted.</strong></li>
+      <li><strong>StatefulSet</strong> for stable identity and per-pod storage.</li>
+      <li><strong>Namespaces</strong> scope names and quota, and don't isolate the network by default.</li>
+    </ul>
+  </div>
+
+  <h2 id="model">The reconciliation model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The one idea</span>
+    <p>You submit a <strong>declaration</strong> of what should exist. A controller watches, compares it to reality,
+      and acts to close the gap — continuously, forever.</p>
+    <p>You never tell Kubernetes to <em>do</em> something. You tell it what <em>should be true</em>.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A thermostat isn't given the instruction "turn on the heating." It's given a target temperature, and it keeps
+      acting until the room matches.</p>
+    <p>So a deleted pod comes back, a lost node's pods reappear elsewhere, and a changed image tag rolls out
+      gradually — not because anyone issued those commands, but because <strong>the declaration still says three
+      healthy pods of version 1.4 should exist</strong>.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">This is also how you debug</div>
+    <p style="margin:0">Because every problem is a gap between declared and actual, the diagnostic question is
+      always <em>"what is the controller trying to do, and what's stopping it?"</em>
+      <br><br>
+      <strong><code>kubectl describe</code></strong> answers that. The Events section at the bottom is where the
+      answer usually is: <code>FailedScheduling</code> because no node has enough CPU,
+      <code>ImagePullBackOff</code> because the registry credential is wrong,
+      <code>CrashLoopBackOff</code> because the container exits on startup.
+      <br><br>
+      That's the habit worth having: <strong><code>describe</code> before <code>logs</code></strong>. Logs tell you
+      what the application said; describe tells you whether the platform even got as far as running it.
+      <br><br>
+      And a rollout that appears "stuck" is usually the controller behaving correctly — refusing to continue because
+      a new pod never became ready. That's the system protecting you, not failing.</p>
+  </div>
+
+  <h2 id="pods-deployments">Pods, ReplicaSets and Deployments <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Object</th><th>Responsibility</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Pod</strong></td><td>The unit of scheduling. Containers inside share an IP, localhost and volumes</td></tr>
+        <tr><td><strong>ReplicaSet</strong></td><td>Keeps N identical pods running. <strong>You don't create these directly</strong></td></tr>
+        <tr><td><strong>Deployment</strong></td><td>Manages ReplicaSets to give you <strong>rolling updates and rollback</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — a Deployment is a ReplicaSet manager, and that's how rollback works</div>
+    <p style="margin:0">Changing a Deployment's pod template doesn't modify the existing ReplicaSet. It
+      <strong>creates a new one</strong> and shifts replicas from old to new gradually, respecting
+      <code>maxUnavailable</code> and <code>maxSurge</code>.
+      <br><br>
+      The old ReplicaSet stays, scaled to zero. Which is exactly why <code>kubectl rollout undo</code> is fast:
+      it scales the old ReplicaSet back up. No rebuild, no re-pull if the image is still cached — same property as
+      an App Service <a href="../24-azure/app-service.html#slots">slot swap</a>.
+      <br><br>
+      It also explains the rollout pausing behaviour. New pods must pass <strong>readiness</strong> before the old
+      ones are removed, so a broken image doesn't take the service down — the rollout stalls with the old pods still
+      serving. That's the safety property, and it only works if you have a readiness probe. Without one, Kubernetes
+      considers a started container ready and will happily replace every working pod with broken ones.
+      <br><br>
+      Which is the practical point: <strong>no readiness probe means no safe rollout.</strong></p>
+  </div>
+
+  <pre data-label="yaml — a Deployment with the parts that matter" class="code-good"><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  labels: { app: orders-api }
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0        # never go below 3 healthy during a rollout
+      maxSurge: 1              # add one at a time
+  selector:
+    matchLabels: { app: orders-api }    # MUST match the template labels
+  template:
+    metadata:
+      labels: { app: orders-api }
+    spec:
+      containers:
+        - name: api
+          image: myacr.azurecr.io/orders-api:1.4.2
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits:   { memory: "256Mi" }
+          readinessProbe:
+            httpGet: { path: /health/ready, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health/live, port: 8080 }
+            periodSeconds: 15
+            failureThreshold: 3
+          envFrom:
+            - configMapRef: { name: orders-config }
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Labels and selectors are the entire wiring mechanism</div>
+    <p style="margin:0">Nothing in Kubernetes references a pod by name. A Deployment finds its pods by
+      <strong>label selector</strong>. A Service finds its endpoints the same way. So do NetworkPolicies and
+      PodDisruptionBudgets.
+      <br><br>
+      That's why <code>spec.selector.matchLabels</code> must match <code>spec.template.metadata.labels</code>. Get it
+      wrong and the Deployment creates pods it doesn't consider its own — so it creates more, endlessly, and nothing
+      obviously errors.
+      <br><br>
+      The subtler bug is a <strong>Service selector that's too broad</strong>. If it selects
+      <code>app: orders-api</code> and you deploy a second Deployment sharing that label — a canary, say — the
+      Service silently sends traffic to both. Which is sometimes what you want and frequently a surprise.
+      <br><br>
+      A Deployment's selector is also <strong>immutable</strong> after creation, so getting labels right early
+      matters. Convention helps: <code>app</code>, <code>version</code> and <code>component</code>, with the Service
+      selecting on <code>app</code> only when you genuinely want every version behind it.</p>
+  </div>
+
+  <h2 id="services">Services and Ingress <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Reachable from</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ClusterIP</strong></td><td>Inside the cluster only</td><td><strong>The default, and almost always right</strong></td></tr>
+        <tr><td><strong>NodePort</strong></td><td>A port on every node</td><td>Rarely — mostly a building block</td></tr>
+        <tr><td><strong>LoadBalancer</strong></td><td>The internet</td><td>Provisions a cloud load balancer. <strong>One per Service</strong></td></tr>
+        <tr><td><strong>Headless</strong> (<code>clusterIP: None</code>)</td><td>DNS returns pod IPs directly</td><td>StatefulSets, client-side load balancing</td></tr>
+        <tr><td><strong>Ingress</strong></td><td>The internet, HTTP(S)</td><td><strong>Host and path routing to many Services through one entry point</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Why Ingress rather than a LoadBalancer per service</div>
+    <p style="margin:0">Each <code>LoadBalancer</code> Service provisions a real cloud load balancer with its own
+      public IP. Ten services means ten load balancers, ten IPs, ten sets of TLS certificates and ten line items on
+      the bill.
+      <br><br>
+      An <strong>Ingress</strong> gives you one entry point that routes by host and path to many Services —
+      centralising TLS termination, certificate management via cert-manager, and any rewriting or auth at the
+      edge.
+      <br><br>
+      Mechanically: the Ingress resource is just a declaration, and an <strong>ingress controller</strong> (NGINX,
+      Application Gateway Ingress Controller, Traefik) is what implements it. No controller means the resource does
+      nothing at all, silently — which is a common first-time confusion.
+      <br><br>
+      Worth knowing that <strong>Gateway API</strong> is the successor: better multi-team support, proper separation
+      between infrastructure and route ownership, and richer traffic rules. Ingress is what you'll meet in existing
+      clusters; Gateway API is where it's going.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Service DNS, and the detail that catches people</div>
+    <p style="margin:0">A Service gets a DNS name: <code>orders-api</code> within the same namespace,
+      <code>orders-api.production.svc.cluster.local</code> fully qualified. That name is stable while the pods behind
+      it come and go — which is the whole point.
+      <br><br>
+      The gotcha: <strong>this is DNS, and .NET's <code>HttpClient</code> caches connections.</strong> A long-lived
+      <code>HttpClient</code> with a pooled connection to a pod that has since been deleted keeps trying to use
+      it — because the DNS lookup already happened.
+      <br><br>
+      That's why <code>IHttpClientFactory</code> with a bounded
+      <code>PooledConnectionLifetime</code> matters in Kubernetes specifically: pods are replaced constantly, so
+      connection reuse has to be time-bounded or you'll see intermittent failures after every deployment.
+      <br><br>
+      Also: <strong>Service load balancing is L4, not L7.</strong> It distributes <em>connections</em>, not requests.
+      So with HTTP/2 or gRPC, which multiplex many requests over one connection, a client can pin all its traffic to
+      a single pod. That's the standard gRPC-in-Kubernetes surprise, and it needs either client-side load balancing
+      via a headless Service or a proxy that understands L7.</p>
+  </div>
+
+  <h2 id="config">ConfigMaps and Secrets <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>ConfigMap</th><th>Secret</th></tr></thead>
+      <tbody>
+        <tr><td>For</td><td>Non-sensitive configuration</td><td>Sensitive values</td></tr>
+        <tr><td>Storage</td><td>Plain text in etcd</td><td><strong>base64 in etcd — encoding, not encryption</strong></td></tr>
+        <tr><td>Consumed as</td><td>Environment variables or mounted files</td><td>Same</td></tr>
+        <tr><td>Env var updates</td><td><strong>Need a pod restart</strong></td><td>Need a pod restart</td></tr>
+        <tr><td>Mounted file updates</td><td>Propagate automatically (eventually)</td><td>Propagate automatically</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Secrets are base64-encoded, and that's the whole protection</div>
+    <p style="margin:0">A Kubernetes Secret is <strong>not encrypted by default</strong>. It's base64, which is
+      encoding — trivially reversible and not a security measure at all.
+      <br><br>
+      What that means practically: anyone with <code>get secrets</code> in the namespace can read every value, they
+      appear in <strong>etcd backups</strong> in recoverable form, and they're visible to anyone who can describe the
+      pod's environment.
+      <br><br>
+      So the sensible position is to <strong>avoid Secrets holding real secrets</strong>. Use
+      <a href="../24-azure/aks.html#identity">workload identity</a> so the pod gets an Entra token and no credential
+      exists, and for things that genuinely must be a secret — a third-party API key — mount it from Key Vault with
+      the <strong>Secrets Store CSI driver</strong>, so it's never a Kubernetes object.
+      <br><br>
+      If you must use Secrets, enable <strong>encryption at rest</strong> for etcd and restrict RBAC on the secrets
+      resource specifically. But the better answer is not to need them.
+      <br><br>
+      And never commit a Secret manifest to Git. If GitOps requires it, that's what SealedSecrets or SOPS exist
+      for — the committed form is encrypted and only the cluster can decrypt it.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Environment variables don't reload; mounted files do</div>
+    <p style="margin:0">A ConfigMap consumed as <strong>environment variables</strong> is read once at container
+      start. Updating the ConfigMap changes nothing until the pod restarts — and nothing tells you that, so the
+      config looks applied and isn't.
+      <br><br>
+      Consumed as a <strong>mounted volume</strong>, the file is updated by the kubelet within a minute or two. So
+      an application using .NET's file-based configuration with <code>reloadOnChange</code> picks it up without a
+      restart.
+      <br><br>
+      Which is the better pattern when you want dynamic configuration — mount a JSON file and let
+      <code>IConfiguration</code> reload it. Read it through
+      <code>IOptionsMonitor</code>, though, not <code>IOptions</code>, or the change is loaded and never observed.
+      <br><br>
+      The common workaround for the env-var case is to <strong>annotate the pod template with a hash of the
+      ConfigMap</strong>, so changing the config changes the template and triggers a rolling update. That's
+      deliberate and visible, which is often preferable to configuration silently changing under a running
+      app.</p>
+  </div>
+
+  <h2 id="workload-types">The other workload types <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Kind</th><th>Gives you</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>StatefulSet</strong></td>
+          <td><strong>Stable names</strong> (<code>db-0</code>, <code>db-1</code>), ordered start-up, <strong>per-pod persistent volume</strong></td>
+          <td>Databases, brokers, anything with per-replica identity</td>
+        </tr>
+        <tr>
+          <td><strong>DaemonSet</strong></td>
+          <td>One pod per node, automatically on new nodes</td>
+          <td>Log collectors, node agents, CNI components</td>
+        </tr>
+        <tr>
+          <td><strong>Job</strong></td>
+          <td>Runs to completion, with retries</td>
+          <td><strong>Database migrations</strong>, one-off tasks</td>
+        </tr>
+        <tr>
+          <td><strong>CronJob</strong></td>
+          <td>Jobs on a schedule</td>
+          <td>Nightly batch, cleanup</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">A StatefulSet doesn't make software distributed</div>
+    <p style="margin:0">StatefulSets provide the <em>primitives</em> stateful software needs: a stable hostname, a
+      volume that follows the pod, and ordered rollout. They provide nothing about replication, failover, leader
+      election or backup.
+      <br><br>
+      So running PostgreSQL as a StatefulSet gives you PostgreSQL with stable storage. It does not give you a
+      highly-available PostgreSQL — that requires an operator that understands replication and promotion, or a
+      managed service.
+      <br><br>
+      Which is why the usual advice holds: <strong>run stateless workloads on Kubernetes and use managed services
+      for data</strong>, unless there's a specific reason not to. Azure SQL, Cosmos DB and Azure Cache for Redis
+      handle backup, patching, failover and point-in-time restore — all of which you would otherwise be building and
+      testing yourself, in the part of the system where mistakes are least recoverable.
+      <br><br>
+      Being able to say that is a stronger signal than knowing StatefulSet mechanics.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Jobs are how migrations should run</div>
+    <p style="margin:0">Running <code>Database.Migrate()</code> at application startup is convenient and it goes
+      wrong at scale: with three replicas, <strong>three pods try to migrate simultaneously</strong>. EF Core takes a
+      lock so it usually survives, but the pods that lose it are blocked, may fail their readiness probe, and can
+      restart-loop while waiting.
+      <br><br>
+      A <strong>Job</strong> — or a Helm pre-upgrade hook — runs the migration exactly once, to completion, before
+      the new pods roll out. If it fails, the deployment stops, which is what you want.
+      <br><br>
+      That also forces the discipline that matters more: <strong>the migration must be backward compatible</strong>,
+      because old pods are still serving while it runs. Expand-and-contract across separate releases — add the
+      column, deploy code that writes both, migrate data, then remove — same as
+      <a href="../29-sdlc/cicd-deployment.html#migrations">any rolling deployment</a>.
+      <br><br>
+      Kubernetes doesn't create that requirement; it just makes ignoring it break in production rather than in
+      staging.</p>
+  </div>
+
+  <h2 id="namespaces">Namespaces and scoping <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>A namespace gives you</th><th>It does not give you</th></tr></thead>
+      <tbody>
+        <tr><td>A scope for object names</td><td><strong>Network isolation</strong> — pods can reach any namespace by default</td></tr>
+        <tr><td>An RBAC boundary</td><td>Node isolation — workloads still share nodes</td></tr>
+        <tr><td>ResourceQuota and LimitRange</td><td>A security boundary against hostile tenants</td></tr>
+        <tr><td>A logical grouping for teams or environments</td><td>Separate control planes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Flat network by default — namespaces don't stop traffic</div>
+    <p style="margin:0">The default Kubernetes network model is <strong>every pod can reach every other pod</strong>,
+      in any namespace. Namespaces scope <em>names</em>, not traffic.
+      <br><br>
+      So a compromised pod in a low-value namespace can talk directly to your payments service, and nothing is
+      blocking it.
+      <br><br>
+      <strong>NetworkPolicies</strong> are how you restrict that, and the strong pattern is
+      <em>default-deny per namespace, then allow what's needed</em> — an allow-list, since a deny-list will always be
+      incomplete. On AKS this needs a network policy engine (Azure Network Policy or Cilium) to be enabled, or the
+      policies are accepted and silently do nothing, which is worse than not having them.
+      <br><br>
+      And for genuinely hostile multi-tenancy — running other people's code — namespaces are not the answer at all.
+      That needs separate clusters, or VM-level isolation, because the container boundary is a shared kernel.</p>
+  </div>
+
+  <h2 id="kubectl">The kubectl you actually use <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <pre data-label="bash — diagnosis first, in order"><code class="language-bash">kubectl get pods -o wide                    # what exists, on which node, restart counts
+kubectl describe pod orders-api-7d4f-x2n    # EVENTS at the bottom - start here
+kubectl logs orders-api-7d4f-x2n            # current container
+kubectl logs orders-api-7d4f-x2n --previous # the one that just crashed
+kubectl logs -l app=orders-api --tail=100   # across all pods by label
+
+kubectl get events --sort-by=.lastTimestamp # cluster-wide, chronological
+kubectl top pods                            # actual CPU/memory vs requests
+
+kubectl rollout status deploy/orders-api    # is the rollout progressing?
+kubectl rollout undo   deploy/orders-api    # scale the previous ReplicaSet back up
+
+kubectl port-forward svc/orders-api 8080:80 # reach a ClusterIP service locally
+kubectl debug -it orders-api-7d4f-x2n \
+  --image=mcr.microsoft.com/dotnet/sdk:9.0 --target=api   # shell alongside a shell-less image</code></pre>
+
+  <div class="note tip">
+    <div class="note-title"><code>--previous</code> and <code>debug</code> are the two worth memorising</div>
+    <p style="margin:0"><strong><code>logs --previous</code></strong> is what you need for a
+      <code>CrashLoopBackOff</code>, because the current container has only just started and hasn't produced the
+      error yet. The reason it crashed is in the <em>previous</em> container's logs, and without this flag you'll
+      watch an empty log and conclude there's nothing there.
+      <br><br>
+      <strong><code>kubectl debug</code></strong> attaches an ephemeral container sharing the target's namespaces —
+      so you get a shell and tooling alongside a chiseled or distroless image that has neither. That's what makes
+      minimal images practical to run: you don't need a shell <em>in</em> the image, you bring one when you need
+      it.
+      <br><br>
+      And the ordering habit: <strong><code>describe</code> before <code>logs</code></strong>. If the container never
+      started — bad image reference, missing ConfigMap, unschedulable — there are no logs to read, and describe tells
+      you that in one line.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Declarative reconciliation: you declare state, controllers close the gap continuously.</li>
+      <li><code>describe</code> before <code>logs</code>; the Events section holds most answers.</li>
+      <li>A Deployment manages ReplicaSets — that's why rollback is instant.</li>
+      <li>No readiness probe means no safe rollout.</li>
+      <li>Labels and selectors are the only wiring; a Deployment's selector is immutable.</li>
+      <li>ClusterIP by default; Ingress instead of a load balancer per service.</li>
+      <li>Service load balancing is L4, so gRPC and HTTP/2 can pin to one pod.</li>
+      <li>Bound <code>PooledConnectionLifetime</code> — pods are replaced constantly.</li>
+      <li>Secrets are base64, not encrypted; prefer workload identity or the CSI driver.</li>
+      <li>Env vars need a restart; mounted files reload.</li>
+      <li>StatefulSet gives identity and storage, not high availability.</li>
+      <li>Run migrations as a Job, and make them backward compatible.</li>
+      <li>Namespaces don't isolate the network — that's NetworkPolicies, default-deny.</li>
+      <li><code>logs --previous</code> for crash loops; <code>kubectl debug</code> for shell-less images.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No readiness probe</strong>, so a broken image replaces every healthy pod.</li>
+    <li><strong>Selector and template labels mismatched</strong>, so pods multiply.</li>
+    <li><strong>A Service selector too broad</strong>, sending traffic to a canary unintentionally.</li>
+    <li><strong>A LoadBalancer per service</strong> instead of one Ingress.</li>
+    <li><strong>An Ingress resource with no controller installed</strong>, silently doing nothing.</li>
+    <li><strong>Real secrets in Kubernetes Secrets</strong>, readable and in etcd backups.</li>
+    <li><strong>Committing Secret manifests</strong> to Git.</li>
+    <li><strong>Expecting env-var ConfigMap changes</strong> to apply without a restart.</li>
+    <li><strong>Running a production database as a StatefulSet</strong> with no operator.</li>
+    <li><strong>Migrating at application startup</strong> with multiple replicas.</li>
+    <li><strong>Assuming namespaces block traffic.</strong></li>
+    <li><strong>NetworkPolicies with no policy engine enabled</strong> on AKS.</li>
+    <li><strong>Reading <code>logs</code> without <code>--previous</code></strong> on a crash loop.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Explain Pod, Deployment and Service, and how they relate. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They're three layers, each solving a problem the one below leaves open."</p>
+        <p>"A <strong>Pod</strong> is the unit of scheduling — one or more containers that share a network namespace,
+          so they see each other on localhost, and share volumes. The key property is that
+          <strong>pods are disposable</strong>. They get a new IP each time, they're evicted, rescheduled and
+          replaced. You never manage them directly."</p>
+        <p>"A <strong>Deployment</strong> declares 'three pods matching this spec should exist'. A controller makes
+          that true — replacing crashed pods, rescheduling when a node dies. It also handles
+          <strong>rolling updates</strong>."</p>
+        <p>"The mechanism there is worth knowing: a Deployment doesn't manage pods directly, it manages
+          <strong>ReplicaSets</strong>. Changing the pod template creates a <em>new</em> ReplicaSet and shifts
+          replicas across gradually. The old one stays at zero replicas — which is why
+          <code>rollout undo</code> is nearly instant: it just scales the old ReplicaSet back up."</p>
+        <p>"And the safety property: new pods must pass their <strong>readiness probe</strong> before old ones are
+          removed. So a broken image stalls the rollout with the old pods still serving. That only works if you have
+          a readiness probe — without one, Kubernetes treats a started container as ready and will cheerfully replace
+          every working pod with broken ones. <strong>No readiness probe means no safe rollout.</strong>"</p>
+        <p>"A <strong>Service</strong> solves the addressing problem the first two create. Pods come and go with
+          different IPs, so nothing can depend on a pod address. A Service is a <strong>stable name and virtual
+          IP</strong> in front of whichever pods currently match its selector, with DNS so another service connects
+          to <code>orders-api</code> and doesn't care what's behind it."</p>
+        <p>"Which brings up the thing that actually ties all three together: <strong>labels and selectors</strong>.
+          Nothing references anything by name. The Deployment finds its pods by label, the Service finds its
+          endpoints by label. That's the whole wiring model, and it's why a mismatch between
+          <code>spec.selector</code> and the template labels causes strange behaviour — the Deployment creates pods
+          it doesn't recognise as its own, so it creates more."</p>
+        <p>"Two things I'd add that matter in practice."</p>
+        <p>"<strong>Service load balancing is L4</strong> — it distributes connections, not requests. With HTTP/2 or
+          gRPC multiplexing many requests over one connection, a client can end up pinned to a single pod. That's the
+          standard gRPC surprise and it needs client-side load balancing or an L7 proxy."</p>
+        <p>"And <strong>connection lifetime</strong>. Because pods are replaced constantly, a long-lived
+          <code>HttpClient</code> holding a pooled connection to a deleted pod fails intermittently after every
+          deployment. <code>IHttpClientFactory</code> with a bounded <code>PooledConnectionLifetime</code> handles
+          it — that's a .NET-specific detail that matters much more in Kubernetes than elsewhere."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know pods are disposable and not managed directly?</li>
+        <li>Do you know a Deployment manages ReplicaSets, enabling rollback?</li>
+        <li>Do you connect readiness probes to safe rollouts?</li>
+        <li>Do you identify labels and selectors as the wiring?</li>
+        <li>Do you know Services are L4?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> managing pods directly.</li>
+        <li><span class="redflag">Red flag:</span> no mention of readiness in the rollout.</li>
+        <li><span class="redflag">Red flag:</span> thinking a Service is an L7 load balancer.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens if a new pod never becomes ready?</li>
+          <li>How does traffic get in from outside?</li>
+          <li>Why would gRPC calls all hit one pod?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A pod is in CrashLoopBackOff. How do you diagnose it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<code>CrashLoopBackOff</code> means the container starts, exits, and Kubernetes restarts it with
+          increasing backoff. So the container <em>is</em> being created — that already rules out scheduling and
+          image-pull problems, which show up as different statuses."</p>
+        <p>"I'd go in a specific order, because the fast checks eliminate whole categories."</p>
+        <p>"<strong><code>kubectl describe pod</code></strong> first, and the Events section at the bottom. That
+          tells me the last exit code and reason, which immediately narrows it:
+          <strong><code>OOMKilled</code> with exit 137</strong> is a memory limit; a non-zero application exit code
+          means the process itself failed; and <strong>a failing liveness probe</strong> is a different problem
+          entirely — the app may be fine and the probe is killing it."</p>
+        <p>"That last case is worth calling out because the fix is the opposite of what it looks like. If the
+          liveness probe has no <code>initialDelaySeconds</code> and the app takes 20 seconds to start, the probe
+          fails during startup and kills the container before it's ready — forever. It looks like a broken
+          application and it's a broken probe. <code>startupProbe</code> is the correct fix, since it suspends
+          liveness until the app is up."</p>
+        <p>"<strong><code>kubectl logs --previous</code></strong> next. This is essential and easily missed: the
+          current container has only just started, so its logs are empty or partial. The actual exception is in the
+          <em>previous</em> container's output. Without the flag you look at an empty log and conclude there's nothing
+          to see."</p>
+        <p>"From the logs, the usual .NET causes are recognisable. <strong>Configuration missing</strong> — an
+          unbound required option, or a null connection string, which is why
+          <code>ValidateOnStart()</code> is worth having so the message is explicit rather than a
+          <code>NullReferenceException</code>. <strong>A dependency unreachable at startup</strong> — the database
+          isn't accepting connections yet, or a NetworkPolicy is blocking it. <strong>A DI resolution
+          failure</strong>, which throws at build time and is usually obvious. Or <strong>a migration failing</strong>
+          if migrations run at startup."</p>
+        <p>"If the logs show nothing at all, that points elsewhere: <strong>the entrypoint is wrong</strong> — a
+          mismatched DLL name, or a command that isn't in the image — or the container can't start because a mounted
+          ConfigMap or Secret doesn't exist, which describe would have shown. Or it exits 0 immediately, which for a
+          worker usually means the host isn't being awaited."</p>
+        <p>"If it's <strong><code>OOMKilled</code></strong>, that's a distinct path. I'd check whether the limit is
+          simply too low, and note the .NET-specific detail that <strong>the GC sizes its heap from the container
+          limit</strong> — so a tight limit makes the GC far more aggressive, burning CPU, and can push the process
+          over anyway. Raising the limit sometimes improves CPU as well as stopping the kills."</p>
+        <p>"For anything I can't reproduce from logs, I'd get inside it. <code>kubectl debug</code> attaches an
+          ephemeral container sharing the pod's namespaces, so I can check DNS resolution, reach the database, and
+          inspect mounted files — even with a chiseled image that has no shell of its own. If the image does have a
+          shell, overriding the command to <code>sleep infinity</code> in a copy of the pod lets me poke at it
+          without the crash loop fighting me."</p>
+        <p>"On the environment-difference angle: if it runs locally and crash-loops in the cluster, the differences
+          are almost always <strong>configuration, identity, or network</strong>. Different config source, a workload
+          identity not federated to the right service account — the missing
+          <code>azure.workload.identity/use</code> label is a classic — or a NetworkPolicy blocking egress. I'd check
+          those three before suspecting the application."</p>
+        <p>"And to stop it recurring: <strong>a startup probe with a generous window</strong>, a liveness probe that
+          checks only what a restart could fix, <strong>never a dependency</strong> — otherwise a 30-second database
+          blip restarts every pod at once and you've caused a full outage — and configuration validation at startup
+          so the failure message names the problem."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>describe</code> comes first and gives the exit reason?</li>
+        <li>Do you know <code>logs --previous</code>?</li>
+        <li>Do you recognise a liveness probe killing a slow-starting app?</li>
+        <li>Do you know <code>startupProbe</code> is the fix?</li>
+        <li>Do you know the .NET GC/limit interaction for OOM?</li>
+        <li>Do you check config, identity and network for environment differences?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "check the logs" and stopping there.</li>
+        <li><span class="redflag">Red flag:</span> not knowing <code>--previous</code>.</li>
+        <li><span class="redflag">Red flag:</span> raising the memory limit without diagnosing.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Difference between startup, readiness and liveness probes?</li>
+          <li>How do you get a shell into an image that has none?</li>
+          <li>How would you confirm a NetworkPolicy is blocking you?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

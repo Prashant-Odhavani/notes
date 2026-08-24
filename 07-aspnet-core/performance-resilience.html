@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance &amp; Resilience — ASP.NET Core</title>
+<meta name="description" content="HttpClientFactory and socket exhaustion, Polly policies, rate limiting, output caching, response compression, health checks and Kestrel limits.">
+<meta name="keywords" content="IHttpClientFactory socket exhaustion HttpClient singleton DNS Polly retry circuit breaker rate limiter output caching response compression health checks kestrel limits thread pool">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="07-aspnet-core/performance-resilience.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Performance &amp; Resilience</h1>
+    <p class="subtitle">The framework features that keep an API up under load — and the
+      <code>HttpClient</code> mistake that appears in more production incidents than any other .NET bug.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Never <code>new HttpClient()</code> per request.</strong> Use
+        <code>IHttpClientFactory</code>. This is the classic .NET production bug.</li>
+      <li>A static <code>HttpClient</code> fixes socket exhaustion but breaks <strong>DNS
+        changes</strong> — the factory handles both.</li>
+      <li><strong>Timeouts first</strong>, then retry with jitter, then a circuit breaker. Order matters.</li>
+      <li>Built-in <strong>rate limiting</strong> (.NET 7+) is per-instance. Across replicas you need a
+        shared store.</li>
+      <li><strong>Health checks:</strong> liveness = am I alive; readiness = can I serve traffic. They must
+        be different endpoints.</li>
+      <li>Most "slow API" problems are database or blocking calls, not framework overhead.</li>
+    </ul>
+  </div>
+
+  <h2 id="httpclient">HttpClient — the classic bug <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — this exhausts sockets under load" class="code-bad"><code class="language-csharp">public async Task&lt;Price&gt; GetPriceAsync(string sku)
+{
+    using var client = new HttpClient();          // new client per call
+    return await client.GetFromJsonAsync&lt;Price&gt;($"/prices/{sku}");
+}</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">Why this fails</span>
+    <p>Disposing an <code>HttpClient</code> doesn't immediately free its socket. The connection sits in
+      <code>TIME_WAIT</code> for up to <strong>four minutes</strong>.</p>
+    <p>Under load you create sockets faster than the OS releases them, run out of ports, and start getting
+      <code>SocketException</code> — "only one usage of each socket address is normally permitted".</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Why this bug is so nasty</div>
+    <p style="margin:0">The <code>using</code> statement looks <em>correct</em>. It's the responsible thing to
+      do with an <code>IDisposable</code>, so it survives code review easily.
+      <br><br>
+      And it works perfectly in development and in light testing. It only fails under sustained load — often
+      first appearing as intermittent failures a few minutes into a load test or a traffic spike.</p>
+  </div>
+
+  <h3 id="static-not-enough">Why a static client isn't the answer either</h3>
+
+  <pre data-label="csharp — fixes sockets, introduces a different bug" class="code-bad"><code class="language-csharp">private static readonly HttpClient Client = new();   // lives forever</code></pre>
+
+  <p>This does solve socket exhaustion — connections are pooled and reused. But a long-lived
+    <code>HttpClient</code> caches DNS resolution at the connection level and <strong>never picks up DNS
+    changes</strong>.</p>
+
+  <p>So when the service you're calling fails over to a new IP — a deployment, a load balancer change, an
+    Azure failover — your app keeps calling the old address until it's restarted. That's a genuinely
+    difficult outage to diagnose, because everything else recovered and only your service didn't.</p>
+
+  <pre data-label="csharp — IHttpClientFactory solves both" class="code-good"><code class="language-csharp">// Program.cs
+builder.Services.AddHttpClient&lt;IPricingClient, PricingClient&gt;(client =&gt;
+{
+    client.BaseAddress = new Uri("https://pricing.internal/");
+    client.Timeout = TimeSpan.FromSeconds(3);          // ALWAYS set this
+});
+
+// Injected and used normally
+public sealed class PricingClient(HttpClient client) : IPricingClient
+{
+    public async Task&lt;Price?&gt; GetAsync(string sku, CancellationToken ct) =&gt;
+        await client.GetFromJsonAsync&lt;Price&gt;($"prices/{sku}", ct);
+}</code></pre>
+
+  <div class="remember">
+    <span class="r-label">What the factory actually does</span>
+    <p>It pools the underlying <strong>message handlers</strong> (which own the sockets) and rotates them on a
+      lifetime — two minutes by default.</p>
+    <p>So sockets get reused (no exhaustion) but handlers are periodically replaced (DNS refreshes). That's
+      why it's the answer rather than either extreme.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">The injected <code>HttpClient</code> is cheap and <strong>meant</strong> to be
+      short-lived — don't cache it in a static field or hold it beyond the consuming service's lifetime.
+      Doing so defeats the handler rotation and reintroduces the DNS problem.</p>
+  </div>
+
+  <h2 id="resilience">Retry, timeout and circuit breaker <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>The patterns themselves — and why ordering matters — are covered in
+    <a href="../19-architecture/resilience-patterns.html">resilience patterns</a>. Here's how you wire them
+    up in ASP.NET Core.</p>
+
+  <pre data-label="csharp — .NET 8+ standard resilience handler" class="code-good"><code class="language-csharp">builder.Services.AddHttpClient&lt;IPricingClient, PricingClient&gt;(c =&gt;
+{
+    c.BaseAddress = new Uri("https://pricing.internal/");
+})
+.AddStandardResilienceHandler(options =&gt;
+{
+    // Per-attempt timeout
+    options.AttemptTimeout.Timeout = TimeSpan.FromSeconds(2);
+
+    // Retry with exponential backoff AND jitter
+    options.Retry.MaxRetryAttempts = 3;
+    options.Retry.UseJitter = true;
+
+    // Stop hammering a dependency that's clearly down
+    options.CircuitBreaker.FailureRatio = 0.5;
+    options.CircuitBreaker.MinimumThroughput = 20;
+
+    // Bounds the WHOLE operation, including retries
+    options.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(10);
+});</code></pre>
+
+  <p>Two details worth understanding rather than copying:</p>
+
+  <ul>
+    <li><strong>Two timeouts, deliberately.</strong> <code>AttemptTimeout</code> bounds each try;
+      <code>TotalRequestTimeout</code> bounds all of them together. Without the total, three retries at two
+      seconds each can exceed what the caller will wait for — so you do work nobody receives.</li>
+    <li><strong><code>MinimumThroughput</code> stops false trips.</strong> Without it, two failures during a
+      quiet period is a 100% failure rate, and the breaker opens on a healthy dependency.</li>
+  </ul>
+
+  <div class="note danger">
+    <div class="note-title">Retry is only safe if the operation is idempotent</div>
+    <p style="margin:0">A timeout means you <strong>don't know</strong> whether the request succeeded — it may
+      have completed and only the response was lost.
+      <br><br>
+      Retrying a <code>GET</code> is fine. Retrying a payment authorisation without an
+      <strong>idempotency key</strong> can charge the customer twice. The standard handler retries by default
+      on transient failures, so for non-idempotent operations you must either supply an idempotency key or
+      disable retry for that client.</p>
+  </div>
+
+  <h2 id="rate-limiting">Rate limiting <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — per-tenant token bucket" class="code-good"><code class="language-csharp">builder.Services.AddRateLimiter(options =&gt;
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    // Partition by tenant, not globally - one heavy tenant shouldn't
+    // consume everyone else's quota.
+    options.AddPolicy("per-tenant", context =&gt;
+        RateLimitPartition.GetTokenBucketLimiter(
+            partitionKey: context.User.FindFirst("tenant_id")?.Value ?? "anonymous",
+            factory: _ =&gt; new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = 100,
+                TokensPerPeriod = 20,
+                ReplenishmentPeriod = TimeSpan.FromSeconds(1),
+                QueueLimit = 0                     // reject rather than queue
+            }));
+
+    // Tell well-behaved clients when to come back
+    options.OnRejected = async (ctx, ct) =&gt;
+    {
+        if (ctx.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+            ctx.HttpContext.Response.Headers.RetryAfter =
+                ((int)retryAfter.TotalSeconds).ToString();
+        await ValueTask.CompletedTask;
+    };
+});
+
+app.UseRateLimiter();      // after UseAuthentication, so the tenant claim exists</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Algorithm</th><th>Behaviour</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td>Fixed window</td><td>N per calendar window</td><td>Simple, but allows a 2N burst across a boundary</td></tr>
+        <tr><td>Sliding window</td><td>N in the trailing period</td><td>Smoother; more state</td></tr>
+        <tr><td>Token bucket</td><td>Refills steadily; bursts allowed up to the bucket size</td><td><strong>Usually the best default</strong></td></tr>
+        <tr><td>Concurrency</td><td>At most N in flight</td><td>Protecting an expensive resource rather than a rate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The limitation to state in an interview</div>
+    <p style="margin:0">The built-in rate limiter holds state <strong>in memory, per instance</strong>. With
+      three replicas, a limit of 100 becomes an effective 300 — and it's uneven, depending on how the load
+      balancer distributes requests.
+      <br><br>
+      For a genuine global limit you need shared state (Redis) or enforcement at the gateway. Knowing that
+      boundary is more valuable than knowing the configuration syntax.</p>
+  </div>
+
+  <h2 id="caching">Output and response caching <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Output caching (.NET 7+)</th><th>Response caching</th></tr></thead>
+      <tbody>
+        <tr><td>Cache lives</td><td>On the server</td><td>In the client/proxy, via headers</td></tr>
+        <tr><td>You control it</td><td>Yes — can evict by tag</td><td>No — you only send hints</td></tr>
+        <tr><td>Works for authenticated responses</td><td>Yes, if you vary by user</td><td>Risky</td></tr>
+        <tr><td>Use for</td><td>Expensive shared responses</td><td>Static or truly public content</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — output caching with tag-based eviction" class="code-good"><code class="language-csharp">builder.Services.AddOutputCache(options =&gt;
+{
+    options.AddPolicy("products", p =&gt; p.Expire(TimeSpan.FromMinutes(5)).Tag("products"));
+});
+
+app.UseOutputCache();
+
+app.MapGet("/api/products", GetProducts).CacheOutput("products");
+
+// When products change, invalidate everything tagged "products"
+app.MapPost("/api/products", async (IOutputCacheStore cache, CancellationToken ct) =&gt;
+{
+    // ...create the product...
+    await cache.EvictByTagAsync("products", ct);
+});</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — caching per-user data globally</div>
+    <p style="margin:0">If a response depends on who's asking and you cache it without varying by user, the
+      first caller's data gets served to everyone else. That's a data leak caused by a performance
+      optimisation.
+      <br><br>
+      Rule: if the response varies by user or tenant, either <code>VaryByValue</code> on that claim, or don't
+      cache it at the response level — cache the expensive <em>data</em> further down instead.</p>
+  </div>
+
+  <h2 id="health-checks">Health checks <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Liveness</strong> — "am I alive?" If this fails, restart me.</p>
+    <p><strong>Readiness</strong> — "can I serve traffic?" If this fails, stop sending me requests but
+      <em>don't</em> restart me.</p>
+  </div>
+
+  <pre data-label="csharp — two endpoints, different checks" class="code-good"><code class="language-csharp">builder.Services.AddHealthChecks()
+    .AddCheck("self", () =&gt; HealthCheckResult.Healthy(), tags: ["live"])
+    .AddDbContextCheck&lt;AppDbContext&gt;("database", tags: ["ready"])
+    .AddCheck&lt;RedisHealthCheck&gt;("cache", tags: ["ready"]);
+
+// Liveness: no dependencies. Only fails if the process is broken.
+app.MapHealthChecks("/health/live", new HealthCheckOptions
+{
+    Predicate = check =&gt; check.Tags.Contains("live")
+});
+
+// Readiness: includes dependencies.
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check =&gt; check.Tags.Contains("ready")
+});</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — the restart loop</div>
+    <p style="margin:0">If your <strong>liveness</strong> probe checks the database, and the database has a
+      brief outage, Kubernetes concludes every pod is dead and restarts them all.
+      <br><br>
+      Now you have a restart storm on top of a database problem — and restarting doesn't fix a database
+      outage, so the pods keep failing. You've turned a degradation into a full outage.
+      <br><br>
+      <strong>Liveness must not check dependencies.</strong> Only readiness should.</p>
+  </div>
+
+  <h2 id="kestrel">Kestrel limits <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <pre data-label="csharp — the limits worth setting deliberately"><code class="language-csharp">builder.WebHost.ConfigureKestrel(options =&gt;
+{
+    options.Limits.MaxConcurrentConnections = 1000;
+    options.Limits.MaxRequestBodySize = 10 * 1024 * 1024;        // 10 MB
+    options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(30);
+
+    // Slowloris defence: require a minimum data rate
+    options.Limits.MinRequestBodyDataRate =
+        new MinDataRate(bytesPerSecond: 100, gracePeriod: TimeSpan.FromSeconds(10));
+});</code></pre>
+
+  <p><code>MaxRequestBodySize</code> is the one people hit: the default is around 30 MB, and a large upload
+    fails with a 413 that isn't obviously about a limit. Raise it deliberately for upload endpoints rather
+    than globally — a global increase makes you easier to exhaust.</p>
+
+  <h2 id="what-actually-slows">What actually makes an API slow <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Symptom</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>N+1 queries</td><td>Hundreds of DB calls per request</td><td><a href="../04-linq/performance.html#n-plus-one">Project or Include</a></td></tr>
+        <tr><td>Missing index</td><td>One slow query dominates</td><td><a href="../10-sql/indexing.html">Index it</a></td></tr>
+        <tr><td>Blocking async (<code>.Result</code>)</td><td>High latency, <strong>low CPU</strong></td><td><a href="../05-csharp-advanced/async-await.html#deadlock">Async all the way</a></td></tr>
+        <tr><td>Sequential independent calls</td><td>Latency = sum of dependencies</td><td><code>Task.WhenAll</code></td></tr>
+        <tr><td>No timeouts</td><td>One slow dependency takes everything down</td><td>Timeout + bulkhead</td></tr>
+        <tr><td>Connection pool exhaustion</td><td>Pool timeout errors under load</td><td>Find the leaked connection or missing <code>using</code></td></tr>
+        <tr><td>Over-fetching</td><td>Large payloads, high allocation</td><td>Project to a DTO</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>In a typical ASP.NET Core app, framework overhead is <strong>not</strong> your bottleneck.</p>
+    <p>It's a database round trip, a missing index, or a blocking call. Profile before optimising anything
+      else.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li><code>new HttpClient()</code> per request → socket exhaustion. Static → stale DNS.
+        <code>IHttpClientFactory</code> → both solved.</li>
+      <li>Always set an <code>HttpClient</code> timeout. The default is 100 seconds.</li>
+      <li>Two timeouts: per attempt and total. Retry needs jitter and idempotency.</li>
+      <li>Circuit breakers need <code>MinimumThroughput</code> or they trip spuriously.</li>
+      <li>Built-in rate limiting is per instance. Partition by tenant, and know the multi-replica limit.</li>
+      <li>Never cache a per-user response globally.</li>
+      <li>Liveness must not check dependencies, or a DB blip becomes a restart storm.</li>
+      <li>Slowness is almost always the database or a blocking call.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>using var client = new HttpClient()</code></strong> — looks correct, exhausts sockets.</li>
+    <li><strong>No <code>HttpClient</code> timeout</strong>, so a hung dependency holds a request for 100
+      seconds.</li>
+    <li><strong>Retry without idempotency</strong> on a payment or order submission.</li>
+    <li><strong>Retry without jitter</strong>, so all clients retry in synchronised waves.</li>
+    <li><strong>Circuit breaker with no minimum throughput</strong>, tripping at 3am on two failures.</li>
+    <li><strong>Global rate limit</strong> instead of per-tenant, letting one client consume the quota.</li>
+    <li><strong>Caching authenticated responses</strong> without varying by user.</li>
+    <li><strong>Liveness probe that checks the database</strong> — restart storms.</li>
+    <li><strong>Raising <code>MaxRequestBodySize</code> globally</strong> instead of per endpoint.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What's wrong with <code>using var client = new HttpClient()</code>? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It causes socket exhaustion, and the frustrating part is that it looks like <em>correct</em> code —
+          it's an <code>IDisposable</code> in a <code>using</code>, which is exactly what you're taught to
+          do."</p>
+        <p>"The problem is that disposing an <code>HttpClient</code> doesn't release its socket immediately.
+          The connection goes into <code>TIME_WAIT</code> for up to four minutes. Under sustained load you
+          create sockets faster than the OS reclaims them, run out of ephemeral ports, and start getting
+          <code>SocketException</code>. And it only shows up under load — development and light testing look
+          fine."</p>
+        <p>"The obvious fix, a static <code>HttpClient</code>, solves that but introduces a different bug: a
+          long-lived client caches DNS at the connection level and never picks up changes. So when the
+          service you're calling fails over to a new IP, your app keeps calling the old one until it's
+          restarted. That's a nasty outage because everything else recovered and only you didn't."</p>
+        <p>"So the answer is <code>IHttpClientFactory</code>. It pools the underlying message handlers, which
+          own the sockets, and rotates them on a lifetime — two minutes by default. Sockets get reused so
+          there's no exhaustion, and handlers get replaced so DNS refreshes. It solves both ends of the
+          trade-off."</p>
+        <p>"Two things I'd add. The injected <code>HttpClient</code> is cheap and meant to be short-lived —
+          caching it in a static field defeats the handler rotation. And I'd always set an explicit timeout,
+          because the default is 100 seconds, which under load means a hung dependency holds request threads
+          long enough to exhaust the thread pool."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the socket/<code>TIME_WAIT</code> mechanism?</li>
+        <li>Do you know the static-client DNS problem — the detail that shows real experience?</li>
+        <li>Do you mention the default timeout?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "you should reuse it" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> "make it static" with no mention of DNS.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you add retry and a circuit breaker to that client?</li>
+          <li>What's the handler lifetime and why does it exist?</li>
+          <li>How would you diagnose socket exhaustion in production?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you add rate limiting to a multi-tenant API?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd use the built-in rate limiter from .NET 7 rather than writing one, partitioned
+          <strong>per tenant</strong> rather than globally. A global limit means one heavy tenant consumes
+          everyone else's quota, which is the noisy-neighbour problem."</p>
+        <p>"For the algorithm I'd default to a token bucket. It allows a reasonable burst — clients often
+          legitimately send a batch — while enforcing a sustained rate. A fixed window lets a client send
+          double the limit across a window boundary, which is a real gap."</p>
+        <p>"Placement matters: it goes <em>after</em> authentication in the pipeline, because I need the
+          tenant claim to build the partition key. Before auth I'd only have the IP, which is much less
+          useful and wrong behind a proxy."</p>
+        <p>"On rejection I'd return 429 with a <code>Retry-After</code> header. Without it, well-behaved
+          clients guess, and they usually guess too aggressively — which keeps you overloaded."</p>
+        <p>"The limitation I'd state explicitly is that the built-in limiter keeps state <strong>in memory per
+          instance</strong>. With three replicas a limit of 100 becomes an effective 300, distributed
+          unevenly depending on the load balancer. For a genuine global limit you need shared state in Redis,
+          or you enforce it at the gateway — API Management or similar — which is usually the better place
+          because it rejects traffic before it reaches your compute."</p>
+        <p>"I'd also want per-tenant limits to be <em>configurable</em>, because in a real SaaS the plan tier
+          usually determines the quota — so the limit has to come from tenant configuration rather than a
+          constant."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you partition per tenant rather than globally?</li>
+        <li>Do you know the per-instance limitation?</li>
+        <li>Do you return <code>Retry-After</code>?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you implement a distributed rate limit with Redis?</li>
+          <li>Should rate limiting live in the app or the gateway?</li>
+          <li>How do you handle a legitimate burst from a big customer?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How should health checks be set up for Kubernetes? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Two separate endpoints, because liveness and readiness answer different questions and have
+          different consequences."</p>
+        <p>"<strong>Liveness</strong> is 'is this process alive?' If it fails, Kubernetes restarts the pod. So
+          it must check <em>only</em> the process itself — no database, no cache, no downstream services.
+          Essentially it returns 200 if the app is running."</p>
+        <p>"<strong>Readiness</strong> is 'can this pod serve traffic?' If it fails, the pod is removed from
+          the load balancer but <em>not</em> restarted. That's where dependency checks belong — database,
+          cache, whatever you can't function without."</p>
+        <p>"The reason this distinction matters is a specific failure I'd want to avoid. If the liveness probe
+          checks the database and the database has a thirty-second blip, Kubernetes concludes every pod is
+          dead and restarts all of them. Now you have a restart storm on top of a database problem — and
+          restarting doesn't fix a database outage, so they keep failing. You've converted a brief
+          degradation into a full outage."</p>
+        <p>"A couple of refinements. I'd add a <strong>startup probe</strong> for apps with slow
+          initialisation, so a long warm-up isn't mistaken for a liveness failure. And I'd make readiness
+          fail <em>during shutdown</em> — the host's <code>ApplicationStopping</code> event is the hook —
+          so the pod is drained from the load balancer before it stops accepting connections. Otherwise
+          you get failed requests on every deployment."</p>
+        <p>"And I'd keep the checks cheap. A readiness probe running every few seconds that executes a real
+          query adds meaningful load and can itself become the problem. A connectivity check is usually
+          enough."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know liveness must not check dependencies? That's the discriminating detail.</li>
+        <li>Can you describe the restart-storm failure?</li>
+        <li>Bonus: startup probes and draining on shutdown.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> one <code>/health</code> endpoint checking everything.</li>
+        <li><span class="redflag">Red flag:</span> not knowing the difference in what Kubernetes does with each.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What should happen to readiness during a rolling deployment?</li>
+          <li>How do you avoid the probe itself loading the database?</li>
+          <li>What if a dependency is optional — degrade or fail readiness?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

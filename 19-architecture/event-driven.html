@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event-Driven Architecture — Architecture</title>
+<meta name="description" content="Events vs commands, choreography vs orchestration, event notification vs event-carrying state transfer, and the real costs of going event-driven.">
+<meta name="keywords" content="event driven architecture events vs commands choreography orchestration event notification event carrying state transfer pub sub eventual consistency integration events saga">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="19-architecture/event-driven.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Event-Driven Architecture</h1>
+    <p class="subtitle">Components react to things that happened instead of being told what to do. Powerful,
+      and more expensive than it first looks.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Command</strong> = "do this", one handler, can be rejected. <strong>Event</strong> = "this
+        happened", any number of listeners, can't be rejected.</li>
+      <li>Events are named in the <strong>past tense</strong>. If it reads like an instruction, it's a
+        command wearing an event's name.</li>
+      <li><strong>Choreography</strong> = each service reacts independently. <strong>Orchestration</strong> =
+        one coordinator drives the steps.</li>
+      <li>Event-driven buys you <strong>decoupling and independent evolution</strong>. It costs you
+        <strong>traceability, ordering and consistency</strong>.</li>
+      <li>The hardest part isn't publishing — it's <strong>knowing what's happening</strong> when a flow
+        spans six services and nobody owns the whole thing.</li>
+      <li>Start with events at genuine boundaries. Not between two classes in the same process.</li>
+    </ul>
+  </div>
+
+  <h2 id="commands-vs-events">Commands vs events <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>A command</strong> tells one specific handler to do something. The sender knows who, and
+      expects it might be rejected.</p>
+    <p><strong>An event</strong> announces that something already happened. The publisher doesn't know who's
+      listening and can't be told "no".</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Command</th><th>Event</th></tr></thead>
+      <tbody>
+        <tr><td>Name</td><td>Imperative — <code>ShipOrder</code></td><td>Past tense — <code>OrderShipped</code></td></tr>
+        <tr><td>Handlers</td><td>Exactly one</td><td>Zero to many</td></tr>
+        <tr><td>Can it be refused?</td><td>Yes — validation can reject it</td><td>No. It already happened</td></tr>
+        <tr><td>Coupling</td><td>Sender knows the receiver</td><td>Publisher doesn't know subscribers</td></tr>
+        <tr><td>Transport</td><td>Queue (point to point)</td><td>Topic (publish/subscribe)</td></tr>
+        <tr><td>Adding a consumer</td><td>Changes the design</td><td>Costs nothing — publisher unaffected</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake — the command dressed as an event</div>
+    <p style="margin:0">Publishing <code>SendWelcomeEmail</code> to a topic. That's a command with an event's
+      transport. The giveaway: it's imperative, exactly one thing should handle it, and the publisher clearly
+      does know what should happen next.
+      <br><br>
+      The event version is <code>UserRegistered</code>. Then the email service <em>decides</em> to send a
+      welcome email — and later, analytics can subscribe too, without the publisher changing.</p>
+  </div>
+
+  <h2 id="event-types">Two kinds of event — this distinction matters <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p>Same mechanism, very different consequences.</p>
+
+  <pre data-label="csharp — event notification: thin, just says what happened"><code class="language-csharp">public sealed record OrderShipped(Guid OrderId, DateTime ShippedAtUtc);</code></pre>
+
+  <pre data-label="csharp — event-carrying state transfer: fat, carries the data too"><code class="language-csharp">public sealed record OrderShipped(
+    Guid OrderId,
+    DateTime ShippedAtUtc,
+    Guid CustomerId,
+    string CustomerEmail,
+    string ShippingAddress,
+    IReadOnlyList&lt;ShippedLine&gt; Lines,
+    decimal Total);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Notification (thin)</th><th>State transfer (fat)</th></tr></thead>
+      <tbody>
+        <tr><td>Consumer needs data</td><td>Calls back to the source</td><td>Already has it</td></tr>
+        <tr><td>Coupling</td><td>Runtime — the source must be available</td><td>Schema — the contract is bigger</td></tr>
+        <tr><td>Source availability</td><td>Consumers break when it's down</td><td>Consumers keep working</td></tr>
+        <tr><td>Data freshness</td><td>Always current (it just fetched)</td><td>A snapshot from publish time</td></tr>
+        <tr><td>Load on the source</td><td>N callbacks per event</td><td>None</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>How to choose:</strong> if consumers need a lot of data or must keep working when the source is
+    down, carry the state. If the data is large, changes fast, or is sensitive, send a notification and let
+    consumers fetch what they need.</p>
+
+  <p>A common middle ground is to include the handful of fields most consumers need, plus the ID for anyone
+    who needs more.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Pointing out that fat events create a <strong>schema contract</strong>. Once six
+      services read <code>CustomerEmail</code> from your event, you can't remove that field without
+      coordinating six deployments. Thin events keep the contract small but push availability coupling back
+      onto the source.
+      <br><br>
+      There's no free option — and saying that is the answer.</p>
+  </div>
+
+  <h2 id="choreography-orchestration">Choreography vs orchestration <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>Take an order flow: payment → inventory → shipping → notification. Two ways to run it.</p>
+
+  <h3 id="choreography">Choreography — everyone reacts</h3>
+
+  <pre data-label="each service listens and acts independently" class="code-good"><code class="language-text" data-nohl>Order service    ── publishes ──▶  OrderPlaced
+                                        │
+        ┌───────────────────────────────┼───────────────────────────────┐
+        ▼                               ▼                               ▼
+  Payment service              Inventory service              Analytics service
+  (reserves funds)             (reserves stock)               (records the event)
+        │                               │
+        ▼                               ▼
+  PaymentAuthorized              StockReserved
+        │                               │
+        └───────────┬───────────────────┘
+                    ▼
+             Shipping service  ──▶ OrderShipped ──▶ Notification service</code></pre>
+
+  <p><strong>Good:</strong> no central bottleneck. Adding a consumer requires no change to anyone else.
+    Services are genuinely decoupled.</p>
+
+  <p><strong>Bad:</strong> the overall process exists nowhere. No file describes the flow. Debugging "why
+    did order 123 never ship?" means checking six services' logs. And changing the sequence means changing
+    several services.</p>
+
+  <h3 id="orchestration">Orchestration — one coordinator</h3>
+
+  <pre data-label="the process is explicit and lives in one place" class="code-good"><code class="language-text" data-nohl>                    ┌──────────────────────────┐
+                    │  Order Orchestrator      │   ← the process lives HERE
+                    │  (saga / workflow)       │
+                    └───┬──────┬──────┬────────┘
+         1. AuthorizePayment  │      │
+              ▼               │      │
+        Payment service       │      │
+                    2. ReserveStock  │
+                              ▼      │
+                       Inventory service
+                                 3. ArrangeShipping
+                                     ▼
+                               Shipping service</code></pre>
+
+  <p><strong>Good:</strong> the whole process is readable in one place. Easy to see where an order got
+    stuck. Compensation logic (refund the payment if shipping fails) has an obvious home.</p>
+
+  <p><strong>Bad:</strong> the orchestrator knows about everyone, so it's a coupling point and it changes
+    whenever the process changes. It can become a bottleneck, and if it's poorly designed it turns into a
+    god service with all the business logic.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Choose</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td>Choreography</td><td>Few steps, no compensation needed, consumers are genuinely independent reactions (analytics, notifications, cache invalidation)</td></tr>
+        <tr><td>Orchestration</td><td>A multi-step business process, order matters, failures need compensation, someone will ask "where is order 123?"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The practical rule</span>
+    <p>If a human will ever ask <strong>"what state is this process in?"</strong> — orchestrate it.</p>
+    <p>Choreography makes that question expensive to answer, and you'll be asked it during an incident.</p>
+  </div>
+
+  <p>The <a href="distributed-data.html#saga">saga pattern</a> covers both variants, including compensation.</p>
+
+  <h2 id="what-it-costs">What event-driven actually costs <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>The benefits get quoted constantly. Here's the other side, which is what interviews probe.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cost</th><th>What it means day to day</th></tr></thead>
+      <tbody>
+        <tr><td>Eventual consistency</td><td>A user saves something and it isn't visible on the next screen. That's a product problem, not just technical</td></tr>
+        <tr><td>Duplicate delivery</td><td>At-least-once is the norm. <strong>Every consumer must be idempotent</strong> or you double-charge someone</td></tr>
+        <tr><td>Out-of-order arrival</td><td><code>OrderCancelled</code> can arrive before <code>OrderPlaced</code>. Handlers must tolerate it</td></tr>
+        <tr><td>Lost traceability</td><td>One user action becomes twelve messages. Without correlation IDs and distributed tracing, debugging is guesswork</td></tr>
+        <tr><td>Schema versioning</td><td>Events are a published contract. Adding a required field breaks consumers still running old code</td></tr>
+        <tr><td>Poison messages</td><td>One malformed message can block a queue forever without a dead-letter strategy</td></tr>
+        <tr><td>Testing difficulty</td><td>"Does this flow work?" needs several services running, or contract tests</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — the one that always bites</div>
+    <p style="margin:0">Assuming exactly-once delivery. It doesn't exist in practice across a network — you
+      get at-least-once, and you make it <em>behave</em> like exactly-once by making handlers idempotent.
+      <br><br>
+      Concretely: store the processed message ID, and if you've seen it, skip. Details in
+      <a href="distributed-data.html#idempotency">idempotency</a>.</p>
+  </div>
+
+  <h2 id="event-design">Designing events well <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <ol class="steps">
+    <li><strong>Past tense, business language.</strong> <code>InvoicePaid</code>, not
+      <code>InvoiceTableUpdated</code>. Events describe business facts, not database operations.</li>
+    <li><strong>Include an event ID and a timestamp.</strong> The ID is what makes idempotency possible; the
+      timestamp is what makes ordering debuggable.</li>
+    <li><strong>Include a correlation ID</strong> flowing from the original request, so you can follow one
+      user action across every service.</li>
+    <li><strong>Version from day one.</strong> Either in the type name (<code>OrderPlacedV2</code>) or in a
+      header. Retrofitting versioning is painful.</li>
+    <li><strong>Only additive changes.</strong> Add optional fields; never remove or repurpose one.
+      Consumers on old code must keep working.</li>
+    <li><strong>Don't leak internals.</strong> Publishing your EF entity as the event means every internal
+      rename becomes a breaking change for other teams.</li>
+  </ol>
+
+  <pre data-label="csharp — an integration event with the metadata that matters" class="code-good"><code class="language-csharp">public sealed record OrderPlacedV1(
+    Guid EventId,              // for idempotency
+    DateTime OccurredAtUtc,    // for ordering and debugging
+    Guid CorrelationId,        // ties back to the originating request
+    Guid OrderId,
+    Guid CustomerId,
+    decimal Total,
+    string Currency);          // primitives only - this is serialized and versioned</code></pre>
+
+  <h2 id="when-not-to">When not to go event-driven</h2>
+
+  <ul>
+    <li><strong>Between two classes in the same process.</strong> A method call is simpler, traceable and
+      transactional. Use in-process <a href="ddd.html#domain-events">domain events</a> if you want decoupling
+      — not a broker.</li>
+    <li><strong>When the caller needs an answer.</strong> If you need a result to continue, that's
+      request/reply. Faking it with events plus a correlation timeout is worse than an HTTP call.</li>
+    <li><strong>When the operation must be transactional.</strong> Events cross the transaction boundary by
+      definition.</li>
+    <li><strong>When the team lacks the operational base.</strong> Without distributed tracing, centralised
+      logging, DLQ monitoring and replay tooling, event-driven turns every bug into an archaeology project.</li>
+  </ul>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Command = one handler, refusable. Event = many handlers, already happened, past tense.</li>
+      <li>Thin events couple you on availability; fat events couple you on schema. Pick deliberately.</li>
+      <li>Choreography for independent reactions; orchestration when someone will ask "where is this process?"</li>
+      <li>At-least-once is the reality. Idempotent handlers are mandatory, not optional.</li>
+      <li>Every event needs an ID, a timestamp and a correlation ID.</li>
+      <li>Events are a public contract — additive changes only.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Commands published as events</strong> (<code>SendEmail</code> on a topic), giving you the
+      coupling of a command with the untraceability of an event.</li>
+    <li><strong>Publishing internal entities</strong> as event payloads, so every rename breaks consumers.</li>
+    <li><strong>No idempotency</strong>, so a redelivered message double-charges or double-ships.</li>
+    <li><strong>No correlation ID</strong>, making cross-service debugging effectively impossible.</li>
+    <li><strong>No dead-letter monitoring</strong> — messages fail silently for weeks.</li>
+    <li><strong>Events for everything</strong>, including two components in the same process that could have
+      used a method call.</li>
+    <li><strong>Assuming ordering</strong> because it worked in testing with one consumer.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What's the difference between a command and an event?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A command tells a specific handler to do something — it's imperative, there's exactly one
+          handler, and it can be rejected. An event says something already happened — past tense, any number
+          of subscribers, and it can't be refused because it's a statement of fact."</p>
+        <p>"The practical difference is in coupling and in what happens when requirements change. With a
+          command, the sender knows the receiver. With an event, the publisher doesn't know who's listening,
+          so you can add a consumer without touching the publisher at all."</p>
+        <p>"The mistake I look for in reviews is a command dressed as an event — something like
+          <code>SendWelcomeEmail</code> published to a topic. It's imperative, one thing should handle it,
+          and the publisher clearly does know what should happen. The event version is
+          <code>UserRegistered</code>, and then the email service <em>decides</em> to send a welcome email.
+          That's what lets analytics subscribe later without a change."</p>
+        <p>"There's a design consequence too. Because an event can't be rejected, anything that needs to be
+          validated or refused has to be a command. If I find myself wanting to 'reject' an event, my model
+          is wrong — the thing hasn't actually happened yet."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the naming convention and why it isn't cosmetic?</li>
+        <li>Do you understand the coupling difference?</li>
+        <li>Can you spot a command-as-event in a design?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which transport would you use for each — queue or topic?</li>
+          <li>How much data should an event carry?</li>
+          <li>What if two services both need to handle the same command?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Choreography or orchestration for a multi-step order process? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"For a genuine multi-step business process with compensation, I'd orchestrate — and the deciding
+          question for me is: <strong>will anyone ever ask 'where is order 123 right now?'</strong> For an
+          order flow, someone absolutely will, probably during an incident."</p>
+        <p>"With choreography, that question is expensive. The process doesn't exist anywhere — it's an
+          emergent property of six services each reacting. To answer it you check six sets of logs and infer
+          what happened. And if the flow needs to change, you change several services."</p>
+        <p>"With orchestration, the process is a readable piece of code in one place. You can query the
+          orchestrator for the current state. And compensation has an obvious home — if shipping fails after
+          payment succeeded, the orchestrator knows to trigger a refund. In choreography that logic gets
+          scattered, or forgotten."</p>
+        <p>"The cost is real though: the orchestrator knows about everyone, so it's a coupling point and it
+          changes whenever the process changes. The way I'd contain that is to keep it thin — it sequences
+          steps and handles failures, but the business rules stay in the services. If the orchestrator starts
+          containing pricing logic, it's become a god service."</p>
+        <p>"I'd still use choreography for the things that are genuinely independent reactions — analytics,
+          notifications, cache invalidation, search indexing. Those aren't steps in a process; they're side
+          effects nobody is waiting on, and coupling them into an orchestrator adds nothing."</p>
+        <p>"So in practice most systems are both: an orchestrated core process, with choreographed reactions
+          hanging off the events it emits."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you weigh operability, not just coupling?</li>
+        <li>Do you know compensation needs a home?</li>
+        <li>Do you recognise most real systems use both?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "choreography, because it's more decoupled" with no
+          mention of debugging or compensation.</li>
+        <li><span class="redflag">Red flag:</span> not knowing what compensation means.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you implement the orchestrator so it survives a restart mid-process?</li>
+          <li>What happens if a compensating action itself fails?</li>
+          <li>How would you monitor a stuck saga?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are the downsides of event-driven architecture?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The one that surprises teams most is <strong>loss of traceability</strong>. One user action
+          becomes a dozen messages across services, and without correlation IDs and distributed tracing from
+          day one, answering 'what happened to this order?' becomes archaeology. That's a bigger day-to-day
+          cost than the consistency issues people usually mention first."</p>
+        <p>"Then <strong>eventual consistency</strong>, which is genuinely a product problem, not just a
+          technical one. A user saves something and it isn't on the next screen. Somebody has to decide
+          whether that's acceptable, and if it isn't, you need UI patterns to handle it — optimistic display,
+          a pending state, or reading your own writes from the source."</p>
+        <p>"<strong>Duplicate and out-of-order delivery.</strong> At-least-once is the reality, so every
+          consumer has to be idempotent — and I'd say that unprompted, because it's where real money gets
+          lost. Out-of-order matters too: a cancellation can arrive before the placement."</p>
+        <p>"<strong>Schema versioning.</strong> Events are a published contract. Once six services read a
+          field, you can't remove it without coordinating six deployments. So additive-only changes, and
+          versioning designed in up front."</p>
+        <p>"And an operational one people underestimate: <strong>poison messages and dead-letter queues</strong>.
+          Without monitoring on the DLQ, messages fail silently for weeks and you find out from a customer."</p>
+        <p>"So my summary would be that event-driven trades <em>compile-time and transactional</em> guarantees
+          for <em>flexibility</em>. It's a good trade at real boundaries between teams or services. It's a bad
+          trade between two classes in the same process, where a method call gives you the same decoupling
+          with none of the cost."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Have you operated one, or only read about it?</li>
+        <li>Does idempotency come up unprompted?</li>
+        <li>Do you recognise eventual consistency as a product decision?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you make a consumer idempotent?</li>
+          <li>How do you handle a poison message?</li>
+          <li>How do you version an event that six services consume?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

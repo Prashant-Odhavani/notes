@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI/CD, Release &amp; Deployment — SDLC</title>
+<meta name="description" content="CI vs CD, build-once-promote-many, blue/green vs canary, feature flags, zero-downtime database migrations, rollback and DORA metrics.">
+<meta name="keywords" content="CI CD continuous integration delivery deployment pipeline blue green canary rolling deployment feature flags database migration expand contract rollback DORA zero downtime">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="29-sdlc/cicd-deployment.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>CI/CD, Release &amp; Deployment</h1>
+    <p class="subtitle">How a merged commit becomes production safely — and why "deploy" and "release" being
+      the same event causes most risky releases.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Deploy ≠ release.</strong> Deploy = the code is running. Release = users can see it.
+        Feature flags separate them, and that's what makes frequent deployment safe.</li>
+      <li>CI means everyone integrates into mainline daily and every integration is verified — not "we have
+        a build server".</li>
+      <li><strong>Build the artifact once, promote the same artifact.</strong> Rebuilding per environment
+        means you never tested what you shipped.</li>
+      <li>Define the <strong>rollback trigger before you ship</strong> — a metric and a threshold, decided
+        in advance.</li>
+      <li>Every schema change must work with the currently deployed code. Expand → migrate → contract.</li>
+      <li>DORA four keys. Speed and stability move <em>together</em> — the trade-off people assume doesn't
+        exist.</li>
+    </ul>
+  </div>
+
+  <h2 id="ci">Continuous integration <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="oneline"><b>One line:</b> everyone merges into the mainline at least daily, and every merge is
+    automatically verified.</div>
+
+  <p>CI is a practice, not a tool. A team with an elaborate Jenkins setup and three-week feature branches is
+    not doing CI.</p>
+
+  <p><strong>Why it matters:</strong> divergence between a branch and mainline grows with time, and the
+    difficulty of reconciling it grows <em>faster</em> than linearly. Two branches that each refactor the
+    same area produce a conflict no tool can resolve safely. Daily integration keeps every merge small and
+    boring.</p>
+
+  <p>A pipeline earning the name does at minimum: build with warnings as errors, run unit and integration
+    tests, run analysers and format checks, scan dependencies for vulnerabilities, and produce a single
+    versioned artifact. And it must be fast enough that people wait for it — see the
+    <a href="testing.html#gates">ten-minute budget</a>.</p>
+
+  <h2 id="cd">Continuous delivery vs continuous deployment</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Continuous delivery</th><th>Continuous deployment</th></tr></thead>
+      <tbody>
+        <tr><td>Definition</td><td>Every passing change is <em>releasable</em>; promotion is a button someone presses</td><td>Every passing change goes to production automatically</td></tr>
+        <tr><td>Requires</td><td>Automated pipeline, reliable tests, environment parity</td><td>All that, plus flags, canaries and fast rollback</td></tr>
+        <tr><td>Good fit</td><td>Regulated domains, coordinated releases</td><td>SaaS with strong telemetry and small changes</td></tr>
+        <tr><td>Failure mode</td><td>The button gets pressed monthly, so batches grow and each release is risky</td><td>Deploying broken changes fast when detection or rollback is weak</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Most organisations should aim for continuous <em>delivery</em> with low-friction
+      promotion, and treat continuous deployment as an outcome of maturity rather than a goal.
+      <br><br>
+      The value is being <strong>able</strong> to deploy at any moment. Whether you press the button
+      automatically matters far less than whether a hotfix can reach production in twenty minutes.</p>
+  </div>
+
+  <h2 id="pipeline">Pipeline design <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Build once, promote the same artifact.</strong></p>
+    <p>Environment differences belong in configuration supplied at runtime, never in the build. Rebuilding
+      per environment means the thing you tested isn't the thing you shipped.</p>
+  </div>
+
+  <pre data-label="yaml — build once, promote many"><code class="language-yaml">jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '9.0.x' }
+      - run: dotnet publish src/Api -c Release -o out /p:Version=1.0.${{ github.run_number }}
+      - run: dotnet test --no-build -c Release
+      - uses: actions/upload-artifact@v4
+        with: { name: api, path: out }
+
+  deploy-prod:
+    needs: build
+    environment: production        # protection rule: requires approval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: api }        # THE SAME bits that were tested
+      - run: ./deploy.sh production</code></pre>
+
+  <p>The important detail is that <code>deploy-prod</code> <strong>downloads</strong> the artifact — it
+    doesn't rebuild. Rebuilding introduces the possibility of different dependency resolution, a different
+    compiler patch version, or different source state. Pipeline mechanics in depth:
+    <a href="../28-github-actions/index.html">GitHub Actions</a>.</p>
+
+  <h2 id="strategies">Deployment strategies <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>How</th><th>Cost</th><th>Rollback</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td>Recreate</td><td>Stop old, start new</td><td>Downtime</td><td>Redeploy old — also downtime</td><td>Internal tools; maintenance windows are acceptable</td></tr>
+        <tr><td>Rolling</td><td>Replace instances in batches</td><td>Both versions live at once</td><td>Batch by batch</td><td>Default for stateless services (App Service, Kubernetes)</td></tr>
+        <tr><td>Blue/green</td><td>Two full environments, switch traffic at once</td><td>Double infrastructure during the switch</td><td>Instant — switch back</td><td>Clean cutover, and you can afford duplicate capacity</td></tr>
+        <tr><td>Canary</td><td>Small % of real traffic, watch metrics, ramp up</td><td>Needs traffic splitting and good telemetry</td><td>Route the canary to zero</td><td>High traffic, where only real traffic is a real test</td></tr>
+        <tr><td>Feature flag</td><td>Code deployed dark, enabled per user/tenant/%</td><td>Flag lifecycle management</td><td>Turn it off — seconds, no deploy</td><td>Almost always, combined with one of the above</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>How to choose:</strong> rolling for infrastructure change, flags for behaviour change.</p>
+
+  <p>Rolling deployments handle "new binary, same behaviour" well. When the risk is that the <em>logic</em>
+    is wrong, a flag is far better — reversible in seconds, no deployment, no schema to unwind.</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Describing blue/green as "zero risk" in an interview. It removes deployment
+      downtime, but it doesn't solve the hard part: <strong>shared state</strong>. Both environments usually
+      talk to the same database, so an incompatible schema change breaks green just as badly — and switching
+      back doesn't undo data the new version wrote.
+      <br><br>
+      Blue/green solves cutover, not compatibility.</p>
+  </div>
+
+  <h3 id="flags">Feature flags in practice <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <pre data-label="csharp — flag-gated behaviour with a safe default"><code class="language-csharp">public async Task&lt;Money&gt; QuoteAsync(Order order, CancellationToken ct)
+{
+    // Default is the OLD path: a flag service outage degrades to "as before".
+    if (!await features.IsEnabledAsync("NewPricingEngine", order.TenantId))
+        return await legacy.QuoteAsync(order, ct);
+
+    try
+    {
+        var quote = await rules.QuoteAsync(order, ct);
+
+        // Shadow comparison during rollout: log divergence, trust the old path.
+        var control = await legacy.QuoteAsync(order, ct);
+        if (control != quote)
+            log.LogWarning("Pricing divergence {Order}: legacy {A} vs new {B}",
+                order.Id, control, quote);
+
+        return quote;
+    }
+    catch (Exception ex)
+    {
+        // A flagged path must never take down the unflagged one.
+        log.LogError(ex, "New pricing failed for {Order}; falling back", order.Id);
+        return await legacy.QuoteAsync(order, ct);
+    }
+}</code></pre>
+
+  <p>Three things make this a safe rollout rather than a risky one:</p>
+
+  <ol class="steps">
+    <li><strong>The default is the old behaviour</strong>, so a flag service outage degrades gracefully.</li>
+    <li><strong>The new path can't fail the request.</strong></li>
+    <li><strong>Shadow comparison produces evidence.</strong> After a week of zero divergence warnings you
+      have a real argument for switching — instead of a hope.</li>
+  </ol>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — flags are debt with a fuse</div>
+    <p style="margin:0">Every flag doubles the number of code paths, and combinations multiply. Set an expiry
+      when you create one, remove it as a tracked task once the rollout is done, and never let a flag become
+      permanent configuration by accident. If it's permanent, it's a <em>setting</em> — and it needs tests
+      covering both values.</p>
+  </div>
+
+  <h2 id="migrations">Database changes and rolling deploys <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>During any rolling deployment, <strong>old and new code run at the same time against the same
+      schema</strong>.</p>
+    <p>So every schema change must be compatible with the currently deployed code.</p>
+  </div>
+
+  <p>The pattern is <strong>expand and contract</strong>, across several separate releases:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Change</th><th>Safe because</th></tr></thead>
+      <tbody>
+        <tr><td>1. Expand</td><td>Add the new nullable column. Don't touch the old one.</td><td>Old code ignores a column it doesn't know about</td></tr>
+        <tr><td>2. Dual write</td><td>Deploy code that writes both, reads old.</td><td>Old code still writing only the old column</td></tr>
+        <tr><td>3. Backfill</td><td>Batch-migrate historical rows, off-peak.</td><td>It's data only</td></tr>
+        <tr><td>4. Switch reads</td><td>Read new, still write both.</td><td>Rollback is safe — old data is still current</td></tr>
+        <tr><td>5. Contract</td><td>Stop writing old; later release drops the column.</td><td>Only after every instance runs the new code</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="sql — bad: the rename that causes an outage" class="code-bad"><code class="language-sql">-- Deployed alongside the app release that uses the new name.
+EXEC sp_rename 'dbo.Customer.Email', 'EmailAddress', 'COLUMN';</code></pre>
+
+  <p>During the rollout, half the instances still run old code and query <code>Email</code>. Every one of
+    those requests fails.</p>
+
+  <p>And rolling back the app <em>doesn't help</em> — the column is already renamed, so old code fails just
+    as hard. You've turned a routine deploy into an outage with no fast exit.</p>
+
+  <pre data-label="sql — expand / contract, spread over releases" class="code-good"><code class="language-sql">-- Release 1: expand (safe with old code running)
+ALTER TABLE dbo.Customer ADD EmailAddress nvarchar(256) NULL;
+-- Release 1 app code: write both, read Email.
+
+-- Backfill in batches so the table is never locked for long.
+WHILE 1 = 1
+BEGIN
+    UPDATE TOP (5000) dbo.Customer
+       SET EmailAddress = Email
+     WHERE EmailAddress IS NULL AND Email IS NOT NULL;
+    IF @@ROWCOUNT = 0 BREAK;
+    WAITFOR DELAY '00:00:01';   -- let other work through
+END
+
+-- Release 2 app code: read EmailAddress, still write both.
+-- Release 3 app code: stop writing Email.
+-- Release 4 (days later): ALTER TABLE dbo.Customer DROP COLUMN Email;</code></pre>
+
+  <p>Four releases instead of one. Feels like overhead until the first time it saves you.</p>
+
+  <p>The <strong>batched backfill</strong> matters independently: a single <code>UPDATE</code> over millions
+    of rows holds locks, blows up the transaction log, and can block the application for minutes. See
+    <a href="../10-sql/transactions.html">locking and blocking</a>.</p>
+
+  <h2 id="rollback">Rollback strategy</h2>
+
+  <p>"We can roll back" is only true if someone verified it recently. Things that quietly make rollback
+    impossible:</p>
+
+  <ul>
+    <li>Schema changes already applied.</li>
+    <li>Messages published in a new format old consumers can't parse.</li>
+    <li>Cache entries written in a new shape.</li>
+    <li>Data the new version wrote that the old version <em>misinterprets</em> rather than rejecting.</li>
+  </ul>
+
+  <p><strong>What to actually do:</strong></p>
+
+  <ul>
+    <li><strong>Define the trigger before shipping.</strong> "If 5xx rate on this endpoint exceeds 1% over
+      five minutes, or p95 latency doubles, we roll back." Decided in advance it's mechanical; decided during
+      an incident it's an argument.</li>
+    <li><strong>Prefer flag-off to redeploy.</strong> Seconds versus minutes.</li>
+    <li><strong>Know your forward-only cases.</strong> Once you've destroyed data or published events, you
+      can only fix forward. Identify those in design — "roll back" isn't available.</li>
+    <li><strong>Practise it.</strong> A rollback path exercised for the first time during an incident is a
+      hypothesis, not a plan.</li>
+  </ul>
+
+  <h2 id="dora">DORA metrics <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Metric</th><th>Measures</th><th>Improved by</th></tr></thead>
+      <tbody>
+        <tr><td>Deployment frequency</td><td>How often you ship</td><td>Smaller batches, automation, flags</td></tr>
+        <tr><td>Lead time for change</td><td>Commit → running in production</td><td>Removing queues: review latency, manual gates, slow pipelines</td></tr>
+        <tr><td>Change failure rate</td><td>% of deployments causing degradation</td><td>Better pre-merge verification, smaller changes, canaries</td></tr>
+        <tr><td>Time to restore</td><td>How long a failure lasts</td><td>Fast rollback, good alerting, practised runbooks</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The counter-intuitive part</span>
+    <p>Speed and stability move <strong>together</strong>. Teams that deploy more often also have lower
+      change failure rates.</p>
+    <p>The mechanism is batch size: frequent deployment forces small changes, and small changes are easier
+      to review, diagnose and reverse.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Separate deploy from release with flags. That single change makes frequent deployment safe.</li>
+      <li>Build once, promote the artifact. Never rebuild per environment.</li>
+      <li>Rolling for infrastructure change, flags for behaviour change, canary when only real traffic tells you the truth.</li>
+      <li>Blue/green doesn't solve schema compatibility. Nothing does except expand/contract.</li>
+      <li>Backfill in batches, always.</li>
+      <li>Decide the rollback trigger before you ship.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Rebuilding per environment</strong>, so what's tested is never what's shipped.</li>
+    <li><strong>Environment-specific code paths</strong> (<code>if (env == "prod")</code>) instead of configuration.</li>
+    <li><strong>Schema migration coupled to the app release</strong> with no compatibility window.</li>
+    <li><strong>Secrets in pipeline variables</strong> instead of a secret store with managed identity — see
+      <a href="../24-azure/config-secrets.html">App Configuration &amp; Key Vault</a>.</li>
+    <li><strong>Manual steps only one person knows.</strong> That's the true single point of failure.</li>
+    <li><strong>Deploying Friday afternoon without rollback.</strong> The problem is never the day — it's the
+      absent rollback path.</li>
+    <li><strong>No smoke test after deployment</strong>, so the first person to notice is a customer.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>Explain blue/green versus canary, and when you'd choose each.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Blue/green runs two complete environments. All traffic is on blue, you deploy to green, verify
+          it, then switch everything at once — usually a load balancer or DNS change. Rollback is switching
+          back, which is nearly instant."</p>
+        <p>"The costs are double infrastructure during the switch, and that verification happens with
+          synthetic traffic — so you learn nothing about real user behaviour until you've already committed
+          everyone."</p>
+        <p>"Canary sends a small fraction of real traffic to the new version — 1%, then 5%, then 25% — while
+          watching error rates and latency. You find problems with real traffic patterns, real data and real
+          cache behaviour while only a small fraction of users is exposed."</p>
+        <p>"Canary's costs: you need traffic splitting, telemetry good enough to compare cohorts, and both
+          versions run concurrently for longer — which makes schema and message compatibility mandatory
+          rather than optional."</p>
+        <p>"I'd choose canary for a high-traffic service where the risk is that logic behaves differently
+          under real load. That's exactly what blue/green can't detect before full cutover. I'd choose
+          blue/green for lower-traffic services where 1% is too small a sample to tell you anything, or where
+          the change is infrastructural and I want a clean reversible cutover."</p>
+        <p>"In practice I'd combine either with feature flags, because the flag gives second-level
+          reversibility for the behaviour itself. And I'd say explicitly that neither addresses the database —
+          a breaking schema change is equally fatal in both, which is why expand-and-contract is the real
+          prerequisite."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the mechanics — and more importantly the limits of each?</li>
+        <li>Do you recognise shared state as the thing neither solves?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> definitions only, no selection criteria.</li>
+        <li><span class="redflag">Red flag:</span> claiming blue/green gives zero-risk deployment.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you canary a background message consumer, where there's no HTTP traffic to split?</li>
+          <li>What metrics decide whether the canary is promoted?</li>
+          <li>How does this work when the change includes a schema migration?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Rename a heavily-used column on a 200-million-row table with zero downtime. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I wouldn't rename it. A rename is a single atomic change that breaks every deployed instance
+          still using the old name — and it makes rollback impossible, because reverting the application
+          doesn't revert the schema."</p>
+        <p>"Instead, a parallel change across several releases."</p>
+        <p>"Release one adds the new nullable column and deploys code that writes both but keeps reading the
+          old one. That's safe against instances running the previous build, because they just ignore a
+          column they don't know about."</p>
+        <p>"Then I backfill in batches — a few thousand rows at a time with a short pause, off-peak,
+          monitoring log growth and blocking. A single UPDATE across 200 million rows would hold locks, bloat
+          the transaction log, and potentially escalate to a table lock. That's an outage in itself."</p>
+        <p>"Release two switches reads to the new column while still writing both, so rollback to release one
+          stays completely safe — both columns are current. I'd let that soak for a few days and run a
+          reconciliation query to verify they agree for recently written rows."</p>
+        <p>"Release three stops writing the old column. Only after that's been stable long enough that
+          rolling back past it is implausible does a final release drop it."</p>
+        <p>"If the column is indexed I'd also create the new index online where the edition supports it —
+          a non-online build on a table that size blocks writes for a long time."</p>
+        <p>"The property I'm protecting throughout is that at every instant, both the currently deployed code
+          and the immediately previous version work against the current schema. That's what zero downtime
+          actually requires, and it's why the answer is four releases rather than one clever statement."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand that rolling deploys mean two code versions coexist?</li>
+        <li>Do you know batched backfill and why a single large UPDATE is dangerous?</li>
+        <li>Do you preserve rollback safety at <em>each</em> step?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "put the app in maintenance mode" when asked for zero downtime.</li>
+        <li><span class="redflag">Red flag:</span> one migration with a rename, "deployed together with the app".</li>
+        <li><span class="redflag">Red flag:</span> no mention of batching the backfill.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you keep the two columns consistent if writes also happen through stored procedures?</li>
+          <li>What if you find a divergence after switching reads?</li>
+          <li>How would you do the equivalent in Cosmos DB, where there's no schema?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your team deploys once a month and every release is stressful. How would you change that?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The stress is a symptom of batch size. A monthly release contains a month of changes, so if
+          anything breaks the suspect list is enormous, diagnosis is slow, and rollback discards a month of
+          work — which means nobody wants to roll back, which makes incidents longer."</p>
+        <p>"Every problem in that sentence gets better as the batch gets smaller. So the goal is more frequent
+          deployment, and the work is removing whatever currently makes frequency impossible."</p>
+        <p>"I'd start by mapping what actually happens between merge and production and timing each step.
+          Usually you find a small number of blockers: a manual regression cycle that takes days, a
+          change-approval board that meets weekly, an environment that must be booked, or a deployment
+          procedure only one person can perform. Each has a different fix."</p>
+        <p>"Then I'd sequence it to build confidence rather than demand trust. First make deployment itself
+          boring and automated, including a smoke test and a scripted rollback — a deployment nobody fears is
+          a prerequisite for everything else. Second, introduce feature flags so merging stops being the same
+          event as releasing; that removes most of the argument against deploying frequently, because
+          deploying dark code is genuinely low risk. Third, replace the manual regression cycle incrementally
+          with automated coverage of the critical paths, so the gate becomes fast rather than removed."</p>
+        <p>"And I'd measure change failure rate before and after, because the objection will be 'moving
+          faster will break things' — and the data reliably shows the opposite once batch size falls. Framing
+          it as risk reduction rather than speed is usually what gets it accepted."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand batch size as the underlying variable?</li>
+        <li>Can you sequence an organisational change so it earns trust incrementally?</li>
+        <li>Do you measure the outcome rather than assert the benefit?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the monthly cadence is imposed by a customer contract?</li>
+          <li>How do you handle a change advisory board that won't move?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

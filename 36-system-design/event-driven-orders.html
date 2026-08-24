@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event-Driven Order System — System Design Exercises</title>
+<meta name="description" content="A worked design: the outbox pattern, sagas and compensation, service boundaries drawn from transactions, and living with eventual consistency.">
+<meta name="keywords" content="event driven order system design outbox pattern saga orchestration choreography compensation eventual consistency service boundaries dual write problem event versioning idempotent consumers pending status">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/event-driven-orders.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Event-Driven Order System</h1>
+    <p class="subtitle">The interesting question is not how to publish events. It is where to draw the service
+      boundaries so you need as few sagas as possible.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Assumed answer</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Steps in placing an order?</td><td>Reserve stock, take payment, create shipment, notify</td><td>A multi-step operation across concerns</td></tr>
+        <tr><td>Can stock be oversold?</td><td><strong>No</strong></td><td>Reservation must be atomic with order creation</td></tr>
+        <tr><td>Must the customer wait for all of it?</td><td>No — confirmation is enough; fulfilment can follow</td><td>Allows async downstream</td></tr>
+        <tr><td>Can payment fail after stock is reserved?</td><td><strong>Yes</strong></td><td>Needs compensation or expiry</td></tr>
+        <tr><td>Volume?</td><td>Hundreds of orders/minute, peaks 10×</td><td>Not a scale problem; a correctness one</td></tr>
+        <tr><td>Team shape?</td><td>One team of eight</td><td><strong>Strong argument against many services</strong></td></tr>
+        <tr><td>Out of scope</td><td>Catalogue, pricing, returns, the warehouse system's internals</td><td>Focus on the order lifecycle</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — start by arguing for fewer services</div>
+    <p style="margin:0">The trap in this question is that "event-driven order system" sounds like an invitation to
+      draw five microservices. The stronger answer starts by asking <strong>what must be transactional
+      together</strong>, and letting that define the boundaries.
+      <br><br>
+      <strong>Stock reservation and order creation must be atomic.</strong> If they're in separate services, you need
+      a saga for the core flow — the most common operation in the system — with compensation logic, eventual
+      consistency and partial-failure states. If they're in one service, it's a single database transaction:
+      correct, simple, and impossible to get wrong.
+      <br><br>
+      So my boundary would be an <strong>Orders service owning orders and stock reservations</strong>, with payment,
+      shipping and notifications as separate concerns reached asynchronously.
+      <br><br>
+      And with one team of eight, I'd start as a <strong>modular monolith</strong> — enforced module boundaries in one
+      deployable — because the single real benefit of separate services is <em>independent deployability</em>, and one
+      team deploying together doesn't need it. The costs are immediate: network calls, distributed tracing, versioned
+      contracts, and no transactions across boundaries.
+      <br><br>
+      Saying that is a strong signal precisely because the question seems to invite the opposite. <strong>The number
+      of sagas in a design is a good proxy for whether the boundaries are right.</strong></p>
+  </div>
+
+  <h2 id="dual-write">The dual-write problem <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — why "save then publish" is broken"><code class="language-text">  BROKEN:
+    using var tx = db.BeginTransaction();
+    db.Orders.Add(order);
+    await db.SaveChangesAsync();       // committed
+    await bus.PublishAsync(evt);       // <-- crash HERE
+    tx.Commit();
+
+  Outcomes:
+    publish fails after commit   -> order exists, NOBODY KNOWS. No payment,
+                                    no shipment. Silent, and undetectable.
+    publish before commit fails  -> event published for an order that does
+                                    not exist. Consumers act on nothing.
+
+  You cannot make a database write and a broker publish atomic.
+  There is no transaction spanning both.</code></pre>
+
+  <pre data-label="csharp — the outbox: one transaction, two effects" class="code-good"><code class="language-csharp">public async Task&lt;Order&gt; PlaceOrderAsync(PlaceOrder cmd, CancellationToken ct)
+{
+    await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+    // 1. Reserve stock - atomic conditional write, same database
+    var reserved = await _db.Database.ExecuteSqlAsync($"""
+        UPDATE Stock SET Reserved = Reserved + {cmd.Quantity}
+        WHERE  Sku = {cmd.Sku}
+          AND  OnHand - Reserved >= {cmd.Quantity}
+        """, ct);
+
+    if (reserved == 0) throw new InsufficientStockException(cmd.Sku);
+
+    // 2. Create the order
+    var order = Order.Create(cmd);
+    _db.Orders.Add(order);
+
+    // 3. Write the EVENT INTO THE SAME DATABASE, same transaction
+    _db.OutboxMessages.Add(new OutboxMessage
+    {
+        Id        = Guid.CreateVersion7(),          // also the dedup key downstream
+        Type      = nameof(OrderPlaced),
+        Payload   = Serialize(new OrderPlaced(order.Id, order.Total, cmd.Sku)),
+        OccurredAt = _clock.UtcNow
+    });
+
+    await _db.SaveChangesAsync(ct);
+    await tx.CommitAsync(ct);      // stock, order and event commit TOGETHER
+
+    return order;
+}
+
+// A separate publisher reads unpublished outbox rows and sends them.
+// At-least-once: it may publish twice if it crashes after send, before marking
+// sent. Consumers must be idempotent - which they must be anyway.</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">The outbox is the answer, and its guarantee is precise</div>
+    <p style="margin:0">The event is written to <strong>the same database, in the same transaction</strong> as the
+      business change. So either both happen or neither does — there's no window.
+      <br><br>
+      A separate publisher then reads unpublished rows and sends them to the broker, marking them sent. If it crashes
+      after sending but before marking, it sends again — so the outbox gives you
+      <strong>at-least-once publication</strong>, not exactly-once.
+      <br><br>
+      That's the right trade. Duplicates are handled by idempotent consumers, which you need anyway because the broker
+      itself is at-least-once. Losing an event is not recoverable; receiving one twice is.
+      <br><br>
+      Two things worth knowing. On Azure SQL you'd typically poll the outbox table with a short interval and a
+      <code>READPAST</code> hint so multiple publishers don't contend. On <strong>Cosmos DB and DynamoDB the change
+      feed is a built-in outbox</strong> — you don't need the table at all, because the store already gives you an
+      ordered log of committed changes. Knowing that is a good detail.
+      <br><br>
+      And the alternative worth naming: <strong>if the consumer is in the same database, you may not need events at
+      all.</strong> The outbox exists because the broker is a separate system. Reaching for events between two modules
+      in one database is adding a distributed-systems problem you didn't have.</p>
+  </div>
+
+  <h2 id="saga">The saga for what remains <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — orchestrated, with compensation and irreversible steps last"><code class="language-text">  OrderPlaced (stock already reserved, atomically)
+       |
+       v
+  [1] Take payment                          COMPENSATE: refund
+       |  failed -> release reservation, mark order PaymentFailed, notify
+       v
+  [2] Confirm reservation -> allocation     COMPENSATE: release
+       |
+       v
+  [3] Create shipment                       COMPENSATE: cancel shipment
+       |  failed -> refund, release, mark order Failed, alert
+       v
+  [4] Send confirmation email               CANNOT BE COMPENSATED - so it is LAST
+       |
+       v
+  Order Confirmed
+
+  Order status is EXPLICIT throughout: Pending -> Paid -> Allocated ->
+  Shipped -> Confirmed, or a Failed/Cancelled terminal state.
+  A Pending order is visible but not treated as real.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Orchestration</th><th>Choreography</th></tr></thead>
+      <tbody>
+        <tr><td>Flow lives</td><td><strong>In one coordinator</strong></td><td>Spread across consumers</td></tr>
+        <tr><td>Readability</td><td><strong>You can read the whole process</strong></td><td>Must be reconstructed from many services</td></tr>
+        <tr><td>Coupling</td><td>Coordinator knows every participant</td><td>Participants know only events</td></tr>
+        <tr><td>Debugging a stuck flow</td><td><strong>Query the coordinator's state</strong></td><td>Correlate logs across services</td></tr>
+        <tr><td>Adding a step</td><td>Change the coordinator</td><td>Add a subscriber, change nothing else</td></tr>
+        <tr><td>Best for</td><td><strong>A business process with compensation</strong></td><td>Independent reactions to a fact</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — orchestrate the process, choreograph the reactions</div>
+    <p style="margin:0">This is usually posed as a choice and it's better treated as two different jobs.
+      <br><br>
+      <strong>Orchestration for the order process itself</strong>, because it has compensation. When payment fails you
+      must release the reservation — that requires something knowing what has already happened and what to undo. In
+      choreography that knowledge is scattered across services, and answering "why is this order stuck?" means
+      correlating logs from four systems.
+      <br><br>
+      <strong>Choreography for reactions that don't affect the outcome.</strong> Analytics, the recommendation engine,
+      the customer's activity feed — these subscribe to <code>OrderConfirmed</code> and the orchestrator neither knows
+      nor cares. Adding one changes nothing.
+      <br><br>
+      The distinguishing question: <strong>does the outcome depend on this step succeeding?</strong> If yes, the
+      coordinator must know about it. If no, it's a subscriber.
+      <br><br>
+      Two saga details worth stating. <strong>Irreversible steps go last</strong> — you cannot un-send an email, so it
+      happens once everything reversible has succeeded. And <strong>compensations must be idempotent and can
+      themselves fail</strong>, so they need retries and eventually a human, because an order stuck
+      half-compensated is worse than either end state.
+      <br><br>
+      And an <strong>explicit status</strong> throughout. A <code>Pending</code> order is visible but not treated as
+      real — which is the semantic equivalent of a lock, and what makes eventual consistency tolerable to everything
+      else reading the data.</p>
+  </div>
+
+  <h2 id="compensation">Compensation is not rollback <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>"Undo"</th><th>Reality</th></tr></thead>
+      <tbody>
+        <tr><td>Payment taken</td><td>Refund</td><td><strong>A second transaction.</strong> Fees may not return; the customer sees both</td></tr>
+        <tr><td>Stock reserved</td><td>Release</td><td>Clean — but someone may have been told it was unavailable meanwhile</td></tr>
+        <tr><td>Shipment created</td><td>Cancel</td><td>Only until it's picked. After that, a return</td></tr>
+        <tr><td>Email sent</td><td><strong>Nothing</strong></td><td>Send a correction, which is a worse experience</td></tr>
+        <tr><td>Webhook fired</td><td><strong>Nothing</strong></td><td>The third party acted on it</td></tr>
+        <tr><td>Loyalty points awarded</td><td>Deduct</td><td>May already have been spent</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">There is no isolation, and that has design consequences</div>
+    <p style="margin:0">A database transaction is invisible until it commits. A saga is <strong>visible at every
+      intermediate step</strong> — another process can read the half-completed state, and often does.
+      <br><br>
+      So the design has to make partial states safe to observe. The mechanism is an <strong>explicit status</strong>:
+      a <code>Pending</code> order appears in the customer's order list marked as processing, isn't counted in revenue,
+      isn't sent to the warehouse, and can't be modified. That's a semantic lock — the row exists but is not yet
+      real.
+      <br><br>
+      Without it, everything reading orders has to know which combinations of fields mean "not finished yet", which is
+      exactly the kind of implicit knowledge that produces bugs in every consumer.
+      <br><br>
+      The other consequence: <strong>ordering compensation matters.</strong> Release the reservation before refunding,
+      or after? If the customer sees a refund and the item still unavailable, they'll re-order and fail. Small
+      details, and they're what distinguishes a saga that works from one that produces support tickets.
+      <br><br>
+      Which is why the honest advice bears repeating: <strong>if the steps can live in one transaction, put them in
+      one transaction.</strong> A saga is what you use when they genuinely cannot — and the goal of good boundary
+      design is to need fewer of them.</p>
+  </div>
+
+  <h2 id="consumers">Consumers <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Requirement</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Idempotent</strong></td><td>Dedupe on the event id, in the same transaction as the work</td></tr>
+        <tr><td><strong>Order-tolerant</strong></td><td>Version or timestamp rejection, not enforced ordering</td></tr>
+        <tr><td><strong>Poison-message safe</strong></td><td>Delivery count, then dead-letter — never rethrow forever</td></tr>
+        <tr><td><strong>Forward-compatible</strong></td><td>Ignore unknown fields; never fail on an added property</td></tr>
+        <tr><td>Fetch current state where possible</td><td>Naturally tolerant of duplication and reordering</td></tr>
+        <tr><td>Failure isolation</td><td>A failing consumer must not block the others</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Event schema evolution is the part that bites eighteen months in</div>
+    <p style="margin:0">An event is a <strong>published contract</strong> with consumers you may not control, and it
+      lives in message queues and possibly in an event store — so old versions exist in flight while new code is
+      deployed.
+      <br><br>
+      The rules that keep it workable:
+      <br><br>
+      <strong>Only add optional fields.</strong> Removing or renaming a field breaks consumers reading it. Changing a
+      type is worse, because it deserialises to something wrong rather than failing.
+      <br><br>
+      <strong>Consumers must ignore unknown fields</strong>, so a producer can add one without a coordinated release.
+      That has to be verified — some serialiser configurations throw on unknown properties, which turns an additive
+      change into an outage.
+      <br><br>
+      <strong>Version the event type</strong> when a breaking change is genuinely needed —
+      <code>OrderPlacedV2</code> published alongside V1 until consumers migrate. Which means you need to know
+      <em>who consumes what</em>, and that's an argument for keeping a record rather than discovering it by breaking
+      someone.
+      <br><br>
+      And the design choice that reduces all of this: <strong>keep events small — identifiers and the fact, not full
+      state.</strong> "Order 123 was placed" changes far less often than a payload containing every order field, and
+      it doesn't couple the producer to what each consumer needs. The cost is a callback to fetch detail, which is
+      usually worth it — and it makes consumers naturally tolerant of duplicates and reordering, because they read
+      current state rather than trusting a snapshot.</p>
+  </div>
+
+  <h2 id="consistency">Living with eventual consistency <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Handling</th></tr></thead>
+      <tbody>
+        <tr><td><strong>User places an order and doesn't see it</strong></td><td>Return the created order directly; don't read from a projection</td></tr>
+        <tr><td>Order shows as Pending for a few seconds</td><td><strong>Show it honestly</strong> — "processing" is fine</td></tr>
+        <tr><td>Report totals differ from the transactional view</td><td>Timestamp the projection: "as at 14:32"</td></tr>
+        <tr><td>A projection falls behind</td><td>Alert on consumer lag, not just errors</td></tr>
+        <tr><td>A projection is wrong</td><td><strong>Rebuild it from the events</strong></td></tr>
+        <tr><td>Two consumers disagree</td><td>One owns the truth; the rest are derived</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — read-after-write is the eventual-consistency problem users notice</div>
+    <p style="margin:0">Most staleness is invisible. A report a few seconds behind is fine; a projection catching up is
+      fine. The one users <em>always</em> notice is <strong>doing something and not seeing it</strong>.
+      <br><br>
+      Place an order, get redirected to the order list, and it isn't there — because the list reads a projection that
+      hasn't caught up. That reads as a lost order, and it generates a duplicate attempt.
+      <br><br>
+      Three fixes, in order of preference. <strong>Return the created resource in the response</strong> so the client
+      already has it and doesn't need to re-read. <strong>Read the user's own recent writes from the authoritative
+      store</strong> rather than the projection. Or <strong>show the pending state explicitly</strong> — "your order
+      is being processed" is honest and reassuring, where an empty list is neither.
+      <br><br>
+      What not to do is make the projection strongly consistent. That serialises reads through the write side and
+      removes the reason the projection exists.
+      <br><br>
+      And the property that makes projections safe to have at all: <strong>they can be rebuilt.</strong> If a
+      projection is wrong — a bug, a missed event, a schema change — you replay from the events rather than trying to
+      repair in place. Which requires that events are retained long enough, and that rebuilding is a tested procedure
+      rather than a theory. Building it <em>before</em> you need it matters, because the day you need it is a bad day
+      to write new code.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Draw boundaries from what must be transactional — stock and orders belong together.</li>
+      <li>The number of sagas is a proxy for whether the boundaries are right.</li>
+      <li>One team of eight doesn't need independent deployability; start modular.</li>
+      <li>Save-then-publish is broken — no transaction spans a database and a broker.</li>
+      <li>The outbox writes the event in the same transaction; publication is at-least-once.</li>
+      <li>Change feed is a built-in outbox in Cosmos and DynamoDB.</li>
+      <li>Orchestrate the process, choreograph the independent reactions.</li>
+      <li>Irreversible steps last; compensations are idempotent and can fail.</li>
+      <li>Compensation is a new business action, not a rollback.</li>
+      <li>A saga has no isolation — an explicit Pending status is the semantic lock.</li>
+      <li>Consumers: idempotent, order-tolerant, poison-safe, ignore unknown fields.</li>
+      <li>Keep events small — identifiers and the fact, not full state.</li>
+      <li>Version the event type for breaking changes, and know who consumes what.</li>
+      <li>Read-after-write is the staleness users notice — return the created resource.</li>
+      <li>Projections must be rebuildable, and rebuilding must be tested.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Design an event-driven order system. How do you keep it consistent? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start somewhere that might be unexpected: <strong>by arguing for fewer services.</strong> The question
+          sounds like an invitation to draw five microservices, and I think the first job is asking
+          <em>what must be transactional together</em>."</p>
+        <p>"<strong>Stock reservation and order creation must be atomic</strong> — otherwise you oversell. If they're in
+          separate services, the most common operation in the system needs a saga, with compensation, eventual
+          consistency and partial-failure states. If they're in one service, it's a single database transaction:
+          correct, simple, impossible to get wrong."</p>
+        <p>"So my boundary is an <strong>Orders service owning orders and reservations</strong>, with payment, shipping
+          and notifications reached asynchronously. And with one team of eight I'd start as a
+          <strong>modular monolith</strong>, because the one real benefit of separate services is independent
+          deployability and a single team deploying together doesn't need it."</p>
+        <p>"<strong>The consistency problem I'd address first is the dual write.</strong> The naive implementation
+          saves the order then publishes an event. Those are two systems with no transaction spanning them, so if the
+          publish fails after the commit, <strong>the order exists and nobody knows</strong> — no payment, no shipment,
+          silent and undetectable. Publishing first is worse: consumers act on an order that doesn't exist."</p>
+        <p>"<strong>The outbox pattern</strong> solves it. The event is written to the same database in the same
+          transaction as the order and the reservation, so all three commit together or none do. A separate publisher
+          reads unpublished rows and sends them."</p>
+        <p>"I'd be precise about the guarantee: that's <strong>at-least-once publication, not exactly-once</strong>. If
+          the publisher crashes after sending but before marking sent, it sends again. That's the right trade —
+          duplicates are handled by idempotent consumers, which you need anyway since the broker is also
+          at-least-once. Losing an event isn't recoverable; receiving one twice is."</p>
+        <p>"Worth noting that on <strong>Cosmos DB or DynamoDB the change feed is a built-in outbox</strong> — the store
+          already gives you an ordered log of committed changes, so there's no table to maintain."</p>
+        <p>"<strong>For what remains, an orchestrated saga</strong>: take payment, confirm allocation, create shipment,
+          notify. Orchestration rather than choreography because there's <em>compensation</em> — when payment fails you
+          must release the reservation, and that requires something knowing what has happened and what to undo. In
+          choreography that knowledge is scattered, and 'why is this order stuck?' means correlating logs from four
+          services."</p>
+        <p>"But I'd choreograph the things that <em>don't</em> affect the outcome — analytics, recommendations, the
+          activity feed. They subscribe to <code>OrderConfirmed</code> and the orchestrator doesn't know they exist.
+          The distinguishing question is: does the outcome depend on this step succeeding?"</p>
+        <p>"<strong>Two saga details.</strong> Irreversible steps go last — you can't un-send an email, so notification
+          happens after everything reversible has succeeded. And compensations must be idempotent and can themselves
+          fail, so they need retries and eventually a human, because half-compensated is worse than either end
+          state."</p>
+        <p>"<strong>I'd be explicit that compensation isn't rollback.</strong> Refunding isn't un-charging; it's a
+          second transaction, the customer sees both entries, and fees may not come back. And a saga has
+          <strong>no isolation</strong> — other processes can read the intermediate state. So orders carry an explicit
+          status, and a <code>Pending</code> order is visible but not treated as real: not counted in revenue, not sent
+          to the warehouse, not modifiable. That's the semantic equivalent of a lock, and it's what makes eventual
+          consistency tolerable to everything else."</p>
+        <p>"<strong>Consumers</strong> must be idempotent — deduping on the event id, in the same transaction as the
+          work, or you can do the work and fail to record that you did. Order-tolerant via version rejection rather
+          than enforced ordering. And they must ignore unknown fields, so a producer can add one without a coordinated
+          release — worth verifying, because some serialiser settings throw on unknown properties and turn an additive
+          change into an outage."</p>
+        <p>"<strong>On events themselves</strong>: keep them small — identifiers and the fact, not full state. That
+          decouples the producer from what each consumer needs, changes far less often, and makes consumers naturally
+          tolerant of duplicates because they read current state rather than trusting a snapshot."</p>
+        <p>"<strong>The user-visible consistency issue</strong> I'd call out is read-after-write. Place an order, get
+          redirected to the order list, and it isn't there because the list reads a projection that hasn't caught up.
+          That reads as a lost order and produces a duplicate attempt. So: return the created order in the response, or
+          read the user's own recent writes from the authoritative store, or show the pending state honestly."</p>
+        <p>"And the property that makes projections safe: <strong>they can be rebuilt from the events.</strong> Which
+          means retention has to be long enough and the rebuild has to be a tested procedure — because the day you need
+          it is a bad day to write new code."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you argue for boundaries based on transactions?</li>
+        <li>Do you identify the dual-write problem unprompted?</li>
+        <li>Do you know the outbox gives at-least-once, not exactly-once?</li>
+        <li>Do you split orchestration from choreography by whether the outcome depends on it?</li>
+        <li>Do you know compensation isn't rollback, and that sagas lack isolation?</li>
+        <li>Do you cover consumer idempotency and event evolution?</li>
+        <li>Do you raise read-after-write and rebuildable projections?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> five microservices with no transactional analysis.</li>
+        <li><span class="redflag">Red flag:</span> save-then-publish with no outbox.</li>
+        <li><span class="redflag">Red flag:</span> treating compensation as a rollback.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you stop the outbox publisher double-sending under multiple instances?</li>
+          <li>Payment succeeded but the saga crashed. What happens?</li>
+          <li>How would you split the monolith later?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

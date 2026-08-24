@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Query Performance &amp; Execution Plans — SQL</title>
+<meta name="description" content="A repeatable tuning workflow: find the slow query, read the plan, fix the real cause. Parameter sniffing, statistics, spills and wait types.">
+<meta name="keywords" content="execution plan estimated actual rows parameter sniffing statistics cardinality estimate key lookup spill memory grant Query Store wait types tempdb hash join nested loops OPTION RECOMPILE OPTIMIZE FOR plan cache DMV tuning workflow">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/performance.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Query Performance &amp; Execution Plans</h1>
+    <p class="subtitle">A repeatable workflow beats knowing tricks. Interviewers ask this to find out whether
+      you diagnose or guess.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Measure, don't guess.</strong> Query Store or the DMVs tell you which query is actually the
+        problem.</li>
+      <li><strong>Estimated vs actual rows is the single most useful number in a plan.</strong> A big gap
+        explains almost every bad plan choice.</li>
+      <li><strong>Bad estimate → wrong join type and wrong memory grant → spills to disk.</strong> That's the
+        chain.</li>
+      <li><strong>Parameter sniffing:</strong> same query, wildly different performance depending on the
+        parameter value.</li>
+      <li><strong>Get the <em>actual</em> plan</strong>, not the estimated one. Only the actual plan has real
+        row counts.</li>
+      <li><strong>Wait types tell you what the server is waiting <em>on</em></strong> — CPU, I/O, locks,
+        memory.</li>
+      <li><strong>Fix the cause, not the symptom.</strong> A hint that papers over a bad estimate breaks later.</li>
+    </ul>
+  </div>
+
+  <h2 id="workflow">The tuning workflow <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Almost every real tuning task follows the same five steps. Having them in order is worth more than
+      knowing a dozen individual fixes.</p>
+  </div>
+
+  <ol class="steps">
+    <li><strong>Find the actual problem query.</strong> Not the one someone complained about — the one
+      consuming the resources. Query Store or DMVs.</li>
+    <li><strong>Get the actual execution plan</strong> with real row counts.</li>
+    <li><strong>Compare estimated vs actual rows</strong> at each operator. Find where they diverge.</li>
+    <li><strong>Identify the cause</strong> — statistics, SARGability, missing index, fan-out, parameter
+      sniffing.</li>
+    <li><strong>Fix and re-measure.</strong> One change at a time, so you know what worked.</li>
+  </ol>
+
+  <div class="note tip">
+    <div class="note-title">Step 1 is the one people skip</div>
+    <p style="margin:0">Developers tune the query they were told about. That's often not the expensive one.
+      <br><br>
+      A query taking 5 seconds and running twice a day costs 10 seconds. A query taking 80ms and running
+      40,000 times an hour costs nearly an hour of CPU. The second one is the problem, and nobody is
+      complaining about it.
+      <br><br>
+      <strong>Sort by total resource consumption, not duration.</strong> That reframing alone is a good senior
+      signal.</p>
+  </div>
+
+  <h2 id="finding-queries">Finding the expensive queries <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="sql — top consumers from the plan cache"><code class="language-sql">SELECT TOP 20
+    qs.execution_count,
+    qs.total_worker_time / 1000    AS total_cpu_ms,
+    qs.total_worker_time / qs.execution_count / 1000 AS avg_cpu_ms,
+    qs.total_logical_reads / qs.execution_count      AS avg_reads,
+    SUBSTRING(st.text, (qs.statement_start_offset/2) + 1,
+        ((CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(st.text)
+          ELSE qs.statement_end_offset END - qs.statement_start_offset)/2) + 1) AS stmt
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+ORDER BY qs.total_worker_time DESC;      -- TOTAL, not average</code></pre>
+
+  <div class="note info">
+    <div class="note-title">Query Store is better — turn it on</div>
+    <p style="margin:0">The DMVs above only show what's currently cached, and the cache clears on restart, on
+      memory pressure, and when statistics change.
+      <br><br>
+      <strong>Query Store</strong> persists query performance history in the database itself, with plan
+      changes over time. That's what lets you answer "this got slow last Tuesday — what changed?", which the
+      plan cache can't.
+      <br><br>
+      It's on by default in Azure SQL and from SQL Server 2022. On older versions, enabling it is one of the
+      highest-value things you can do to a production database.</p>
+  </div>
+
+  <h2 id="reading-plans">Reading an execution plan <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Plan type</th><th>Contains</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Estimated</strong> (Ctrl+L)</td><td>Only the optimiser's guesses</td><td>Quick check without running an expensive query</td></tr>
+        <tr><td><strong>Actual</strong> (Ctrl+M)</td><td><strong>Estimated <em>and</em> real row counts</strong>, spill warnings, actual time per operator</td><td><strong>Real diagnosis.</strong> Always prefer this</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The three things to look at, in order</span>
+    <ol>
+      <li><strong>Estimated vs actual rows.</strong> A gap over ~10× is your prime suspect.</li>
+      <li><strong>Warnings</strong> on operators — implicit conversion, spills, missing index, no join
+        predicate. Yellow triangles are free diagnosis.</li>
+      <li><strong>The fattest arrow.</strong> Arrow thickness is row count. A thick arrow early means you're
+        moving far more data than the result needs.</li>
+    </ol>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Ignore the operator cost percentages</div>
+    <p style="margin:0">The percentages in a plan are derived from the <em>estimates</em>. If the estimate is
+      wrong, the percentages are wrong too — and the operator showing "2%" can be the one taking all the time.
+      <br><br>
+      In an actual plan, use <strong>actual elapsed time and actual rows</strong> per operator instead. This
+      trips up a lot of people who learned to "look for the high-percentage operator".</p>
+  </div>
+
+  <h3 id="operators">Operators worth recognising</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Operator</th><th>Means</th><th>Concerning when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Clustered Index Scan</strong></td><td>Reading the whole table</td><td>You expected a small result set</td></tr>
+        <tr><td><strong>Key Lookup</strong></td><td>Fetching columns the index didn't have</td><td>High row count — fix with <code>INCLUDE</code></td></tr>
+        <tr><td><strong>Nested Loops</strong></td><td>For each outer row, seek the inner</td><td>Outer input is large — a bad-estimate symptom</td></tr>
+        <tr><td><strong>Hash Match</strong></td><td>Builds a hash table in memory</td><td>Spilling to disk, or unexpected on small inputs</td></tr>
+        <tr><td><strong>Sort</strong></td><td>Ordering rows</td><td>Almost always removable with the right index</td></tr>
+        <tr><td><strong>Table Spool / Eager Spool</strong></td><td>Materialising an intermediate set</td><td>Often a sign of a Halloween-protection issue or a bad plan shape</td></tr>
+        <tr><td><strong>Parallelism (Gather Streams)</strong></td><td>Multi-core execution</td><td>Fine — unless <code>CXPACKET</code> waits dominate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">Join operators, in one line each</span>
+    <ul>
+      <li><strong>Nested Loops</strong> — good when the outer input is small and the inner side has an index.
+        Terrible when the outer input turns out to be large.</li>
+      <li><strong>Hash Match</strong> — good for large unsorted inputs. Needs memory.</li>
+      <li><strong>Merge Join</strong> — cheapest, but requires both inputs already sorted on the join key.</li>
+    </ul>
+    <p>The optimiser picks based on <em>estimated</em> row counts. So a bad estimate means the wrong join —
+      which is why estimates matter more than any individual operator.</p>
+  </div>
+
+  <h2 id="estimates">Bad estimates: the root of most bad plans <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>You tell a caterer to expect 20 guests. They set 20 places and cook 20 meals.</p>
+    <p>2,000 people arrive.</p>
+    <p>Nothing about the plan was unreasonable — it was built for the wrong number. That's what a bad
+      cardinality estimate does, and why the failure is so disproportionate.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Consequence of a low estimate</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>Nested loops chosen</td><td>Millions of iterations instead of one hash build</td></tr>
+        <tr><td>Memory grant sized too small</td><td><strong>Sort or hash spills to tempdb</strong> — often the biggest single factor</td></tr>
+        <tr><td>Serial plan chosen</td><td>One core doing work that could be parallelised</td></tr>
+        <tr><td>Wrong index chosen</td><td>Seek plus a million key lookups instead of a scan</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="estimate-causes">Why estimates go wrong</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Stale statistics</strong></td><td><code>UPDATE STATISTICS</code>; consider a more aggressive sample or <code>PERSIST_SAMPLE_PERCENT</code></td></tr>
+        <tr><td><strong>Non-SARGable predicate</strong></td><td>Rewrite it — the optimiser can't estimate through a function</td></tr>
+        <tr><td><strong>Table variable</strong></td><td>Use <code>#temp</code>, which has statistics</td></tr>
+        <tr><td><strong>Multi-statement TVF</strong></td><td>Convert to inline, or materialise into a temp table</td></tr>
+        <tr><td><strong>Correlated columns</strong></td><td>The optimiser assumes independence. City and postcode aren't independent — hence the underestimate. Multi-column statistics can help</td></tr>
+        <tr><td><strong>Local variables</strong></td><td><code>DECLARE @d date = ...; WHERE Created &gt; @d</code> uses a fixed guess, not the histogram</td></tr>
+        <tr><td><strong>Parameter sniffing</strong></td><td>See below</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The local-variable trap</div>
+    <p style="margin:0">A <strong>parameter</strong> gets its actual value sniffed at compile time, so the
+      optimiser can use the histogram.
+      <br><br>
+      A <strong>local variable</strong> has no value at compile time, so SQL Server falls back to a fixed
+      guess — 30% of the table for an inequality, or the density for equality.
+      <br><br>
+      That means moving a parameter into a local variable "for clarity" can change the plan dramatically. It's
+      also occasionally used deliberately as a poor man's <code>OPTIMIZE FOR UNKNOWN</code> — which is worth
+      knowing, because you'll see it in old code and wonder why.</p>
+  </div>
+
+  <h2 id="parameter-sniffing">Parameter sniffing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>SQL Server compiles a plan using the <strong>first</strong> parameter value it sees, then reuses that
+      plan for every later call.</p>
+    <p>If parameter values imply very different amounts of data, one plan can't be good for all of them.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>You plan a route for a bicycle. It's a great route — narrow lanes, short cuts.</p>
+    <p>Then you reuse that same route for a lorry.</p>
+    <p>Nothing was wrong with the plan. It was made for a different shape of problem.</p>
+  </div>
+
+  <pre data-label="sql — one query, two very different workloads"><code class="language-sql">CREATE PROCEDURE dbo.usp_OrdersByCountry @country char(2)
+AS
+SELECT * FROM [Order] WHERE Country = @country;
+
+EXEC dbo.usp_OrdersByCountry 'LU';   -- 200 rows      -> nested loops + seeks. Good.
+EXEC dbo.usp_OrdersByCountry 'US';   -- 8 million rows -> SAME plan. 8M seeks + lookups.</code></pre>
+
+  <div class="remember">
+    <span class="r-label">The symptom that identifies it</span>
+    <p><strong>The same query is sometimes fast and sometimes slow, with no code change.</strong></p>
+    <p>Often it goes bad after a restart, a failover, or a statistics update — because that's when the plan is
+      recompiled, possibly with an unrepresentative first parameter.</p>
+    <p>And the classic tell: <em>it's fast when I run the same SQL in SSMS but slow from the app</em> — because
+      SSMS compiled a fresh plan with your parameter, while the app is reusing the cached one.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Fix</th><th>Cost</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><code>OPTION (RECOMPILE)</code></td><td>Compiles every execution — CPU per call, and no plan reuse</td><td>Infrequent queries with very skewed parameters. <strong>Usually the simplest correct answer</strong></td></tr>
+        <tr><td><code>OPTIMIZE FOR (@p = 'US')</code></td><td>Always plans for that value</td><td>You know the dominant case</td></tr>
+        <tr><td><code>OPTIMIZE FOR UNKNOWN</code></td><td>Uses average density, ignores the actual value</td><td>You want consistent mediocre rather than sometimes-terrible</td></tr>
+        <tr><td>Split into separate procedures</td><td>More code</td><td>Two genuinely distinct access patterns — big customer vs small</td></tr>
+        <tr><td>Local-variable copy</td><td>Same effect as <code>OPTIMIZE FOR UNKNOWN</code></td><td>Legacy trick; prefer the explicit hint</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the honest ranking</div>
+    <p style="margin:0"><strong>Consistent-mediocre beats occasionally-catastrophic.</strong> An 800ms query
+      every time is usually better for a system than 50ms most of the time and 90 seconds sometimes, because
+      the 90-second case is what exhausts the thread pool and takes the site down.
+      <br><br>
+      But I'd check the boring causes first. Sometimes the "parameter sniffing problem" is a missing index —
+      with the right index <em>both</em> plans are fast and the sniffing stops mattering. Reaching for hints
+      before checking indexes fixes the symptom and leaves the cause.
+      <br><br>
+      <strong>Query Store plan forcing</strong> is also worth naming: if you can see the good plan in history,
+      you can force it without changing any code — very useful as an immediate mitigation while you fix the
+      real problem.</p>
+  </div>
+
+  <h2 id="spills">Spills and memory grants <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Sorts and hash joins need memory, granted <strong>before</strong> the query runs, based on the
+      estimate.</p>
+    <p>The grant is fixed. If the estimate was too low, the operator runs out of memory mid-flight and
+      <strong>spills to tempdb</strong> — disk instead of RAM.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Why a spill is so expensive</div>
+    <p style="margin:0">It's not a gentle degradation. Sorting 2 million rows in memory versus writing them to
+      tempdb, reading them back in sorted runs, and merging is frequently a 10–100× difference.
+      <br><br>
+      In an actual plan a spill shows as a warning on the Sort or Hash Match operator. It's one of the most
+      actionable things you can find — and the fix is usually to fix the <em>estimate</em>, not to ask for more
+      memory.
+      <br><br>
+      The opposite problem exists too: an over-estimate grants far too much memory, which other queries then
+      have to wait for. That shows as <code>RESOURCE_SEMAPHORE</code> waits — queries waiting for a memory
+      grant while the server has plenty of free memory.</p>
+  </div>
+
+  <h2 id="statistics">Statistics <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Statistics are a <strong>histogram</strong> of a column's data distribution. They're how the optimiser
+      guesses row counts.</p>
+    <p>Auto-update happens after roughly 20% of rows change (or <code>SQRT(1000 × rows)</code> on newer
+      versions with the better threshold). On a big table, 20% is a lot of drift.</p>
+  </div>
+
+  <pre data-label="sql — check how stale they are"><code class="language-sql">SELECT
+    OBJECT_NAME(s.object_id) AS table_name,
+    s.name                   AS stat_name,
+    sp.last_updated,
+    sp.rows,
+    sp.modification_counter          -- rows changed since last update
+FROM sys.stats s
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
+WHERE sp.modification_counter &gt; 1000
+ORDER BY sp.modification_counter DESC;</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The ascending-key problem</div>
+    <p style="margin:0">Statistics on an ever-increasing column — a creation date or identity — are
+      <strong>always</strong> out of date at the top end. The newest rows are beyond the last histogram step,
+      so the optimiser estimates very few rows for "created today".
+      <br><br>
+      Which is exactly the query dashboards run constantly. Classic symptom: today's report is slow, last
+      month's is fine.
+      <br><br>
+      Mitigations: update statistics on that table more often than the automatic threshold, and enable
+      <code>TF 2371</code> on older versions for the lower auto-update threshold. This is a good specific thing
+      to mention — it shows real operational experience.</p>
+  </div>
+
+  <h2 id="waits">Wait statistics <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Plans tell you what a query <em>does</em>. Wait stats tell you what the server is <em>waiting
+      for</em> — which is where to look when the whole instance is slow rather than one query.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Wait type</th><th>Means</th><th>Look at</th></tr></thead>
+      <tbody>
+        <tr><td><code>PAGEIOLATCH_*</code></td><td>Waiting to read data from disk</td><td>Missing indexes, insufficient memory, slow storage</td></tr>
+        <tr><td><code>LCK_M_*</code></td><td>Blocked by another transaction's lock</td><td>Long transactions, missing indexes, isolation level</td></tr>
+        <tr><td><code>CXPACKET</code> / <code>CXCONSUMER</code></td><td>Parallelism coordination</td><td>Often benign; check MAXDOP and cost threshold</td></tr>
+        <tr><td><code>RESOURCE_SEMAPHORE</code></td><td>Waiting for a memory grant</td><td>Over-estimated grants from bad statistics</td></tr>
+        <tr><td><code>WRITELOG</code></td><td>Waiting for the transaction log</td><td>Log file storage speed; too many small transactions</td></tr>
+        <tr><td><code>SOS_SCHEDULER_YIELD</code></td><td>CPU pressure</td><td>Genuinely CPU-bound queries; scalar UDFs</td></tr>
+        <tr><td><code>PAGELATCH_*</code> on tempdb</td><td>tempdb allocation contention</td><td>Add tempdb data files (one per core up to 8)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Wait stats for "the server is slow". Execution plans for "this query is slow".</strong></p>
+    <p>Using the wrong tool for the question is why people spend a day tuning a query when the real problem
+      was tempdb contention or a full log drive.</p>
+  </div>
+
+  <h2 id="ef-core">Where .NET applications go wrong <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Problem</th><th>Symptom</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>N+1 queries</strong></td><td>Thousands of tiny fast queries</td><td><code>Include()</code>, or projection</td></tr>
+        <tr><td><strong>Client-side evaluation</strong></td><td>Whole table loaded, filtered in memory</td><td>Keep it in <code>IQueryable</code>; EF Core 3+ throws instead</td></tr>
+        <tr><td><strong>No projection</strong></td><td>Selecting 40 columns to display 3</td><td><code>Select()</code> into a DTO — also enables covering indexes</td></tr>
+        <tr><td><strong>Tracking read-only queries</strong></td><td>Memory and CPU on change tracking</td><td><code>AsNoTracking()</code></td></tr>
+        <tr><td><strong><code>AddWithValue</code></strong></td><td>Implicit conversion, no index seek</td><td>Specify <code>SqlDbType</code></td></tr>
+        <tr><td><strong>Row-by-row updates</strong></td><td>10,000 round trips</td><td><code>ExecuteUpdateAsync</code>, or bulk copy</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The N+1 problem is usually the biggest single win</div>
+    <p style="margin:0">Each query is fast, so nothing looks wrong in the plan cache — they're all 2ms. But 1
+      + 1,000 round trips at 1ms of network latency each is a full second of pure waiting, before the database
+      has done anything.
+      <br><br>
+      It's invisible in a plan, invisible in a slow-query log, and obvious the moment you count queries per
+      request. Which is why request-level query counting in development is worth setting up.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Find the query consuming the most <em>total</em> resource, not the one someone noticed.</li>
+      <li>Always get the actual plan. The estimated plan can't show you what went wrong.</li>
+      <li>Estimated vs actual rows is the highest-value number in a plan.</li>
+      <li>Ignore cost percentages — they're derived from the same estimates that may be wrong.</li>
+      <li>Bad estimate → wrong join and undersized memory grant → spill to tempdb.</li>
+      <li>Parameter sniffing: same query, inconsistent speed. Check indexes before adding hints.</li>
+      <li>Consistent-mediocre beats occasionally-catastrophic.</li>
+      <li>Ascending keys mean statistics are always stale at the top — today's data estimates badly.</li>
+      <li>Wait stats for server-wide problems; plans for single queries.</li>
+      <li>In .NET, N+1 and missing projection usually cost more than any single query's plan.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Tuning the query someone complained about</strong> rather than the expensive one.</li>
+    <li><strong>Reading the estimated plan</strong> and drawing conclusions about actual behaviour.</li>
+    <li><strong>Chasing the highest cost percentage</strong> instead of actual time and rows.</li>
+    <li><strong>Adding hints before checking indexes and statistics.</strong></li>
+    <li><strong><code>OPTION (RECOMPILE)</code> on a query running thousands of times a minute</strong> —
+      trading a plan problem for a CPU problem.</li>
+    <li><strong>Ignoring spill warnings.</strong></li>
+    <li><strong>Never enabling Query Store</strong>, so "it got slow last week" is unanswerable.</li>
+    <li><strong>Tuning queries when wait stats point at storage, tempdb or the log.</strong></li>
+    <li><strong>Changing several things at once</strong>, so you don't know what helped.</li>
+    <li><strong>Testing on a dataset that isn't production-shaped.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>A page that used to load in 200ms now takes 30 seconds. Walk me through your diagnosis. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd establish <strong>what changed and when</strong>, because 'used to be fast' is the most
+          useful clue I have. A deployment? A data volume threshold? A failover or restart? Did it degrade
+          gradually or overnight?"</p>
+        <p>"Then I'd confirm it's actually the database. A slow page might be N+1 queries, a slow external call,
+          or something on the application side entirely. I'd look at APM traces or just log the query count and
+          total database time for that request. If it's 400 queries at 2ms each, the plan is irrelevant and the
+          fix is in the data access code."</p>
+        <p>"Assuming it is one query: I'd get the <strong>actual execution plan</strong>, and compare
+          estimated versus actual rows at each operator. That single comparison explains most bad plans,
+          because the optimiser chose join types and memory grants from those estimates. If it expected 100
+          rows and got 2 million, it picked nested loops where it needed a hash join, and the memory grant was
+          sized for 100 rows so any sort spilled to tempdb."</p>
+        <p>"Given it was fast before and is slow now with no code change, my leading hypotheses are:"</p>
+        <p>"<strong>Parameter sniffing.</strong> The plan was recompiled — after a restart, a failover, or a
+          statistics update — with an unrepresentative parameter, and now every call reuses that bad plan.
+          Quick test: run the same SQL in SSMS with the same parameters. If it's fast there and slow from the
+          app, that's almost certainly it, because SSMS compiled a fresh plan."</p>
+        <p>"<strong>Stale statistics.</strong> The table grew and the histogram no longer reflects it. Auto
+          update needs ~20% of rows changed, which on a large table is a lot of drift. And if the query filters
+          on a date or identity column there's the ascending-key problem — the newest rows are beyond the last
+          histogram step, so 'today' always estimates low. Classic version of this: today's dashboard is slow,
+          last month's is fine."</p>
+        <p>"<strong>A data volume threshold crossed.</strong> A plan that was fine at 100,000 rows becomes
+          untenable at 5 million. Nothing changed except size."</p>
+        <p>"<strong>An index was dropped or disabled</strong> — worth checking, it happens during
+          maintenance."</p>
+        <p>"For an immediate mitigation I'd look at Query Store, which keeps plan history. If I can see the
+          previous good plan I can force it — that buys the site back in minutes with no deployment, while I
+          fix the actual cause."</p>
+        <p>"Then I'd change one thing at a time and re-measure, so I know what worked rather than shipping four
+          changes and guessing."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask what changed before diving in?</li>
+        <li>Do you check it's even the database?</li>
+        <li>Do you know the estimated-vs-actual comparison?</li>
+        <li>Do you separate immediate mitigation from root cause?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add an index" immediately.</li>
+        <li><span class="redflag">Red flag:</span> restarting SQL Server — it clears the cache, appears to
+          fix it, and teaches you nothing.</li>
+        <li><span class="redflag">Red flag:</span> no mention of reading a plan.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you confirm parameter sniffing?</li>
+          <li>What's the downside of forcing a plan?</li>
+          <li>How would you detect N+1 in development?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Explain parameter sniffing and how you'd fix it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"SQL Server compiles a plan the first time a query runs, using the actual parameter values it sees —
+          that's the sniffing, and normally it's helpful, because using real values gives better estimates than
+          guessing. The plan is then cached and reused."</p>
+        <p>"The problem is <strong>data skew</strong>. If I have a procedure filtering orders by country, and
+          the first call is for Luxembourg with 200 rows, the optimiser builds a perfectly sensible plan —
+          nested loops, index seek, key lookups. Then someone calls it for the US with 8 million rows and gets
+          that same plan: 8 million seeks and 8 million key lookups instead of one scan and a hash join. It
+          might take minutes."</p>
+        <p>"The symptom is <strong>the same query being inconsistently slow with no code change</strong>, and
+          it often starts after a restart, failover, or statistics update — because that's when the plan gets
+          recompiled with whatever parameter happens to arrive first. The classic tell is 'it's fast in SSMS
+          but slow from the app', because SSMS compiled a fresh plan for your parameter."</p>
+        <p>"Fixes, and I'd order them deliberately."</p>
+        <p>"<strong>First, check whether it's really a sniffing problem.</strong> Quite often the right index
+          is missing, and with it <em>both</em> plans are fast — so the skew stops mattering. Reaching for
+          hints before checking indexes fixes the symptom and leaves the cause in place."</p>
+        <p>"<strong><code>OPTION (RECOMPILE)</code></strong> — compiles every execution with the actual
+          parameter, so every call gets an appropriate plan. Simple and usually correct. The cost is CPU per
+          execution and no plan reuse, so I wouldn't put it on something running thousands of times a minute —
+          that trades a plan problem for a CPU problem."</p>
+        <p>"<strong><code>OPTIMIZE FOR UNKNOWN</code></strong> — ignores the actual value and uses average
+          density. You get a consistently average plan. That's often the right trade, because
+          consistent-mediocre beats occasionally-catastrophic: an 800ms query every time is better for the
+          system than 50ms usually and 90 seconds sometimes, since the 90-second case is what exhausts the
+          thread pool and takes the site down."</p>
+        <p>"<strong><code>OPTIMIZE FOR (@p = 'US')</code></strong> when I genuinely know the dominant case and
+          want to guarantee the big one is fast."</p>
+        <p>"<strong>Splitting the procedure</strong> when there are two genuinely different access patterns —
+          a branch on row count that calls one of two procedures, each getting its own plan. More code, but
+          both cases are optimal and it's explicit rather than relying on a hint's side effects."</p>
+        <p>"And as an immediate mitigation, <strong>Query Store plan forcing</strong>: if the good plan is in
+          history I can force it without touching code or deploying. That's the fastest way to stop the
+          bleeding while I decide on the real fix."</p>
+        <p>"One thing I'd flag: <code>WITH RECOMPILE</code> on the whole procedure is a blunter instrument than
+          <code>OPTION (RECOMPILE)</code> on the statement — it recompiles everything, so I'd use the statement
+          hint where I can."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know sniffing is normally beneficial, and skew is the actual problem?</li>
+        <li>Can you name the symptom and the SSMS-vs-app tell?</li>
+        <li>Do you check indexes before hinting?</li>
+        <li>Do you articulate the consistency-vs-peak trade-off?</li>
+        <li>Do you know about plan forcing?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "<code>OPTION (RECOMPILE)</code>" with no mention of cost.</li>
+        <li><span class="redflag">Red flag:</span> describing sniffing as a bug in SQL Server.</li>
+        <li><span class="redflag">Red flag:</span> clearing the plan cache as a fix.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why does a local variable behave differently from a parameter?</li>
+          <li>What are the risks of forcing a plan long-term?</li>
+          <li>How does this interact with statistics updates?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>The whole database server is slow, not one query. Where do you start? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Different question from a slow query, and I'd use a different tool: <strong>wait
+          statistics</strong>. They tell me what the server is waiting <em>on</em>, which points at the
+          bottleneck instead of making me guess."</p>
+        <p>"I'd look at <code>sys.dm_os_wait_stats</code> — or better, <code>sys.dm_exec_session_wait_stats</code>
+          and what's actually happening right now, since cumulative stats since startup can be dominated by
+          history that's no longer relevant."</p>
+        <p>"Then I'd interpret the top waits:"</p>
+        <p>"<code>PAGEIOLATCH</code> means reading from disk — so either not enough memory to hold the working
+          set, missing indexes causing scans that read far more than needed, or genuinely slow storage.
+          <code>LCK_M_*</code> means blocking, so I'd look at long transactions and isolation level, and
+          consider RCSI. <code>WRITELOG</code> points at log storage or too many small transactions.
+          <code>RESOURCE_SEMAPHORE</code> means queries queuing for memory grants, usually because bad
+          estimates are causing over-sized grants. <code>PAGELATCH</code> on tempdb is allocation contention,
+          fixed by adding tempdb data files. <code>SOS_SCHEDULER_YIELD</code> is CPU pressure."</p>
+        <p>"Alongside that I'd check the boring operational things, because they're common and quick to rule
+          out: is a disk full, is the log growing because a backup hasn't run, is there a maintenance job or
+          index rebuild running right now, has someone started a large reporting query, did the VM get resized,
+          is another workload sharing the storage."</p>
+        <p>"Then I'd check whether it's actually one query causing it all. A single bad plan running thousands
+          of times can saturate CPU or flood I/O and make everything look slow. So high total-resource
+          consumers from Query Store, not just averages."</p>
+        <p>"The important thing is the order: <strong>waits tell me which direction to look</strong>, then I
+          drill into specific queries. Going straight to query tuning when the answer is a full log drive or
+          tempdb contention wastes a day and fixes nothing."</p>
+        <p>"And I'd separate mitigation from diagnosis. If the system is down, killing a runaway query or
+          failing over buys time. But I'd capture the wait stats and plans <em>first</em>, because a restart
+          clears exactly the evidence I need."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know wait stats are the tool for server-wide problems?</li>
+        <li>Can you interpret the common wait types?</li>
+        <li>Do you check operational basics — disks, backups, maintenance?</li>
+        <li>Do you capture evidence before mitigating?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> going straight to individual query tuning.</li>
+        <li><span class="redflag">Red flag:</span> "restart it" as step one.</li>
+        <li><span class="redflag">Red flag:</span> "add more memory" with no diagnosis.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How many tempdb files, and why?</li>
+          <li>What does a high <code>CXPACKET</code> actually tell you?</li>
+          <li>How would you find the query saturating CPU?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

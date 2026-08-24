@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strategy, Coverage &amp; CI — Testing</title>
+<meta name="description" content="Which test levels to invest in, coverage as a metric versus a target, mutation testing, dealing with flaky tests, and what belongs in the pipeline.">
+<meta name="keywords" content="test strategy coverage code coverage target mutation testing Stryker flaky tests quarantine CI pipeline test speed shift left legacy code testing seams approval tests snapshot">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="17-testing/strategy.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Strategy, Coverage &amp; CI</h1>
+    <p class="subtitle">Where to spend testing effort, which metrics are honest, and how to stop a suite rotting
+      once it exists.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Invest by risk</strong>, not uniformly. Test what would hurt most if wrong.</li>
+      <li><strong>Coverage measures execution, not verification.</strong> Useful as a diagnostic, harmful as a
+        target.</li>
+      <li><strong>Mutation testing measures whether tests actually catch bugs.</strong></li>
+      <li><strong>A flaky test is worse than no test</strong> — it trains people to ignore failures.</li>
+      <li><strong>Quarantine flaky tests immediately</strong>, then fix or delete them.</li>
+      <li><strong>Fast tests on every commit</strong>, slower ones on merge or a schedule.</li>
+      <li><strong>For legacy code, write tests at the boundary first</strong>, then refactor.</li>
+    </ul>
+  </div>
+
+  <h2 id="where-to-invest">Where to invest <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The principle</span>
+    <p>Testing effort should follow <strong>risk</strong>: how likely something is to be wrong, multiplied by how
+      much it costs if it is.</p>
+    <p>Uniform coverage across a codebase spends the same effort on a payment calculation and a
+      <code>ToString()</code> override, which is obviously wrong when stated plainly and is what a coverage target
+      encourages.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Test heavily</th><th>Test lightly</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Money, pricing, tax, billing</strong> — wrong answers cost real money</td><td>Getters, setters, simple mappers</td></tr>
+        <tr><td><strong>Authorisation and tenant isolation</strong> — a bug here is a breach</td><td>Framework behaviour you didn't write</td></tr>
+        <tr><td><strong>State machines and workflow transitions</strong></td><td>Generated code</td></tr>
+        <tr><td><strong>Anything with a compliance or audit requirement</strong></td><td>Logging statements</td></tr>
+        <tr><td><strong>Concurrency and idempotency</strong></td><td>Configuration wiring — covered by one integration test</td></tr>
+        <tr><td><strong>Code that has broken before</strong></td><td>Throwaway or spike code</td></tr>
+        <tr><td><strong>Boundaries and error paths</strong></td><td>The happy path alone</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — error paths are under-tested and over-represented in incidents</div>
+    <p style="margin:0">Most suites test the happy path thoroughly and the failure paths barely at all, because
+      the happy path is easier to write and feels like the point.
+      <br><br>
+      But the happy path is also what gets exercised constantly in manual testing, in staging, and by every user
+      every day. <strong>The failure paths are the ones nobody exercises until production does.</strong>
+      <br><br>
+      What happens when the payment gateway times out mid-transaction? When the message is a duplicate? When the
+      database rejects a constraint? When the input is null, empty, enormous, or a different tenant's id?
+      <br><br>
+      That's where incidents come from, and it's where a test has the highest marginal value — because it's the
+      only thing exercising that branch.
+      <br><br>
+      "I'd prioritise the error paths and boundaries over adding more happy-path coverage" is a strong answer,
+      because it reflects where defects actually live rather than where tests are easy to write.</p>
+  </div>
+
+  <h2 id="coverage">Coverage <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">What it does and doesn't tell you</span>
+    <p><strong>Coverage says a line was executed. It says nothing about whether a test would notice if that line
+      were wrong.</strong></p>
+    <p>So you can reach 90% with tests that assert almost nothing — and that's exactly what happens when coverage
+      becomes a target rather than a signal.</p>
+  </div>
+
+  <pre data-label="csharp — 100% covered, verifies nothing" class="code-bad"><code class="language-csharp">[Fact]
+public void CalculateTotal_does_not_throw()
+{
+    var result = _calculator.CalculateTotal(order);   // every line executed
+    Assert.NotNull(result);                            // asserts essentially nothing
+}
+// Change the tax rate, the discount logic, or the rounding - this still passes.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Coverage as a…</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Diagnostic</strong> — "what isn't tested at all?"</td><td><strong>Genuinely useful.</strong> Zero coverage on the pricing engine is a real finding</td></tr>
+        <tr><td><strong>Trend</strong> — "is it falling?"</td><td>Useful, especially on new code</td></tr>
+        <tr><td><strong>Target</strong> — "we require 80%"</td><td><strong>Harmful.</strong> Produces tests written for the number</td></tr>
+        <tr><td><strong>Quality measure</strong></td><td><strong>Meaningless.</strong> It measures execution, not verification</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">If you must have a gate, gate on new code</div>
+    <p style="margin:0">A global threshold on a legacy codebase either blocks all work or gets set so low it means
+      nothing. And retrofitting tests purely to reach a number produces the worst tests in the codebase.
+      <br><br>
+      <strong>Coverage on the diff</strong> is a more defensible gate: new and changed lines must be covered, and
+      the existing figure is left alone. That stops decline without demanding a retrospective project, and it puts
+      the requirement where the author has context.
+      <br><br>
+      I'd still treat it as a prompt for discussion rather than a hard block — because there are legitimate
+      exceptions, and a gate that can't be overridden gets gamed rather than respected.</p>
+  </div>
+
+  <h2 id="mutation">Mutation testing <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The idea</span>
+    <p>Deliberately introduce bugs into the code — flip a <code>&gt;</code> to <code>&gt;=</code>, negate a
+      condition, change a constant, remove a statement — and check whether any test <strong>fails</strong>.</p>
+    <p>A mutation that survives means <strong>no test would have caught that bug</strong>. Which is the question
+      coverage can't answer.</p>
+  </div>
+
+  <pre data-label="text — what a report tells you"><code class="language-text">  Original:   if (subtotal &gt; 1000) discount = 0.05m;
+
+  Mutants:
+    if (subtotal &gt;= 1000)     KILLED    <- a test caught the boundary change
+    if (subtotal &lt; 1000)      KILLED
+    if (true)                 SURVIVED  <- nothing tests the below-threshold case
+    discount = 0.0m;          SURVIVED  <- nothing asserts the discount VALUE
+
+  Line coverage: 100%.  Mutation score: 50%.
+  Two real bugs would ship undetected.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this is the metric that measures what you care about</div>
+    <p style="margin:0">Coverage answers "did a test run this line?". Mutation testing answers <strong>"would a
+      test catch a bug in this line?"</strong> — which is the actual question.
+      <br><br>
+      It reliably finds two things coverage hides: <strong>missing assertions</strong>, where the code runs and
+      nothing checks the result, and <strong>untested boundaries</strong>, where you test 500 and 2000 but never
+      999, 1000 and 1001.
+      <br><br>
+      In .NET the tool is <strong>Stryker.NET</strong>. The honest caveat is that it's <em>slow</em> — it re-runs
+      your tests once per mutant, so a full run on a large codebase takes a long time.
+      <br><br>
+      Which makes the practical use targeted rather than universal: run it on the <strong>genuinely critical
+      modules</strong> — pricing, tax, authorisation, anything financial — rather than the whole solution, and run
+      it on a schedule rather than per commit.
+      <br><br>
+      Even one run on your most important module is usually revealing, and it's a much better use of effort than
+      pushing coverage from 78% to 85%.</p>
+  </div>
+
+  <h2 id="flaky">Flaky tests <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="note danger">
+    <div class="note-title">A flaky test is worse than no test</div>
+    <p style="margin:0">Not merely annoying — actively harmful, because of what it does to the team's
+      behaviour.
+      <br><br>
+      It <strong>trains people to ignore failures.</strong> Once "just re-run it" becomes normal, a
+      <em>genuine</em> failure gets re-run too, and eventually merged. The suite has stopped functioning as a gate
+      while still consuming CI time and appearing to work.
+      <br><br>
+      It also destroys the signal you need most: when everything is occasionally red, nobody can tell whether
+      today's red is real.
+      <br><br>
+      So flakiness is a <strong>reliability problem to be fixed with urgency</strong>, not a known
+      inconvenience. A suite that's 99% reliable across 500 tests fails somewhere on most runs.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Shared state between tests</strong></td><td>Reset between tests; construct data per test</td></tr>
+        <tr><td><strong>Order dependency</strong></td><td>Randomise order locally to surface it, then remove the coupling</td></tr>
+        <tr><td><strong>Real time and timing</strong></td><td><code>TimeProvider</code>; never <code>Thread.Sleep</code></td></tr>
+        <tr><td><strong>Fixed waits for async work</strong></td><td>Poll for the condition with a timeout, don't sleep a guess</td></tr>
+        <tr><td><strong>Test parallelism</strong></td><td>Isolate resources, or serialise the affected collection</td></tr>
+        <tr><td><strong>External dependencies</strong></td><td>Stub them — a test hitting a real API is flaky by definition</td></tr>
+        <tr><td><strong>Culture and timezone</strong></td><td>Set both explicitly in the test</td></tr>
+        <tr><td><strong>Unordered results asserted as ordered</strong></td><td>Assert set equality, or order explicitly</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Quarantine immediately, then fix or delete</div>
+    <p style="margin:0">The instinct is to add a retry attribute and move on. That hides the flakiness and keeps
+      the false confidence.
+      <br><br>
+      Better: <strong>quarantine it</strong> — move it out of the blocking suite into a separately-reported set —
+      so the main pipeline is trustworthy again immediately. Then it's a tracked item with an owner.
+      <br><br>
+      And apply a deadline: <strong>fixed or deleted within a sprint.</strong> A quarantine with no expiry becomes
+      a graveyard of tests nobody looks at, which is the same problem with extra process.
+      <br><br>
+      Deleting a flaky test is a legitimate outcome. A test that can't be made reliable provides no signal, and
+      removing it is honest about that — whereas leaving it retrying pretends coverage exists that doesn't.
+      <br><br>
+      Being willing to say "I'd delete it" is a good senior signal, because most people won't.</p>
+  </div>
+
+  <pre data-label="csharp — polling instead of sleeping" class="code-good"><code class="language-csharp">// Flaky: 500ms is a guess. Too short on loaded CI, wasteful when fast.
+await Task.Delay(500);
+(await _db.Orders.CountAsync()).Should().Be(1);
+
+// Reliable: wait for the CONDITION, with a timeout
+await Assert.EventuallyAsync(
+    async () =&gt; await _db.Orders.CountAsync() == 1,
+    timeout: TimeSpan.FromSeconds(5),
+    pollInterval: TimeSpan.FromMilliseconds(50));
+// Fast when the work is fast; tolerant when CI is slow.</code></pre>
+
+  <h2 id="ci">What belongs in the pipeline <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Stage</th><th>Runs</th><th>Budget</th><th>Blocking?</th></tr></thead>
+      <tbody>
+        <tr><td><strong>On every commit</strong></td><td>Build, analysers, unit tests</td><td><strong>Under 5 minutes</strong></td><td>Yes</td></tr>
+        <tr><td><strong>On pull request</strong></td><td>The above plus integration tests</td><td>Under 15 minutes</td><td>Yes</td></tr>
+        <tr><td><strong>On merge to main</strong></td><td>Plus contract tests, a smoke E2E set</td><td>Under 30 minutes</td><td>Yes</td></tr>
+        <tr><td><strong>Nightly</strong></td><td>Full E2E, mutation testing, performance, security scans</td><td>Hours are fine</td><td>No — reported</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the commit-stage budget is the constraint that matters</div>
+    <p style="margin:0">If the fast feedback loop takes twenty minutes, developers stop waiting for it. They push
+      and context-switch, so a failure arrives after they've moved on — and the cost of fixing it has gone up
+      several times because they've lost the context.
+      <br><br>
+      So <strong>under five minutes for the commit stage is a real engineering requirement</strong>, not an
+      aspiration. It's what keeps the loop tight enough that people act on results.
+      <br><br>
+      Which forces useful discipline: unit tests must be genuinely fast, so no database and no network. Integration
+      tests go to a later stage. And when the commit stage creeps past the budget, that's a signal to
+      <em>investigate</em> — usually a test that quietly acquired an I/O dependency.
+      <br><br>
+      The corollary: <strong>put slow-but-valuable things in a non-blocking nightly stage</strong> rather than
+      dropping them. Full E2E, mutation testing and performance tests are worth running; they aren't worth
+      blocking every commit on.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Tests that fail only in CI</div>
+    <p style="margin:0">Almost always one of four causes, and worth checking in this order.
+      <br><br>
+      <strong>Parallelism</strong> — CI may run with different concurrency, so shared-state coupling surfaces
+      there and not locally. <strong>Order</strong> — a different execution order exposes a dependency between
+      tests. <strong>Environment</strong> — culture, timezone, locale or line endings differ from your machine.
+      <strong>Timing</strong> — CI machines are slower and noisier, so fixed waits that pass locally time out.
+      <br><br>
+      The diagnostic that finds most of these quickly: <strong>run locally with randomised order and the same
+      parallelism as CI</strong>. If it fails, it was never a CI problem — it was a latent bug your local run
+      happened to hide.</p>
+  </div>
+
+  <h2 id="legacy">Testing legacy code <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The bind</span>
+    <p>The code has no tests <em>because</em> it's hard to test — static dependencies, no interfaces,
+      <code>DateTime.Now</code> everywhere, a 900-line method.</p>
+    <p>And you can't safely refactor it to be testable, <strong>because there are no tests</strong>. That circle is
+      the actual problem.</p>
+  </div>
+
+  <ol class="steps">
+    <li><strong>Find the widest seam you can reach</strong> — an API endpoint, a public method, a message handler.
+      Not the class you want to change.</li>
+    <li><strong>Write characterisation tests there</strong> — capture what it currently does, including behaviour
+      that looks wrong.</li>
+    <li><strong>Refactor toward testability</strong>, with those tests as the safety net.</li>
+    <li><strong>Add focused tests</strong> to the newly-testable units.</li>
+    <li><strong>Then change the behaviour</strong> — and now the characterisation test failing is
+      <em>informative</em>.</li>
+  </ol>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — characterisation tests capture current behaviour, not correct behaviour</div>
+    <p style="margin:0">This is the key distinction, and it's counter-intuitive.
+      <br><br>
+      A characterisation test asserts <strong>what the code does today, bugs included</strong>. If it rounds
+      incorrectly, you assert the incorrect rounding.
+      <br><br>
+      The purpose isn't to validate correctness — it's to <strong>detect change</strong>. So when you refactor, any
+      difference in behaviour shows up immediately, including differences you didn't intend. That's what makes the
+      refactor safe.
+      <br><br>
+      Fixing the bug is a <em>separate, deliberate step</em>: change the code, watch the characterisation test
+      fail, and update it consciously with a note explaining why the behaviour changed. That gives you an audit
+      trail of intentional changes rather than accidental ones.
+      <br><br>
+      Trying to fix bugs while refactoring means you can't tell which change caused a difference — and that's how
+      a refactor becomes an incident.
+      <br><br>
+      <strong>Approval tests</strong> are well suited to this: capture the entire output as a snapshot and diff
+      against it, rather than hand-writing assertions for behaviour you don't yet understand.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Test at the widest seam, not the narrowest</div>
+    <p style="margin:0">The instinct is to unit test the class you're about to change. In legacy code that's
+      usually the hardest place to start — it's the one with the static calls and the tangled dependencies.
+      <br><br>
+      <strong>Go wider.</strong> An HTTP endpoint or a message handler is often testable <em>as-is</em> with
+      <code>WebApplicationFactory</code> and a real database, without touching the code at all. That gives you a
+      safety net immediately, at the cost of a slower test.
+      <br><br>
+      Then refactor inward with that net in place, and add fast focused tests to the pieces as they become
+      testable.
+      <br><br>
+      That sequencing — <strong>coarse test first, then refactor, then fine tests</strong> — is what makes legacy
+      work tractable. Starting with the unit test means changing untested code, which is the thing you were trying
+      to avoid.</p>
+  </div>
+
+  <h2 id="what-not-to-test">What not to test <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Don't test</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>The framework</strong></td><td>A test proving <code>[Required]</code> rejects null tests ASP.NET Core, not you</td></tr>
+        <tr><td><strong>Third-party libraries</strong></td><td>Test <em>your usage</em> of them, at the integration level</td></tr>
+        <tr><td><strong>Trivial properties</strong></td><td>A getter returning a field has no logic to be wrong</td></tr>
+        <tr><td><strong>Private methods directly</strong></td><td>Test them through the public behaviour that uses them</td></tr>
+        <tr><td><strong>Generated code</strong></td><td>Test the generator, or the behaviour it produces</td></tr>
+        <tr><td><strong>Log messages</strong></td><td>Unless a log <em>is</em> the deliverable, as in audit</td></tr>
+        <tr><td><strong>Implementation structure</strong></td><td>"This class has three dependencies" isn't behaviour</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Testing private methods is a design signal</div>
+    <p style="margin:0">If a private method feels like it needs its own test, that usually means it contains
+      <strong>enough logic to be its own concept</strong> — and the right response is to extract it into a class
+      with a public interface, then test it directly.
+      <br><br>
+      Making it <code>internal</code> plus <code>InternalsVisibleTo</code> is the common workaround. It works, and
+      it locks the test to the current structure — so the test breaks when you reorganise, which is the brittleness
+      problem again.
+      <br><br>
+      So: <strong>the difficulty testing a private method is information</strong>. Either it's simple enough to be
+      covered through the public behaviour, or it's substantial enough to deserve extraction. Reaching for
+      reflection or <code>InternalsVisibleTo</code> skips that decision.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Invest by risk — likelihood of being wrong times cost if it is.</li>
+      <li>Error paths and boundaries are under-tested and over-represented in incidents.</li>
+      <li>Coverage measures execution, not verification. Diagnostic yes, target no.</li>
+      <li>If you gate, gate on the diff rather than the whole codebase.</li>
+      <li>Mutation testing measures whether tests would catch a bug — run it on critical modules, on a
+        schedule.</li>
+      <li>A flaky test trains people to ignore failures, which is worse than no test.</li>
+      <li>Quarantine flaky tests immediately; fix or delete within a sprint.</li>
+      <li>Poll for conditions with a timeout; never sleep a guess.</li>
+      <li>Commit stage under five minutes, or people stop waiting for it.</li>
+      <li>Slow-but-valuable tests go in a non-blocking nightly stage.</li>
+      <li>CI-only failures are usually parallelism, order, environment or timing.</li>
+      <li>For legacy code: characterisation tests at the widest seam, then refactor, then fine tests.</li>
+      <li>Difficulty testing a private method means it should be extracted.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>A mandated coverage percentage</strong>, producing tests written for the number.</li>
+    <li><strong>Uniform coverage</strong> across trivial and critical code alike.</li>
+    <li><strong>Only happy-path tests.</strong></li>
+    <li><strong>Retry attributes on flaky tests</strong> instead of fixing them.</li>
+    <li><strong>Tolerating flakiness</strong> until nobody trusts the suite.</li>
+    <li><strong><code>Thread.Sleep</code></strong> to wait for async work.</li>
+    <li><strong>A commit stage over ten minutes</strong>, so developers stop waiting.</li>
+    <li><strong>Full E2E on every commit</strong>, making the pipeline slow and flaky.</li>
+    <li><strong>Refactoring legacy code before writing a characterisation test.</strong></li>
+    <li><strong>Fixing bugs while refactoring</strong>, so differences can't be attributed.</li>
+    <li><strong>Testing private methods via reflection.</strong></li>
+    <li><strong>Testing the framework</strong> rather than your own logic.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What code coverage should a project aim for? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd push back on the framing, because <strong>a coverage target is the wrong instrument</strong> —
+          and I'd explain why rather than just refusing the number."</p>
+        <p>"Coverage measures whether a line was <em>executed</em> by a test. It says nothing about whether the
+          test would notice if that line were wrong. So you can reach 90% with tests that assert almost
+          nothing — call the method, assert not-null — and that's precisely what happens when the percentage
+          becomes a target. People write tests to satisfy the number, and the worst tests in a codebase are
+          usually the ones added to hit a coverage gate."</p>
+        <p>"Meanwhile the things that break in production — error paths, boundary conditions, concurrent access,
+          malformed input — tend to be the <em>uncovered</em> parts, because they're harder to write tests for. So
+          the metric actively points effort away from where the risk is."</p>
+        <p>"What I'd use instead is <strong>risk-based investment</strong>: test heavily where being wrong is
+          expensive. Money, pricing and tax. Authorisation and tenant isolation, where a bug is a breach. State
+          machines. Anything with a compliance requirement. Anything that has broken before. And test lightly the
+          getters, the mappers, and the framework behaviour I didn't write."</p>
+        <p>"Where coverage <em>is</em> useful is as a <strong>diagnostic</strong> rather than a goal. 'The pricing
+          engine has zero coverage' is a real finding worth acting on. And as a <strong>trend</strong>, especially
+          on new code — a sudden drop is worth a conversation."</p>
+        <p>"If an organisation insists on a gate, I'd argue for <strong>coverage on the diff</strong> rather than
+          globally: new and changed lines must be covered, the existing figure is left alone. That stops decline
+          without demanding a retrospective testing project, and it puts the requirement where the author has
+          context. I'd still make it a prompt rather than a hard block, because a gate that can't be overridden
+          gets gamed."</p>
+        <p>"And the metric I'd actually reach for if I wanted to know whether tests verify anything is
+          <strong>mutation testing</strong>. It changes the code — flips a comparison, negates a condition,
+          alters a constant — and checks whether any test fails. A surviving mutant means no test would catch that
+          bug, which is the question coverage can't answer."</p>
+        <p>"In .NET that's Stryker.NET. It's slow, because it re-runs the suite per mutant, so I'd run it on the
+          genuinely critical modules on a schedule rather than the whole solution per commit. One run on the
+          pricing engine is usually more revealing than pushing coverage from 78% to 85%."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know coverage measures execution, not verification?</li>
+        <li>Can you explain why a target is counterproductive?</li>
+        <li>Do you propose risk-based investment instead?</li>
+        <li>Do you know about mutation testing?</li>
+        <li>Can you offer a workable compromise if a gate is mandated?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "80%" with no reasoning.</li>
+        <li><span class="redflag">Red flag:</span> "100%, always."</li>
+        <li><span class="redflag">Red flag:</span> treating coverage as a quality measure.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you decide what's high risk?</li>
+          <li>How does mutation testing work?</li>
+          <li>What if management mandates a number?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Your CI suite fails intermittently and the team re-runs until green. What do you do? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd treat this as urgent, because the suite has already stopped working as a gate. Once 'just re-run
+          it' is normal, a <strong>genuine</strong> failure gets re-run too and eventually merged — so the tests
+          are consuming CI time while providing false confidence. That's worse than having no suite, because
+          nobody realises the protection is gone."</p>
+        <p>"<strong>First, measure it.</strong> I'd collect per-test pass/fail history across runs so I know which
+          tests are flaky and how often. Most CI systems can report this. Without data it's anecdote, and the team
+          will disagree about which tests are the problem."</p>
+        <p>"<strong>Then restore trust immediately by quarantining.</strong> Move the flaky tests out of the
+          blocking suite into a separately-reported set. That makes the main pipeline trustworthy again <em>today</em>
+          rather than after the fixes land — which matters, because the behaviour of ignoring failures is what
+          you're trying to stop."</p>
+        <p>"What I'd <strong>not</strong> do is add retry attributes. That hides the flakiness and keeps the false
+          confidence — you've made the symptom invisible while the cause remains."</p>
+        <p>"<strong>Then fix by cause</strong>, and they cluster into a few categories."</p>
+        <p>"<strong>Shared state and order dependency</strong> — the most common. One test's data affects another's
+          assertion, so failures depend on execution order. I'd surface these deliberately by running locally with
+          <em>randomised order</em>, then fix by resetting state between tests and constructing data per test
+          rather than sharing fixtures."</p>
+        <p>"<strong>Timing.</strong> Fixed waits — <code>Task.Delay(500)</code> — that pass locally and time out on
+          a loaded CI machine. The fix is to poll for the condition with a timeout, so it's fast when the work is
+          fast and tolerant when CI is slow. And <code>TimeProvider</code> for anything time-dependent, which also
+          makes those tests instant."</p>
+        <p>"<strong>Parallelism.</strong> CI may run different concurrency to local, so tests sharing a database
+          interfere there and not locally. Either isolate the resource per collection or serialise the affected
+          ones — slower, and better than intermittent failures."</p>
+        <p>"<strong>Environment</strong> — culture, timezone, line endings differing from developer machines. Set
+          them explicitly in the test."</p>
+        <p>"<strong>External dependencies.</strong> A test calling a real API is flaky by definition. Stub
+          it."</p>
+        <p>"The diagnostic I'd emphasise: <strong>run locally with randomised order and CI's parallelism.</strong>
+          If it fails, it was never a CI problem — it was a latent bug that your local run happened to hide. That
+          reframing matters, because teams often treat these as infrastructure issues when they're test defects."</p>
+        <p>"Then a <strong>policy so it doesn't return</strong>: a quarantined test is fixed or
+          <strong>deleted</strong> within a sprint, with a named owner. A quarantine with no expiry becomes a
+          graveyard, which is the same problem with extra process."</p>
+        <p>"And I'd be explicit that <strong>deleting is a legitimate outcome</strong>. A test that can't be made
+          reliable provides no signal — removing it is honest, whereas leaving it retrying pretends coverage exists
+          that doesn't. Most teams won't delete a test, and that reluctance is how the graveyard forms."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you recognise the suite has already failed as a gate?</li>
+        <li>Do you quarantine to restore trust immediately?</li>
+        <li>Do you refuse retry attributes as the fix?</li>
+        <li>Can you enumerate the causes and their fixes?</li>
+        <li>Do you know the randomised-order diagnostic?</li>
+        <li>Will you delete a test?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> adding automatic retries.</li>
+        <li><span class="redflag">Red flag:</span> "CI machines are just slower" as the explanation.</li>
+        <li><span class="redflag">Red flag:</span> no plan to prevent recurrence.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you detect order dependency systematically?</li>
+          <li>How would you get the team to agree to delete tests?</li>
+          <li>What do you do about a flaky E2E test that covers a critical journey?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

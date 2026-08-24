@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C# Advanced — Overview</title>
+<meta name="description" content="The runtime-level C# topics that separate mid from senior: garbage collection, async/await internals, concurrency, and performance.">
+<meta name="keywords" content="csharp advanced garbage collection async await concurrency performance senior interview runtime internals">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="05-csharp-advanced/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>C# Advanced: Memory, Async &amp; Concurrency</h1>
+    <p class="subtitle">This is the section that separates a mid-level from a senior C# developer. Not
+      because it's obscure — because it's where production problems actually come from.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>The GC is generational: most objects die young, and collecting them is cheap. Objects that survive
+        get promoted and become expensive.</li>
+      <li><code>async</code> is about <strong>not blocking a thread while waiting</strong>. It is not about
+        making things faster.</li>
+      <li><code>.Result</code> and <code>.Wait()</code> on an async call are how you deadlock a web app.</li>
+      <li>Concurrency = several things in progress. Parallelism = several things executing at once. Not the
+        same problem.</li>
+      <li>A memory leak in .NET is almost always something long-lived holding a reference to something
+        short-lived.</li>
+      <li>Measure before optimising. <code>BenchmarkDotNet</code>, not a stopwatch and a hunch.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-here">Why this comes after LINQ <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>These topics are deliberately placed here rather than with the other C# material, because they build on
+    things you've now seen:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Topic</th><th>What it assumes you already know</th></tr></thead>
+      <tbody>
+        <tr><td><a href="memory-gc.html">Memory &amp; GC</a></td><td>Value vs reference types, the heap, closures capturing variables</td></tr>
+        <tr><td><a href="async-await.html">async / await</a></td><td>Iterators and state machines (<code>yield return</code>), delegates</td></tr>
+        <tr><td><a href="concurrency.html">Concurrency</a></td><td>Async, plus reference-type sharing</td></tr>
+        <tr><td><a href="performance.html">Performance &amp; internals</a></td><td>Expression trees, generics, allocation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>If any of those prerequisites feel shaky, go back to
+    <a href="../01-csharp-fundamentals/index.html">section 01</a> first. This material is much harder
+    without them.</p>
+
+  <h2 id="what-interviewers-want">What interviewers are looking for here <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>These questions are a proxy for <strong>"have you debugged something hard in production?"</strong></p>
+    <p>Anyone can define <code>async</code>. Far fewer can explain why an app deadlocked, or why memory grew
+      by 200 MB a day and then stopped growing after one line changed.</p>
+  </div>
+
+  <p>The questions that come up most, and what each is really probing:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>What it's really testing</th></tr></thead>
+      <tbody>
+        <tr><td>"What does <code>async</code> actually do?"</td><td>Whether you think it creates threads (it doesn't)</td></tr>
+        <tr><td>"Why does <code>.Result</code> deadlock?"</td><td>Whether you understand the synchronisation context</td></tr>
+        <tr><td>"How would you find a memory leak?"</td><td>Whether you've ever taken a dump and looked at roots</td></tr>
+        <tr><td>"When would you use a <code>lock</code>?"</td><td>Whether you know the cheaper alternatives first</td></tr>
+        <tr><td>"Is this code thread-safe?"</td><td>Whether you can spot a read-modify-write</td></tr>
+        <tr><td>"How do you know it's faster?"</td><td>Whether you measure or guess</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">The strongest answers in this area are <strong>stories with a mechanism</strong>.
+      <br><br>
+      "Memory grew steadily and never recovered. I took a dump, looked at what was rooting the large object
+      set, and found an event handler that was never unsubscribed — the publisher was a singleton, so every
+      request's subscriber stayed alive forever."
+      <br><br>
+      That answer proves the knowledge in a way no definition can.</p>
+  </div>
+
+  <h2 id="the-big-misconceptions">Three misconceptions to clear up first</h2>
+
+  <p>These come up constantly, and getting them right early makes the rest of the section easier.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>People think</th><th>Actually</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>"<code>async</code> makes code run on another thread"</td>
+          <td>No. <code>async</code> <em>releases</em> the current thread while waiting for I/O. No new
+              thread is created. For CPU work you need <code>Task.Run</code>, which is a different thing.</td>
+        </tr>
+        <tr>
+          <td>"The GC is slow, so I should avoid allocating"</td>
+          <td>Gen 0 collection is very cheap. What's expensive is objects <em>surviving</em> to Gen 2 and
+              the large object heap. Short-lived garbage is close to free.</td>
+        </tr>
+        <tr>
+          <td>"C# is managed, so it can't leak"</td>
+          <td>It leaks constantly — just differently. Anything reachable from a long-lived root can't be
+              collected. Static collections, events and captured closures are the usual culprits.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="contents">Section contents</h2>
+  <div class="card-grid" data-section-index></div>
+
+  <div class="note info">
+    <div class="note-title">Where this sits in the learning path</div>
+    <p style="margin:0">This closes out Part 1. Next is
+      <a href="../06-dotnet-platform/index.html">the .NET platform</a> — hosting, dependency injection,
+      configuration and logging — and then
+      <a href="../07-aspnet-core/index.html">ASP.NET Core</a>.
+      <br><br>
+      Async and concurrency come up constantly in both, which is why they're covered here first.</p>
+  </div>
+
+  <h2 id="reading-order">Suggested reading order</h2>
+
+  <ol class="steps">
+    <li><strong><a href="async-await.html">async / await</a></strong> — the most frequently asked, and the
+      one most often misunderstood. Start here if you're short on time.</li>
+    <li><strong><a href="memory-gc.html">Memory &amp; GC</a></strong> — needed to reason about leaks and
+      allocation, and referenced by everything else.</li>
+    <li><strong><a href="concurrency.html">Concurrency</a></strong> — builds on async; covers the
+      thread-safety questions.</li>
+    <li><strong><a href="performance.html">Performance &amp; internals</a></strong> — reflection, expression
+      trees, source generators, benchmarking. Least often asked, most impressive when it lands.</li>
+  </ol>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

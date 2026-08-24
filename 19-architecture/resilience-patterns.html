@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Resilience Patterns — Architecture</title>
+<meta name="description" content="Timeout, retry, circuit breaker, bulkhead, rate limiting and fallback — what each protects against, how they combine, and how they cause outages when done wrong.">
+<meta name="keywords" content="resilience retry timeout circuit breaker bulkhead rate limiting fallback exponential backoff jitter retry storm cascading failure polly graceful degradation load shedding">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="19-architecture/resilience-patterns.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Resilience Patterns</h1>
+    <p class="subtitle">How a system survives its dependencies failing — and how these same patterns cause
+      outages when they're applied carelessly.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Timeout</strong> — the most important one. Without it, a slow dependency exhausts your
+        threads and takes you down too.</li>
+      <li><strong>Retry</strong> — only for transient failures, only with backoff <em>and jitter</em>, only
+        on idempotent operations.</li>
+      <li><strong>Circuit breaker</strong> — stop calling something that's clearly broken. Fail fast, give it
+        room to recover.</li>
+      <li><strong>Bulkhead</strong> — isolate resources so one bad dependency can't consume everything.</li>
+      <li><strong>Rate limiting</strong> — protect yourself from callers. <strong>Load shedding</strong> —
+        reject work you can't complete.</li>
+      <li>Order matters: <code>timeout → retry → circuit breaker → bulkhead</code>, and the outer timeout
+        must cover all retries.</li>
+    </ul>
+  </div>
+
+  <h2 id="why">The failure these prevent <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>The classic distributed outage isn't a service crashing. It's a service getting
+      <strong>slow</strong> — and everything upstream piling up behind it until they all fall over.</p>
+  </div>
+
+  <p>Here's the mechanism, step by step, because interviewers ask you to trace it:</p>
+
+  <ol class="steps">
+    <li>A downstream dependency starts responding in 30 seconds instead of 50ms.</li>
+    <li>Your requests to it don't fail — they <em>wait</em>. Each one holds a thread and a connection.</li>
+    <li>New requests keep arriving. Threads accumulate in the waiting state.</li>
+    <li>The thread pool or connection pool exhausts.</li>
+    <li>Now <em>every</em> endpoint fails, including ones that never touch the slow dependency.</li>
+    <li>Your callers start piling up behind you. The failure propagates upward.</li>
+  </ol>
+
+  <p>Notice that the visible symptom — "the whole API is down" — is several steps away from the cause.
+    That's why resilience patterns matter: they stop the propagation at step 2.</p>
+
+  <h2 id="timeout">Timeout <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="oneline"><b>One line:</b> never wait indefinitely for anything that crosses a network.</div>
+
+  <p>This is the single highest-value resilience pattern, and the most commonly missing one.</p>
+
+  <pre data-label="csharp — bad: no timeout means an unbounded wait" class="code-bad"><code class="language-csharp">var response = await _httpClient.GetAsync(url);   // default is 100 seconds!</code></pre>
+
+  <pre data-label="csharp — bounded, and cancellable" class="code-good"><code class="language-csharp">// Client-level default
+services.AddHttpClient&lt;IPricingClient, PricingClient&gt;(c =&gt;
+{
+    c.BaseAddress = new Uri("https://pricing.internal/");
+    c.Timeout = TimeSpan.FromSeconds(3);       // fail fast
+});
+
+// Per-call, combined with the caller's cancellation
+using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+cts.CancelAfter(TimeSpan.FromSeconds(2));
+var response = await _httpClient.GetAsync(url, cts.Token);</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Choosing the number</div>
+    <p style="margin:0">Set the timeout from the dependency's <strong>p99 latency</strong>, not from its
+      average. If p99 is 200ms, a 2-second timeout is generous but still fails fast.
+      <br><br>
+      Common mistake: setting it to 30 seconds "to be safe". That's not safe — it means 30 seconds of holding
+      a thread while the user has long since given up.
+      <br><br>
+      And your timeout must be <em>shorter</em> than your caller's, otherwise you're doing work for a request
+      nobody is waiting for any more.</p>
+  </div>
+
+  <p>Timeouts apply to more than HTTP: database commands, message locks, distributed locks, and any
+    <code>await</code> that could block indefinitely.</p>
+
+  <h2 id="retry">Retry <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="oneline"><b>One line:</b> try again, because some failures are temporary — but only under
+    strict conditions.</div>
+
+  <p><strong>Three conditions, all required:</strong></p>
+
+  <ol class="steps">
+    <li><strong>The failure must be transient.</strong> Timeouts, 503s, 429s, connection resets. Never retry
+      a 400 or a validation failure — the answer won't change, and you're adding load for nothing.</li>
+    <li><strong>The operation must be idempotent</strong>, or protected by an idempotency key. Retrying a
+      payment authorisation that actually succeeded charges the customer twice.</li>
+    <li><strong>Backoff with jitter.</strong> Without it, every client retries at the same instant and
+      recreates the spike that caused the failure.</li>
+  </ol>
+
+  <pre data-label="csharp — bad: three ways to make an outage worse" class="code-bad"><code class="language-csharp">for (var i = 0; i &lt; 5; i++)
+{
+    try { return await _client.PostAsync(url, content); }   // not idempotent!
+    catch { await Task.Delay(100); }                        // fixed delay, no jitter
+}                                                           // retries EVERYTHING, incl. 400s</code></pre>
+
+  <pre data-label="csharp — Polly, with the conditions handled" class="code-good"><code class="language-csharp">var retry = new ResiliencePipelineBuilder&lt;HttpResponseMessage&gt;()
+    .AddRetry(new RetryStrategyOptions&lt;HttpResponseMessage&gt;
+    {
+        MaxRetryAttempts = 3,
+        BackoffType = DelayBackoffType.Exponential,
+        UseJitter = true,                                  // spreads the retries out
+        ShouldHandle = new PredicateBuilder&lt;HttpResponseMessage&gt;()
+            .Handle&lt;HttpRequestException&gt;()
+            .Handle&lt;TimeoutRejectedException&gt;()
+            .HandleResult(r =&gt; r.StatusCode is HttpStatusCode.ServiceUnavailable
+                                            or HttpStatusCode.TooManyRequests)
+        // note: 400/401/404 are NOT retried
+    })
+    .Build();</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — the retry storm</div>
+    <p style="margin:0">Retries <strong>multiply load on a system that is already struggling</strong>.
+      <br><br>
+      Three retries means 4× the traffic at exactly the worst moment. Add a second service that also retries
+      and you have 16×. This is how a brief blip becomes a sustained outage — and it's entirely
+      self-inflicted.
+      <br><br>
+      Always cap attempts, always use jitter, and always pair retries with a <a href="#circuit-breaker">circuit
+      breaker</a> so you stop retrying when the dependency is properly down.</p>
+  </div>
+
+  <h2 id="circuit-breaker">Circuit breaker <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="oneline"><b>One line:</b> after enough failures, stop calling — fail immediately instead of
+    waiting, and try again later.</div>
+
+  <pre data-label="the three states" class="code-good"><code class="language-text" data-nohl>   ┌──────────┐   failures exceed threshold    ┌──────────┐
+   │  CLOSED  │ ─────────────────────────────▶ │   OPEN   │
+   │          │                                │          │
+   │ calls go │                                │ calls    │
+   │ through  │ ◀───────────────────────────── │ fail     │
+   └──────────┘      trial call succeeded      │ instantly│
+        ▲                                      └────┬─────┘
+        │                                           │ after a break duration
+        │            ┌───────────────┐              │
+        └────────────│   HALF-OPEN   │◀─────────────┘
+     trial succeeds  │ let ONE call  │
+                     │ through to    │──── trial fails ──▶ back to OPEN
+                     │ test recovery │
+                     └───────────────┘</code></pre>
+
+  <p><strong>Why this helps both sides:</strong></p>
+
+  <ul>
+    <li><strong>You</strong> stop waiting on something that's clearly broken — no threads held, fast
+      failure, you can serve a fallback.</li>
+    <li><strong>The dependency</strong> gets breathing room to recover instead of being hammered while it's
+      trying to restart.</li>
+  </ul>
+
+  <p>The <strong>half-open</strong> state is the clever part: after the break, one trial call is allowed
+    through. If it succeeds the circuit closes; if it fails the circuit opens again. That's how it detects
+    recovery without flooding the recovering service.</p>
+
+  <pre data-label="csharp — retry inside, breaker outside"><code class="language-csharp">var pipeline = new ResiliencePipelineBuilder&lt;HttpResponseMessage&gt;()
+    .AddTimeout(TimeSpan.FromSeconds(10))        // outermost: covers ALL retries
+    .AddCircuitBreaker(new CircuitBreakerStrategyOptions&lt;HttpResponseMessage&gt;
+    {
+        FailureRatio = 0.5,                      // 50% of calls failing
+        MinimumThroughput = 20,                  // ...over at least 20 calls
+        SamplingDuration = TimeSpan.FromSeconds(30),
+        BreakDuration = TimeSpan.FromSeconds(15)
+    })
+    .AddRetry(new RetryStrategyOptions&lt;HttpResponseMessage&gt; { MaxRetryAttempts = 3, UseJitter = true })
+    .AddTimeout(TimeSpan.FromSeconds(2))         // innermost: per attempt
+    .Build();</code></pre>
+
+  <div class="remember">
+    <span class="r-label">The ordering rule</span>
+    <p>Outer timeout → circuit breaker → retry → inner timeout.</p>
+    <p>The <strong>inner</strong> timeout bounds each attempt. The <strong>outer</strong> one bounds the
+      whole operation including retries — otherwise 3 retries × 2s each can exceed what the caller will wait
+      for.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0"><code>MinimumThroughput</code> exists for a reason. Without it, two failures during
+      a quiet period (2 out of 2 calls = 100% failure) trip the breaker and take out a healthy dependency.
+      Always require a meaningful sample before the breaker can open.</p>
+  </div>
+
+  <h2 id="bulkhead">Bulkhead <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="oneline"><b>One line:</b> partition your resources so one failure can't consume all of them.</div>
+
+  <p>Named after ship compartments — one flooded compartment doesn't sink the vessel.</p>
+
+  <pre data-label="the problem it solves" class="code-bad"><code class="language-text" data-nohl>WITHOUT bulkheads - one shared thread pool of 100:
+
+  Slow recommendation service (nice-to-have)
+        │
+        ▼
+  ┌─────────────────────────────────────┐
+  │  100 threads, all waiting on it     │  ← checkout now fails too,
+  └─────────────────────────────────────┘     even though it never calls
+                                              the recommendation service</code></pre>
+
+  <pre data-label="csharp — cap concurrency per dependency" class="code-good"><code class="language-csharp">// Recommendations: nice to have. Cap it at 10 concurrent calls.
+// Even if it hangs completely, only 10 threads are affected.
+private readonly SemaphoreSlim _recommendationLimit = new(10);
+
+public async Task&lt;IReadOnlyList&lt;Product&gt;&gt; GetRecommendationsAsync(CancellationToken ct)
+{
+    if (!await _recommendationLimit.WaitAsync(TimeSpan.FromMilliseconds(50), ct))
+        return [];                    // shed rather than queue - it's optional data
+
+    try { return await _recommendations.GetAsync(ct); }
+    finally { _recommendationLimit.Release(); }
+}</code></pre>
+
+  <p>Bulkheads apply at several levels, and the higher levels matter more:</p>
+
+  <ul>
+    <li><strong>Thread/concurrency limits</strong> per dependency, as above.</li>
+    <li><strong>Separate connection pools</strong> per database, so a slow reporting query can't exhaust the
+      pool that checkout needs.</li>
+    <li><strong>Separate instances</strong> — run critical and non-critical workloads on different compute,
+      so a batch job can't starve the API.</li>
+    <li><strong>Separate queues</strong> per priority or per tenant, so one noisy tenant can't monopolise
+      processing. See <a href="../23-multi-tenant-saas/scaling-operations.html">noisy neighbours</a>.</li>
+  </ul>
+
+  <h2 id="rate-limiting">Rate limiting and load shedding <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Rate limiting</th><th>Load shedding</th></tr></thead>
+      <tbody>
+        <tr><td>Protects against</td><td>Individual callers using more than their share</td><td>Total load exceeding what you can serve</td></tr>
+        <tr><td>Decision based on</td><td>Who is calling (per key/tenant/IP)</td><td>Current system health — queue depth, latency, CPU</td></tr>
+        <tr><td>Response</td><td>429 with <code>Retry-After</code></td><td>503, or degrade to a cheaper response</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Four common algorithms, in increasing sophistication:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Algorithm</th><th>How it works</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td>Fixed window</td><td>N requests per calendar minute</td><td>Simple, but allows a 2N burst across a window boundary</td></tr>
+        <tr><td>Sliding window</td><td>N requests in the trailing 60 seconds</td><td>Smoother; more state to track</td></tr>
+        <tr><td>Token bucket</td><td>Tokens refill at a steady rate; each request spends one</td><td>Allows controlled bursts. Usually the best default</td></tr>
+        <tr><td>Concurrency limit</td><td>At most N in flight at once</td><td>Protects resources rather than rate — good for expensive operations</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Best practice</div>
+    <p style="margin:0">Always return <code>Retry-After</code> with a 429. Without it, well-behaved clients
+      guess — and usually retry too fast, which keeps you overloaded.
+      <br><br>
+      And rate limit <em>per tenant or API key</em>, not just globally. A global limit means one heavy user
+      can consume everyone's quota, which is exactly the noisy-neighbour problem.</p>
+  </div>
+
+  <h2 id="fallback">Fallback and graceful degradation <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="oneline"><b>One line:</b> when something fails, serve something useful instead of an error.</div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Fallback</th><th>Good for</th><th>Danger</th></tr></thead>
+      <tbody>
+        <tr><td>Cached/stale data</td><td>Product catalogue, config, reference data</td><td>Users see outdated information — must be acceptable</td></tr>
+        <tr><td>Default value</td><td>Recommendations, personalisation, optional widgets</td><td>Silently degraded experience nobody notices is broken</td></tr>
+        <tr><td>Queue for later</td><td>Anything that doesn't need an immediate answer</td><td>Needs a way to report eventual failure</td></tr>
+        <tr><td>Reduced functionality</td><td>Read-only mode when writes fail</td><td>Must be explicitly communicated to the user</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — the silent fallback</div>
+    <p style="margin:0">A fallback that hides a failure is a trap. If pricing falls back to a cached value and
+      nobody is alerted, you can serve stale prices for days.
+      <br><br>
+      <strong>Every fallback must emit a metric and alert on sustained use.</strong> Falling back is fine;
+      falling back <em>unnoticed</em> is not.
+      <br><br>
+      And never fall back to a default for something safety-critical. "Couldn't check permissions, so I'll
+      allow it" is how breaches happen — fail <em>closed</em> for anything security-related.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Timeouts first. They're the pattern that prevents the cascade, and the most often missing.</li>
+      <li>Retry only transient failures, only idempotent operations, always with jitter and a cap.</li>
+      <li>Retries multiply load — pair them with a circuit breaker or you amplify the outage.</li>
+      <li>Circuit breakers need a minimum throughput, or quiet periods trip them spuriously.</li>
+      <li>Bulkheads stop one bad dependency consuming everything. Separate pools, not just limits.</li>
+      <li>Every fallback needs a metric. Silent degradation is worse than failure.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No timeout at all</strong>, or a default so long it's effectively none.</li>
+    <li><strong>Retrying non-idempotent operations</strong>, causing duplicate charges or duplicate orders.</li>
+    <li><strong>Retrying 4xx responses</strong> — the answer won't change, so it's pure extra load.</li>
+    <li><strong>Fixed-delay retries with no jitter</strong>, so all clients hammer in lockstep.</li>
+    <li><strong>A circuit breaker with no minimum throughput</strong>, tripping on two failures at 3am.</li>
+    <li><strong>Total retry time exceeding the caller's timeout</strong>, so all the work is wasted.</li>
+    <li><strong>Fallbacks with no alerting</strong>, so degraded mode becomes permanent and invisible.</li>
+    <li><strong>Resilience only on HTTP calls</strong>, leaving database commands and message locks unbounded.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>Explain the circuit breaker pattern. When would it hurt you? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It tracks failures to a dependency, and once they cross a threshold it stops making calls
+          entirely — failing immediately instead of waiting. After a break period it lets one trial call
+          through: succeed and it closes, fail and it opens again. That's the closed, open, half-open cycle."</p>
+        <p>"It helps both sides. I stop holding threads waiting on something that's clearly broken, so I can
+          fail fast or serve a fallback. And the dependency gets room to recover instead of being hammered
+          while it's restarting — which matters, because a service coming back up under full load often just
+          falls over again."</p>
+        <p>"Where it hurts is misconfiguration, and I've seen both directions."</p>
+        <p>"<strong>Too sensitive:</strong> if there's no minimum throughput requirement, two failures during
+          a quiet period is 100% failure rate, and you've taken out a perfectly healthy dependency. So the
+          breaker needs a meaningful sample — something like 50% failures over at least 20 calls in 30
+          seconds."</p>
+        <p>"<strong>Wrong scope:</strong> a breaker on the whole client means one bad endpoint opens the
+          circuit for all of them. If a service has one slow reporting endpoint and nine fast ones, breaking
+          all ten is over-reacting."</p>
+        <p>"And the one people miss: <strong>a breaker without a fallback just converts a slow failure into a
+          fast failure.</strong> That's still better — you're not exhausting threads — but the user still gets
+          an error. The value really lands when you pair it with something useful: cached data, a default, or
+          a degraded experience."</p>
+        <p>"I'd also make sure the breaker state is visible in telemetry. An open circuit is an incident
+          signal, and if nobody can see it you'll be debugging 'the API is fast but returning errors' without
+          the obvious clue."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know all three states and what half-open is for?</li>
+        <li>Can you name real misconfigurations?</li>
+        <li>Do you connect it to fallbacks and observability?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> describing only open and closed.</li>
+        <li><span class="redflag">Red flag:</span> no mention of thresholds or minimum throughput.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do retry and circuit breaker interact? Which wraps which?</li>
+          <li>What do you return while the circuit is open?</li>
+          <li>How would you test this?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your service calls a payment API. It starts timing out. Walk me through what happens and how you'd protect against it.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Without protection, the failure mode is a cascade. Requests to the payment API stop returning but
+          don't fail either — they wait. Each one holds a thread and a connection. New requests keep arriving,
+          threads accumulate, and eventually the thread pool or connection pool is exhausted."</p>
+        <p>"At that point <em>every</em> endpoint starts failing, including ones that never touch payments.
+          That's the part people miss — the visible symptom is 'the whole API is down', which is several steps
+          away from the actual cause."</p>
+        <p>"To protect against it, in order of importance:"</p>
+        <p>"<strong>Timeout</strong> first, set from the payment API's p99 — maybe 3 seconds. That alone stops
+          the cascade, because threads are released instead of accumulating. It's the highest-value thing and
+          it's what's usually missing."</p>
+        <p>"<strong>Bulkhead</strong> second: cap concurrent calls to payments at some number well below my
+          total capacity. Even if every one of those hangs for the full timeout, the rest of the service keeps
+          serving."</p>
+        <p>"<strong>Circuit breaker</strong> third, so once it's clearly broken I stop trying and fail fast,
+          and give it room to recover."</p>
+        <p>"<strong>Retry</strong> — but carefully, because payments are the case where retry is dangerous. A
+          timeout means I don't know whether the charge went through. So retrying needs an idempotency key
+          that the provider honours; otherwise I risk double-charging a customer, which is far worse than
+          failing the request."</p>
+        <p>"For the user experience, I'd rather return a clear 'payment is being processed, we'll confirm
+          shortly' than a 500 — which means the order goes into a pending state and reconciles against the
+          provider later. That's more work, but for payments it's the honest design."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you trace the cascade mechanism, not just name patterns?</li>
+        <li>Do you get that timeout is the critical one?</li>
+        <li>Do you recognise the "did it actually succeed?" ambiguity in payments?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add retries" as the first answer — that makes it worse.</li>
+        <li><span class="redflag">Red flag:</span> no mention of thread/connection pool exhaustion.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you know whether the payment actually went through after a timeout?</li>
+          <li>What would you monitor to catch this earlier?</li>
+          <li>How do you test this behaviour before it happens in production?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do retries make an outage worse?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They multiply load on a system that's already struggling — which is the exact opposite of what
+          it needs."</p>
+        <p>"If every client retries three times, a service that's failing sees 4× its normal traffic. And
+          because retries usually come with fixed delays, they arrive in synchronised waves — every client
+          retrying at the same instant, recreating the spike."</p>
+        <p>"It compounds across layers too. If service A retries calls to B, and B retries calls to C, then C
+          sees up to 16× the original load. A brief blip in C becomes a sustained outage, and it's entirely
+          self-inflicted."</p>
+        <p>"There's also a subtle version: retry after a <em>timeout</em>. The original request may still be
+          running server-side, so now the server is processing two copies of the same work while you wait on
+          the second one. You've doubled the load per logical request without gaining anything."</p>
+        <p>"The mitigations are: jitter, so retries spread out instead of synchronising. A hard cap on
+          attempts — three is usually plenty; if three didn't work, a fourth won't. A circuit breaker, so
+          once the dependency is clearly down we stop retrying entirely. And only retrying genuinely
+          transient failures — retrying a 400 is pure waste."</p>
+        <p>"The other side of it is that the receiving service should protect itself rather than trusting
+          callers to behave. Rate limiting per client and load shedding when overloaded — returning 429 with
+          <code>Retry-After</code> — is what actually stops a badly-behaved client from taking you down."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand retry amplification and how it compounds across layers?</li>
+        <li>Do you know jitter's purpose specifically?</li>
+        <li>Do you think about defending from the receiving side too?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's a retry budget?</li>
+          <li>How do you retry safely when you can't tell whether the first attempt succeeded?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

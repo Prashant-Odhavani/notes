@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LINQ Performance &amp; Providers — LINQ</title>
+<meta name="description" content="LINQ performance in practice: the N+1 problem, translation failures, client evaluation, allocation costs, and when to stop using LINQ.">
+<meta name="keywords" content="linq performance N+1 query client evaluation translation failure allocation closure allocation ef core provider AsNoTracking projection Any vs Count deferred execution">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="04-linq/performance.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>LINQ Performance &amp; Providers</h1>
+    <p class="subtitle">Where LINQ costs you real money: N+1 queries, work moving to the wrong machine,
+      and allocations in hot loops.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>N+1</strong> — one query for the list, then one more per item. The single most common
+        LINQ-related performance bug.</li>
+      <li><strong>Client evaluation</strong> — the provider can't translate part of your query, so it
+        fetches everything and filters in memory.</li>
+      <li>Project to <strong>only the columns you need</strong>. <code>Select</code> into a DTO beats
+        fetching whole entities.</li>
+      <li>Use <code>AsNoTracking</code> for read-only queries — EF stops building change-tracking state.</li>
+      <li>In hot loops, each LINQ operator allocates an enumerator and each lambda may allocate a closure.
+        A <code>for</code> loop can be genuinely faster.</li>
+      <li>Order matters: filter (<code>Where</code>) <em>before</em> you sort or project, so less data
+        moves through the pipeline.</li>
+    </ul>
+  </div>
+
+  <h2 id="n-plus-one">The N+1 problem <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>You run one query to get a list, then accidentally run another query <strong>for every item</strong>
+      in that list.</p>
+    <p>100 orders becomes 101 database round trips.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>You've got a shopping list with 50 items, and you drive to the shop and back <strong>once per
+      item</strong>.</p>
+    <p>Each trip is fast. Fifty trips is your afternoon gone. The fix isn't a faster car — it's one trip.</p>
+  </div>
+
+  <pre data-label="csharp — 1 + 100 queries" class="code-bad"><code class="language-csharp">var orders = await db.Orders.Take(100).ToListAsync();      // 1 query
+
+foreach (var order in orders)
+{
+    // Lazy loading: each access hits the database again
+    Console.WriteLine(order.Customer.Name);                 // 100 more queries
+}</code></pre>
+
+  <pre data-label="csharp — 1 query, with a join" class="code-good"><code class="language-csharp">var orders = await db.Orders
+    .Include(o =&gt; o.Customer)          // JOIN - fetched together
+    .Take(100)
+    .ToListAsync();</code></pre>
+
+  <pre data-label="csharp — better still: only the columns you actually use" class="code-good"><code class="language-csharp">var summaries = await db.Orders
+    .Take(100)
+    .Select(o =&gt; new OrderSummary(o.Id, o.Customer.Name, o.Total))
+    .ToListAsync();</code></pre>
+
+  <p>The third version generates a single query selecting three columns. No entity materialisation, no
+    change tracking, no over-fetching.</p>
+
+  <div class="note danger">
+    <div class="note-title">The N+1 that hides in a projection</div>
+    <p style="margin:0">This is the version people miss. It looks like a projection, but the inner
+      <code>ToList()</code> forces a separate query per order:</p>
+    <pre data-label="csharp — one query per order" class="code-bad"><code class="language-csharp">var result = orders.Select(o =&gt; new
+{
+    o.Id,
+    Lines = db.OrderLines.Where(l =&gt; l.OrderId == o.Id).ToList()   // N queries
+});</code></pre>
+    <p style="margin:0">If <code>orders</code> is already a materialised list, EF has no way to combine
+      these. Use <code>Include</code> on the original query, or a single grouped query, or EF Core's
+      <code>AsSplitQuery()</code> which does <em>two</em> queries deliberately rather than N.</p>
+  </div>
+
+  <h3 id="detecting-n1">How to detect it</h3>
+
+  <ol class="steps">
+    <li><strong>Log the SQL.</strong> In EF Core, <code>LogTo(Console.WriteLine)</code> in development. If
+      you see the same query shape repeating, that's N+1.</li>
+    <li><strong>Count queries per request</strong> in telemetry. Application Insights shows dependency
+      counts — a request making 200 SQL calls is obvious once you look.</li>
+    <li><strong>Watch for it in review.</strong> Any navigation-property access inside a loop over
+      materialised entities is suspect.</li>
+  </ol>
+
+  <h2 id="client-evaluation">Client evaluation and translation failures <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>EF can only translate the C# it understands. If your <code>Where</code> calls something it can't turn
+      into SQL, it can't push the filter to the database.</p>
+  </div>
+
+  <pre data-label="csharp — EF cannot translate a custom method" class="code-bad"><code class="language-csharp">// IsEligible() is your own C# method. There is no SQL equivalent.
+var eligible = await db.Customers
+    .Where(c =&gt; IsEligible(c))       // EF Core 3.0+: throws InvalidOperationException
+    .ToListAsync();</code></pre>
+
+  <div class="note info">
+    <div class="note-title">This behaviour changed — and the change was good</div>
+    <p style="margin:0"><strong>Before EF Core 3.0</strong>, EF would silently give up, fetch the entire
+      table, and run your method in memory. Queries worked in development with 50 rows and collapsed in
+      production with 5 million.
+      <br><br>
+      <strong>From EF Core 3.0</strong>, it throws instead. That's a much better default: a loud failure at
+      development time beats a silent one at 3am. If you genuinely want client evaluation, you now have to
+      ask for it with <code>AsEnumerable()</code>, which makes the intent visible in code review.</p>
+  </div>
+
+  <p><strong>Three ways to fix it:</strong></p>
+
+  <pre data-label="csharp — option 1: express the rule in translatable LINQ" class="code-good"><code class="language-csharp">var eligible = await db.Customers
+    .Where(c =&gt; c.IsActive &amp;&amp; c.CreditScore &gt; 600)     // becomes a WHERE clause
+    .ToListAsync();</code></pre>
+
+  <pre data-label="csharp — option 2: a reusable expression" class="code-good"><code class="language-csharp">// An Expression can be translated; a Func cannot.
+public static Expression&lt;Func&lt;Customer, bool&gt;&gt; IsEligible() =&gt;
+    c =&gt; c.IsActive &amp;&amp; c.CreditScore &gt; 600;
+
+var eligible = await db.Customers.Where(IsEligible()).ToListAsync();</code></pre>
+
+  <pre data-label="csharp — option 3: filter in SQL first, then in memory" class="code-good"><code class="language-csharp">var eligible = (await db.Customers
+        .Where(c =&gt; c.IsActive)        // cheap filter in SQL - cuts it to a small set
+        .ToListAsync())
+    .Where(c =&gt; ComplexRule(c))        // expensive C# rule on the small set
+    .ToList();</code></pre>
+
+  <p>Option 2 is the interesting one for interviews: it's the difference between
+    <code>Func&lt;T, bool&gt;</code> and <code>Expression&lt;Func&lt;T, bool&gt;&gt;</code>, and it's the
+    basis of the <a href="../18-design-patterns/enterprise.html#specification">Specification pattern</a>.</p>
+
+  <h2 id="over-fetching">Over-fetching <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>The most common EF performance problem after N+1, and the easiest to fix.</p>
+
+  <pre data-label="csharp — fetches every column of every row, tracked" class="code-bad"><code class="language-csharp">// Order has 30 columns including a large Notes field.
+// You need two of them.
+var list = await db.Orders.ToListAsync();
+var names = list.Select(o =&gt; new { o.Id, o.Total });</code></pre>
+
+  <pre data-label="csharp — SELECT Id, Total" class="code-good"><code class="language-csharp">var names = await db.Orders
+    .Select(o =&gt; new { o.Id, o.Total })      // projection happens in SQL
+    .ToListAsync();</code></pre>
+
+  <p>Projecting early does three things at once: less data over the wire, no entity objects allocated, and
+    EF skips change tracking because there's no entity to track.</p>
+
+  <h3 id="asnotracking"><code>AsNoTracking</code></h3>
+
+  <pre data-label="csharp — for read-only queries"><code class="language-csharp">var orders = await db.Orders
+    .AsNoTracking()                 // don't build change-tracking snapshots
+    .Where(o =&gt; o.Total &gt; 1000)
+    .ToListAsync();</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>By default EF keeps a snapshot of every entity it loads, so it can work out what changed when you
+      call <code>SaveChanges</code>.</p>
+    <p>If you're only reading, that snapshot is wasted work and wasted memory. <code>AsNoTracking</code>
+      skips it.</p>
+  </div>
+
+  <p>It matters most on large result sets — the tracking cost scales with the number of entities. For a
+    single-entity lookup you'll never notice.</p>
+
+  <div class="note warn">
+    <div class="note-title">Don't use it if you intend to update</div>
+    <p style="margin:0">An untracked entity isn't known to the context, so modifying it and calling
+      <code>SaveChanges</code> does nothing. You'd have to attach it explicitly — at which point you may as
+      well have tracked it.
+      <br><br>
+      Note that <strong>projections are untracked automatically</strong>. If you
+      <code>Select</code> into a DTO, there's nothing to track, so <code>AsNoTracking</code> is redundant.</p>
+  </div>
+
+  <h2 id="ordering">Operator order matters <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — sorts everything, then throws most of it away" class="code-bad"><code class="language-csharp">var top = orders
+    .OrderByDescending(o =&gt; o.Total)      // sorts all 1,000,000
+    .Where(o =&gt; o.Status == Status.Paid)  // then filters
+    .Take(10);</code></pre>
+
+  <pre data-label="csharp — filter first, sort a smaller set" class="code-good"><code class="language-csharp">var top = orders
+    .Where(o =&gt; o.Status == Status.Paid)  // cut it down first
+    .OrderByDescending(o =&gt; o.Total)
+    .Take(10);</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Filter, then sort, then project, then page.</strong></p>
+    <p>Every operator processes whatever the previous one gave it — so shrink the data as early as possible.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The exception: <code>IQueryable</code></div>
+    <p style="margin:0">Against a database, order matters much less, because EF builds one SQL statement and
+      the <strong>query optimiser</strong> decides the actual execution order. Filtering before sorting is
+      still good practice for readability and portability, but it isn't the performance cliff it is in
+      memory.
+      <br><br>
+      In-memory LINQ has no optimiser. Every operator runs exactly as written.</p>
+  </div>
+
+  <h2 id="allocations">Allocation costs in hot paths <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <p>LINQ is not free. Each operator in a chain allocates an enumerator object, and each lambda that
+    captures a variable allocates a closure.</p>
+
+  <pre data-label="csharp — allocates per call: closure + 2 enumerators" class="code-bad"><code class="language-csharp">// Called millions of times in a tight loop
+public int SumMatching(int[] values, int threshold) =&gt;
+    values.Where(v =&gt; v &gt; threshold).Sum();     // 'threshold' is captured -&gt; closure</code></pre>
+
+  <pre data-label="csharp — zero allocations" class="code-good"><code class="language-csharp">public int SumMatching(int[] values, int threshold)
+{
+    var sum = 0;
+    for (var i = 0; i &lt; values.Length; i++)
+        if (values[i] &gt; threshold) sum += values[i];
+    return sum;
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Keep this in proportion</div>
+    <p style="margin:0">This matters in a <strong>hot loop</strong> — millions of iterations, or a
+      per-request path in a high-throughput service. It does not matter in a controller action that runs
+      100 times a second.
+      <br><br>
+      LINQ's readability is worth real allocations almost everywhere. Rewrite as a loop when a
+      <strong>profiler</strong> tells you to, not on suspicion. Saying that in an interview is a better
+      answer than "LINQ is slow, avoid it".</p>
+  </div>
+
+  <h3 id="cheap-wins">Cheap wins that don't hurt readability</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Instead of</th><th>Use</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.Count() &gt; 0</code></td><td><code>list.Count &gt; 0</code></td><td>The property is O(1); the method sets up an enumerator</td></tr>
+        <tr><td><code>db.X.Count(...) &gt; 0</code></td><td><code>db.X.AnyAsync(...)</code></td><td><code>EXISTS</code> stops at the first row instead of counting all</td></tr>
+        <tr><td><code>.Where(x =&gt; ...).First()</code></td><td><code>.First(x =&gt; ...)</code></td><td>One operator instead of two — one fewer enumerator</td></tr>
+        <tr><td><code>.OrderBy(...).First()</code></td><td><code>.MinBy(...)</code></td><td>Single pass instead of a full sort (.NET 6+)</td></tr>
+        <tr><td><code>.ToList().Count</code></td><td><code>.Count()</code></td><td>Don't materialise a list just to count it</td></tr>
+        <tr><td>Repeated <code>Contains</code> on a list</td><td>Build a <code>HashSet</code> once</td><td>O(1) lookup instead of O(n) per check</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>N+1 is the big one. Look for navigation access inside a loop, and log your SQL in development.</li>
+      <li><code>Include</code> fixes N+1; a projection is usually better still.</li>
+      <li>EF Core 3.0+ throws on untranslatable queries instead of silently fetching everything. That's a
+        feature.</li>
+      <li><code>Expression&lt;Func&lt;&gt;&gt;</code> can be translated; <code>Func&lt;&gt;</code> cannot.</li>
+      <li>Project to the columns you need. <code>AsNoTracking</code> for read-only entity queries.</li>
+      <li>Filter before sorting in memory. Against SQL, the optimiser handles it.</li>
+      <li>LINQ allocates. Rewrite as a loop only when a profiler says so.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Navigation property access inside a loop</strong> — the textbook N+1.</li>
+    <li><strong><code>.ToList()</code> before filtering</strong>, moving the whole table into memory.</li>
+    <li><strong>Fetching whole entities for a read-only list view</strong> instead of projecting.</li>
+    <li><strong><code>AsNoTracking</code> then trying to save</strong> — the update silently does nothing.</li>
+    <li><strong>Sorting before filtering</strong> on a large in-memory collection.</li>
+    <li><strong><code>Contains</code> on a large list inside a loop</strong> — O(n²). Use a
+      <code>HashSet</code>.</li>
+    <li><strong>Assuming LINQ is always fine</strong> in a hot path — and equally, avoiding it everywhere
+      "for performance" without measuring.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What is the N+1 problem, and how do you find and fix it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It's when you run one query to fetch a list and then, without meaning to, one more query for
+          each item in that list. Fetch 100 orders and touch <code>order.Customer.Name</code> in a loop and
+          you've made 101 round trips."</p>
+        <p>"Each individual query is fast, which is why it hides in development with 20 rows and then falls
+          over in production. The cost is dominated by round-trip latency, not by the queries themselves."</p>
+        <p>"To find it, I'd log the generated SQL — in EF Core that's <code>LogTo</code> in development. The
+          signature is obvious once you look: the same query shape repeating with a different parameter.
+          In production I'd look at dependency counts per request in Application Insights; a request making
+          200 SQL calls stands out immediately."</p>
+        <p>"To fix it, <code>Include</code> is the direct answer — it turns the related data into a join so
+          it comes back with the original query. But usually I'd prefer a <strong>projection</strong>:
+          <code>Select</code> into a DTO with just the fields I need. That's one query, only the columns I
+          use, no entity materialisation, and no change tracking."</p>
+        <p>"One caveat with <code>Include</code>: if you include several collections, you get a cartesian
+          product — the row count multiplies and you transfer far more data than you need. EF Core's
+          <code>AsSplitQuery()</code> handles that by issuing one query per collection instead. So it's two
+          or three queries by design rather than N by accident."</p>
+        <p>"Prevention-wise, I'd disable lazy loading. Lazy loading is what makes N+1 <em>invisible</em> —
+          the code looks like a property access. With it off, you have to be explicit about what you're
+          loading, and the problem stops happening silently."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the mechanism, not just the name?</li>
+        <li>Can you say how you'd <em>detect</em> it, not just fix it?</li>
+        <li>Bonus: cartesian explosion and lazy loading as the root cause.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "use <code>Include</code>" with no mention of detection or projections.</li>
+        <li><span class="redflag">Red flag:</span> not knowing it's about round trips rather than query cost.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the downside of <code>Include</code> on two collections?</li>
+          <li>Should lazy loading ever be enabled?</li>
+          <li>How would you catch this in CI rather than in production?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Is LINQ slower than a <code>for</code> loop? Does it matter?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"For in-memory collections, yes — measurably. Each operator in a chain allocates an enumerator,
+          each element goes through at least one delegate call, and a lambda that captures a local allocates
+          a closure object. A hand-written loop does none of that."</p>
+        <p>"Whether it matters depends entirely on where the code sits. In a request handler that runs a few
+          hundred times a second over a list of twenty items, the difference is unmeasurable and I'd take
+          the readability every time. In a loop running millions of iterations, or a per-element path in a
+          high-throughput pipeline, it shows up clearly in a profiler and I'd rewrite it."</p>
+        <p>"So my position is: write LINQ by default, and optimise where a profiler points. I wouldn't
+          pre-emptively write loops everywhere — that's trading a large readability cost across the whole
+          codebase for a saving in the 1% of it that's hot."</p>
+        <p>"There are also cheap wins that cost no readability. Using <code>.Count</code> the property
+          rather than <code>.Count()</code> the method on a list. <code>First(predicate)</code> rather than
+          <code>Where(...).First()</code>. <code>MinBy</code> rather than sorting to take one item.
+          Building a <code>HashSet</code> once instead of calling <code>Contains</code> on a list inside a
+          loop — that last one turns an O(n²) into O(n), which is an algorithmic fix, not a micro-optimisation."</p>
+        <p>"And I'd separate this from <code>IQueryable</code> entirely. There, the performance question
+          isn't allocation — it's whether the work happens in the database or in my process, and that's
+          orders of magnitude more important than enumerator overhead."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the actual mechanism of the overhead?</li>
+        <li>Do you keep it proportionate rather than cargo-culting?</li>
+        <li>Do you distinguish micro-optimisation from algorithmic improvement?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "LINQ is slow, avoid it" — dogma.</li>
+        <li><span class="redflag">Red flag:</span> "it makes no difference" — it does; you just usually don't care.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where does the closure allocation come from exactly?</li>
+          <li>How would you benchmark this properly?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your EF query throws "could not be translated". What's happening and what do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It means EF walked my expression tree and hit something it can't turn into SQL — usually a call
+          to one of my own methods, or a .NET API with no SQL equivalent."</p>
+        <p>"The important context is that this used to <em>not</em> throw. Before EF Core 3.0, EF would
+          silently fetch the whole table and evaluate that part in memory. So the query worked fine in
+          development against a small dataset and then became a full table scan in production. Throwing
+          instead was a deliberate breaking change, and a good one — I'd much rather find out at development
+          time."</p>
+        <p>"To fix it I'd look at what can't be translated. Usually the rule can be expressed directly in
+          LINQ that EF understands — comparisons, string methods it maps, arithmetic. That's the best
+          outcome because the filter stays in the database."</p>
+        <p>"If I want the rule reusable, I'd write it as an <code>Expression&lt;Func&lt;T, bool&gt;&gt;</code>
+          rather than a method returning <code>bool</code>. An expression can be composed into the query
+          tree and translated; a compiled delegate can't. That distinction is exactly the basis of the
+          Specification pattern."</p>
+        <p>"If the logic genuinely can't be translated — something involving an external service, or complex
+          C# — then I'd do it in two stages: push whatever cheap filters I can into SQL to reduce the set,
+          materialise that, then apply the expensive rule in memory. The key is that the SQL filter has to
+          cut the data down enough that the in-memory step is on a small set."</p>
+        <p>"What I'd avoid is reaching for <code>AsEnumerable()</code> as a reflex to make the error go
+          away. That silences the compiler and reintroduces the exact full-table-scan behaviour EF Core 3
+          was trying to prevent."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the EF Core 3.0 behaviour change and why it happened?</li>
+        <li>Do you know <code>Expression</code> vs <code>Func</code> is the lever?</li>
+        <li>Do you recognise <code>AsEnumerable()</code> as papering over it?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you write a reusable, composable filter that EF can translate?</li>
+          <li>What can you do if you need a SQL function EF doesn't know about?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

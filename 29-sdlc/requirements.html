@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Requirements &amp; Analysis — SDLC</title>
+<meta name="description" content="Requirements for senior engineers: elicitation, functional vs non-functional, the NFR checklist, acceptance criteria, spotting ambiguity.">
+<meta name="keywords" content="requirements gathering elicitation functional non-functional requirements NFR acceptance criteria user stories INVEST given when then ambiguity SLA SLO scope creep">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="29-sdlc/requirements.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Requirements &amp; Analysis</h1>
+    <p class="subtitle">Where most project failures are actually created — and the habits that catch them
+      while they're still cheap.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>A requirement says <strong>what must be true</strong>, not how to build it. If it names a
+        technology, it's probably a design decision in disguise.</li>
+      <li>Functional = what the system does. Non-functional = how well. NFRs are the ones people skip, and
+        they dictate the architecture you can't change later.</li>
+      <li>Every requirement needs something <strong>observable</strong>. "Fast" isn't a requirement.
+        "p95 under 400ms at 500 rps" is.</li>
+      <li>The most valuable question is <em>why</em> — usually asked three times.</li>
+      <li>Ambiguity has tells: "etc.", "and/or", "user-friendly", "handle", "support", passive voice with no
+        actor.</li>
+      <li>Write down assumptions. A written assumption is a risk someone can disprove in five minutes.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-requirements-fail">What actually goes wrong <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>Requirement defects are the most expensive kind, because they survive every downstream quality gate:</p>
+
+  <ul>
+    <li>Code review doesn't catch "we built the wrong thing".</li>
+    <li>Unit tests happily verify the wrong behaviour.</li>
+    <li>QA usually tests against the same misunderstood spec.</li>
+  </ul>
+
+  <p>So it surfaces when a real user touches it — the most expensive moment possible.</p>
+
+  <p><strong>Four failure modes cover most of it:</strong></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Failure</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td>Missing requirement</td><td>Nobody said what happens when the payment provider times out, so the code does whatever it happens to do</td></tr>
+        <tr><td>Ambiguous requirement</td><td>"Show recent orders" — three people, three definitions of recent</td></tr>
+        <tr><td>Solution stated as requirement</td><td>"Add a Redis cache" instead of "product page loads in under 500ms" — which forecloses cheaper options like fixing the query</td></tr>
+        <tr><td>Unstated NFR</td><td>Everyone assumed 10,000 records. It's now 4 million and the design can't survive it</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="requirement-types">Types of requirement <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Answers</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td>Business</td><td>Why are we doing this at all?</td><td>Cut support contacts about failed exports by 50% this quarter</td></tr>
+        <tr><td>User</td><td>What does a person need to do?</td><td>An admin needs to see why an export failed without contacting support</td></tr>
+        <tr><td>Functional</td><td>What must the system do?</td><td>The export detail view shows failure reason, timestamp and retry history</td></tr>
+        <tr><td>Non-functional</td><td>How well, under what conditions?</td><td>Loads in under 1s at p95 for exports up to 10,000 rows</td></tr>
+        <tr><td>Constraint</td><td>What's fixed?</td><td>Must run in the existing App Service plan; no new Azure resources</td></tr>
+        <tr><td>Assumption</td><td>What are we treating as true?</td><td>Failure reasons already exist in the logs and can be persisted cheaply</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Best practice</div>
+    <p style="margin:0">Write assumptions down explicitly in the ticket. A documented assumption becomes a
+      testable risk someone can invalidate in five minutes. An assumption in your head becomes a late
+      surprise. In interviews, stating assumptions out loud is one of the cheapest ways to look senior.</p>
+  </div>
+
+  <h2 id="elicitation">Getting requirements out of people <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>People are bad at describing what they want in the abstract, and excellent at reacting to something
+      concrete.</p>
+    <p>That one fact drives which technique you pick.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>Best for</th><th>Weakness</th></tr></thead>
+      <tbody>
+        <tr><td>Interviews</td><td>Motivation and constraints — the "why"</td><td>People describe the process they wish they had, not the one they use</td></tr>
+        <tr><td>Observation / shadowing</td><td>Finding the spreadsheets and copy-paste steps nobody mentions</td><td>Time-expensive</td></tr>
+        <tr><td>Prototype or mockup</td><td>Turning vague preferences into decisions fast</td><td>Gets mistaken for a nearly-finished product</td></tr>
+        <tr><td>Existing data analysis</td><td>Replacing opinion with fact: real volumes, real error rates</td><td>Only shows behaviour the current system allows</td></tr>
+        <tr><td>Support tickets</td><td>Real pain, ranked by frequency and cost</td><td>Biased toward vocal users</td></tr>
+        <tr><td>Event storming / workshops</td><td>Cross-team domain understanding and terminology</td><td>Needs the right people in the room</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="questions-to-ask">The questions that find hidden requirements</h3>
+
+  <p>Keep this as a standing checklist. These consistently surface what nobody wrote down:</p>
+
+  <ul>
+    <li><strong>Volume and growth.</strong> How many today, how many in two years, what's the peak vs the
+      average? (A 10:1 peak-to-average ratio changes the architecture.)</li>
+    <li><strong>Failure behaviour.</strong> When the downstream system is down — fail, queue, degrade, or
+      serve stale? Who decides?</li>
+    <li><strong>Concurrency.</strong> Can two people act on the same thing at once, and what should win?
+      This one question prevents a whole category of production bug.</li>
+    <li><strong>Data lifecycle.</strong> Who can see it, how long do we keep it, must it be deletable on
+      request, does it cross a regional boundary?</li>
+    <li><strong>Correctness tolerance.</strong> Must this be immediately consistent, or is a few seconds of
+      staleness fine? This determines whether you can use caching, replicas or async messaging at all —
+      see <a href="../19-architecture/distributed-data.html">consistency</a>.</li>
+    <li><strong>Reversibility.</strong> If this is wrong, how do we undo it?</li>
+    <li><strong>Definition of success.</strong> What measurement in three months tells us it was worth
+      building?</li>
+  </ul>
+
+  <h2 id="functional-vs-nfr">Functional vs non-functional <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>Very common interview question. The weak answer is a definition. The strong answer explains
+    <strong>why the distinction matters</strong>:</p>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>A missing functional requirement usually costs you a feature. A missing non-functional one often
+      costs you the <strong>architecture</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Functional</th><th>Non-functional</th></tr></thead>
+      <tbody>
+        <tr><td>Describes</td><td>What the system does</td><td>How well, under what conditions</td></tr>
+        <tr><td>Verified by</td><td>Feature and acceptance tests</td><td>Load tests, chaos tests, security review, audits</td></tr>
+        <tr><td>Cost of adding late</td><td>Usually linear — build the feature</td><td>Often architectural — may need a redesign</td></tr>
+        <tr><td>Owned by</td><td>Product, with engineering input</td><td>Engineering, often <em>only</em> if engineering raises it</td></tr>
+        <tr><td>Example</td><td>User can export orders to CSV</td><td>1M rows in under 5 min without hurting API latency</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Concretely: if nobody says the export must handle a million rows, you write it synchronously in a
+    request handler. Finding out later means moving to a background worker, adding storage, changing the API
+    contract and re-testing everything.</p>
+
+  <h3 id="nfr-checklist">The NFR checklist <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <p>Run this against any feature — in real work or in a design interview. Each line should end with a
+    number, not an adjective.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Category</th><th>Ask</th><th>Turned into something testable</th></tr></thead>
+      <tbody>
+        <tr><td>Performance</td><td>Latency at which percentile, at what load?</td><td>p95 &lt; 400ms, p99 &lt; 1s at 500 rps sustained</td></tr>
+        <tr><td>Throughput</td><td>How many per second/day, peak vs average?</td><td>2M events/day, peak 900/s for 20 min at 09:00 UTC</td></tr>
+        <tr><td>Availability</td><td>What uptime, measured how, over what window?</td><td>99.9% monthly on checkout, excluding scheduled maintenance</td></tr>
+        <tr><td>Scalability</td><td>What grows, and by how much?</td><td>Tenants grow 5× in 18 months; largest tenant is 40% of volume</td></tr>
+        <tr><td>Durability</td><td>How much data may we lose in a disaster?</td><td>RPO 5 minutes, RTO 1 hour</td></tr>
+        <tr><td>Security</td><td>Who may see and do what?</td><td>PII encrypted at rest; admin actions require re-auth</td></tr>
+        <tr><td>Compliance</td><td>Which regime, and what does it force?</td><td>GDPR erasure within 30 days; EU data stays in EU regions</td></tr>
+        <tr><td>Observability</td><td>How will we debug this at 2am?</td><td>Correlation ID end to end; failure reason on a dashboard, not just logs</td></tr>
+        <tr><td>Cost</td><td>What's the budget per unit of work?</td><td>Under $0.002 per processed document at 1M/month</td></tr>
+        <tr><td>Accessibility</td><td>Which standard?</td><td>WCAG 2.1 AA on customer-facing screens</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Stating availability without saying what "down" means. 99.9% sounds precise but it's
+      43 minutes a month — and if you measure it as "the health endpoint returned 200", you can be fully
+      compliant while every customer request fails. Tie availability to something users care about:
+      successful checkouts, not pings.</p>
+  </div>
+
+  <h2 id="writing-requirements">Writing requirements that survive contact with code <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>User stories are a format for a conversation. The value is in the acceptance criteria attached to them.</p>
+
+  <pre data-label="a story with useful acceptance criteria" class="code-good"><code class="language-text" data-nohl>As a tenant administrator
+I want to see why an export failed
+So that I can fix the input data without raising a support ticket
+
+Acceptance criteria
+  1. Given an export in state Failed
+     When the admin opens the detail view
+     Then the failure reason, timestamp and row number are displayed.
+
+  2. Given a failure with no user-actionable cause
+     When the detail view is opened
+     Then a generic message and a support reference ID are shown -
+     no stack trace, no internal identifiers.
+
+  3. Given an export with 10,000 rows
+     When the detail view is opened
+     Then it renders within 1 second at p95.
+
+  4. Failure reasons are retained for 90 days, then purged with the export.
+
+Out of scope
+  - Retrying the export from this screen (separate story).
+  - Bulk failure reporting.</code></pre>
+
+  <p>Three things make this useful rather than ceremonial:</p>
+
+  <ol class="steps">
+    <li>It states the <strong>error path</strong>, including the security decision not to leak internals.</li>
+    <li>It carries a <strong>non-functional criterion with a number</strong>.</li>
+    <li>It declares what's <strong>out of scope</strong> — which is how you stop the story quietly doubling
+      during development.</li>
+  </ol>
+
+  <h3 id="invest">INVEST — use it as a review checklist</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Letter</th><th>Means</th><th>Smell if violated</th></tr></thead>
+      <tbody>
+        <tr><td>Independent</td><td>Buildable without another story landing first</td><td>Stories that must ship as a batch</td></tr>
+        <tr><td>Negotiable</td><td>Describes need, not implementation</td><td>Story dictates table names and class structure</td></tr>
+        <tr><td>Valuable</td><td>Delivers something observable to someone</td><td>"Create the DAO layer" — that's a task</td></tr>
+        <tr><td>Estimable</td><td>The team can size it</td><td>Can't estimate ⇒ unknown work ⇒ needs a spike</td></tr>
+        <tr><td>Small</td><td>Fits comfortably in one iteration</td><td>Carried over sprint after sprint</td></tr>
+        <tr><td>Testable</td><td>Objective pass/fail</td><td>"System should be intuitive"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">"Small" means vertically sliced</div>
+    <p style="margin:0">A thin path through UI, API, domain and storage that a user can actually exercise.
+      Horizontal slices ("build all the entities", "build all the endpoints") give you weeks of work with
+      nothing demonstrable, and pile up all the integration risk at the end — exactly where you least want it.</p>
+  </div>
+
+  <h2 id="ambiguity">Spotting ambiguity <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>Reading a spec and immediately naming the three things it doesn't say is one of the most visible senior
+    behaviours in an interview. These are the reliable tells:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tell</th><th>Example</th><th>The question it forces</th></tr></thead>
+      <tbody>
+        <tr><td>Unquantified adjective</td><td>"fast", "large", "recent", "scalable"</td><td>How fast, at which percentile, under what load?</td></tr>
+        <tr><td>Open-ended list</td><td>"CSV, XML, etc."</td><td>What exactly is in scope? "etc." isn't implementable</td></tr>
+        <tr><td>Passive voice, no actor</td><td>"the order is approved"</td><td>By whom? With what permission? What if they lack it?</td></tr>
+        <tr><td>and/or</td><td>"send email and/or SMS"</td><td>Which one, when, decided by what rule?</td></tr>
+        <tr><td>Vague verb</td><td>"handle", "support", "manage", "process"</td><td>What are the observable outputs and side effects?</td></tr>
+        <tr><td>No error path</td><td>Only the happy path described</td><td>What about timeout, duplicate, partial failure, invalid input?</td></tr>
+        <tr><td>Implicit uniqueness</td><td>"look up the customer by email"</td><td>Can two customers share an email? What if zero match?</td></tr>
+        <tr><td>Missing time semantics</td><td>"orders from today"</td><td>Whose timezone? Created or paid? Including in-flight?</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="analysis">Turning requirements into design input <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p>Three artefacts do most of the work:</p>
+
+  <p><strong>1. A domain glossary.</strong> Agree what a word means before you name a class after it. If
+    Sales say "account" meaning the company and Support say "account" meaning the login, you'll build that
+    confusion into your schema and live with it for years. (This is ubiquitous language — see
+    <a href="../19-architecture/ddd.html">DDD</a>.)</p>
+
+  <p><strong>2. State transitions.</strong> For anything with a lifecycle, write the states and the legal
+    moves between them. Most "impossible" production bugs are illegal transitions nobody enumerated:
+    cancelling a shipped order, refunding twice, activating a deleted tenant.</p>
+
+  <pre data-label="csharp — writing this down forces the conversation"><code class="language-csharp">public enum ExportState { Queued, Running, Completed, Failed, Cancelled }
+
+private static readonly Dictionary&lt;ExportState, ExportState[]&gt; Allowed = new()
+{
+    [ExportState.Queued]    = [ExportState.Running, ExportState.Cancelled],
+    [ExportState.Running]   = [ExportState.Completed, ExportState.Failed, ExportState.Cancelled],
+    [ExportState.Completed] = [],
+    [ExportState.Failed]    = [ExportState.Queued],   // retry - deliberate and documented
+    [ExportState.Cancelled] = []
+};</code></pre>
+
+  <p>The value isn't the code. It's that writing it forces the question "can a cancelled export be
+    retried?" — which costs a minute here and an incident later.</p>
+
+  <p><strong>3. Rules with owners.</strong> Separate genuine policy ("VAT applies to EU customers") from
+    accidental current behaviour. Policy belongs in the domain and should be easy to change. Accidental
+    behaviour shouldn't be enshrined in tests.</p>
+
+  <h2 id="traceability">Handling change <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Requirements change. That's normal. What must not happen is change without visibility.</p>
+
+  <ul>
+    <li>Every PR references a work item; every work item states its acceptance criteria.</li>
+    <li>Non-obvious business rules get a test name that names the <em>rule</em>:
+      <code>Refund_IsRejected_When_OrderOlderThan90Days</code> beats <code>TestRefund2</code>.</li>
+    <li>When a requirement changes mid-flight, record it with the reason. Six months later, "why does it do
+      this?" has an answer — which stops someone "fixing" deliberate behaviour.</li>
+  </ul>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — how scope creep actually arrives</div>
+    <p style="margin:0">Not as "please double the scope". As five "while you're in there" additions, each
+      individually reasonable.
+      <br><br>
+      The defence isn't refusal, it's <strong>visibility</strong>. Accept the change and state its cost in
+      the same sentence: "yes, that's about two extra days and pushes the integration work into next sprint
+      — do you want it now or as a follow-up?" That moves the decision to the person who owns the deadline.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Ask "why" until you reach the problem, not the requester's chosen solution.</li>
+      <li>Run the NFR checklist on everything. One number per quality expectation.</li>
+      <li>Write acceptance criteria as the tests you'll write. If you can't, it isn't testable yet.</li>
+      <li>Ask "what should happen when…" for at least three failure cases before starting.</li>
+      <li>Slice vertically. A slice that can't ship isn't a story.</li>
+      <li>Price scope changes out loud instead of absorbing them silently.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Accepting a solution as a requirement.</strong> "Add a queue" may be right — but ask what
+      outcome it's meant to produce. Sometimes a 20-line fix delivers it.</li>
+    <li><strong>Designing for imagined scale.</strong> Ask for real numbers. Engineers routinely build for
+      100× the load that ever arrives and pay for it in complexity daily.</li>
+    <li><strong>Only capturing the happy path.</strong> Most production code is error handling; most specs
+      aren't.</li>
+    <li><strong>Gold-plating.</strong> Unrequested capability still has to be maintained, tested, documented
+      and secured forever.</li>
+    <li><strong>Silent assumptions about time and identity.</strong> Timezones, DST, clock skew, duplicate
+      emails, "unique" identifiers that aren't.</li>
+    <li><strong>Treating the ticket as the whole truth.</strong> It's a pointer to a conversation that
+      already happened without you.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What's the difference between functional and non-functional requirements?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Functional describes what the system does — a user can submit an order, an admin can export a
+          report. Non-functional describes how well it must do it under stated conditions: latency,
+          throughput, availability, security, retention, cost."</p>
+        <p>"The reason I care practically is cost of change. A missing functional requirement costs you the
+          feature you didn't build. A missing non-functional one often costs you the architecture."</p>
+        <p>"Concrete example: if nobody says the export must handle a million rows, you write it
+          synchronously in a request handler. Finding out later means moving to a background worker, adding
+          storage, changing the API contract and re-testing everything."</p>
+        <p>"So on any piece of work I run a short checklist — volume and growth, latency target and
+          percentile, availability expectation, failure behaviour, data sensitivity and retention, and cost."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the definition (table stakes) and why it matters (the signal)?</li>
+        <li>Do you actively elicit NFRs, or wait to be handed them?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> the definition only, with no consequence attached.</li>
+        <li><span class="redflag">Red flag:</span> listing "performance, security, scalability" without ever
+          attaching a measurement.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Give me an NFR you added that the business hadn't asked for.</li>
+          <li>How would you test an availability requirement?</li>
+          <li>What's the difference between an SLA, an SLO and an SLI?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>A product owner gives you a one-line ticket: "Add search to the orders page." What do you do?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I wouldn't start with the design. I'd find out what problem search is meant to solve, because
+          that changes almost everything."</p>
+        <p>"If users are hunting for one order they already know the ID of, that's a lookup and it's trivial.
+          If they want 'all orders from that customer last week that failed', that's filtering — and the
+          right answer is probably structured filters, not a text box. If they're exploring — 'orders
+          mentioning a returned item' — that's real search, and a completely different technology decision."</p>
+        <p>"Then the specifics: which fields, prefix or substring or full-text, case and accent sensitivity,
+          and — importantly — must it respect tenant and permission boundaries? It must, and that has to be
+          enforced in the query, not filtered after retrieval."</p>
+        <p>"Volume is the pivotal question. Substring search over 50,000 rows is a <code>LIKE</code>. Over
+          50 million it's a full-text index or a dedicated search service, and those have very different
+          operational costs."</p>
+        <p>"I'd also nail down result behaviour, which is always underspecified: sort order, pagination, what
+          shows on zero results, whether archived orders are included."</p>
+        <p>"Then I'd agree the thinnest first slice — probably exact ID plus a customer filter, server-side
+          paged — ship it, and use real usage data to decide whether fuzzy search is worth building at all."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you interrogate the request, or start designing?</li>
+        <li>Do tenancy and authorization come up as part of the requirement?</li>
+        <li>Do you size the solution to the data volume?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "I'd add Elasticsearch" as the first sentence — a big
+          operational commitment made before knowing the row count.</li>
+        <li><span class="redflag">Red flag:</span> no mention of permissions or tenant scoping. Cross-tenant
+          leaks get introduced exactly here.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Now they want fuzzy matching on customer name. Does your answer change?</li>
+          <li>How would you keep a search index consistent with the database?</li>
+          <li>What if the largest tenant has 200 million orders and the smallest has 200?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you handle a requirement you think is technically wrong?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I check whether I understand the constraint behind it. 'Technically wrong' often turns out
+          to be 'optimising for something I wasn't told about' — a contractual obligation, a migration
+          deadline, a customer commitment. So I ask what outcome the requirement is protecting."</p>
+        <p>"If it's still wrong after that, I make the cost concrete rather than arguing in principle. Not
+          'this is bad practice' but: 'this means every tenant shares one table with no partition key, so at
+          our projected growth the biggest tenant's queries will degrade everyone else's by next spring, and
+          splitting it later needs a migration with downtime. The alternative costs about three extra days
+          now.'"</p>
+        <p>"Then I'd offer a smaller reversible option if one exists — ship the simple version behind a flag,
+          keep the interface stable so the storage decision stays changeable."</p>
+        <p>"And if the decision goes against me, I disagree and commit — but I write the risk down with a
+          date. That's not political cover. It's so that when the symptom shows up in eight months, the team
+          can connect it to the decision instead of rediscovering it. The thing I most want to avoid is
+          being quietly right while the organisation pays for it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you influence without escalating, and disagree without becoming an obstacle?</li>
+        <li>Do you translate technical risk into business consequence?</li>
+        <li>Do you accept decisions you lost?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "I'd just build it the right way anyway."</li>
+        <li><span class="redflag">Red flag:</span> "I'd escalate to my manager" as step one.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Tell me about a time you were overruled and turned out to be right. What did you do next?</li>
+          <li>What if the person insisting is more senior and wrong in public?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-scenario">Scenario</h3>
+
+  <details class="qa">
+    <summary>Two weeks into a six-week feature, you discover the core requirement was misunderstood.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Raise it the same day. The cost grows with every day of building on top of it, and there's no
+          version of this where waiting helps."</p>
+        <p>"But I'd spend an hour first establishing what's actually true, so the conversation is about facts:
+          what was understood, what's actually needed, what of the existing work still applies, and roughly
+          what the options cost."</p>
+        <p>"Then I'd bring options, not a problem. Usually: (a) adapt what exists — cheapest if the
+          misunderstanding was about behaviour rather than the model; (b) keep the infrastructure and rewrite
+          the domain logic — realistic when the shape of the data was wrong; (c) start over on this piece,
+          which is sometimes genuinely cheapest, because sunk cost isn't a reason to keep bad foundations."</p>
+        <p>"I'd also want to know how it happened, without making it a blame exercise. It's usually one of
+          three things: the acceptance criteria meant different things to different people, there was no demo
+          of working software until late, or the person who actually knew the domain was never in the
+          conversation. Each has a cheap fix — a glossary, a mid-sprint demo, inviting the right person.
+          Naming the mechanism is what stops it recurring. 'We'll communicate better' doesn't."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you surface bad news early? Single most important trait in a senior engineer.</li>
+        <li>Can you reason about sunk cost rationally?</li>
+        <li>Do you fix the process as well as the symptom?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "keep going and mention it at the sprint review".</li>
+        <li><span class="redflag">Red flag:</span> "we can't throw away two weeks of work" — sunk cost reasoning.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the deadline is committed to a customer and can't move?</li>
+          <li>How would you have caught this in week one?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Sales wants it configurable per customer, engineering wants one behaviour. How do you resolve it?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd try to turn it from a preference argument into a data question. How many customers have
+          actually asked, what would they set it to, and are those values clustered? Very often
+          'configurable' turns out to mean two or three real variants — and then the right answer is a small
+          enumeration, which is dramatically cheaper to build, test and support."</p>
+        <p>"I'd also make the ongoing cost visible, because it's invisible to whoever is asking. Every
+          configuration point multiplies the state space: more test combinations, more support questions of
+          the form 'it behaves differently for this customer', more bugs that only reproduce under one flag
+          combination, and a migration burden every time the feature evolves."</p>
+        <p>"The framing I use is that configuration isn't free flexibility — it's deferred decision-making
+          that engineering pays interest on forever."</p>
+        <p>"Practically I'd look for the middle: one sensible default, with the variation behind a per-tenant
+          setting that isn't exposed in the UI initially. That satisfies the one deal that triggered it
+          without committing the product to a configuration surface. And I'd be explicit that this is a
+          product decision with an engineering cost — my job is to price the options accurately, not to win."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand configurability as a long-term cost rather than a feature?</li>
+        <li>Can you find an option that de-risks both positions?</li>
+        <li>Do you know which decisions are yours to make?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you implement per-tenant configuration without polluting the domain logic?</li>
+          <li>When does per-tenant customization become a different product rather than a setting?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

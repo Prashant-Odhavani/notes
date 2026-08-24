@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>App Service — Azure</title>
+<meta name="description" content="Plans and what you're paying for, scaling, deployment slots and the swap mechanics, networking, and the diagnostics that actually help.">
+<meta name="keywords" content="Azure App Service plan tiers scale up scale out autoscale deployment slots swap warm up always on VNet integration private endpoint Kudu diagnostics health check ARR affinity">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/app-service.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>App Service</h1>
+    <p class="subtitle">The least fashionable and frequently correct choice for a .NET web application. Slots are
+      the feature worth understanding properly.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>You pay for the plan</strong>, not the app. Many apps can share one plan and its
+        resources.</li>
+      <li><strong>Scale up</strong> = a bigger instance. <strong>Scale out</strong> = more instances.</li>
+      <li><strong>Deployment slots give zero-downtime releases</strong> and instant rollback.</li>
+      <li><strong>A swap is a routing change</strong>, not a redeploy — that's why rollback is instant.</li>
+      <li><strong>Warm up before swapping</strong>, or the first users hit a cold app.</li>
+      <li><strong>Turn off ARR affinity</strong> unless you genuinely need sticky sessions.</li>
+      <li><strong>Always On</strong> for anything that must not be unloaded when idle.</li>
+    </ul>
+  </div>
+
+  <h2 id="plans">Plans and what you're paying for <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The billing model</span>
+    <p>You pay for the <strong>App Service Plan</strong> — a set of VMs — per hour, whether your app is receiving
+      traffic or not.</p>
+    <p>Multiple apps can run on one plan and <strong>share its CPU and memory</strong>. So the plan is the unit of
+      both cost and resource contention.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tier</th><th>Gives you</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Free / Shared</strong></td><td>Quotas, no SLA, no custom domain SSL</td><td>Experiments only</td></tr>
+        <tr><td><strong>Basic</strong></td><td>Custom domains, manual scale, <strong>no slots</strong></td><td>Dev and test</td></tr>
+        <tr><td><strong>Standard</strong></td><td><strong>Slots (5), autoscale, daily backups</strong></td><td>Most production apps</td></tr>
+        <tr><td><strong>Premium v3</strong></td><td>More slots, better hardware, <strong>zone redundancy</strong>, higher scale</td><td>Production needing HA or scale</td></tr>
+        <tr><td><strong>Isolated v2</strong></td><td>Dedicated App Service Environment, full VNet isolation</td><td>Strict compliance or network isolation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Basic has no deployment slots, and that's the tier decision</div>
+    <p style="margin:0">Slots are the single most valuable App Service feature, and they start at
+      <strong>Standard</strong>. Choosing Basic to save money means giving up zero-downtime deployment and instant
+      rollback.
+      <br><br>
+      That's usually the wrong trade for anything production, because the alternative is deploying over the running
+      app — brief downtime, and a rollback means redeploying the previous build.
+      <br><br>
+      <strong>Premium v3 also has better price-performance than Standard</strong> on newer hardware, so the naive
+      cost comparison can mislead. And zone redundancy — which distributes instances across availability zones — is
+      Premium v3 only, so a Standard plan has no protection against a zone failure however many instances you run.
+      <br><br>
+      "Standard as the minimum for production, Premium v3 if we need zone redundancy or the performance" is the
+      calibrated answer.</p>
+  </div>
+
+  <h2 id="scaling">Scaling <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Scale up (vertical)</th><th>Scale out (horizontal)</th></tr></thead>
+      <tbody>
+        <tr><td>Means</td><td>A bigger instance size</td><td><strong>More instances</strong></td></tr>
+        <tr><td>Helps with</td><td>Memory pressure, CPU-bound single requests</td><td><strong>Concurrent request volume</strong></td></tr>
+        <tr><td>Ceiling</td><td>The largest SKU</td><td>Effectively high</td></tr>
+        <tr><td>Requires</td><td>Nothing — it's a setting</td><td><strong>A stateless app</strong></td></tr>
+        <tr><td>Downtime</td><td>Brief restart</td><td>None</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Scaling out breaks anything holding local state</div>
+    <p style="margin:0">The moment there's more than one instance, a request can land on any of them. Which breaks
+      four things that work perfectly on a single instance:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>In-memory session or cache.</strong> Instance 2 doesn't have what instance 1 stored.</li>
+      <li><strong>Files written to local disk.</strong> Each instance has its own — though note App Service
+        shares <code>/home</code> across instances by default, which surprises people in both directions.</li>
+      <li><strong>In-memory rate limiting or counters.</strong> Three instances means three times the limit.</li>
+      <li><strong>Background timers in the web app.</strong> Every instance runs them, so a nightly job runs
+        <em>n</em> times.</li>
+    </ul>
+    <p style="margin:8px 0 0">That last one is the most damaging and the least obvious — a scheduled task inside a
+      web app silently multiplies when you scale out, so an email goes three times.
+      <br><br>
+      The fixes: <a href="../16-redis/index.html">distributed cache and session</a>, blob storage for files,
+      Redis-backed rate limiting, and moving scheduled work out to a Function or a singleton-guarded job. All of
+      which should be done <em>before</em> you need to scale, because discovering them during a traffic spike is
+      the worst time.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">ARR affinity: off by default in your head, on by default in Azure</div>
+    <p style="margin:0">App Service enables <strong>ARR affinity</strong> (session affinity) by default, which
+      pins a client to one instance using a cookie.
+      <br><br>
+      That's there to make legacy stateful apps work when scaled out. For a stateless application it's
+      <strong>actively harmful</strong>: load distributes unevenly, a scale-out event doesn't relieve existing
+      clients because they stay pinned, and losing an instance drops those users' state.
+      <br><br>
+      <strong>Turn it off</strong> for anything stateless. It's a single setting, and leaving it on is one of the
+      most common reasons scaling out doesn't help as much as expected.
+      <br><br>
+      If you genuinely need affinity, that's a signal to fix the state rather than keep the pinning — because
+      affinity also prevents graceful instance replacement during platform maintenance.</p>
+  </div>
+
+  <h2 id="slots">Deployment slots <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What they are</span>
+    <p>A slot is a <strong>separate running instance of your app on the same plan</strong>, with its own hostname.
+      You deploy to it, verify it, then <strong>swap</strong> it with production.</p>
+    <p>The swap is a <strong>routing change</strong> — the warmed-up slot becomes production and the old production
+      becomes the staging slot. Which is why rolling back is another swap, and takes seconds.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Swap step</th><th>What happens</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Production settings are applied to the staging slot</td></tr>
+        <tr><td>2</td><td><strong>The slot restarts</strong> with those settings</td></tr>
+        <tr><td>3</td><td>Azure warms it up — requests the root path, or your configured warm-up paths</td></tr>
+        <tr><td>4</td><td>Warm-up must succeed, or <strong>the swap is aborted</strong></td></tr>
+        <tr><td>5</td><td>Routing switches. The old production becomes staging</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — step 2 is why "it worked in staging" fails after a swap</div>
+    <p style="margin:0">The subtlety people miss: <strong>slot-specific settings are applied and the slot restarts
+      <em>before</em> the swap.</strong>
+      <br><br>
+      So the app you verified in staging — with the staging database, the staging API keys — is <em>not</em> the
+      app that goes live. Azure restarts it with production configuration first.
+      <br><br>
+      That's correct and necessary, and it means your verification in staging didn't test the production
+      configuration. If a production setting is missing or malformed, you find out during the swap.
+      <br><br>
+      Which is why <strong>warm-up matters</strong>: it's the only check that runs against production settings
+      before traffic switches. Configure <code>WEBSITE_SWAP_WARMUP_PING_PATH</code> to hit a real health endpoint
+      that exercises the database and critical dependencies — then a bad production setting <em>aborts the
+      swap</em> instead of taking the site down.
+      <br><br>
+      Mark settings as <strong>slot settings</strong> (sticky) for anything that must not follow the app —
+      connection strings, environment name, keys. Everything else swaps with the app, which is usually what you
+      want for application configuration.</p>
+  </div>
+
+  <pre data-label="text — the settings that matter for slots"><code class="language-text">  WEBSITE_SWAP_WARMUP_PING_PATH   = /health/ready
+  WEBSITE_SWAP_WARMUP_PING_STATUSES = 200
+
+  WEBSITE_WARMUP_PATH             = /health/ready   (for scale-out warm-up too)
+
+  Mark as SLOT SETTINGS (do not swap):
+    ConnectionStrings__Default
+    ASPNETCORE_ENVIRONMENT
+    ApplicationInsights__ConnectionString</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Slots also give you canary releases</div>
+    <p style="margin:0">Beyond swapping, you can <strong>route a percentage of traffic</strong> to a slot — 10% to
+      the new version, watch the metrics, then increase or roll back.
+      <br><br>
+      That's a genuine canary deployment with no extra infrastructure, and it's the safest way to release a change
+      you're unsure about. Combine it with per-slot Application Insights and you can compare error rates and
+      latency between versions directly.
+      <br><br>
+      One caveat: traffic routing uses a cookie to keep a user on the same version, so a user's experience is
+      consistent — which is what you want, and it means the split isn't perfectly even per request.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Slots share the plan's resources</div>
+    <p style="margin:0">A slot isn't free capacity. It runs on the <strong>same App Service Plan</strong>, so a
+      staging slot under load-test consumes the CPU and memory production needs.
+      <br><br>
+      Which means: don't run performance tests against a slot on the production plan, and be aware that several
+      active slots on a small plan will contend.
+      <br><br>
+      For genuine load testing, use a separate plan. This is the same reasoning as
+      <a href="../10-sql/scaling-operations.html#scaling-reads">keeping reporting off the production
+      database</a> — shared capacity means one workload can degrade another.</p>
+  </div>
+
+  <h2 id="networking">Networking <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Feature</th><th>Direction</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><strong>VNet integration</strong></td><td><strong>Outbound</strong></td><td>Your app reaches resources in a VNet — a private database, an internal API</td></tr>
+        <tr><td><strong>Private endpoint</strong></td><td><strong>Inbound</strong></td><td>Your app is reachable only from the VNet; no public endpoint</td></tr>
+        <tr><td><strong>Access restrictions</strong></td><td>Inbound</td><td>IP or service-tag allow-lists on the public endpoint</td></tr>
+        <tr><td><strong>Hybrid Connections</strong></td><td>Outbound</td><td>Reach a specific on-premises host without a VPN</td></tr>
+        <tr><td><strong>NAT Gateway</strong></td><td>Outbound</td><td>A stable outbound IP for third-party allow-listing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The distinction that gets confused</div>
+    <p style="margin:0"><strong>VNet integration is outbound only.</strong> It lets your app <em>call into</em> a
+      virtual network. It does <strong>not</strong> make your app private — the public endpoint is still
+      there.
+      <br><br>
+      To make the app private you need a <strong>private endpoint</strong>, which is the inbound counterpart.
+      <br><br>
+      Teams routinely enable VNet integration, assume the app is now internal, and leave a publicly-reachable
+      endpoint. The two features are frequently used together and they solve opposite problems.
+      <br><br>
+      Also worth knowing: <strong>outbound IPs change</strong> when you scale or change tier, so third parties
+      that allow-list your IP will break. A NAT Gateway gives a stable outbound address, which is the correct fix
+      rather than repeatedly updating an allow-list.</p>
+  </div>
+
+  <h2 id="diagnostics">Diagnostics that actually help <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Diagnose and solve problems</strong></td><td><strong>Start here.</strong> Automated detectors for restarts, CPU, memory, failed requests</td></tr>
+        <tr><td><strong>Application Insights</strong></td><td>Request and dependency telemetry, exceptions, traces</td></tr>
+        <tr><td><strong>Log stream</strong></td><td>Live tail of application logs — good for immediate feedback</td></tr>
+        <tr><td><strong>Kudu / Advanced Tools</strong></td><td>The file system, process explorer, environment variables</td></tr>
+        <tr><td><strong>Health check</strong></td><td>Removes unhealthy instances from rotation automatically</td></tr>
+        <tr><td><strong>Crash / memory dumps</strong></td><td>Via the Diagnose blade, for hangs and leaks</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the health check endpoint does real work</div>
+    <p style="margin:0">Configuring a health-check path isn't documentation. App Service <strong>polls it and takes
+      unhealthy instances out of the load balancer</strong>, then replaces them if they stay unhealthy.
+      <br><br>
+      So a single bad instance — one with a corrupted connection pool, or one that's OOM-thrashing — stops
+      receiving traffic automatically instead of failing a proportion of requests until someone notices.
+      <br><br>
+      The design matters though, and it's the same distinction as
+      <a href="../20-microservices/operations.html#health">liveness versus readiness</a>: the check should verify
+      <em>this instance</em> can serve traffic, not that every dependency is up.
+      <br><br>
+      If the health check fails whenever the database is briefly unavailable, then <strong>every</strong> instance
+      reports unhealthy simultaneously and App Service removes them all — turning a 30-second database blip into a
+      full outage that you caused. Check the things specific to the instance; degrade gracefully on shared
+      dependencies.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Always On, and why idle unloading catches people</div>
+    <p style="margin:0">By default App Service <strong>unloads an app after about 20 minutes of no
+      requests</strong>. The next request pays a cold start — and any in-process background work simply stops.
+      <br><br>
+      So a <code>BackgroundService</code> or a hosted timer in a web app <em>silently stops running</em> on a
+      low-traffic site. That's a genuinely confusing failure: the job worked in testing and mysteriously doesn't
+      run overnight in production.
+      <br><br>
+      <strong>Always On</strong> prevents the unload, and it's available from Basic upward. Enable it for anything
+      with background work or where first-request latency matters.
+      <br><br>
+      But the better answer for scheduled work is to <strong>move it out of the web app</strong> — into a Function
+      with a timer trigger, or a separate worker — because a web app is scaled for request handling and its
+      instance count is the wrong control for background jobs. And as noted above, scaling out makes an in-app
+      timer run on every instance.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>You pay for the plan; apps on one plan share its resources.</li>
+      <li>Slots start at Standard — that's the minimum production tier.</li>
+      <li>Zone redundancy is Premium v3 only.</li>
+      <li>Scale out requires a stateless app — session, cache, files and timers all break otherwise.</li>
+      <li>An in-app scheduled job runs once per instance when scaled out.</li>
+      <li>Turn off ARR affinity unless you genuinely need it.</li>
+      <li>A swap applies production settings and restarts <em>before</em> switching — so staging didn't test
+        production config.</li>
+      <li>Configure warm-up to a real health path; a failed warm-up aborts the swap.</li>
+      <li>Mark connection strings and environment as slot settings.</li>
+      <li>Traffic routing to a slot gives you a canary release for free.</li>
+      <li>VNet integration is outbound; a private endpoint is inbound. They're different problems.</li>
+      <li>Health checks remove bad instances — don't fail them on shared dependencies.</li>
+      <li>Always On, or background work stops when the app idles out.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Basic tier in production</strong>, so no slots and no autoscale.</li>
+    <li><strong>Scaling out with in-memory session</strong> or cache.</li>
+    <li><strong>A background timer inside the web app</strong>, multiplying on scale-out.</li>
+    <li><strong>ARR affinity left on</strong> for a stateless app.</li>
+    <li><strong>No warm-up configured</strong>, so the first users after a swap hit a cold app.</li>
+    <li><strong>Connection strings not marked as slot settings</strong>, so staging config swaps into
+      production.</li>
+    <li><strong>Load testing a slot</strong> on the production plan.</li>
+    <li><strong>Assuming VNet integration makes the app private.</strong></li>
+    <li><strong>Third parties allow-listing outbound IPs</strong> that change on scale.</li>
+    <li><strong>A health check that fails on database unavailability</strong>, removing every instance.</li>
+    <li><strong>No Always On</strong>, so background work silently stops.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How do you deploy with zero downtime, and how do you roll back? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>Deployment slots.</strong> Deploy to a staging slot, verify it, then swap with production."</p>
+        <p>"The reason this gives zero downtime is that <strong>the swap is a routing change, not a
+          redeploy</strong>. The staging slot is already running and warmed; swapping just switches which one
+          receives traffic. And the previous production version becomes the staging slot — so
+          <strong>rollback is another swap</strong>, and it takes seconds."</p>
+        <p>"That's the key property. Without slots, a rollback means redeploying the previous build, which takes
+          as long as a deployment and involves rebuilding or re-fetching an artefact — during an incident."</p>
+        <p>"The mechanics worth understanding, because there's a step people miss: when you initiate a swap, Azure
+          <strong>applies production settings to the staging slot and restarts it</strong>, warms it up, and only
+          then switches routing."</p>
+        <p>"Which means <strong>the app you verified in staging is not the app that goes live</strong> — it's
+          restarted with production configuration first. So your staging verification didn't test the production
+          settings. If a production connection string is wrong or missing, you'd find out during the swap."</p>
+        <p>"That's why <strong>warm-up configuration matters</strong>. Setting
+          <code>WEBSITE_SWAP_WARMUP_PING_PATH</code> to a real health endpoint — one that exercises the database
+          and critical dependencies — means Azure hits it with production settings applied, and
+          <strong>a failure aborts the swap</strong> rather than taking the site down. It's the only check that
+          runs against production config before traffic moves."</p>
+        <p>"I'd also mark the right things as <strong>slot settings</strong>, which are sticky and don't swap:
+          connection strings, <code>ASPNETCORE_ENVIRONMENT</code>, the Application Insights connection string.
+          Otherwise staging's database connection follows the app into production, which is the classic slot
+          accident."</p>
+        <p>"Beyond swapping, slots also give <strong>canary releases</strong>: route 10% of traffic to the new
+          version, watch error rate and latency, then increase or roll back. That's a genuine canary with no extra
+          infrastructure, and it's the safest way to release something uncertain."</p>
+        <p>"Two caveats. <strong>Slots need Standard tier or above</strong> — Basic has none, which is the main
+          reason not to run Basic in production. And <strong>slots share the plan's resources</strong>, so a
+          staging slot under load test consumes CPU production needs; for real load testing I'd use a separate
+          plan."</p>
+        <p>"One thing I'd add regardless of slots: the deployment has to be <strong>backward compatible with the
+          database</strong>. Both versions run simultaneously during the swap and during any canary period, so a
+          migration that renames a column breaks whichever version isn't expecting it. That's expand-and-contract
+          across separate releases, and slots don't solve it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know a swap is a routing change, hence instant rollback?</li>
+        <li>Do you know production settings are applied and the slot restarts first?</li>
+        <li>Do you configure warm-up, and know it can abort the swap?</li>
+        <li>Do you know about slot settings?</li>
+        <li>Do you raise database backward compatibility?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "use slots" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> no mention of warm-up or slot settings.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that both versions run during the
+          transition.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What should the warm-up endpoint check?</li>
+          <li>How do you handle a database migration alongside this?</li>
+          <li>What if the new version is fine but slower?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>You scale out from one instance to three and things start breaking. Why? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Almost certainly <strong>local state</strong> — something that worked because there was only ever one
+          instance. I'd check five things, roughly in order of how often they're the cause."</p>
+        <p>"<strong>In-memory session or cache.</strong> A request lands on instance 2 and the session stored on
+          instance 1 isn't there, so users appear randomly logged out or lose form data. The fix is a distributed
+          store — Redis — for both session and cache."</p>
+        <p>"<strong>Background timers inside the web app.</strong> This is the most damaging one and the least
+          obvious. A <code>BackgroundService</code> or hosted timer runs on <em>every</em> instance, so a nightly
+          job that sends invoices now sends them three times. Nothing errors — the work just happens
+          repeatedly."</p>
+        <p>"The fix is to move scheduled work out to a Function with a timer trigger, which is a singleton by
+          default, or guard it with a distributed lock. And really it belongs outside the web app anyway, because
+          instance count is scaled for request handling and is the wrong control for background jobs."</p>
+        <p>"<strong>In-memory rate limiting or counters.</strong> ASP.NET Core's built-in rate limiter is
+          per-instance, so a 100-per-minute limit becomes 300 across three instances. Same for any in-memory
+          counter or deduplication set. Needs Redis-backed shared state."</p>
+        <p>"<strong>Local file writes.</strong> Uploads or generated files written to local disk. Worth knowing
+          that App Service actually shares <code>/home</code> across instances by default, which cuts both ways —
+          it may work, and it's slow and a contention point. Blob storage is the right answer."</p>
+        <p>"<strong>Singleton assumptions</strong> more generally — an in-memory queue, a static cache warmed at
+          startup, a lock that only guards within one process."</p>
+        <p>"There's also an App Service specific thing I'd check: <strong>ARR affinity</strong>. It's
+          <em>on by default</em>, pinning each client to one instance with a cookie. If that's what was masking
+          the state problem, then turning it off would have surfaced these issues immediately — and leaving it on
+          means scaling out doesn't help much, because existing clients stay pinned to their original
+          instance."</p>
+        <p>"So for a stateless app I'd turn affinity off, and if the app genuinely needs it, that's a signal to
+          fix the state rather than keep the pinning — affinity also prevents graceful instance replacement during
+          platform maintenance."</p>
+        <p>"The broader point: <strong>these are all the same bug</strong> — state that lives in a process rather
+          than a shared store. Which is why 'is this app stateless?' is the question to answer <em>before</em> you
+          need to scale, not during a traffic spike. Running two instances in a test environment from the start
+          surfaces every one of these immediately."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you identify local state as the common cause?</li>
+        <li>Do you catch the background-timer multiplication?</li>
+        <li>Do you know in-memory rate limiting doesn't work across instances?</li>
+        <li>Do you know ARR affinity is on by default?</li>
+        <li>Do you suggest running two instances early to surface this?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "scale back down."</li>
+        <li><span class="redflag">Red flag:</span> enabling affinity as the fix rather than a diagnosis.</li>
+        <li><span class="redflag">Red flag:</span> no mention of background jobs.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you make a scheduled job run exactly once?</li>
+          <li>Where should uploaded files go?</li>
+          <li>How do you test for this before scaling?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notification &amp; Real-Time Platform — System Design Exercises</title>
+<meta name="description" content="A worked design: fan-out, channel routing, preferences and quiet hours, delivery guarantees, provider failure, and real-time transport with SignalR.">
+<meta name="keywords" content="notification system design fan out email SMS push in-app preferences quiet hours deduplication digest delivery guarantees provider failover SignalR backplane WebSocket scale out template versioning bounce handling">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/notifications.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Notification &amp; Real-Time Platform</h1>
+    <p class="subtitle">The hard parts are not delivery. They are fan-out amplification, preference evaluation, and
+      not sending the same thing four times.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Assumed answer</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Channels?</td><td><strong>In-app, email, SMS, push, webhook</strong></td><td>Each has different latency, cost and failure behaviour</td></tr>
+        <tr><td>Fan-out shape?</td><td>Mostly 1-to-1, but some events notify <strong>10,000+ users</strong></td><td>One event can become 40,000 sends</td></tr>
+        <tr><td>Latency?</td><td>In-app instant; email and SMS within a minute</td><td>Real-time transport for in-app only</td></tr>
+        <tr><td>Guarantee?</td><td><strong>At-least-once, don't lose it</strong>. Duplicates embarrassing but survivable</td><td>Deduplication needed, not exactly-once transport</td></tr>
+        <tr><td>Ordering?</td><td>Nice to have, not required</td><td><strong>Avoids a whole class of complexity</strong></td></tr>
+        <tr><td>Preferences?</td><td>Per user, per channel, per type, plus quiet hours</td><td>Evaluation is a real subsystem</td></tr>
+        <tr><td>Out of scope</td><td>Template authoring UI, marketing campaigns, analytics</td><td>Focus on delivery correctness and fan-out</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Two answers that simplify the design substantially</div>
+    <p style="margin:0"><strong>Ordering isn't required.</strong> That removes partitioned consumers, sessions,
+      sequence tracking and head-of-line blocking management. Worth confirming explicitly, because if ordering
+      <em>were</em> required — "the cancellation must not arrive before the confirmation" — the design changes
+      significantly.
+      <br><br>
+      <strong>Duplicates are survivable but should be prevented.</strong> So the transport can be plain at-least-once
+      and deduplication happens in the pipeline, rather than needing exotic delivery guarantees. Much cheaper than
+      trying to build exactly-once, which isn't achievable anyway.
+      <br><br>
+      The answer that <em>complicates</em> things is the fan-out shape. <strong>One event producing 10,000
+      notifications across four channels is 40,000 sends</strong>, and that amplification is the real scaling
+      characteristic of this system — not request volume. A platform handling 100 events a second is comfortable until
+      one of those events is a broadcast.</p>
+  </div>
+
+  <h2 id="architecture">Shape <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — fan-out happens in a stage of its own, deliberately"><code class="language-text">  Producer services
+       |  publish a domain event: "InvoiceOverdue", "OrderShipped"
+       v
+  Notification API  ->  Service Bus topic   ONE message per EVENT, not per recipient
+                              |
+                              v
+                        FAN-OUT WORKER
+                          resolve recipients        (may be 10,000)
+                          load preferences
+                          evaluate: send? which channels? now or later?
+                          write one row per (recipient, channel), in batches
+                              |
+                              v
+                        one message per DELIVERY, onto per-channel queues
+                              |
+        +---------------+-----+------+--------------+
+        v               v            v              v
+     email q         sms q       push q         in-app q
+        |               |            |              |
+     SendGrid       Twilio       FCM/APNS      SignalR + persisted store
+        |               |            |
+        +---------------+------------+--> status callbacks -> Deliveries table
+                                          bounces / failures -> retry or DLQ</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Component</th><th>Choice</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Ingest</strong></td><td>Service Bus topic</td><td>Per-message reliability and dead-lettering matter here</td></tr>
+        <tr><td><strong>Fan-out</strong></td><td>A worker writing per-delivery rows in batches</td><td><strong>Separates amplification from sending</strong></td></tr>
+        <tr><td><strong>Per-channel queues</strong></td><td>One queue per channel</td><td>Independent scaling; an SMS outage doesn't block email</td></tr>
+        <tr><td><strong>Delivery record</strong></td><td>A row per (notification, recipient, channel)</td><td>Status, retries, audit, and deduplication</td></tr>
+        <tr><td><strong>In-app real-time</strong></td><td>SignalR with a backplane, plus a persisted store</td><td>Offline users must still see it</td></tr>
+        <tr><td><strong>Preferences</strong></td><td>Its own store, cached aggressively</td><td>Read on every delivery decision</td></tr>
+        <tr><td>Templates</td><td>Versioned, rendered at send time</td><td>Rendering late lets you fix a broken template</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — separate the fan-out stage from the send stage</div>
+    <p style="margin:0">The decision that matters most is <strong>publishing one message per event, not one per
+      recipient</strong>, and expanding it in a dedicated stage.
+      <br><br>
+      If the producer publishes 10,000 messages, several things go wrong. The publishing service blocks while doing
+      it. A failure halfway leaves an unknown subset published with no record of progress. Retrying republishes
+      everything. And the producer now needs to know about recipients and preferences, which isn't its job.
+      <br><br>
+      With a fan-out stage: <strong>one durable message in, expansion happens once, per-delivery rows are written in
+      batches, and each delivery is independently retryable.</strong> If the worker crashes halfway, the persisted
+      rows record exactly what already exists — so a retry resumes rather than duplicating.
+      <br><br>
+      It also means fan-out and sending <strong>scale independently</strong>. Expanding 10,000 recipients is a
+      database operation; sending 10,000 emails is rate-limited by a provider. Those want completely different
+      concurrency, and coupling them means one constrains the other.
+      <br><br>
+      <strong>Per-channel queues</strong> matter for the same reason. If SMS shares a queue with email and Twilio is
+      down, retrying SMS delays every email. Separate queues contain a provider outage to its own channel — the
+      bulkhead pattern applied to messaging.</p>
+  </div>
+
+  <h2 id="preferences">Preferences and suppression <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — evaluate in this order, stopping at the first block"><code class="language-text">1  GLOBAL UNSUBSCRIBE / legal suppression   -> never send. No exceptions.
+2  Hard bounce or spam complaint             -> suppress that address
+3  Channel disabled by the user              -> skip that channel
+4  This notification type opted out          -> skip
+5  QUIET HOURS in the user's time zone       -> defer, or drop if time-sensitive
+6  DIGEST preference                         -> accumulate, do not send now
+7  Rate cap ("max 5 emails per day")         -> defer or drop
+8  DEDUPLICATION key already sent recently   -> skip
+                                             -> otherwise SEND
+
+TRANSACTIONAL notifications - password reset, security alert, receipt - bypass
+steps 2-7 but NEVER step 1. That distinction is legal, not a preference.</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">The transactional versus marketing distinction is a legal boundary</div>
+    <p style="margin:0">A password reset must arrive even if the user has turned off email notifications and it's
+      3am — otherwise they're locked out of their account. So transactional messages bypass preferences.
+      <br><br>
+      <strong>They must not bypass a global unsubscribe or a legal suppression.</strong> Under GDPR, PECR and CAN-SPAM
+      the consequences of sending to someone who has withdrawn consent are regulatory, not a customer-satisfaction
+      issue.
+      <br><br>
+      So <strong>every notification type needs an explicit classification</strong> — transactional or marketing — and
+      that classification decides which rules apply. Getting it wrong in either direction is bad: a marketing message
+      classified as transactional is a compliance breach, and a password reset classified as marketing means users
+      can't recover their accounts.
+      <br><br>
+      Two structural points. The classification belongs on the <strong>notification type definition</strong>, not
+      decided per send, so it's reviewable and consistent. And <strong>hard bounces must feed back into
+      suppression</strong> automatically — continuing to send to an address that permanently rejected mail damages
+      your sender reputation, which degrades deliverability for every other customer. That's a shared resource being
+      spent by a bug.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Quiet hours need the user's time zone, stored explicitly</div>
+    <p style="margin:0">"Don't send between 10pm and 8am" is meaningless without knowing whose 10pm. So the user's
+      time zone has to be stored — as an IANA identifier like <code>Europe/London</code>, not as a UTC offset, because
+      offsets change with daylight saving and a stored offset is wrong for half the year.
+      <br><br>
+      Then a deferred notification needs a <strong>scheduled delivery mechanism</strong>. Service Bus scheduled
+      messages handle this directly: set <code>ScheduledEnqueueTime</code> to the end of quiet hours and the broker
+      holds it. No polling table, no timer job.
+      <br><br>
+      The design question worth raising: <strong>what happens to a deferred notification that's no longer
+      relevant?</strong> An "invoice overdue" deferred to 8am may have been paid at 11pm. So the send step should
+      re-check relevance rather than trusting the queued message — which is the same
+      <a href="../35-scaling-scenarios/distributed.html#ordering">read-current-state-rather-than-trust-the-payload</a>
+      principle from event handling.
+      <br><br>
+      And a cap on deferral: if quiet hours would delay something by more than a few hours, it may be better to drop
+      it than to send stale information the next morning.</p>
+  </div>
+
+  <h2 id="dedup">Deduplication <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — dedupe on a deterministic key, enforced by the database" class="code-good"><code class="language-csharp">// The key describes WHAT is being said to WHOM, on which channel.
+// Deterministic, so a retry produces the same key.
+var dedupKey = $"{notificationType}:{recipientId}:{channel}:{entityId}:{bucket:yyyyMMddHH}";
+
+var delivery = new Delivery
+{
+    DedupKey  = dedupKey,          // UNIQUE INDEX on this column
+    Recipient = recipientId,
+    Channel   = channel,
+    Status    = DeliveryStatus.Pending
+};
+
+try
+{
+    _db.Deliveries.Add(delivery);
+    await _db.SaveChangesAsync(ct);      // insert FIRST - the DB is the arbiter
+}
+catch (DbUpdateException e) when (e.IsUniqueViolation())
+{
+    // Already created by a duplicate message or a retry. Not an error.
+    _log.DuplicateSuppressed(dedupKey);
+    return;
+}
+
+// Only now enqueue the send. If this fails, a sweeper picks up
+// Pending rows older than a threshold and re-enqueues them.
+await _queue.SendAsync(new SendDelivery(delivery.Id), ct);</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Insert first, let the unique index decide — never check-then-insert</div>
+    <p style="margin:0">The tempting implementation is "have we sent this? no? then send it." Under any concurrency —
+      a duplicate message, two instances processing the same event, a retry — <strong>both checks pass and both
+      send</strong>.
+      <br><br>
+      So the deduplication key gets a <strong>unique index</strong>, and the code inserts first. The second attempt
+      fails on the constraint, which is caught and treated as success. The database arbitrates atomically and no
+      amount of concurrency defeats it.
+      <br><br>
+      That's the same primitive as the booking system's conditional update and an HTTP idempotency key: <strong>make
+      the database the arbiter, not your code.</strong>
+      <br><br>
+      Two details that matter for it to work. The key must be <strong>deterministic</strong> — derived from the event
+      and recipient, not generated fresh on receipt, or every retry produces a new key and dedupes nothing. And it
+      usually needs a <strong>time bucket</strong>, because "you have a new message" should be sendable again
+      tomorrow; a permanently unique key would suppress it forever.
+      <br><br>
+      Note also the ordering in the code: <strong>the row is committed before the send is enqueued</strong>. The
+      reverse order means a send can happen with no record of it — so a retry duplicates. This way the failure mode is
+      a row with no send, which a sweeper can detect and re-enqueue. <strong>Prefer a recoverable gap over an
+      unrecoverable duplicate.</strong></p>
+  </div>
+
+  <h2 id="realtime">Real-time in-app delivery <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Transport</strong></td><td><strong>SignalR</strong> — WebSockets with automatic fallback</td></tr>
+        <tr><td><strong>Scale-out</strong></td><td><strong>Azure SignalR Service</strong>, or a Redis backplane</td></tr>
+        <tr><td><strong>Offline users</strong></td><td><strong>Always persist</strong>; the push is an optimisation</td></tr>
+        <tr><td>Targeting</td><td>User id as the group; a user may have several connections</td></tr>
+        <tr><td>Reconnection</td><td>Client fetches anything missed since its last known id</td></tr>
+        <tr><td>Connection limits</td><td>A concurrent-connection ceiling per instance or SKU</td></tr>
+        <tr><td>Authentication</td><td>Token on connect, and re-authenticate on reconnect</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — persist first, push second</div>
+    <p style="margin:0">The mistake is treating the real-time push as the delivery mechanism. It isn't:
+      <strong>a WebSocket push to a user who isn't connected simply vanishes</strong>, with no error and no record.
+      <br><br>
+      So the notification is <strong>written to a store first</strong>, and the push is a hint that something new
+      exists. A connected user sees it instantly; a disconnected user sees it when they next load the page and fetch
+      unread items. Same data, two delivery paths, one source of truth.
+      <br><br>
+      That also makes reconnection straightforward: the client remembers the last notification id it saw and requests
+      anything newer. No replay buffer on the server, no delivery tracking per connection — which matters because a
+      user can have several connections open across devices and tabs.
+      <br><br>
+      On scale-out, the detail worth knowing: <strong>WebSocket connections are stateful and pinned to one
+      instance</strong>. So instance A cannot push to a user connected to instance B without a
+      <strong>backplane</strong> — Redis, or Azure SignalR Service which handles it as a managed concern. Without one,
+      scaling out means notifications only reach the subset of users who happen to be connected to the instance that
+      handled the event.
+      <br><br>
+      And each connection consumes memory and a socket for its whole lifetime, so <strong>concurrent connections, not
+      requests per second, is the capacity metric</strong> — which is why the Azure service exists: it moves that
+      capacity concern off your app plan entirely.</p>
+  </div>
+
+  <h2 id="failure">Provider failure and retries <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Failure</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Transient provider error (5xx, timeout)</strong></td><td>Retry with backoff and jitter</td></tr>
+        <tr><td><strong>Rate limited (429)</strong></td><td>Respect <code>Retry-After</code>; throttle the consumer</td></tr>
+        <tr><td><strong>Invalid recipient (4xx)</strong></td><td><strong>Do not retry.</strong> Mark failed, suppress the address</td></tr>
+        <tr><td><strong>Provider fully down</strong></td><td>Circuit breaker; queue depth grows rather than burning retries</td></tr>
+        <tr><td><strong>Hard bounce (async callback)</strong></td><td>Add to the suppression list permanently</td></tr>
+        <tr><td>Soft bounce</td><td>Retry later, with a limit</td></tr>
+        <tr><td>Retries exhausted</td><td>Dead-letter, <strong>and alert on DLQ depth</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">A provider outage should grow a queue, not burn through retries</div>
+    <p style="margin:0">When a provider is completely down, retrying each message three times with backoff means every
+      message exhausts its retries and dead-letters. Then recovery involves replaying a dead-letter queue full of
+      messages that were never actually undeliverable.
+      <br><br>
+      A <strong>circuit breaker</strong> changes that: once the failure rate crosses a threshold, stop calling the
+      provider and stop consuming the queue. Messages accumulate — which is exactly what a queue is for — and
+      processing resumes when the breaker closes. Nothing is lost and nothing needs replaying.
+      <br><br>
+      The distinction that makes retries useful at all: <strong>retry 5xx and timeouts, never 4xx.</strong> An invalid
+      email address will be invalid on the fourth attempt too, so retrying wastes quota and delays real work. Worse,
+      repeatedly sending to a known-bad address damages sender reputation.
+      <br><br>
+      Two things worth having. <strong>A secondary provider</strong> for critical channels, with the breaker failing
+      over to it — genuinely valuable for SMS and password-reset email, where an hour of downtime is a serious
+      incident. And <strong>alerting on dead-letter depth</strong>, because a DLQ nobody watches is the same as
+      discarding the messages.</p>
+  </div>
+
+  <h2 id="operations">Operability <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Need</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td><strong>"Did the customer get it?"</strong></td><td>Delivery record with status per channel, queryable by support</td></tr>
+        <tr><td><strong>Alert on delivery failure rate</strong></td><td>Per channel, since one provider failing is normal-ish</td></tr>
+        <tr><td><strong>Alert on a business metric stopping</strong></td><td>"No notifications sent in 15 minutes" catches unknown failures</td></tr>
+        <tr><td>Queue depth trend per channel</td><td>Growing lag means the provider or consumer is the bottleneck</td></tr>
+        <tr><td>Template rendering failures</td><td>Alert — a broken template silently fails a whole type</td></tr>
+        <tr><td>Cost per channel</td><td>SMS is orders of magnitude more expensive than email</td></tr>
+        <tr><td>A kill switch per notification type</td><td><strong>Stop a runaway send without a deployment</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — a per-type kill switch is the control you'll be grateful for</div>
+    <p style="margin:0">A notification platform can do damage very quickly. A bug in recipient resolution, a
+      mis-scheduled job, or a reprocessed backlog can send tens of thousands of wrong messages in minutes — and
+      <strong>you cannot un-send an email.</strong>
+      <br><br>
+      So a feature flag per notification type, and a global pause, are worth having from day one. When something goes
+      wrong the response is "turn it off now, investigate after", and needing a deployment to do that costs you
+      thousands of messages.
+      <br><br>
+      The related protections: <strong>a rate cap per recipient</strong>, so a bug can't send one person 500 emails,
+      and <strong>a total volume alert</strong> — "we've sent 10× the normal hourly volume" catches a runaway before a
+      customer complains.
+      <br><br>
+      This is the operational lesson specific to systems with irreversible external side effects. In most systems a
+      bug means bad data you can correct. Here it means messages in customers' inboxes, and the only available control
+      is <strong>how fast you can stop it</strong>.
+      <br><br>
+      Which is also the argument for <strong>rendering templates at send time</strong> rather than at fan-out: a
+      broken template can be fixed while messages are still queued, instead of having baked wrong content into
+      40,000 pending rows.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Fan-out amplification, not request volume, is the scaling characteristic.</li>
+      <li>Publish one message per event; expand in a dedicated fan-out stage.</li>
+      <li>Fan-out and sending scale independently, so don't couple them.</li>
+      <li>Per-channel queues, so a provider outage is contained.</li>
+      <li>Confirm ordering isn't required — it removes a lot of complexity.</li>
+      <li>Evaluate preferences in a fixed order, stopping at the first block.</li>
+      <li>Transactional bypasses preferences but never a legal suppression.</li>
+      <li>Hard bounces must feed suppression automatically — reputation is shared.</li>
+      <li>Store IANA time zones, not offsets, for quiet hours.</li>
+      <li>Re-check relevance before sending a deferred notification.</li>
+      <li>Deduplicate with a deterministic key and a unique index; insert first.</li>
+      <li>Commit the row before enqueuing the send — prefer a recoverable gap to a duplicate.</li>
+      <li>Persist first, push second; a WebSocket push to a disconnected user vanishes.</li>
+      <li>SignalR needs a backplane once you scale out; connections are the capacity metric.</li>
+      <li>A provider outage should grow a queue, not exhaust retries — use a breaker.</li>
+      <li>Retry 5xx, never 4xx.</li>
+      <li>A per-type kill switch and a volume alert, because you can't un-send.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Design a notification platform. One event may notify 10,000 users. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The number that shapes this is the <strong>fan-out amplification</strong>. One event notifying 10,000
+          users across four channels is 40,000 sends — so the scaling characteristic isn't request volume, it's
+          expansion. A platform handling 100 events a second is comfortable until one of them is a broadcast."</p>
+        <p>"I'd also confirm two things early, because they simplify a lot. <strong>Is ordering
+          required?</strong> If not, I avoid partitioned consumers, sessions and sequence tracking entirely. And
+          <strong>are duplicates survivable?</strong> If they're embarrassing rather than harmful, I can use plain
+          at-least-once transport and dedupe in the pipeline, rather than chasing exactly-once — which isn't
+          achievable anyway."</p>
+        <p>"<strong>The key design decision is publishing one message per event, not one per recipient</strong>, and
+          expanding it in a dedicated fan-out stage."</p>
+        <p>"If the producer published 10,000 messages: it blocks while doing so, a failure halfway leaves an unknown
+          subset published with no record of progress, retrying republishes everything, and the producer now needs to
+          know about recipients and preferences — which isn't its job."</p>
+        <p>"With a fan-out worker: one durable message in, expansion happens once, per-delivery rows are written in
+          batches, and each delivery is independently retryable. A crash halfway is recoverable because the rows
+          record what already exists."</p>
+        <p>"It also lets fan-out and sending scale independently. Expanding 10,000 recipients is a database operation;
+          sending 10,000 emails is rate-limited by a provider. Those want very different concurrency."</p>
+        <p>"<strong>Per-channel queues</strong> for the same reason — if SMS shares a queue with email and Twilio is
+          down, retrying SMS delays every email. Separate queues contain a provider outage to its channel."</p>
+        <p>"<strong>Preferences are a real subsystem</strong>, evaluated in a fixed order: global unsubscribe first,
+          then bounces and suppressions, then channel and type opt-outs, then quiet hours, digest preference, rate
+          caps, and finally deduplication."</p>
+        <p>"The important distinction is <strong>transactional versus marketing</strong>. A password reset must arrive
+          even at 3am with email notifications off, otherwise the user is locked out. But it must never bypass a
+          <em>legal</em> suppression — that's a regulatory boundary, not a preference. So every notification type needs
+          an explicit classification, on the type definition rather than decided per send."</p>
+        <p>"<strong>Deduplication</strong> uses a deterministic key — type, recipient, channel, entity, and a time
+          bucket — with a <strong>unique index</strong> on it. And the code inserts first and treats a constraint
+          violation as success, rather than checking then inserting, because check-then-insert is itself a race that
+          both callers pass."</p>
+        <p>"That's the same primitive as an idempotency key or a conditional update: <strong>make the database the
+          arbiter, not the application code.</strong>"</p>
+        <p>"I'd also be deliberate about ordering: <strong>commit the delivery row before enqueuing the send</strong>.
+          The reverse means a send can happen with no record, so a retry duplicates. This way the failure mode is a
+          row with no send, which a sweeper detects and re-enqueues — a recoverable gap rather than an unrecoverable
+          duplicate."</p>
+        <p>"<strong>For real-time in-app</strong>, SignalR with Azure SignalR Service for the backplane — WebSocket
+          connections are pinned to an instance, so without a backplane, scaling out means notifications only reach
+          users connected to the instance that handled the event."</p>
+        <p>"And the rule there: <strong>persist first, push second.</strong> A push to a disconnected user simply
+          vanishes with no error, so the store is the truth and the push is an optimisation. Reconnection then just
+          means fetching anything newer than the last id the client saw."</p>
+        <p>"<strong>On failure</strong>: retry 5xx and timeouts with backoff and jitter, never 4xx — an invalid address
+          stays invalid and retrying damages sender reputation. A circuit breaker for a provider that's fully down, so
+          the queue grows rather than every message exhausting its retries and dead-lettering. Hard bounces feed the
+          suppression list automatically."</p>
+        <p>"<strong>The operational control I'd insist on is a per-type kill switch.</strong> This system can send
+          tens of thousands of wrong messages in minutes and <em>you cannot un-send an email</em>. So a feature flag
+          per notification type, a global pause, a per-recipient rate cap, and an alert on abnormal volume. Needing a
+          deployment to stop a runaway send costs thousands of messages."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you identify fan-out amplification as the scaling issue?</li>
+        <li>Do you publish per event and expand in a stage?</li>
+        <li>Do you separate channels into their own queues?</li>
+        <li>Do you know transactional must not bypass legal suppression?</li>
+        <li>Do you dedupe with a unique index rather than a check?</li>
+        <li>Do you persist before pushing, and know why SignalR needs a backplane?</li>
+        <li>Do you raise the kill switch and volume alerting?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> the producer publishing one message per recipient.</li>
+        <li><span class="redflag">Red flag:</span> one shared queue for every channel.</li>
+        <li><span class="redflag">Red flag:</span> treating the WebSocket push as the delivery mechanism.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you implement digests?</li>
+          <li>A bug sent 50,000 wrong emails. What now, and what prevents it?</li>
+          <li>How would you add ordering if it became a requirement?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

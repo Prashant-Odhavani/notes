@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agile, Scrum, Kanban &amp; DevOps — SDLC</title>
+<meta name="description" content="Scrum vs Kanban, making ceremonies useful, DevOps as an ownership model, technical debt you can actually get funded, and documentation that survives.">
+<meta name="keywords" content="agile scrum kanban sprint retrospective standup WIP limits devops culture technical debt refactoring documentation ADR runbook continuous improvement scrumban">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="29-sdlc/process.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Agile, Scrum, Kanban &amp; DevOps</h1>
+    <p class="subtitle">The process layer — plus technical debt, refactoring and documentation, which is
+      where process meets code.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>Agile is a set of values about responding to change. Scrum and Kanban are two mechanisms for
+        creating short feedback loops. Confusing the values with the ceremonies is the standard mistake.</li>
+      <li>Scrum = fixed iterations, scope frozen inside them. Kanban = continuous flow with WIP limits.
+        Choose by the <em>shape of the work</em>.</li>
+      <li>DevOps = removing the handoff between building and running. "You build it, you run it."</li>
+      <li>Technical debt is only a useful word if you talk about the <strong>interest</strong> — what it
+        costs per sprint.</li>
+      <li>Deliberate debt taken for a deadline is a legitimate decision. Accidental debt from ignorance
+        isn't the same thing.</li>
+      <li>Documentation that survives lives next to the code and answers <strong>why</strong>, not what.</li>
+    </ul>
+  </div>
+
+  <h2 id="agile">Agile, minus the industry <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>The underlying claim is narrow and defensible:</p>
+
+  <blockquote>For most software, requirements can't be fully known up front. So a process that produces
+    working software frequently and adapts will beat one that plans exhaustively and executes.</blockquote>
+
+  <p>Everything else — ceremonies, certifications, tooling — is implementation detail. Most of the
+    industry's dysfunction comes from adopting the detail and discarding the claim.</p>
+
+  <div class="remember">
+    <span class="r-label">The diagnostic that actually works</span>
+    <p><strong>How quickly can feedback change what we build next?</strong></p>
+    <p>A team running every ceremony perfectly but shipping twice a year has the form without the substance.
+      A team with no ceremonies that releases daily and adjusts is doing the thing that matters.</p>
+  </div>
+
+  <h2 id="scrum-kanban">Scrum vs Kanban <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Scrum</th><th>Kanban</th></tr></thead>
+      <tbody>
+        <tr><td>Cadence</td><td>Fixed sprints (1–4 weeks), scope frozen inside</td><td>Continuous flow; work pulled as capacity frees</td></tr>
+        <tr><td>Core constraint</td><td>The sprint commitment</td><td>WIP limits per column</td></tr>
+        <tr><td>Planning</td><td>Up front per sprint</td><td>Just in time per item</td></tr>
+        <tr><td>Key metrics</td><td>Velocity, sprint burndown</td><td>Cycle time, throughput, WIP, flow efficiency</td></tr>
+        <tr><td>Roles</td><td>PO, Scrum Master, Developers</td><td>None prescribed</td></tr>
+        <tr><td>Good fit</td><td>Feature work with plannable scope; teams needing rhythm</td><td>Support, ops, incident-heavy, unpredictable arrivals</td></tr>
+        <tr><td>Fails when</td><td>Priorities change mid-sprint constantly; interrupts dominate</td><td>No WIP discipline — becomes an infinite to-do list with a board</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>The honest recommendation for most product teams:</strong> Scrum's rhythm plus Kanban's WIP
+    discipline — which is roughly what "Scrumban" means in practice.</p>
+
+  <p>Sprint boundaries give useful checkpoints for planning and reflection. WIP limits are what actually
+    reduce cycle time, via <a href="estimation-planning.html#flow">Little's Law</a>.</p>
+
+  <p>And if a team is drowning in unplanned work, Kanban is the honest choice. Pretending you can commit to a
+    sprint while 40% of capacity is interrupts just produces failed sprints and demoralisation.</p>
+
+  <h3 id="ceremonies">Making the ceremonies useful</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Purpose</th><th>Degraded form</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>Daily standup</td><td>Surface blockers, coordinate today</td><td>Status report to the manager</td><td>Walk the board right-to-left. Discuss work, not people. 10 minutes.</td></tr>
+        <tr><td>Planning</td><td>Agree what to build; confirm it's understood</td><td>Estimation marathon</td><td>Refine ahead of time; planning confirms rather than discovers</td></tr>
+        <tr><td>Refinement</td><td>Make upcoming work ready</td><td>Skipped — so planning becomes analysis</td><td>Short, regular, with acceptance criteria as the output</td></tr>
+        <tr><td>Review / demo</td><td>Get feedback from real stakeholders</td><td>Internal demo to the team</td><td>Show working software to someone who'll use it</td></tr>
+        <tr><td>Retrospective</td><td>Improve the system of work</td><td>Ritual complaining, no follow-through</td><td>One or two actions with owners; check last time's first</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Retros that generate ten actions and complete none.
+      <br><br>
+      The pattern that works: <strong>start each retro by reviewing the previous actions.</strong> If they
+      weren't done, that's the first topic — usually they were too vague or had no owner. One completed
+      improvement per fortnight compounds. Ten uncompleted ones teach the team that retros are theatre.</p>
+  </div>
+
+  <h2 id="devops">DevOps <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="oneline"><b>One line:</b> the people who build the software also run it, so the incentives stop
+    being opposed.</div>
+
+  <p>DevOps started as a response to a specific dysfunction: developers rewarded for shipping change,
+    operators rewarded for stability, throwing work over a wall at each other.</p>
+
+  <p><strong>What actually changes when a team owns operations:</strong></p>
+
+  <ul>
+    <li>Observability stops being an afterthought — the person who'll debug it at 2am is writing it now.</li>
+    <li>Deployment gets automated quickly, because the team doing it manually is the team suffering it.</li>
+    <li>Reliability work gets prioritised honestly, because the cost is felt rather than exported.</li>
+  </ul>
+
+  <div class="note warn">
+    <div class="note-title">The caveat worth stating in an interview</div>
+    <p style="margin:0">"You build it, you run it" is only sustainable with a real rotation, compensation and
+      enough people. Imposed on a team of four with no alerting hygiene, it's just unpaid overtime with a
+      modern name.
+      <br><br>
+      Platform teams exist to make it viable — paved paths, shared pipelines, observability infrastructure —
+      so product teams can own their services without each reinventing the operational layer.</p>
+  </div>
+
+  <h2 id="tech-debt">Technical debt <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>The metaphor only works if you talk about the <strong>interest</strong> — what it costs you every
+      sprint.</p>
+    <p>Without that, "technical debt" just means "code I don't like".</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Origin</th><th>How to treat it</th></tr></thead>
+      <tbody>
+        <tr><td>Deliberate + prudent</td><td>"We ship the simple version for the deadline and fix it in March"</td><td>Legitimate. Record it with the reason and a date — it's a decision, not a failure</td></tr>
+        <tr><td>Deliberate + reckless</td><td>"No time for tests"</td><td>Usually a false economy — the rework arrives in the same release</td></tr>
+        <tr><td>Accidental + prudent</td><td>"Now it's built, we see the better design"</td><td>Normal and healthy. Refactor next time you touch it</td></tr>
+        <tr><td>Accidental + reckless</td><td>Nobody knew better</td><td>A skills and review problem, not a scheduling one</td></tr>
+        <tr><td>Bit rot</td><td>Framework EOL, deprecated APIs</td><td>Non-negotiable scheduled maintenance — the deadline is set by someone else</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="funding-debt">Getting debt work funded</h3>
+
+  <div class="vs-grid">
+    <div class="bad">
+      <span class="vs-label">Arguments that fail</span>
+      <p>"The code is messy."<br>"It's not clean architecture."<br>"We need a rewrite quarter."</p>
+    </div>
+    <div class="good">
+      <span class="vs-label">Arguments that work</span>
+      <p>"Changes in billing take 3× longer than elsewhere, and 60% of last quarter's incidents came from
+        there."<br><br>"This framework stops getting security updates in November."</p>
+    </div>
+  </div>
+
+  <p><strong>The delivery mechanism matters as much as the argument.</strong> Large refactoring projects are
+    hard to fund and frequently abandoned halfway, leaving two patterns in the codebase — worse than either.</p>
+
+  <p>Continuous small repayment attached to feature work is more effective and rarely needs permission: when
+    you touch an area, leave it better, bounded to the change you're making. Reserving a fixed slice of
+    capacity (commonly 10–20%) formalises it without a business case each time.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — knowing what NOT to fix</div>
+    <p style="margin:0">Code that's ugly but stable, rarely touched and well covered costs almost nothing to
+      leave alone. Debt only has interest if you keep visiting it.
+      <br><br>
+      So prioritise by <strong>change frequency</strong>, not by how uncomfortable the code makes you. "I'd
+      leave that alone, we haven't touched it in two years" is judgement, not laziness.</p>
+  </div>
+
+  <h2 id="refactoring">Refactoring as a habit</h2>
+
+  <p>Refactoring means changing structure <em>without</em> changing behaviour. That constraint is what makes
+    it safe — abandoning it is what makes "refactors" break production.</p>
+
+  <ul>
+    <li><strong>Tests first.</strong> Without them you're not refactoring, you're rewriting and hoping. If
+      tests don't exist, write characterisation tests that pin current behaviour — including behaviour that
+      looks wrong.</li>
+    <li><strong>Small steps, build green, commit often.</strong> A refactor branch open for two weeks will
+      conflict with everything.</li>
+    <li><strong>Never in the same commit as behaviour change</strong> — see
+      <a href="development.html#pr-size">development</a>.</li>
+    <li><strong>Prefer the boy-scout rule</strong> (leave the area slightly better) over scheduled refactoring
+      projects.</li>
+    <li><strong>Know when to stop.</strong> Refactoring toward an abstraction that isn't needed yet is
+      over-engineering with better branding.</li>
+  </ul>
+
+  <h2 id="documentation">Documentation that survives <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Most documentation dies because it duplicates what the code already says — so it drifts, and then it
+    actively misleads.</p>
+
+  <p>The documentation worth writing captures what code <em>can't</em>:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Artifact</th><th>Answers</th><th>Where it lives</th></tr></thead>
+      <tbody>
+        <tr><td>README</td><td>How do I run, test and debug this locally?</td><td>Repo root; verified by a new joiner following it</td></tr>
+        <tr><td>ADR</td><td>Why is it built this way, and what did we reject?</td><td><code>/docs/adr</code>, immutable — see <a href="architecture-design.html#adr">ADRs</a></td></tr>
+        <tr><td>Runbook</td><td>This alert fired — what do I do?</td><td>Linked directly from the alert</td></tr>
+        <tr><td>API reference</td><td>What's the contract?</td><td>Generated from code (OpenAPI), never hand-maintained</td></tr>
+        <tr><td>Architecture overview</td><td>What are the components and how do they talk?</td><td>One diagram, in the repo, dated</td></tr>
+        <tr><td>Onboarding guide</td><td>What context does a new engineer need?</td><td>Updated by each new joiner as they hit gaps</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Two rules keep it honest:</strong> put it in the repository so it's versioned and reviewed with
+    the code, and prefer <em>why</em> over <em>what</em> — the code already documents what it does, and does
+    it accurately.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Pick Scrum or Kanban by how work arrives, not by preference.</li>
+      <li>WIP limits reduce cycle time. Ceremonies alone don't.</li>
+      <li>Retros: review last time's actions first, and finish one or two.</li>
+      <li>DevOps is an ownership model. The tooling follows from it.</li>
+      <li>Fund debt with change-time and incident data, and repay it incrementally.</li>
+      <li>Don't repay debt in code you never touch.</li>
+      <li>Documentation lives in the repo and explains <em>why</em>.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Adopting ceremonies without shortening the feedback loop</strong> — form without function.</li>
+    <li><strong>Velocity used as a performance metric</strong>, which guarantees estimate inflation.</li>
+    <li><strong>Sprint commitments treated as promises to external stakeholders</strong>, converting a
+      planning tool into a liability.</li>
+    <li><strong>"Definition of done" stopping at merged</strong>, so unreleased work piles up.</li>
+    <li><strong>Debt discussed as an aesthetic complaint</strong> rather than a measurable cost.</li>
+    <li><strong>Documentation written once at project start</strong> — worse than none, because people trust it.</li>
+    <li><strong>Retro actions with no owner.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>Scrum or Kanban — which do you prefer?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I don't have a fixed preference — I'd pick based on how the work arrives."</p>
+        <p>"Scrum assumes you can meaningfully commit to a scope for a fixed period, which works for feature
+          development where priorities are stable for a couple of weeks. Kanban assumes work arrives
+          unpredictably and optimises flow instead, which is right for support-heavy or platform teams."</p>
+        <p>"The failure I've seen most is running Scrum in an environment that's really Kanban. The team
+          commits, 40% of capacity goes to production issues, the sprint fails, and everyone concludes the
+          team is underperforming — when the process was simply mismatched. There I'd either move to Kanban,
+          or explicitly reserve capacity for unplanned work and commit to less. The honest fix is to stop
+          pretending the work is plannable."</p>
+        <p>"The elements I actually care about aren't framework-specific: small batches, WIP limits, a real
+          demo to someone who'll use the software, and a retro that produces one action that gets done. I'd
+          take a team with those and no framework over a certified Scrum team without them."</p>
+        <p>"If pushed for a default: sprint cadence for rhythm and planning, with Kanban's WIP limits inside
+          it — because WIP limits are what actually reduce cycle time."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you reason about process fit instead of advocating a brand?</li>
+        <li>Have you seen process fail, and do you know why?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> reciting the Scrum guide's roles and events.</li>
+        <li><span class="redflag">Red flag:</span> "process is overhead, we just ship" — real teams need
+          coordination mechanisms.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you handle a team where half the capacity is unplanned support?</li>
+          <li>What if the PO changes priorities mid-sprint every sprint?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you convince management to invest in reducing technical debt? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd stop using the phrase 'technical debt'. To a non-engineer it sounds like engineers wanting
+          time to make the code nicer. I'd translate it into what the business already tracks: delivery
+          speed, incident frequency, and risk."</p>
+        <p>"That means gathering evidence first. Which modules take disproportionately long to change —
+          measurable from PR cycle time by area. Where do incidents originate — measurable from postmortems.
+          What manual work recurs every sprint."</p>
+        <p>"Then the pitch is concrete: 'changes to billing take about three times longer than equivalent work
+          elsewhere, and it was implicated in six of our nine incidents last quarter. Two sprints on it
+          should bring change time down to normal, which pays back within a quarter.' That's an investment
+          case — it can be argued with or accepted on its merits."</p>
+        <p>"I'd also propose the smallest credible slice rather than a rewrite. A large remediation project is
+          a big bet that's easy to refuse and easy to abandon halfway. Fixing the single worst area, showing
+          a measurable improvement, then asking for the next one is what builds the credibility that funds
+          the rest."</p>
+        <p>"And for the ongoing baseline I'd prefer a standing allocation — maybe 15% of capacity — so routine
+          repayment doesn't need a business case every time."</p>
+        <p>"The other half is prioritisation. Not all debt is worth repaying. Code that's ugly but stable and
+          rarely touched has almost no interest. Targeting by change frequency and incident correlation is
+          also what makes the argument credible — it shows I'm proposing to fix the expensive parts, not
+          everything that offends me."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you communicate engineering concerns in business terms?</li>
+        <li>Do you prioritise debt by cost rather than taste?</li>
+        <li>Do you propose incremental, verifiable work?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "management should just trust engineers".</li>
+        <li><span class="redflag">Red flag:</span> asking for a rewrite or a dedicated "tech debt quarter".</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if you get the two sprints and it takes four?</li>
+          <li>How do you stop the debt reaccumulating?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does DevOps mean to you, beyond tooling?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It's about removing the handoff between the people who build software and the people who run it —
+          because that handoff creates opposed incentives, and every dysfunction follows from that. The
+          tooling is a consequence, not the substance."</p>
+        <p>"Concretely, on a team that has it, the same people write the code, own the pipeline, carry the
+          pager and write the postmortem."</p>
+        <p>"That changes behaviour in ways process mandates can't. People add useful telemetry because they'll
+          be the ones searching for it at 2am. Deployment becomes boring quickly because nobody wants a
+          stressful manual procedure they personally have to run. Reliability work gets prioritised because
+          the cost is felt by the team rather than exported."</p>
+        <p>"I'd add one caveat, because it's where the idea gets abused: 'you build it, you run it' without a
+          real rotation, compensation and enough headcount is just unpaid on-call. Making it sustainable
+          usually needs a platform capability — shared pipelines, paved-path deployment, observability
+          infrastructure — so each product team isn't rebuilding the operational fundamentals."</p>
+        <p>"And the metric I'd watch to know it's working is the DORA set, particularly time to restore —
+          shared ownership shows up there first."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand it as an ownership model rather than a job title or toolchain?</li>
+        <li>Do you recognise the sustainability caveat?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> listing tools — Docker, Kubernetes, Jenkins — as the definition.</li>
+        <li><span class="redflag">Red flag:</span> "DevOps is a role we hire for" with no acknowledgement of the tension.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you introduce this in an organisation with a separate ops department?</li>
+          <li>What should a platform team own, and what shouldn't it?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

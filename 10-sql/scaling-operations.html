@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Partitioning, Replication &amp; Recovery — SQL</title>
+<meta name="description" content="Scaling a relational database and keeping it recoverable: partitioning, read replicas, backup strategy, RPO/RTO and high availability.">
+<meta name="keywords" content="table partitioning partition switching sliding window read replica always on availability group failover cluster log shipping backup full differential log recovery model RPO RTO point in time restore archiving sharding">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/scaling-operations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Partitioning, Replication &amp; Recovery</h1>
+    <p class="subtitle">Scaling the database, and being able to get it back. The second half is what actually
+      ends careers.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Partitioning is not a performance feature.</strong> Its real value is manageability —
+        near-instant archiving via partition switching.</li>
+      <li><strong>Scale reads with replicas; scale writes by sharding.</strong> Only one of those is easy.</li>
+      <li><strong>RPO = how much data you can lose. RTO = how long you can be down.</strong> Everything else
+        follows from those two numbers.</li>
+      <li><strong>Full + differential + log backups</strong> give point-in-time recovery. Log backups are what
+        make the RPO small.</li>
+      <li><strong>An untested backup is not a backup.</strong> Restore is the only real test.</li>
+      <li><strong>Simple recovery model = no log backups = you lose everything since the last full
+        backup.</strong></li>
+      <li><strong>Replicas are asynchronous by default</strong> — reading from one means reading slightly stale
+        data.</li>
+    </ul>
+  </div>
+
+  <h2 id="partitioning">Table partitioning <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Partitioning splits one logical table into several physical pieces, usually by date range.</p>
+    <p>Queries and application code don't change at all — it's still one table name.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The misconception worth correcting in an interview</div>
+    <p style="margin:0"><strong>Partitioning is primarily a manageability feature, not a performance
+      feature.</strong>
+      <br><br>
+      Partition elimination does help — a query filtered on the partition key skips irrelevant partitions. But
+      a good index gives you most of the same benefit with far less complexity.
+      <br><br>
+      Where partitioning is genuinely transformative is <strong>partition switching</strong>: moving an entire
+      partition in or out of a table is a metadata operation. Archiving a month of data goes from a
+      multi-hour, log-flooding <code>DELETE</code> to something that completes in under a second.
+      <br><br>
+      Saying "I'd partition this to make queries faster" is the answer they're listening for as a mistake.</p>
+  </div>
+
+  <pre data-label="sql — partition by month"><code class="language-sql">-- 1. Function: where the boundaries are
+CREATE PARTITION FUNCTION pf_Monthly (datetime2(3))
+AS RANGE RIGHT FOR VALUES
+   ('2024-01-01', '2024-02-01', '2024-03-01', '2024-04-01');
+
+-- 2. Scheme: which filegroup each partition lives on
+CREATE PARTITION SCHEME ps_Monthly
+AS PARTITION pf_Monthly ALL TO ([PRIMARY]);
+
+-- 3. Table on the scheme. The partition column MUST be in every unique index.
+CREATE TABLE dbo.OrderHistory
+(
+    Id         bigint       NOT NULL,
+    CreatedUtc datetime2(3) NOT NULL,
+    Total      decimal(19,4) NOT NULL,
+    CONSTRAINT PK_OrderHistory PRIMARY KEY CLUSTERED (CreatedUtc, Id)
+) ON ps_Monthly(CreatedUtc);</code></pre>
+
+  <pre data-label="sql — archiving in milliseconds instead of hours" class="code-good"><code class="language-sql">-- Staging table: identical structure, same filegroup, same indexes
+CREATE TABLE dbo.OrderHistory_Archive_202401 (...);
+
+-- Metadata-only. No data is copied, no rows are logged.
+ALTER TABLE dbo.OrderHistory
+    SWITCH PARTITION 2 TO dbo.OrderHistory_Archive_202401;
+
+-- Now drop, compress, or move that table wherever you like.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Partitioning gives you</th><th>Partitioning costs you</th></tr></thead>
+      <tbody>
+        <tr><td>Near-instant archive and purge via switching</td><td>The partition column must be in every unique index — including the PK</td></tr>
+        <tr><td>Partition-level index rebuilds</td><td>Real complexity: functions, schemes, filegroups, a sliding-window job</td></tr>
+        <tr><td>Partition-level compression (cold data compressed, hot not)</td><td>Queries not filtering on the partition key can get <em>slower</em></td></tr>
+        <tr><td>Piecemeal restore of just the hot partitions</td><td>Statistics are per-table by default, so estimates on huge tables can suffer</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title"><code>RANGE RIGHT</code> vs <code>RANGE LEFT</code>, and the empty-partition rule</div>
+    <p style="margin:0"><code>RANGE RIGHT</code> puts the boundary value in the <em>right</em> (later)
+      partition. With date boundaries that's what you want — <code>'2024-02-01'</code> belongs to February, not
+      January. <code>RANGE LEFT</code> with dates leads to off-by-one bugs that are hard to spot.
+      <br><br>
+      And <strong>always split an empty partition</strong>. Splitting a partition containing data moves every
+      row and is fully logged — the exact expensive operation you adopted partitioning to avoid. A
+      sliding-window job should add the next empty partition ahead of time, not when data arrives.</p>
+  </div>
+
+  <h2 id="scaling-reads">Scaling reads <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>How it helps</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Indexes</strong></td><td>Cheapest, biggest win. Always first</td><td>Write cost</td></tr>
+        <tr><td><strong>Caching</strong></td><td>Removes reads entirely</td><td>Invalidation is the hard part</td></tr>
+        <tr><td><strong>Read replicas</strong></td><td>Offloads reporting and read-heavy traffic</td><td><strong>Replication lag</strong> — stale reads</td></tr>
+        <tr><td><strong>Read model / CQRS</strong></td><td>A shape optimised for querying</td><td>Eventual consistency, more moving parts</td></tr>
+        <tr><td><strong>Scale up</strong></td><td>Trivial, and often the right answer</td><td>Ceiling, and cost curve</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — "scale up first" is often correct</div>
+    <p style="margin:0">Doubling the size of a managed database instance takes minutes and needs no
+      architectural change. Sharding takes months and permanently increases the complexity of everything.
+      <br><br>
+      A modern single instance handles a genuinely large workload. Most applications that "need sharding"
+      actually need three indexes and to stop running reports against the primary.
+      <br><br>
+      Reaching for distributed architecture before exhausting the cheap options is a common
+      over-engineering signal — and saying so is a strong senior answer, provided you also know <em>where</em>
+      the ceiling is and what you'd do when you hit it.</p>
+  </div>
+
+  <h3 id="replication-lag">Replication lag is a correctness problem, not just latency</h3>
+
+  <pre data-label="csharp — the read-your-own-writes bug" class="code-bad"><code class="language-csharp">// Write goes to the primary
+await _writeDb.Orders.AddAsync(order);
+await _writeDb.SaveChangesAsync();
+
+// Redirect to the order page - which reads from a replica
+return RedirectToAction("Details", new { id = order.Id });
+
+// The replica hasn't received it yet -> 404 on the order the user just created</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mitigation</th><th>How it works</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Read from primary after a write</strong></td><td>Sticky-to-primary for that user for a few seconds. Simple and effective</td></tr>
+        <tr><td><strong>Return the written entity</strong></td><td>Don't re-read at all — you already have it</td></tr>
+        <tr><td><strong>Route by intent</strong></td><td>Reporting and search → replica; anything in a write flow → primary</td></tr>
+        <tr><td><strong>Synchronous commit</strong></td><td>No lag, but write latency now includes the replica round trip</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Replicas are for workloads that tolerate stale data.</strong></p>
+    <p>Dashboards, reports, search, exports, analytics — yes. Anything the user is about to read back after
+      writing — no.</p>
+    <p>Deciding this per query, deliberately, is the whole skill. A global "reads go to the replica" switch is
+      how you ship intermittent 404s.</p>
+  </div>
+
+  <h2 id="ha">High availability <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technology</th><th>Gives you</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Always On Availability Groups</strong></td>
+          <td>Automatic failover, readable secondaries, per-database granularity</td>
+          <td>The modern default. Sync commit for zero data loss, async for distance</td>
+        </tr>
+        <tr>
+          <td><strong>Failover Cluster Instance</strong></td>
+          <td>Instance-level failover on shared storage</td>
+          <td>Whole instance moves; storage is a single point of failure</td>
+        </tr>
+        <tr>
+          <td><strong>Log shipping</strong></td>
+          <td>Periodic log restore to a warm standby</td>
+          <td>Simple, cheap, manual failover, RPO = shipping interval</td>
+        </tr>
+        <tr>
+          <td><strong>Azure SQL built-in HA</strong></td>
+          <td>Managed — three replicas, automatic failover</td>
+          <td>You don't configure it. See <a href="azure-sql.html#ha">Azure SQL</a></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Synchronous vs asynchronous commit — the actual trade</div>
+    <p style="margin:0"><strong>Synchronous:</strong> the primary waits for the secondary to harden the log
+      before acknowledging the commit. Zero data loss on failover, and every write pays the network round trip.
+      Practical only within a datacentre or availability zone.
+      <br><br>
+      <strong>Asynchronous:</strong> the primary commits immediately. Writes are fast and you can replicate
+      across regions, but a failover loses whatever hadn't shipped.
+      <br><br>
+      So the common production shape is <em>synchronous within the region</em> for HA and
+      <em>asynchronous to another region</em> for disaster recovery. That's a good concrete answer, because it
+      shows the two requirements are different.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">HA is not backup</div>
+    <p style="margin:0">A replica faithfully replicates <code>DELETE FROM Orders</code> with no
+      <code>WHERE</code> clause. Within seconds every copy is equally wrong.
+      <br><br>
+      HA protects against <strong>infrastructure failure</strong>. Backups protect against
+      <strong>mistakes, corruption and ransomware</strong>. You need both, and confusing them is a genuinely
+      dangerous mistake.</p>
+  </div>
+
+  <h2 id="backup">Backup and recovery <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Start with the two numbers</span>
+    <p><strong>RPO — Recovery Point Objective:</strong> how much data can we afford to lose? Determines backup
+      <em>frequency</em>.</p>
+    <p><strong>RTO — Recovery Time Objective:</strong> how long can we be down? Determines backup
+      <em>strategy</em> and where the copies live.</p>
+    <p>Both come from the business, not from you. Everything technical follows from them.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Backup type</th><th>Contains</th><th>Restore role</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Full</strong></td><td>The entire database</td><td>The baseline. Everything builds on it</td></tr>
+        <tr><td><strong>Differential</strong></td><td>All changes since the last <em>full</em></td><td>Reduces how many log backups you must apply</td></tr>
+        <tr><td><strong>Transaction log</strong></td><td>All log records since the last log backup</td><td><strong>Point-in-time recovery.</strong> This is what makes RPO small</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The standard strategy</span>
+    <p><strong>Weekly full → daily differential → log backups every 5–15 minutes.</strong></p>
+    <p>Restore order: full, then the <em>latest</em> differential, then every log backup after it, in order, to
+      the moment you want.</p>
+    <p>The log interval <em>is</em> your RPO. Want to lose at most 5 minutes? Back up the log every 5 minutes.</p>
+  </div>
+
+  <h3 id="recovery-models">Recovery models</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Model</th><th>Log backups</th><th>Point-in-time restore</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Full</strong></td><td>Required</td><td>Yes</td><td><strong>Any production database</strong></td></tr>
+        <tr><td><strong>Simple</strong></td><td>Not possible</td><td><strong>No</strong></td><td>Dev, test, rebuildable data warehouses</td></tr>
+        <tr><td><strong>Bulk-logged</strong></td><td>Yes</td><td>Limited during bulk operations</td><td>Temporarily, during a large load</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Two failure modes that recur constantly</div>
+    <p style="margin:0"><strong>1. Simple recovery in production.</strong> Someone switched it to "stop the log
+      growing". The log stops growing because it's truncated at each checkpoint — and now log backups are
+      impossible, so the RPO is silently "since the last full backup". Often discovered during an incident.
+      <br><br>
+      <strong>2. Full recovery with no log backups.</strong> The mirror image: the model is correct but nobody
+      configured log backups, so the log grows forever until the disk fills and the database stops accepting
+      writes. Then someone shrinks the log, which fixes nothing and fragments everything.
+      <br><br>
+      Both are really the same mistake — treating the log as a nuisance rather than as the mechanism that makes
+      point-in-time recovery possible.</p>
+  </div>
+
+  <h3 id="restore-testing">Test the restore, not the backup</h3>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">A backup job reporting success proves a file was written. It does not prove the file is
+      restorable, that you have the right encryption key, that anyone knows the procedure, or that the restore
+      fits inside the RTO.
+      <br><br>
+      Things I'd want in place:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Automated restore to a separate environment</strong>, regularly. This is the only real test,
+        and it also gives you a realistic dataset for testing.</li>
+      <li><strong><code>RESTORE VERIFYONLY</code> plus <code>CHECKSUM</code></strong> as a cheap continuous
+        check.</li>
+      <li><strong>A measured RTO.</strong> "We can restore" means nothing without "in 40 minutes" — and a
+        2 TB restore over a network is not fast.</li>
+      <li><strong>Offsite and immutable copies.</strong> Ransomware encrypts network-reachable backups too.
+        Immutability is what makes a backup ransomware-proof.</li>
+      <li><strong>A written, tested runbook.</strong> During an incident nobody invents a restore procedure
+        correctly.</li>
+    </ul>
+  </div>
+
+  <pre data-label="sql — point-in-time restore"><code class="language-sql">RESTORE DATABASE MyDb FROM DISK = 'full.bak'
+    WITH NORECOVERY, REPLACE;                  -- stay in restoring state
+
+RESTORE DATABASE MyDb FROM DISK = 'diff.bak'
+    WITH NORECOVERY;
+
+RESTORE LOG MyDb FROM DISK = 'log1.trn' WITH NORECOVERY;
+RESTORE LOG MyDb FROM DISK = 'log2.trn'
+    WITH STOPAT = '2024-06-01T14:32:00', RECOVERY;   -- stop just before the mistake</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Recovering from a bad <code>DELETE</code> without downtime</div>
+    <p style="margin:0">Don't restore over the live database. Restore a <strong>copy</strong> to the moment
+      before the mistake, then copy the affected rows back.
+      <br><br>
+      Far less disruptive, and it doesn't discard the legitimate work that happened after the mistake — which
+      a straight point-in-time restore of the production database would throw away.</p>
+  </div>
+
+  <h2 id="sharding">Sharding — the last resort <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Sharding splits data across <strong>multiple databases</strong> by some key — tenant, customer, region.
+      It's the only way to scale writes beyond one machine.</p>
+    <p>It also removes cross-shard joins, cross-shard transactions and cross-shard uniqueness. Permanently.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>You lose</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Cross-shard joins</td><td>Aggregate in the application, or maintain a separate reporting store</td></tr>
+        <tr><td>Cross-shard transactions</td><td>Need <a href="../19-architecture/distributed-data.html#saga">sagas</a></td></tr>
+        <tr><td>Global uniqueness</td><td>Need a distributed ID scheme</td></tr>
+        <tr><td>Simple schema changes</td><td>Now a rolling operation across N databases</td></tr>
+        <tr><td>Even load</td><td>Hot shards — one large tenant can outgrow its shard</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Choosing the shard key is the decision you can't take back</div>
+    <p style="margin:0">Resharding a live system is one of the hardest operations in this business. So the key
+      has to be right the first time.
+      <br><br>
+      You want a key that <strong>appears in nearly every query</strong>, distributes evenly, and matches your
+      natural consistency boundary. Tenant ID in a B2B SaaS is the classic good example — most queries are
+      already scoped to a tenant, so almost nothing needs to cross shards.
+      <br><br>
+      A bad key means every query fans out to every shard, which is slower than the single database you
+      started with. See <a href="../23-multi-tenant-saas/index.html">multi-tenant SaaS</a> for the tenancy
+      angle.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Partitioning is for manageability — switching makes archiving instant. It's not primarily a
+        performance feature.</li>
+      <li>Always split empty partitions, and use <code>RANGE RIGHT</code> for dates.</li>
+      <li>Scale up and add indexes before considering distribution.</li>
+      <li>Replicas serve stale-tolerant reads. Route per query, never globally.</li>
+      <li>Sync commit within a region for HA, async across regions for DR.</li>
+      <li>HA is not backup — a replica replicates your mistakes perfectly.</li>
+      <li>RPO and RTO are business decisions; the backup strategy follows from them.</li>
+      <li>Log backup interval = your RPO.</li>
+      <li>Simple recovery model means no point-in-time restore. Check this on every production database.</li>
+      <li>Only a tested restore counts, and immutable offsite copies are what survive ransomware.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Partitioning for performance</strong> when an index would do.</li>
+    <li><strong>Splitting a partition that contains data</strong>, causing a fully-logged data movement.</li>
+    <li><strong>Routing all reads to a replica</strong>, producing intermittent read-your-own-writes bugs.</li>
+    <li><strong>Treating HA as backup.</strong></li>
+    <li><strong>Production databases in simple recovery.</strong></li>
+    <li><strong>Full recovery model with no log backups</strong>, filling the disk.</li>
+    <li><strong>Shrinking the log routinely</strong> instead of backing it up.</li>
+    <li><strong>Never testing a restore.</strong></li>
+    <li><strong>Backups only on network shares</strong> reachable from the compromised server.</li>
+    <li><strong>Sharding before scaling up</strong> or fixing indexes.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Design a backup strategy for a system that can lose at most 5 minutes of data. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Five minutes is the RPO, so that directly sets the log backup interval: <strong>transaction log
+          backups every 5 minutes</strong>. That's the only mechanism that gives point-in-time recovery, so it
+          has to be in place."</p>
+        <p>"The prerequisite is that the database is in the <strong>full recovery model</strong>. In simple
+          recovery, log backups aren't possible at all, so the RPO would silently be 'since the last full
+          backup' — worth verifying explicitly, because I've seen production databases in simple recovery that
+          nobody knew about until an incident."</p>
+        <p>"Then a weekly full backup and daily differentials. The differentials aren't about RPO, they're
+          about <strong>RTO</strong> — without them a restore has to replay a week of log backups, which could
+          be 2,000 files. With daily diffs it's the full, one diff, and at most a day of logs."</p>
+        <p>"Then I'd ask about RTO, because it's the number people forget. If the requirement is 15 minutes and
+          the database is 2 TB, log shipping to a warm standby or an availability group isn't optional — a
+          restore from files won't finish in time no matter how the backups are arranged. If RTO is 4 hours,
+          restoring from backup is fine."</p>
+        <p>"Beyond the schedule, the parts that actually determine whether this works:"</p>
+        <p>"<strong>Automated restore testing.</strong> A successful backup job proves a file was written. It
+          doesn't prove the file is restorable, that we have the encryption key, or that the restore fits in
+          the RTO. I'd restore to a separate environment on a schedule and verify — which conveniently also
+          gives us a realistic dataset for testing."</p>
+        <p>"<strong>Offsite and immutable copies.</strong> Ransomware encrypts backups on reachable network
+          shares. Immutability — write-once storage with a retention lock — is what makes a backup actually
+          survive that."</p>
+        <p>"<strong>Backup <code>CHECKSUM</code> and <code>RESTORE VERIFYONLY</code></strong> as a cheap
+          continuous validity check, plus regular <code>DBCC CHECKDB</code>, because backing up an already-corrupt
+          database just gives you corrupt backups."</p>
+        <p>"<strong>A written runbook</strong>, and monitoring that alerts on a <em>missed</em> backup — not
+          just a failed one. A job that silently stopped running is the common case."</p>
+        <p>"And I'd separate HA from backup explicitly. An availability group gives fast failover for
+          infrastructure failure, but a replica faithfully replicates a bad <code>DELETE</code> within seconds.
+          Backups are what protect against mistakes, corruption and ransomware. We need both, for different
+          reasons."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you connect RPO to log backup frequency?</li>
+        <li>Do you ask about RTO, not just RPO?</li>
+        <li>Do you know differentials are an RTO optimisation?</li>
+        <li>Do you talk about testing restores and immutability?</li>
+        <li>Do you distinguish HA from backup?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "nightly full backups" for a 5-minute RPO.</li>
+        <li><span class="redflag">Red flag:</span> no mention of testing the restore.</li>
+        <li><span class="redflag">Red flag:</span> "we have a replica, so we're covered."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Someone deleted a table 20 minutes ago. Walk me through recovery.</li>
+          <li>What's the restore order and why?</li>
+          <li>How do you handle a 5 TB database within a 30-minute RTO?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>A 900-million-row table is causing problems. Would you partition it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My first question is <strong>what problem specifically</strong>, because partitioning solves a
+          narrow set of problems and people usually reach for it expecting a general speed-up."</p>
+        <p>"If the problem is <strong>slow queries</strong>, partitioning is probably the wrong tool. I'd look
+          at indexes first. Partition elimination helps only when the query filters on the partition key, and a
+          good index on that same column gives most of the same benefit with none of the complexity. I'd want
+          to see the plans before agreeing to partition anything."</p>
+        <p>"If the problem is <strong>archiving or purging</strong> — that's where partitioning is genuinely
+          transformative. Deleting 30 million old rows normally means a long-running, fully-logged operation
+          that escalates to a table lock and blocks the application. With partitioning, <code>SWITCH
+          PARTITION</code> moves the whole partition out as a metadata operation — under a second, barely any
+          log. That alone can justify the complexity."</p>
+        <p>"If the problem is <strong>maintenance windows</strong> — index rebuilds or statistics updates
+          taking too long — partitioning lets you rebuild one partition at a time, which fits in a window."</p>
+        <p>"If the problem is <strong>storage cost</strong>, partitioning lets you compress cold partitions
+          heavily and leave the hot one uncompressed. That's a real win on a table where 95% of the data is
+          never read."</p>
+        <p>"So my answer depends on the answer to that first question. Assuming it's archiving, I'd
+          partition by month on the date column, and be clear about the costs upfront:"</p>
+        <p>"The <strong>partition column must be in every unique index including the primary key</strong>,
+          which often means changing the PK — a real migration on a 900-million-row table, not a quick change.
+          <strong>Queries that don't filter on the partition key can get slower</strong>, because they now touch
+          every partition. And it needs a <strong>sliding-window job</strong> to add future partitions and
+          switch out old ones, which is operational code somebody has to own."</p>
+        <p>"Two implementation details I'd get right because they're easy to get wrong: use
+          <code>RANGE RIGHT</code> so a boundary date falls in the later partition — <code>RANGE LEFT</code>
+          with dates causes off-by-one bugs — and <strong>always split empty partitions</strong>. Splitting one
+          that contains data moves every row and is fully logged, which is exactly the operation we adopted
+          partitioning to avoid."</p>
+        <p>"Before any of that though, I'd ask the cheaper questions: does all 900 million rows need to be in
+          the live table at all? If 95% is historical and rarely queried, moving it to a separate archive table
+          or a cheaper store may solve the problem outright, with far less complexity than partitioning. And
+          batched deletes in a loop handle purging adequately for many workloads — a few thousand rows per
+          transaction, staying under the lock escalation threshold."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask what problem you're solving?</li>
+        <li>Do you know partitioning is manageability-first, not performance-first?</li>
+        <li>Do you know switching is the real win?</li>
+        <li>Do you name the PK constraint and the sliding-window job?</li>
+        <li>Do you consider simpler options first?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "yes, partitioning makes queries faster."</li>
+        <li><span class="redflag">Red flag:</span> no mention of the unique-index requirement.</li>
+        <li><span class="redflag">Red flag:</span> jumping to partitioning without looking at indexes.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does partition switching actually work?</li>
+          <li>What breaks if the PK doesn't include the partition column?</li>
+          <li>How would you do the migration with minimal downtime?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Reads are overloading the primary. How do you scale? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd go cheapest-first, because the expensive options are also the irreversible ones."</p>
+        <p>"<strong>First, find out what the reads actually are.</strong> Very often a small number of queries
+          account for most of the load — a missing index causing scans, or an N+1 pattern generating thousands
+          of tiny queries per request. Fixing those can remove the problem entirely, and it's hours of work
+          rather than weeks."</p>
+        <p>"<strong>Second, is reporting running against the primary?</strong> That's an extremely common
+          cause, and it's a routing decision rather than an architectural one. Analytical queries scanning
+          large tables alongside OLTP traffic is the classic pattern here."</p>
+        <p>"<strong>Third, caching.</strong> A read that never reaches the database is the cheapest possible
+          read. Reference data, lookup tables, expensive aggregates — all good candidates. The hard part is
+          invalidation, so I'd start with things where a short TTL is acceptable rather than trying to build
+          precise invalidation everywhere."</p>
+        <p>"<strong>Fourth, scale up.</strong> Unglamorous and frequently correct. Doubling instance size takes
+          minutes, needs no code change, and is trivially reversible. Compared to any distributed option it's
+          almost free — I'd want a clear reason not to do this before moving on."</p>
+        <p>"<strong>Fifth, read replicas.</strong> Now we're changing the application's consistency model, so
+          this needs care. The critical rule is <strong>route per query, not globally</strong>. Replicas are
+          asynchronous, so a global 'reads go to the replica' switch produces read-your-own-writes bugs — the
+          user creates an order, gets redirected to it, and sees a 404 because the replica hasn't caught up.
+          Intermittent, environment-dependent, and miserable to debug."</p>
+        <p>"So I'd route deliberately: reporting, search, exports and dashboards to the replica; anything in a
+          write flow to the primary. And where a user has just written something, either return the entity I
+          already have rather than re-reading, or pin that user to the primary for a few seconds."</p>
+        <p>"<strong>Sixth, a dedicated read model</strong> — a denormalized shape built for the queries, updated
+          asynchronously. More moving parts, but it's the right answer when the read pattern is genuinely
+          different from the write pattern, like a search or analytics surface."</p>
+        <p>"<strong>Sharding I'd treat as a separate conversation</strong>, because it's for write scaling, not
+          read scaling. If reads are the problem, sharding is a lot of permanent complexity aimed at the wrong
+          bottleneck."</p>
+        <p>"The thing I'd emphasise is that steps one to four are reversible and cheap, and step five changes
+          the consistency guarantees the whole application relies on. So I'd want to have genuinely exhausted
+          the cheap options before making that trade — not because replicas are bad, but because 'we added
+          replicas' is a much harder thing to undo than 'we added an index'."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you diagnose before scaling?</li>
+        <li>Do you consider scale-up rather than jumping to distribution?</li>
+        <li>Do you know replication lag is a correctness issue?</li>
+        <li>Do you route per query rather than globally?</li>
+        <li>Do you separate read scaling from write scaling?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "shard it" for a read problem.</li>
+        <li><span class="redflag">Red flag:</span> replicas with no mention of lag.</li>
+        <li><span class="redflag">Red flag:</span> skipping straight past indexing and caching.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you implement read-your-own-writes with a replica?</li>
+          <li>How do you decide cache TTLs?</li>
+          <li>When does scale-up stop being an option?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

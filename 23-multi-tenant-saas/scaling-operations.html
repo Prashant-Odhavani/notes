@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scaling &amp; Noisy Neighbours — Multi-Tenant SaaS</title>
+<meta name="description" content="Per-tenant throttling and quotas, resource isolation, monitoring and cost attribution per tenant, and disaster recovery granularity.">
+<meta name="keywords" content="noisy neighbour multi-tenant throttling per tenant rate limit quota resource governance tenant metrics cost attribution per tenant SLA disaster recovery RPO RTO per tenant restore fair queuing">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="23-multi-tenant-saas/scaling-operations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Scaling &amp; Noisy Neighbours</h1>
+    <p class="subtitle">In a shared system, one tenant's behaviour is everyone else's performance problem. The
+      defences are mostly about limits and visibility.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Per-tenant limits are mandatory</strong> in any shared model, not a nice-to-have.</li>
+      <li><strong>Limit at several layers</strong> — requests, concurrency, query cost, storage.</li>
+      <li><strong>Every metric needs a tenant dimension</strong>, or you can't attribute anything.</li>
+      <li><strong>Background work is where fairness breaks</strong> — one tenant's bulk job starves the
+        queue.</li>
+      <li><strong>Cost per tenant is harder than it looks</strong>, and commercially important.</li>
+      <li><strong>DR granularity follows the isolation model.</strong> Shared schema makes per-tenant restore
+        hard.</li>
+      <li><strong>Tiered SLAs need enforceable mechanisms</strong>, not just contract wording.</li>
+    </ul>
+  </div>
+
+  <h2 id="noisy-neighbour">The noisy neighbour problem <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>One tenant does something heavy — a bulk import, an unbounded report, a runaway integration — and
+      <strong>every other tenant's response times degrade</strong>.</p>
+    <p>They did nothing wrong and they're the ones complaining. That asymmetry is what makes this the defining
+      operational problem of shared multi-tenancy.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Shared resource</th><th>How one tenant monopolises it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Database CPU and I/O</strong></td><td>An expensive query, or a missing index on their data volume</td></tr>
+        <tr><td><strong>Connection pool</strong></td><td>Long-running transactions holding connections</td></tr>
+        <tr><td><strong>Application threads</strong></td><td>Slow synchronous work occupying request threads</td></tr>
+        <tr><td><strong>Background job queue</strong></td><td><strong>A bulk import enqueuing 100,000 jobs</strong></td></tr>
+        <tr><td><strong>Cache memory</strong></td><td>Large working set evicting everyone else's entries</td></tr>
+        <tr><td><strong>Rate-limited third parties</strong></td><td>Consuming a shared external API quota</td></tr>
+        <tr><td><strong>Locks</strong></td><td>Contention on shared tables or sequences</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The queue is the one people forget</div>
+    <p style="margin:0">API rate limiting gets attention. <strong>Background job queues rarely do</strong>, and
+      they're where fairness breaks worst.
+      <br><br>
+      One tenant starts a bulk import that enqueues 100,000 jobs. A shared FIFO queue processes them in order — so
+      every other tenant's job sits behind that backlog. A different tenant's password-reset email is now
+      <strong>hours late</strong>, and nothing is technically broken.
+      <br><br>
+      A single rate limit doesn't help, because the work was legitimately submitted and legitimately queued.
+      <br><br>
+      The fixes are structural: <strong>a queue per tenant with round-robin consumption</strong>, or
+      <strong>priority queues</strong> separating interactive work from bulk, or <strong>concurrency limits per
+      tenant</strong> so one tenant can only ever occupy N workers.
+      <br><br>
+      Separating interactive from bulk is usually the cheapest effective step — a password reset and a 100,000-row
+      import should never share a queue, regardless of tenancy.</p>
+  </div>
+
+  <h2 id="limits">Per-tenant limits <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Limit</th><th>Protects</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Requests per minute</strong></td><td>API capacity</td><td>Redis-backed rate limiter keyed by tenant</td></tr>
+        <tr><td><strong>Concurrent requests</strong></td><td>Threads and connections</td><td>A concurrency limiter per tenant</td></tr>
+        <tr><td><strong>Query cost / timeout</strong></td><td>Database CPU</td><td>Command timeout; result-size caps; mandatory paging</td></tr>
+        <tr><td><strong>Concurrent background jobs</strong></td><td><strong>Queue fairness</strong></td><td>A per-tenant worker allowance</td></tr>
+        <tr><td><strong>Storage and row counts</strong></td><td>Database size</td><td>Checked at write time, enforced by plan</td></tr>
+        <tr><td><strong>Payload and page size</strong></td><td>Memory and bandwidth</td><td>Maximum request body; maximum page size</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — per-tenant rate limiting, enforced globally" class="code-good"><code class="language-csharp">// ASP.NET Core's built-in limiter is PER INSTANCE, so with 5 replicas a
+// 100/min limit becomes 500/min. For a genuine global limit, back it with Redis.
+builder.Services.AddRateLimiter(options =&gt;
+{
+    options.AddPolicy("per-tenant", httpContext =&gt;
+    {
+        var tenant = httpContext.RequestServices
+            .GetRequiredService&lt;ITenantContext&gt;();
+
+        // Partition by tenant, and read the limit from their plan
+        return RateLimitPartition.GetTokenBucketLimiter(
+            partitionKey: tenant.TenantId,
+            factory: _ =&gt; new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = tenant.Plan.BurstLimit,
+                TokensPerPeriod = tenant.Plan.RequestsPerMinute,
+                ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                QueueLimit = 0                       // reject rather than queue
+            });
+    });
+
+    options.OnRejected = async (ctx, ct) =&gt;
+    {
+        ctx.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        ctx.HttpContext.Response.Headers.RetryAfter = "60";
+        await ctx.HttpContext.Response.WriteAsJsonAsync(new
+        {
+            error = "Rate limit exceeded for your plan.",
+            limit = ctx.HttpContext.RequestServices
+                .GetRequiredService&lt;ITenantContext&gt;().Plan.RequestsPerMinute
+        }, ct);
+    };
+});</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — token bucket, and limits tied to the plan</div>
+    <p style="margin:0">Two choices in that code worth defending.
+      <br><br>
+      <strong>A token bucket rather than a fixed window.</strong> A fixed window allows 2N requests across a
+      boundary — 100 at 10:00:59 and 100 at 10:01:00 — which is exactly the burst you were protecting against. A
+      token bucket refills steadily and permits a bounded burst, which matches how integrations actually behave:
+      idle for a while, then a batch.
+      <br><br>
+      <strong>Limits read from the tenant's plan, not hardcoded.</strong> That makes the limit a
+      <em>product</em> feature — enterprise plans get higher limits, and support can raise one temporarily
+      without a deploy. If limits are constants, every exception becomes a code change.
+      <br><br>
+      And the .NET-specific point: <strong>ASP.NET Core's built-in limiter is per-instance and in-memory.</strong>
+      With five replicas a 100/minute limit is effectively 500/minute. For a genuine global limit you need shared
+      state — a Redis-backed limiter, as on
+      <a href="../16-redis/distributed-primitives.html#rate-limiting">the Redis page</a>. That's the distinction
+      interviewers are checking when they ask you to <em>implement</em> rate limiting rather than configure
+      it.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Decide what happens when the limiter is unavailable</div>
+    <p style="margin:0">If the limit is enforced through Redis and Redis is down, do you <strong>fail open</strong>
+      (allow everything) or <strong>fail closed</strong> (reject everything)?
+      <br><br>
+      Failing closed means a cache outage becomes a total outage — almost always worse than being briefly
+      un-throttled. So <strong>fail open, log loudly</strong>, and optionally fall back to the per-instance
+      limiter as a rough backstop.
+      <br><br>
+      That's a decision to make deliberately in design, not to discover during an incident when every tenant is
+      getting 429s because the rate limiter can't reach its store.</p>
+  </div>
+
+  <h2 id="resource-governance">Database-level isolation <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Model</th><th>Mechanism available</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Database per tenant, elastic pool</strong></td><td><strong>Per-database min and max</strong> — the strongest and simplest control</td></tr>
+        <tr><td><strong>Shared schema, Azure SQL</strong></td><td>Query Store to identify the offender; Resource Governor only on-premises</td></tr>
+        <tr><td><strong>Shared schema, application-enforced</strong></td><td>Command timeouts, mandatory paging, result caps</td></tr>
+        <tr><td><strong>Cosmos DB</strong></td><td>Throughput per container, or hierarchical partition keys with per-tenant monitoring</td></tr>
+        <tr><td><strong>Read replicas</strong></td><td>Route heavy tenant reporting to a replica</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">In a shared schema, the application is your only governor</div>
+    <p style="margin:0">Azure SQL has no per-tenant resource governance within one database — Resource Governor is
+      an on-premises feature. So in a shared schema, <strong>all enforcement has to happen in the
+      application</strong>.
+      <br><br>
+      Which means: <strong>command timeouts</strong> so no single query can run for minutes;
+      <strong>mandatory paging</strong> with a maximum page size, so no endpoint can return an unbounded result
+      set; <strong>result-count caps</strong> that fail loudly rather than silently truncating; and
+      <strong>rejecting queries with no tenant-selective filter</strong>, since those are both a leak risk and a
+      full-table scan.
+      <br><br>
+      That last one connects to the <a href="../08-http-web-apis/rest-design.html">unbounded query surface</a>
+      problem: an endpoint accepting arbitrary filters and date ranges is a denial-of-service vector against your
+      own shared database, and in a multi-tenant system the victim is other customers.
+      <br><br>
+      If per-tenant resource limits are genuinely required, that's an argument for moving that tenant to its own
+      database in an elastic pool — where the platform enforces it.</p>
+  </div>
+
+  <h2 id="monitoring">Per-tenant observability <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The rule</span>
+    <p><strong>Every metric, log line and trace needs a tenant dimension.</strong></p>
+    <p>Without it you cannot answer the first question of any incident — <em>is this one tenant or
+      everyone?</em> — and you cannot identify which tenant is causing a load problem.</p>
+    <p>Aggregate p99 latency across all tenants hides the case where one tenant is experiencing 10 seconds and
+      everyone else is fine.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Signal</th><th>Why per-tenant</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Request rate and latency</strong></td><td>Identify the noisy tenant and the affected ones</td></tr>
+        <tr><td><strong>Error rate</strong></td><td>An error spike for one tenant is usually their data or config</td></tr>
+        <tr><td><strong>Database time consumed</strong></td><td>The strongest signal of a noisy neighbour</td></tr>
+        <tr><td><strong>Throttled requests</strong></td><td>A tenant hitting limits is a support conversation, or an upsell</td></tr>
+        <tr><td><strong>Storage and row counts</strong></td><td>Growth planning and plan enforcement</td></tr>
+        <tr><td><strong>Background job queue depth</strong></td><td>Fairness, and a stuck tenant</td></tr>
+        <tr><td><strong>Feature usage</strong></td><td>Product decisions, and billing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Cardinality — the practical constraint</div>
+    <p style="margin:0">Adding a tenant dimension to every metric multiplies your time series by the tenant count.
+      With ten thousand tenants and fifty metrics that's five hundred thousand series, which is expensive in most
+      metrics backends and can be slow to query.
+      <br><br>
+      The pragmatic shape: <strong>tenant id on logs and traces always</strong>, since those are queried
+      selectively rather than aggregated. For <strong>metrics</strong>, either restrict the tenant dimension to a
+      small set of important counters, or emit per-tenant detail only for the top N tenants by volume and bucket
+      the rest.
+      <br><br>
+      Trace <strong>baggage</strong> is the efficient mechanism for the tenant id, because it propagates across
+      services and through message headers automatically — so a downstream service and an async consumer both have
+      it without you passing it explicitly.</p>
+  </div>
+
+  <h2 id="cost">Cost per tenant <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why it matters commercially</span>
+    <p>Without per-tenant cost you cannot tell whether a customer is profitable, price a plan sensibly, or justify
+      moving a tenant to dedicated infrastructure.</p>
+    <p>And in a shared model it's genuinely hard, because the bill arrives as one number for the whole
+      platform.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cost</th><th>Attribution approach</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Dedicated resources</strong></td><td>Direct — tag the resource with the tenant</td></tr>
+        <tr><td><strong>Shared compute</strong></td><td>Apportion by request count or measured request duration</td></tr>
+        <tr><td><strong>Shared database</strong></td><td>Apportion by query time consumed, or by row and storage share</td></tr>
+        <tr><td><strong>Storage</strong></td><td>Measure per tenant directly — usually straightforward</td></tr>
+        <tr><td><strong>Egress</strong></td><td>Sum response bytes per tenant</td></tr>
+        <tr><td><strong>Third-party APIs</strong></td><td>Count calls per tenant at the point of use</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — measure request duration, not request count</div>
+    <p style="margin:0">Apportioning shared compute by request count is easy and misleading. A tenant making
+      100,000 trivial requests and one making 1,000 heavy reports may cost the same, or the reverse.
+      <br><br>
+      <strong>Request duration, or better, database time consumed, tracks actual resource use.</strong> The
+      practical version is to record elapsed time and the database time per request tagged by tenant, then
+      apportion the shared bill by each tenant's share of the total.
+      <br><br>
+      That's approximate and it's defensible — good enough to identify the tenant consuming 40% of your database
+      while paying 2% of your revenue, which is the finding that actually changes decisions.
+      <br><br>
+      The commercial consequence worth naming: <strong>this is how you discover that your cheapest plan is
+      loss-making</strong>, and it's the data that justifies either a price change, a usage limit, or moving that
+      customer to dedicated infrastructure where their cost is visible.
+      <br><br>
+      Teams that never measure this find out when the cloud bill outgrows revenue growth and nobody can explain
+      why.</p>
+  </div>
+
+  <h2 id="dr">Disaster recovery granularity <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Scenario</th><th>Shared schema</th><th>Database per tenant</th></tr></thead>
+      <tbody>
+        <tr><td>Restore everything</td><td>Straightforward</td><td>N restores</td></tr>
+        <tr><td><strong>Restore one tenant</strong></td><td><strong>Very hard</strong> — restore a copy, copy rows back</td><td><strong>Trivial</strong></td></tr>
+        <tr><td>One tenant's bad bulk import</td><td>Selective row surgery</td><td>Point-in-time restore</td></tr>
+        <tr><td>Delete a tenant permanently</td><td>Hard, especially in backups</td><td>Drop the database</td></tr>
+        <tr><td>Per-tenant retention policy</td><td>Not really possible</td><td>Per-database configuration</td></tr>
+        <tr><td>Per-tenant RPO/RTO commitments</td><td>One policy for everyone</td><td>Per tenant</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">"Restore just our data" is the request that exposes the model</div>
+    <p style="margin:0">A customer runs a bad import and asks you to roll back to yesterday. In a shared schema
+      you <strong>cannot restore the database</strong> — that would revert every other tenant.
+      <br><br>
+      So the procedure is: restore a <em>copy</em> of the database to the point in time, then selectively copy that
+      tenant's rows back across every affected table, in foreign-key order, while the live system continues taking
+      writes for them.
+      <br><br>
+      That's bespoke, error-prone work under time pressure, and it's slow. <strong>Write and test the runbook
+      before you need it</strong> — including which tables are tenant-owned and what order they must be restored
+      in.
+      <br><br>
+      The alternative that avoids most of this is <strong>soft deletes plus an audit trail</strong> for
+      destructive operations, so "undo this import" becomes a supported feature rather than a database recovery
+      exercise. That's worth building deliberately in a shared model, because it converts a recovery problem into
+      a product one.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Tiered SLAs need mechanisms, not just contract wording</div>
+    <p style="margin:0">Selling an enterprise tier with a stronger uptime or RPO commitment means you must
+      <strong>actually be able to deliver it differently</strong>.
+      <br><br>
+      In a fully shared model you can't: everyone shares the same database, the same backup schedule and the same
+      failure domain. So a 99.9% tier and a 99.99% tier are the same system with different paperwork — and when
+      an outage happens, both are breached identically.
+      <br><br>
+      Delivering genuinely tiered availability requires <strong>different infrastructure</strong> — a dedicated
+      database with zone redundancy, geo-replication, or a separate pod for premium tenants.
+      <br><br>
+      So a tiered SLA is an architecture commitment, not a sales decision. Being the person who points that out
+      before the contract is signed is valuable.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Noisy neighbours are the defining operational problem of shared multi-tenancy.</li>
+      <li>Background job queues are where fairness breaks worst — separate interactive from bulk.</li>
+      <li>Limit at several layers: requests, concurrency, query cost, storage, payload size.</li>
+      <li>Token bucket over fixed window; read limits from the tenant's plan.</li>
+      <li>ASP.NET Core's rate limiter is per-instance — Redis-back it for a global limit.</li>
+      <li>Decide the fail-open behaviour when the limiter's store is unavailable.</li>
+      <li>In a shared schema the application is your only resource governor.</li>
+      <li>Every log and trace needs a tenant dimension; be careful with metric cardinality.</li>
+      <li>Attribute cost by request duration or database time, not request count.</li>
+      <li>Per-tenant restore is very hard in a shared schema — write the runbook in advance.</li>
+      <li>Soft deletes convert a recovery problem into a product feature.</li>
+      <li>Tiered SLAs require tiered infrastructure, not just tiered contracts.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No per-tenant limits</strong>, so one tenant can degrade everyone.</li>
+    <li><strong>A shared FIFO job queue</strong>, letting one bulk import starve everyone.</li>
+    <li><strong>Rate limiting per instance</strong> and assuming it's global.</li>
+    <li><strong>Fixed-window limits</strong> where burst protection was the point.</li>
+    <li><strong>Hardcoded limits</strong>, so every exception needs a deploy.</li>
+    <li><strong>Failing closed</strong> when the rate-limit store is down.</li>
+    <li><strong>Unbounded endpoints</strong> with no maximum page size.</li>
+    <li><strong>No tenant dimension</strong> on logs, traces or metrics.</li>
+    <li><strong>Per-tenant metrics for every metric</strong>, causing a cardinality explosion.</li>
+    <li><strong>Cost attributed by request count.</strong></li>
+    <li><strong>Discovering per-tenant restore is impossible</strong> during an incident.</li>
+    <li><strong>Selling a tiered SLA</strong> the architecture can't deliver.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>One tenant's activity is slowing the system for everyone. What do you do? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd separate the immediate mitigation from the structural fix, because the first thing needed is to
+          stop the harm to other tenants."</p>
+        <p>"<strong>First, identify it — which requires per-tenant telemetry.</strong> If every metric, log line
+          and trace carries a tenant dimension, this is a query. If it doesn't, I'm correlating timestamps against
+          customer complaints, which is slow and this is exactly the incident where you find out you needed
+          it."</p>
+        <p>"The strongest signal is <strong>database time consumed per tenant</strong>, not request count — a
+          tenant making 100,000 trivial requests may cost far less than one running 1,000 heavy reports. In Azure
+          SQL, Query Store plus the tenant id in the query context, or an application-level measure of elapsed
+          database time tagged by tenant."</p>
+        <p>"<strong>Immediate mitigation</strong>, in order of how quickly I can apply it: <strong>throttle that
+          tenant</strong> specifically, if limits are configurable per tenant rather than hardcoded — which is a
+          good argument for reading limits from their plan record. If it's one runaway query or job, kill it. If
+          it's a bulk operation, move it to a lower-priority queue so it stops competing with interactive
+          work."</p>
+        <p>"Then I'd want to know <strong>what they're actually doing</strong>, because it changes the response.
+          Legitimate heavy use means a capacity or plan conversation. A missing index on their data volume means
+          it's my bug, not their behaviour — and a tenant with ten times more data than anyone else frequently
+          exposes a query that was fine for everyone else. A runaway integration in a retry loop means it's
+          probably their bug, and I should be rejecting it with 429s."</p>
+        <p>"<strong>Structurally</strong>, the fixes depend on the shared resource."</p>
+        <p>"<strong>Per-tenant rate limits</strong> at the API — token bucket rather than fixed window, because a
+          fixed window allows a double burst across the boundary. And Redis-backed, because ASP.NET Core's
+          built-in limiter is per-instance, so with five replicas a 100/minute limit is really 500/minute."</p>
+        <p>"<strong>Concurrency limits</strong> as well as rate limits, since a tenant making few but very slow
+          requests can occupy all your threads without exceeding a request-rate limit."</p>
+        <p>"<strong>Queue fairness</strong>, which is the one people miss. A shared FIFO queue means one tenant's
+          100,000-job import puts every other tenant's work behind it — so a password reset is hours late and
+          nothing is technically broken. That needs a per-tenant concurrency allowance, or separate queues for
+          interactive versus bulk work. Separating interactive from bulk is usually the cheapest effective
+          step."</p>
+        <p>"<strong>Bounded endpoints</strong> — mandatory paging with a maximum page size, command timeouts, and
+          result caps. In a shared schema the application is the only resource governor available, because Azure
+          SQL has no per-tenant governance within one database."</p>
+        <p>"And the option I'd raise if this tenant is persistently the problem: <strong>move them to their own
+          database</strong> in an elastic pool. Then the platform enforces the isolation, their cost becomes
+          visible and attributable, and other tenants are structurally protected rather than protected by
+          limits I have to tune. That's also the commercial conversation — if they're consuming 40% of capacity,
+          that should be reflected in what they pay."</p>
+        <p>"Which is why <strong>runtime connection resolution from a tenant catalogue</strong> matters: it makes
+          that move a migration plus a config row rather than a code change."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you need per-tenant telemetry to identify it?</li>
+        <li>Do you measure database time rather than request count?</li>
+        <li>Do you separate mitigation from structural fix?</li>
+        <li>Do you consider that it might be your missing index, not their behaviour?</li>
+        <li>Do you know rate limits alone don't fix queue fairness?</li>
+        <li>Do you raise moving them to dedicated infrastructure?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add rate limiting" with no diagnosis.</li>
+        <li><span class="redflag">Red flag:</span> scaling up the database as the answer.</li>
+        <li><span class="redflag">Red flag:</span> no mention of background job fairness.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you implement per-tenant queue fairness?</li>
+          <li>How do you decide what limit to set?</li>
+          <li>How would you move that tenant with no downtime?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Onboarding, Billing &amp; Migration — Multi-Tenant SaaS</title>
+<meta name="description" content="Automated tenant provisioning, usage metering and billing, per-tenant feature flags, migrating a tenant between models, and offboarding including GDPR deletion.">
+<meta name="keywords" content="tenant provisioning onboarding automation usage metering billing seat based consumption feature flags per tenant entitlements tenant migration zero downtime offboarding GDPR right to erasure data export">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="23-multi-tenant-saas/lifecycle-billing.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Onboarding, Billing &amp; Migration</h1>
+    <p class="subtitle">The tenant lifecycle. Provisioning gets built early and badly; offboarding gets built
+      when a lawyer asks.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Provisioning must be automated and idempotent</strong> — it's a distributed workflow that
+        partially fails.</li>
+      <li><strong>Meter usage from day one</strong>, even before you bill for it.</li>
+      <li><strong>Never compute a bill from application state</strong> — bill from an immutable usage ledger.</li>
+      <li><strong>Entitlements are per tenant; feature flags are per rollout.</strong> Different mechanisms.</li>
+      <li><strong>Tenant migration needs dual-write or a read-only window.</strong></li>
+      <li><strong>GDPR erasure includes backups</strong>, which is the hard part.</li>
+      <li><strong>Export before delete</strong> — offboarding customers are entitled to their data.</li>
+    </ul>
+  </div>
+
+  <h2 id="provisioning">Provisioning a tenant <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why this is harder than it looks</span>
+    <p>Creating a tenant isn't one insert. It's a <strong>multi-step workflow across several systems</strong> —
+      catalogue, database, identity provider, billing, storage — any of which can fail partway.</p>
+    <p>Which makes it a <a href="../20-microservices/data-consistency.html#saga">saga</a>, and it needs to be
+      treated as one rather than as a controller action.</p>
+  </div>
+
+  <pre data-label="text — the steps, and what each can leave behind"><code class="language-text">  1. Reserve the tenant slug            <- unique constraint; must not race
+  2. Create the catalogue record        <- status: Provisioning
+  3. Provision the data store           <- new DB, or a row in the shared one
+  4. Run schema migrations             <- can fail, must be resumable
+  5. Seed reference and default data
+  6. Create the identity tenant / app registration
+  7. Create the billing customer        <- external system, may already exist
+  8. Provision blob container / storage
+  9. Send the invitation to the admin user
+ 10. Mark the catalogue record Active   <- the ONLY step that makes it usable
+
+  Fail at step 7 and you have a database, an identity tenant and no billing.
+  Retrying naively creates a second database.</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Provisioning must be idempotent, and the state must be explicit</div>
+    <p style="margin:0">This is the failure people hit in the first month of real onboarding: a step fails, someone
+      retries, and now there are two databases, two billing customers, or an identity tenant nobody records.
+      <br><br>
+      Two requirements. <strong>Each step must be safe to re-run</strong> — check whether the resource already
+      exists before creating it, and use deterministic names derived from the tenant id rather than random ones,
+      so a retry finds the previous attempt instead of making another.
+      <br><br>
+      And <strong>the tenant's status must be explicit and persisted</strong> — <code>Provisioning</code>,
+      <code>Active</code>, <code>Suspended</code>, <code>Deleting</code> — with the last completed step recorded,
+      so a resumed run continues rather than restarting.
+      <br><br>
+      Critically, <strong>the tenant must not be usable until the final step</strong>. A half-provisioned tenant
+      that can log in but has no billing record or no seeded data produces confusing support tickets and, worse,
+      real usage you can't invoice.
+      <br><br>
+      And there needs to be a <strong>cleanup path</strong> for provisioning that fails permanently, or you
+      accumulate orphaned databases and identity registrations that nobody can attribute.</p>
+  </div>
+
+  <pre data-label="csharp — resumable, idempotent provisioning" class="code-good"><code class="language-csharp">public async Task&lt;Result&gt; ProvisionAsync(ProvisionRequest req, CancellationToken ct)
+{
+    // Deterministic id, so a retry addresses the same tenant
+    var tenantId = DeterministicGuid.From(req.Slug);
+
+    var tenant = await _catalogue.FindAsync(tenantId, ct)
+                 ?? await _catalogue.CreateAsync(tenantId, req, ct);
+
+    if (tenant.Status == TenantStatus.Active) return Result.Ok();   // already done
+
+    // Each step checks-then-creates and records progress, so this resumes
+    await RunStepAsync(tenant, ProvisionStep.DataStore,
+        () =&gt; _stores.EnsureCreatedAsync(tenant, ct), ct);
+
+    await RunStepAsync(tenant, ProvisionStep.Migrations,
+        () =&gt; _migrator.MigrateAsync(tenant, ct), ct);
+
+    await RunStepAsync(tenant, ProvisionStep.Identity,
+        () =&gt; _identity.EnsureTenantAsync(tenant, ct), ct);
+
+    await RunStepAsync(tenant, ProvisionStep.Billing,
+        () =&gt; _billing.EnsureCustomerAsync(tenant, ct), ct);
+
+    // Only now is it usable
+    await _catalogue.SetStatusAsync(tenant.Id, TenantStatus.Active, ct);
+    return Result.Ok();
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Deterministic ids make retries safe</div>
+    <p style="margin:0">Generating the tenant id from a hash of the slug — rather than
+      <code>Guid.NewGuid()</code> — means a retried provisioning request addresses <em>the same</em> tenant. So the
+      catalogue lookup finds the previous attempt and resumes.
+      <br><br>
+      Same technique for downstream resource names: a database called <code>t_{tenantId}</code> and a billing
+      customer with the tenant id as its idempotency key. Then "create if not exists" is genuinely achievable
+      across all of them.
+      <br><br>
+      With random ids, a retry has no way to discover what the previous attempt created — so you either leak
+      resources or build a reconciliation process to find them. Determinism is much cheaper.</p>
+  </div>
+
+  <h2 id="metering">Metering usage <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Billing model</th><th>What you must measure</th><th>Difficulty</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Flat per tenant</strong></td><td>Nothing</td><td>Trivial</td></tr>
+        <tr><td><strong>Per seat</strong></td><td>Active users, and what "active" means</td><td>Easy — until you define active</td></tr>
+        <tr><td><strong>Per unit consumed</strong></td><td>API calls, storage, documents, messages</td><td><strong>Hard to get right</strong></td></tr>
+        <tr><td><strong>Tiered with overage</strong></td><td>Consumption plus a plan limit</td><td>Hard, and needs clear communication</td></tr>
+        <tr><td><strong>Hybrid</strong></td><td>All of the above</td><td>Hardest</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — bill from an immutable ledger, never from application state</div>
+    <p style="margin:0">The tempting implementation is to count from live data: <code>SELECT COUNT(*) FROM
+      Documents WHERE TenantId = @t</code> at month end.
+      <br><br>
+      That breaks in ways that matter commercially. <strong>Deletions change history</strong> — a tenant who
+      created 10,000 documents and deleted 9,000 gets billed for 1,000, which is wrong under a consumption model.
+      <strong>You cannot reproduce a past invoice</strong>, so a billing dispute is unanswerable.
+      <strong>Retroactive changes silently alter old bills.</strong> And a schema change can break historical
+      billing.
+      <br><br>
+      The correct shape is an <strong>append-only usage ledger</strong>: a row per billable event with the tenant,
+      the meter, the quantity and the timestamp. Never updated, never deleted. Invoices are computed by summing a
+      period, and <strong>the computed invoice is itself stored</strong> — so it's reproducible even if the ledger
+      is later reinterpreted.
+      <br><br>
+      That also makes the whole thing auditable, which matters the first time a customer disputes a charge — you
+      can show them exactly what was counted and when.
+      <br><br>
+      "Meter into an immutable ledger and store the computed invoice" is the answer that shows you've dealt with
+      billing rather than reasoned about it.</p>
+  </div>
+
+  <pre data-label="csharp — writing usage records" class="code-good"><code class="language-csharp">public sealed record UsageRecord(
+    Guid TenantId,
+    string Meter,              // "api.requests", "storage.gb", "documents.created"
+    decimal Quantity,
+    DateTime OccurredUtc,
+    string IdempotencyKey);    // so a retry doesn't double-count
+
+// Written asynchronously - metering must never fail the user's request
+await _usage.RecordAsync(new UsageRecord(
+    tenant.TenantId, "documents.created", 1, DateTime.UtcNow,
+    IdempotencyKey: $"doc:{document.Id}"), ct);</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Three metering details that cause real problems</div>
+    <p style="margin:0"><strong>Metering must not fail the operation.</strong> If writing the usage record throws,
+      the user's document creation should still succeed. So it goes through a queue or an outbox — but then it's
+      at-least-once, which is why the <strong>idempotency key</strong> matters: without it a retry double-counts
+      and you overbill.
+      <br><br>
+      <strong>Define "active user" precisely and in writing.</strong> Logged in this month? Performed any action?
+      Merely provisioned? Each gives a different invoice, and the ambiguity surfaces as a dispute. Seat-based
+      billing looks simple and this is where it isn't.
+      <br><br>
+      <strong>Meter before you bill.</strong> Instrument usage from launch even on a flat-fee plan. When you later
+      introduce consumption pricing you'll have historical data to set the tiers sensibly — otherwise you're
+      guessing, and you'll discover your limits are wrong after announcing them.</p>
+  </div>
+
+  <h2 id="entitlements">Entitlements and feature flags <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Entitlement</th><th>Feature flag</th></tr></thead>
+      <tbody>
+        <tr><td>Answers</td><td><strong>"Has this tenant paid for it?"</strong></td><td><strong>"Is this code enabled yet?"</strong></td></tr>
+        <tr><td>Driven by</td><td>The plan and contract</td><td>Rollout and risk</td></tr>
+        <tr><td>Lifetime</td><td><strong>Permanent</strong></td><td><strong>Temporary</strong> — removed after rollout</td></tr>
+        <tr><td>Owned by</td><td>Commercial / product</td><td>Engineering</td></tr>
+        <tr><td>Changing it</td><td>An upgrade or a contract change</td><td>A config toggle</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — conflating these is a mess that's hard to unwind</div>
+    <p style="margion:0">Using one flag system for both means <strong>you can never delete a flag</strong>, because
+      some flags are permanent entitlements and some are temporary rollout switches, and after a year nobody knows
+      which is which.
+      <br><br>
+      So the codebase accumulates hundreds of flags, each doubling the paths through the code, and removing any of
+      them risks disabling something a customer pays for.
+      <br><br>
+      Keep them separate. <strong>Entitlements live on the tenant record</strong>, derived from the plan, and are
+      checked as <code>tenant.Plan.Includes(Feature.AdvancedReporting)</code> — permanent, commercially owned, and
+      auditable. <strong>Feature flags live in a flag system</strong> with an owner and a removal date, and are
+      deleted once the rollout completes.
+      <br><br>
+      They compose legitimately: a new feature ships behind a flag for rollout, and once fully rolled out the flag
+      is removed and the entitlement check remains. Being explicit about that distinction is a good architectural
+      signal, because most teams discover it too late.</p>
+  </div>
+
+  <pre data-label="csharp — entitlement checks derived from the plan" class="code-good"><code class="language-csharp">// Permanent, commercial
+if (!_tenant.Plan.Includes(Feature.ApiAccess))
+    return Results.Forbid();   // or 402 Payment Required, with an upgrade link
+
+// Quantitative entitlements need enforcing at the write, atomically
+var used = await _seats.CountActiveAsync(_tenant.TenantId, ct);
+if (used &gt;= _tenant.Plan.SeatLimit)
+    return Results.Problem("Seat limit reached for your plan.", statusCode: 402);
+
+// Temporary, engineering - removed after rollout
+if (await _flags.IsEnabledAsync("new-pricing-engine", _tenant.TenantId))
+    return await _newEngine.PriceAsync(order, ct);</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Enforce quantitative limits atomically</div>
+    <p style="margin:0">A check-then-insert on a seat limit has a race: two concurrent invitations both read 9 of
+      10 seats used, both proceed, and the tenant now has 11 seats on a 10-seat plan.
+      <br><br>
+      That's the <a href="../10-sql/transactions.html#anomalies">lost update</a> problem, and the fix is the same:
+      an atomic conditional insert, or a unique constraint on a seat-slot table, rather than reading a count and
+      then acting on it.
+      <br><br>
+      It matters commercially, not just technically — a tenant discovering they can exceed their limit will keep
+      doing it, and reclaiming those seats later is an awkward customer conversation.</p>
+  </div>
+
+  <h2 id="migration">Migrating a tenant <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">When you need this</span>
+    <p>Moving a tenant from the pooled shared schema to their own database — because they've grown, signed an
+      enterprise contract, or become a noisy neighbour.</p>
+    <p>Also moving between regions for data residency, or between pods for capacity.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Downtime</th><th>Complexity</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Read-only window</strong></td>
+          <td>Minutes of read-only</td>
+          <td><strong>Low.</strong> Usually the right answer</td>
+        </tr>
+        <tr>
+          <td><strong>Full maintenance window</strong></td>
+          <td>Minutes to hours offline</td>
+          <td>Lowest, and least acceptable</td>
+        </tr>
+        <tr>
+          <td><strong>Dual-write</strong></td>
+          <td>None</td>
+          <td><strong>High</strong> — two stores, reconciliation, cutover logic</td>
+        </tr>
+        <tr>
+          <td><strong>Change-feed replication</strong></td>
+          <td>Seconds</td>
+          <td>Moderate — if you already have CDC or an outbox</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <ol class="steps">
+    <li><strong>Provision the target</strong> and migrate its schema to the same version.</li>
+    <li><strong>Copy the bulk of the data</strong> while the tenant continues working normally.</li>
+    <li><strong>Put the tenant into read-only mode</strong> — a status on the catalogue record that the
+      application enforces.</li>
+    <li><strong>Copy the delta</strong> since the bulk copy.</li>
+    <li><strong>Verify</strong> — row counts per table, checksums on key tables, a few spot-checked records.</li>
+    <li><strong>Update the catalogue</strong> to point at the new store and clear read-only.</li>
+    <li><strong>Keep the old data</strong> for a defined period before deleting it.</li>
+  </ol>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — a read-only window is usually the right trade</div>
+    <p style="margin:0">Dual-write gives zero downtime and costs a great deal: writing to two stores, handling
+      partial failures between them, reconciling divergence, and a cutover that has to be atomic. It's a
+      genuinely difficult distributed-systems problem for a one-off operation.
+      <br><br>
+      A <strong>read-only window</strong> of a few minutes is usually acceptable to a B2B customer if it's
+      scheduled and communicated — and it removes the entire class of consistency problems, because nothing
+      changes while you copy the delta.
+      <br><br>
+      "Your account will be read-only for ten minutes at 2am on Sunday" is an easy conversation. Rebuilding a
+      tenant's data after a botched dual-write is not.
+      <br><br>
+      The details that make it work: <strong>read-only must be enforced by the application</strong> from the
+      catalogue status, not by hoping nobody writes. <strong>Verify before cutover</strong>, with row counts and
+      checksums rather than a visual check. And <strong>keep the old data</strong> for a week or two — because
+      the rollback path is repointing the catalogue back, and that only works if the source still exists.</p>
+  </div>
+
+  <h2 id="offboarding">Offboarding and deletion <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Stage</th><th>What happens</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Cancellation</strong></td><td>Billing stops at period end; access continues</td></tr>
+        <tr><td><strong>Suspension</strong></td><td>Access blocked; data retained. Reversible</td></tr>
+        <tr><td><strong>Grace period</strong></td><td>30–90 days to change their mind or export</td></tr>
+        <tr><td><strong>Export</strong></td><td><strong>Their data, in a usable format.</strong> Often contractual</td></tr>
+        <tr><td><strong>Soft delete</strong></td><td>Marked deleted, still recoverable</td></tr>
+        <tr><td><strong>Hard delete</strong></td><td>Data removed from live systems</td></tr>
+        <tr><td><strong>Backup expiry</strong></td><td>Data leaves backups as retention passes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">GDPR erasure and backups — the genuinely hard part</div>
+    <p style="margin:0">A right-to-erasure request means removing personal data from <strong>everywhere</strong>,
+      including backups. And you cannot selectively delete one tenant's rows from a backup of a shared database
+      without restoring, modifying and re-taking it — which is impractical and would break every other tenant's
+      restore point.
+      <br><br>
+      The accepted position is to <strong>document it honestly</strong>: personal data is deleted from live systems
+      immediately, and expires from backups within the stated retention period, which is defined and
+      short — typically 30 or 35 days. Regulators have generally accepted that where the retention period is
+      documented, bounded, and backups are not used for anything except recovery.
+      <br><br>
+      What you must be able to state: <strong>where the data lives</strong> (every table, blob container, search
+      index, log store, analytics warehouse and third-party system), <strong>how long backups retain it</strong>,
+      and <strong>that backups are not queried operationally</strong>.
+      <br><br>
+      The parts most often missed are <strong>logs, the analytics warehouse and third-party processors</strong> —
+      the customer support tool, the email provider, the error tracker. A GDPR request covers those too, and
+      "we deleted it from the database" is an incomplete answer.
+      <br><br>
+      <strong>Database-per-tenant makes this dramatically easier</strong>: drop the database, and their backups
+      are their own and expire independently. That's a real argument for the model that rarely appears in the
+      cost comparison.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Export before delete, and make it self-service</div>
+    <p style="margin:0">A departing customer is usually contractually entitled to their data, and GDPR gives a
+      right to portability regardless. So <strong>export is a feature, not a favour</strong>.
+      <br><br>
+      Build it self-service — a request that produces a downloadable archive of their data in a documented format
+      (JSON or CSV plus any files). Doing it manually per customer is expensive, error-prone, and slow at exactly
+      the moment goodwill matters.
+      <br><br>
+      It also has value beyond offboarding: enterprise procurement asks about data portability, and being able to
+      demonstrate it removes an objection during the sale.
+      <br><br>
+      Sequence it correctly: <strong>export, confirm they have it, then delete.</strong> Deleting first and then
+      receiving an export request is not recoverable.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Provisioning is a saga across several systems — make it idempotent and resumable.</li>
+      <li>Deterministic ids and resource names make retries safe.</li>
+      <li>A tenant must not be usable until the final provisioning step completes.</li>
+      <li>Have a cleanup path for permanently failed provisioning.</li>
+      <li>Bill from an append-only usage ledger, and store the computed invoice.</li>
+      <li>Metering must not fail the user's operation, so it needs an idempotency key.</li>
+      <li>Define "active user" precisely; meter from launch even on flat pricing.</li>
+      <li>Entitlements are permanent and commercial; feature flags are temporary and engineering-owned.</li>
+      <li>Enforce quantitative limits atomically, not check-then-insert.</li>
+      <li>A short read-only window beats dual-write for tenant migration.</li>
+      <li>Verify with row counts and checksums, and keep the source data for rollback.</li>
+      <li>GDPR erasure covers logs, analytics and third parties — and backups need a documented policy.</li>
+      <li>Export before delete, self-service.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Manual provisioning</strong>, so onboarding doesn't scale and is inconsistent.</li>
+    <li><strong>Non-idempotent provisioning</strong>, so a retry creates duplicate resources.</li>
+    <li><strong>A tenant usable mid-provisioning</strong>, generating unbillable usage.</li>
+    <li><strong>Orphaned resources</strong> from failed provisioning with no cleanup.</li>
+    <li><strong>Computing bills from live application state.</strong></li>
+    <li><strong>No idempotency key on usage records</strong>, so retries overbill.</li>
+    <li><strong>Metering that can fail the user's request.</strong></li>
+    <li><strong>No agreed definition of "active user"</strong>, producing billing disputes.</li>
+    <li><strong>Entitlements and feature flags in one system</strong>, so flags can never be removed.</li>
+    <li><strong>Check-then-insert on seat limits.</strong></li>
+    <li><strong>Dual-write for a one-off tenant migration.</strong></li>
+    <li><strong>No verification</strong> before cutover, or source data deleted immediately.</li>
+    <li><strong>No answer for backups</strong> in a GDPR erasure request.</li>
+    <li><strong>Forgetting logs, analytics and third parties</strong> when deleting tenant data.</li>
+    <li><strong>No export capability</strong> until a customer leaves.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>A customer invokes their right to erasure. Walk me through what happens. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The first thing I'd need is a <strong>documented inventory of everywhere their data lives</strong>,
+          because 'delete it from the database' is an incomplete answer and the gaps are where the compliance
+          failure is."</p>
+        <p>"That inventory covers: every table in the operational database, blob or file storage, the search
+          index, the cache, <strong>logs</strong>, the <strong>analytics warehouse</strong>, and
+          <strong>third-party processors</strong> — the support tool, the email provider, the error tracker, the
+          payment provider. Those last three categories are the ones teams miss, and a GDPR request covers them
+          all."</p>
+        <p>"The sequence I'd follow: <strong>export first</strong>, because they're usually contractually entitled
+          to their data and GDPR gives a portability right regardless — and deleting before exporting isn't
+          recoverable. Then confirm they have it. Then delete."</p>
+        <p>"Then <strong>soft delete with a grace period</strong>, because erasure requests are occasionally
+          mistaken or disputed, and a reversible window of a defined length is prudent. Then hard delete from all
+          live systems."</p>
+        <p>"<strong>The hard part is backups</strong>, and I'd be honest about it rather than claim it's solved.
+          You cannot selectively remove one tenant's rows from a backup of a shared database — that would require
+          restoring it, modifying it and re-taking it, which is impractical and would invalidate every other
+          tenant's restore point."</p>
+        <p>"So the accepted position is to <strong>document it</strong>: personal data is deleted from live systems
+          immediately and expires from backups within a stated retention period — typically 30 or 35 days.
+          Regulators have generally accepted that where the period is <strong>defined, bounded, and backups aren't
+          used for anything except recovery</strong>. What you cannot do is have indefinite backup retention and
+          claim compliance."</p>
+        <p>"There's a related exception worth mentioning: some data you're <strong>legally required to
+          retain</strong> — invoices and transaction records for tax purposes, typically six or seven years.
+          Erasure doesn't override that. So the honest answer is that personal data is deleted while
+          legally-mandated financial records are retained in a minimised form, and that distinction needs to be
+          in the privacy policy rather than improvised when asked."</p>
+        <p>"The architectural observation I'd make: <strong>database-per-tenant makes this dramatically
+          easier</strong>. You drop the database, and their backups are their own and expire independently — so
+          there's no shared-backup problem at all. That's a genuine argument for the model that rarely appears in
+          the cost comparison, and it's one enterprise procurement teams specifically ask about."</p>
+        <p>"Practically, I'd want this <strong>automated and tested</strong> rather than a runbook someone follows
+          under pressure. A deletion workflow that enumerates every store, with a verification step confirming the
+          data is gone, and an audit record of what was deleted and when — because you may need to demonstrate
+          compliance later, and 'we're fairly sure we deleted it' isn't evidence."</p>
+        <p>"And I'd flag the <strong>immutable usage ledger</strong> as something to think about, since I'd have
+          argued for billing from an append-only ledger. Those records need either anonymising — replacing the
+          tenant identifier while keeping the aggregate for financial reporting — or falling under the
+          legal-retention exception. Append-only and right-to-erasure are in genuine tension, and it's better to
+          have decided that in advance."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the data inventory extends beyond the database?</li>
+        <li>Do you export before deleting?</li>
+        <li>Are you honest about the backup problem, with a documented policy?</li>
+        <li>Do you know legal retention can override erasure?</li>
+        <li>Do you connect it to the isolation model?</li>
+        <li>Do you spot the tension with an immutable ledger?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "delete their rows" with no mention of backups, logs or third
+          parties.</li>
+        <li><span class="redflag">Red flag:</span> claiming backups can be selectively edited.</li>
+        <li><span class="redflag">Red flag:</span> no export step.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle the usage ledger?</li>
+          <li>How would you prove deletion happened?</li>
+          <li>What if a third-party processor can't delete on request?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you move a large tenant from the shared database to its own, with minimal disruption? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd use a <strong>short read-only window</strong> rather than dual-write, and I'd justify that
+          choice explicitly because zero-downtime sounds better and usually isn't worth it here."</p>
+        <p>"Dual-write means writing to both stores during the transition, handling the case where one write
+          succeeds and the other fails, reconciling divergence, and making the cutover atomic. That's a genuinely
+          hard distributed-systems problem to build and test — for a <em>one-off</em> operation."</p>
+        <p>"A read-only window of a few minutes, scheduled and communicated, removes that entire class of problem
+          because nothing changes while I copy the delta. 'Your account will be read-only for ten minutes at 2am
+          Sunday' is an easy conversation with a B2B customer. Recovering a tenant's data after a botched
+          dual-write is not."</p>
+        <p>"The sequence:"</p>
+        <p>"<strong>Provision the target</strong> and migrate its schema to exactly the same version as the
+          source — a version mismatch here is a subtle way to corrupt the copy."</p>
+        <p>"<strong>Bulk copy while they work normally.</strong> This is the bit that takes time, and it happens
+          with no impact. I'd copy in foreign-key order so referential integrity holds at every point."</p>
+        <p>"<strong>Enter read-only mode</strong>, enforced by the application from a status on the catalogue
+          record — not by hoping nobody writes. That flag needs to be checked in one place that all writes pass
+          through, which is another argument for having a tenant context service rather than ambient state."</p>
+        <p>"<strong>Copy the delta</strong> since the bulk copy. Small, so this is quick."</p>
+        <p>"<strong>Verify</strong> — row counts per table, checksums on the important ones, and spot-check a few
+          records including recently-modified ones. Not a visual check; an automated comparison that fails
+          loudly."</p>
+        <p>"<strong>Flip the catalogue</strong> to point at the new store and clear read-only. Because connection
+          resolution is at runtime from the catalogue, that's a config change rather than a deployment — which is
+          exactly why runtime resolution matters architecturally."</p>
+        <p>"<strong>Keep the source data</strong> for a week or two. The rollback path is repointing the catalogue
+          back, and that only works while the source still exists. Deleting immediately removes your escape
+          route."</p>
+        <p>"Things I'd get right that are easy to miss. <strong>Background jobs and queued messages for that
+          tenant</strong> — in-flight work will target the old store, so I'd drain the queue before the window or
+          ensure consumers resolve the connection per message rather than caching it. <strong>Caches</strong> need
+          invalidating for that tenant, or you'll serve stale data from the old store's cached results.
+          <strong>Their blob storage</strong> may need moving too, and that's often larger than the database.
+          And <strong>a rehearsal</strong> against a copy first, because the first attempt reveals the ordering
+          problems."</p>
+        <p>"If a read-only window genuinely isn't acceptable — a global tenant with no quiet period —
+          <strong>change-feed replication</strong> is the middle option: replicate continuously from the source
+          using CDC or an outbox until the target is caught up, then a seconds-long cutover. That's much less work
+          than dual-write if the change-capture mechanism already exists, and considerably more if it
+          doesn't."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you choose read-only over dual-write, with reasoning?</li>
+        <li>Do you verify with counts and checksums before cutover?</li>
+        <li>Do you keep the source for rollback?</li>
+        <li>Do you consider background jobs, caches and blob storage?</li>
+        <li>Do you rehearse it?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> dual-write chosen reflexively for zero downtime.</li>
+        <li><span class="redflag">Red flag:</span> no verification step.</li>
+        <li><span class="redflag">Red flag:</span> deleting the source immediately.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you enforce read-only reliably?</li>
+          <li>What if the copy takes longer than the window?</li>
+          <li>How would you handle in-flight background jobs?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

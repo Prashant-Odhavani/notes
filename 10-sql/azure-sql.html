@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure SQL</title>
+<meta name="description" content="Deployment options, DTU vs vCore, serverless, elastic pools, built-in HA, geo-replication, security and the things that differ from SQL Server on a VM.">
+<meta name="keywords" content="Azure SQL Database Managed Instance DTU vCure vCore serverless hyperscale elastic pool geo-replication failover group auto-failover point in time restore transient fault retry Managed Identity Always Encrypted Ledger firewall private endpoint">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/azure-sql.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Azure SQL</h1>
+    <p class="subtitle">The managed options, what they cost you in control, and the application changes that
+      actually matter when you move.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Three options:</strong> SQL Database (PaaS, single database), Managed Instance (near-full
+        SQL Server), SQL Server on a VM (you manage everything).</li>
+      <li><strong>vCore is the default purchasing model now.</strong> DTU is a legacy blended metric that
+        makes capacity planning guesswork.</li>
+      <li><strong>HA is built in and free</strong> — you don't configure availability groups.</li>
+      <li><strong>Backups are automatic</strong> with point-in-time restore for 7–35 days.</li>
+      <li><strong>Transient faults are normal.</strong> Retry logic isn't optional — this is the single
+        biggest application change.</li>
+      <li><strong>Elastic pools</strong> share capacity across many databases with uneven load — the
+        multi-tenant workhorse.</li>
+      <li><strong>Use Managed Identity</strong>, not connection-string passwords.</li>
+    </ul>
+  </div>
+
+  <h2 id="deployment-options">Which option <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>SQL Database</th><th>Managed Instance</th><th>SQL Server on VM</th></tr></thead>
+      <tbody>
+        <tr><td>Model</td><td>PaaS — single database or pool</td><td>PaaS — instance-scoped</td><td>IaaS</td></tr>
+        <tr><td>Patching &amp; backups</td><td>Automatic</td><td>Automatic</td><td><strong>Yours</strong></td></tr>
+        <tr><td>Cross-database queries</td><td><strong>No</strong> (elastic query only)</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td>SQL Agent</td><td><strong>No</strong> — use Elastic Jobs or a Function</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td>CLR, Service Broker, linked servers</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td>Common use</td><td>New cloud applications</td><td><strong>Lift-and-shift</strong> from on-prem</td><td>Legacy needs, full OS control</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to choose, in one line each</span>
+    <ul>
+      <li><strong>New application?</strong> SQL Database.</li>
+      <li><strong>Migrating an existing app that uses SQL Agent, cross-database queries or Service
+        Broker?</strong> Managed Instance — it exists precisely so you don't have to rewrite those.</li>
+      <li><strong>Need a specific SQL Server version, an unusual extension, or full OS control?</strong> VM,
+        and accept that patching and backups are now your job.</li>
+    </ul>
+  </div>
+
+  <h2 id="purchasing">DTU vs vCore <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>DTU</strong> is a single blended number covering CPU, memory and I/O. You buy "100 DTUs" without
+      knowing how much of each you get.</p>
+    <p><strong>vCore</strong> separates them — you choose cores and storage explicitly, so you can size for
+      what you actually need.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>DTU</th><th>vCore</th></tr></thead>
+      <tbody>
+        <tr><td>Transparency</td><td>Opaque blend — hard to reason about</td><td><strong>Explicit</strong> cores, memory, storage</td></tr>
+        <tr><td>Scale independently</td><td>No — one dial</td><td>Yes</td></tr>
+        <tr><td>Hybrid Benefit (reuse licences)</td><td>No</td><td><strong>Yes</strong> — often a large saving</td></tr>
+        <tr><td>Serverless / Hyperscale</td><td>No</td><td>Yes</td></tr>
+        <tr><td>Verdict</td><td>Legacy. Small, predictable databases only</td><td><strong>The default choice</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Why DTU causes real problems</div>
+    <p style="margin:0">You can be at 100% DTU without knowing whether you're CPU-bound, memory-bound or
+      I/O-bound. So the only remedy is to buy a bigger DTU tier — you can't fix the actual constraint because
+      you can't see it.
+      <br><br>
+      Under vCore, the same investigation tells you "we're I/O bound", and you address that specifically.
+      <br><br>
+      "I'd move off DTU so I can see which resource is the constraint" is a good, concrete senior answer.</p>
+  </div>
+
+  <h3 id="service-tiers">Service tiers</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tier</th><th>Characteristics</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>General Purpose</strong></td><td>Remote storage, ~5–10ms latency. One compute replica</td><td>Most workloads. The default</td></tr>
+        <tr><td><strong>Business Critical</strong></td><td>Local SSD, ~1–2ms. Three replicas, one <strong>free readable</strong></td><td>Low-latency OLTP; also the cheapest way to get a read replica</td></tr>
+        <tr><td><strong>Hyperscale</strong></td><td>Up to 100 TB, near-instant backups, up to 30 replicas</td><td>Very large databases; fast scaling</td></tr>
+        <tr><td><strong>Serverless</strong></td><td>Autoscales, pauses when idle, per-second billing</td><td>Dev/test, intermittent workloads</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — two non-obvious tier facts</div>
+    <p style="margin:0"><strong>Business Critical includes a readable secondary at no extra cost.</strong> Set
+      <code>ApplicationIntent=ReadOnly</code> in the connection string and reporting traffic goes to a
+      different replica. That's often the cheapest way to stop reports affecting live traffic, and people
+      routinely pay for a separate geo-replica without realising they already have one.
+      <br><br>
+      <strong>Hyperscale backups are snapshot-based</strong>, so backup and restore time is largely independent
+      of database size. A 50 TB restore is minutes, not days. That changes the RTO conversation completely for
+      large databases — and it's the reason to choose Hyperscale even when you don't need 100 TB.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Serverless: know the cold start</div>
+    <p style="margin:0">Auto-pause is genuinely useful for dev and test — you stop paying for compute
+      entirely. But resuming takes roughly a minute, and the first connection <strong>fails</strong> rather than
+      waiting.
+      <br><br>
+      So serverless needs retry logic even more than usual, and it's a poor fit for anything user-facing with
+      sporadic traffic — the user who arrives after an idle period gets an error.</p>
+  </div>
+
+  <h2 id="elastic-pools">Elastic pools <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>200 tenants each need occasional bursts of capacity but sit idle most of the time.</p>
+    <p>Provisioning each one for its peak is like giving every office worker their own printer sized for the
+      busiest day of the year.</p>
+    <p>An elastic pool is the shared printer room: one pool of capacity, drawn on by whoever needs it.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Good fit</th><th>Poor fit</th></tr></thead>
+      <tbody>
+        <tr><td>Many databases with <strong>uncorrelated</strong> peaks</td><td>All databases busy at the same time — no headroom to share</td></tr>
+        <tr><td>Low average utilisation per database</td><td>Consistently high utilisation</td></tr>
+        <tr><td>Database-per-tenant SaaS</td><td>A single dominant database that starves the rest</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The mechanism that makes them work — and the trap</div>
+    <p style="margin:0">Pools let you set <strong>per-database min and max</strong> vCores. The max stops one
+      tenant consuming the whole pool; the min guarantees a floor for important tenants.
+      <br><br>
+      Without a per-database cap, one tenant running a bad report degrades every other tenant in the pool —
+      the classic noisy-neighbour problem, and the thing people forget to configure.
+      <br><br>
+      Pools also share the storage limit, so one large tenant can exhaust it for everyone. Both are why
+      <em>uncorrelated</em> peaks matter: if everyone is busy simultaneously, a pool is just a smaller total
+      allocation.</p>
+  </div>
+
+  <h2 id="ha">High availability and disaster recovery <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Capability</th><th>What you get</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Built-in HA</strong></td><td>Automatic, included. 99.99% SLA (99.995% with zone redundancy). Nothing to configure</td></tr>
+        <tr><td><strong>Zone redundancy</strong></td><td>Replicas across availability zones in the region. A checkbox</td></tr>
+        <tr><td><strong>Active geo-replication</strong></td><td>Up to 4 readable secondaries in other regions. Manual failover</td></tr>
+        <tr><td><strong>Auto-failover groups</strong></td><td>Geo-replication plus a <strong>stable listener endpoint</strong> and automatic failover</td></tr>
+        <tr><td><strong>Automated backups</strong></td><td>Full/diff/log, point-in-time restore 7–35 days, no setup</td></tr>
+        <tr><td><strong>Long-term retention</strong></td><td>Weekly/monthly/yearly, up to 10 years</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Geo-replication vs failover group</span>
+    <p><strong>Use failover groups.</strong></p>
+    <p>Geo-replication alone gives you a secondary — but failing over means changing the connection string
+      everywhere, which is a deployment during an incident.</p>
+    <p>A failover group provides a <strong>listener endpoint that follows the primary</strong>. Failover needs
+      no application change at all. Same replication underneath, dramatically better operationally.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two DR facts worth stating</div>
+    <p style="margin:0"><strong>Geo-replication is asynchronous</strong>, so a regional failover can lose the
+      last few seconds of committed transactions — typically an RPO around 5 seconds. If that's unacceptable
+      you need a different design, not a different setting.
+      <br><br>
+      <strong>Automated backups are region-local by default.</strong> Configure geo-redundant backup storage,
+      or a regional outage takes your restore points with it. That's a setting, not a given, and it's an easy
+      thing to miss.</p>
+  </div>
+
+  <h2 id="retry">Transient faults — the change your code actually needs <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why this is different from on-prem</span>
+    <p>Azure SQL performs maintenance, patching and reconfiguration continuously, and can move your database
+      between nodes.</p>
+    <p>So <strong>brief connection failures are expected behaviour</strong>, not incidents. Code that assumed a
+      stable connection breaks.</p>
+  </div>
+
+  <pre data-label="csharp — EF Core: built-in retry" class="code-good"><code class="language-csharp">builder.Services.AddDbContext&lt;AppDbContext&gt;(options =&gt;
+    options.UseSqlServer(connectionString, sql =&gt;
+    {
+        sql.EnableRetryOnFailure(
+            maxRetryCount: 5,
+            maxRetryDelay: TimeSpan.FromSeconds(30),
+            errorNumbersToAdd: null);       // known transient codes by default
+
+        sql.CommandTimeout(30);
+    }));</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Error</th><th>Meaning</th><th>Retry?</th></tr></thead>
+      <tbody>
+        <tr><td><strong>40613</strong></td><td>Database not currently available (moving nodes)</td><td>Yes, with backoff</td></tr>
+        <tr><td><strong>40501</strong></td><td>Service busy — throttled</td><td>Yes, longer backoff</td></tr>
+        <tr><td><strong>49918/49919/49920</strong></td><td>Not enough resources to process the request</td><td>Yes</td></tr>
+        <tr><td><strong>10928/10929</strong></td><td>Resource limit reached</td><td>Yes</td></tr>
+        <tr><td><strong>4060</strong></td><td>Cannot open database — usually auth or wrong name</td><td><strong>No</strong> — fix the config</td></tr>
+        <tr><td><strong>18456</strong></td><td>Login failed</td><td><strong>No</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The trap: retry plus explicit transactions</div>
+    <p style="margin:0"><code>EnableRetryOnFailure</code> retries individual operations. If you have an
+      <strong>explicit</strong> transaction spanning several <code>SaveChanges</code> calls, a retry of one
+      call inside it makes no sense — the transaction is already dead. EF Core throws rather than doing
+      something incorrect.
+      <br><br>
+      The fix is to wrap the whole unit in an <strong>execution strategy</strong> so the entire transaction is
+      retried as one atomic block:</p>
+    <pre data-label="csharp" class="code-good"><code class="language-csharp">var strategy = db.Database.CreateExecutionStrategy();
+
+await strategy.ExecuteAsync(async () =&gt;
+{
+    await using var tx = await db.Database.BeginTransactionAsync();
+    // ... multiple SaveChangesAsync calls ...
+    await tx.CommitAsync();
+});</code></pre>
+    <p style="margin:0">The retried block must be <strong>idempotent</strong>, because it may run more than
+      once. That's the part people miss — and it's exactly the same requirement as
+      <a href="../08-http-web-apis/reliability.html#idempotency-keys">retry-safety in HTTP APIs</a>.</p>
+  </div>
+
+  <h2 id="security">Security <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Feature</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Microsoft Entra auth + Managed Identity</strong></td><td><strong>No password anywhere.</strong> The platform issues and rotates the token</td></tr>
+        <tr><td><strong>Private endpoint</strong></td><td>Removes the public endpoint entirely — traffic stays on the virtual network</td></tr>
+        <tr><td><strong>Transparent Data Encryption</strong></td><td>Encrypts data at rest. On by default</td></tr>
+        <tr><td><strong>Always Encrypted</strong></td><td>Encrypted in the client driver — the server never sees plaintext</td></tr>
+        <tr><td><strong>Dynamic Data Masking</strong></td><td>Masks values in query results for non-privileged users</td></tr>
+        <tr><td><strong>Row-Level Security</strong></td><td>A predicate function filters rows per user or tenant</td></tr>
+        <tr><td><strong>Auditing / Defender</strong></td><td>Logs access; flags anomalous patterns and likely injection</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — connection string with no secret" class="code-good"><code class="language-csharp">// appsettings.json
+// "Db": "Server=tcp:my.database.windows.net,1433;Database=app;
+//        Authentication=Active Directory Default;Encrypt=True;"
+
+// No password. The Managed Identity of the App Service or container
+// authenticates, and the token is rotated by the platform.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — Managed Identity is the answer to secret rotation</div>
+    <p style="margin:0">Key Vault is a real improvement over a password in <code>appsettings.json</code>, but
+      you're still managing a secret — storing it, rotating it, auditing who read it.
+      <br><br>
+      Managed Identity removes the secret entirely. There's nothing to leak in a config file, a log, a
+      screenshot or a repository.
+      <br><br>
+      "I'd use Managed Identity so there's no credential to rotate" is a much stronger answer than "I'd put
+      the password in Key Vault", and it's the same reasoning as
+      <a href="../07-aspnet-core/security.html">avoiding long-lived secrets generally</a>.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two Azure SQL security defaults to check</div>
+    <p style="margin:0"><strong>"Allow Azure services to access this server"</strong> sounds harmless. It
+      permits connections from <em>any</em> Azure subscription, including other tenants'. Turn it off and use a
+      private endpoint or specific firewall rules.
+      <br><br>
+      <strong>Row-Level Security is enforced by the database</strong>, which makes it genuinely valuable for
+      multi-tenancy — a forgotten <code>WHERE TenantId = ...</code> in one query can't leak data. But note it
+      does not apply to members of <code>db_owner</code> unless you explicitly enable that, so the account your
+      application connects with must not be over-privileged.</p>
+  </div>
+
+  <h2 id="cost">Cost <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lever</th><th>Typical impact</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Reserved capacity</strong> (1 or 3 years)</td><td>Large discount for steady workloads</td></tr>
+        <tr><td><strong>Azure Hybrid Benefit</strong></td><td>Reuse existing SQL Server licences — vCore only</td></tr>
+        <tr><td><strong>Elastic pools</strong></td><td>Often the single biggest saving for many-database estates</td></tr>
+        <tr><td><strong>Serverless for dev/test</strong></td><td>Pays nothing while paused</td></tr>
+        <tr><td><strong>Query tuning</strong></td><td>A smaller tier costs less every month, forever</td></tr>
+        <tr><td><strong>Right-sizing on real metrics</strong></td><td>Over-provisioning is the most common waste</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The cost argument for tuning</div>
+    <p style="margin:0">On-prem, a wasteful query costs nothing extra — the hardware is already paid for. In
+      the cloud it shows up on the invoice every month.
+      <br><br>
+      So "we added an index and dropped two service tiers" is a real, recurring saving, and framing tuning as
+      cost reduction rather than a technical nicety is often how you get time allocated for it.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>SQL Database for new apps, Managed Instance for lift-and-shift, VM only when you need OS control.</li>
+      <li>vCore over DTU — you can see which resource is the constraint.</li>
+      <li>Business Critical includes a free readable secondary via
+        <code>ApplicationIntent=ReadOnly</code>.</li>
+      <li>Hyperscale's snapshot backups make restore time largely size-independent.</li>
+      <li>Elastic pools need uncorrelated peaks and per-database caps.</li>
+      <li>HA and backups are built in; geo-redundant backup storage is a setting to check.</li>
+      <li>Failover groups, not bare geo-replication — the listener endpoint is the point.</li>
+      <li>Transient-fault retry is mandatory, and explicit transactions need an execution strategy.</li>
+      <li>Managed Identity removes the secret rather than protecting it.</li>
+      <li>Query tuning is now a recurring cost saving.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No retry logic</strong>, treating normal transient faults as outages.</li>
+    <li><strong>Explicit transactions with retry enabled</strong> and no execution strategy.</li>
+    <li><strong>Geo-replication without a failover group</strong>, so failover needs a deployment.</li>
+    <li><strong>Assuming backups are geo-redundant</strong> when they're region-local by default.</li>
+    <li><strong>Paying for a read replica</strong> when Business Critical already includes one.</li>
+    <li><strong>Elastic pools with no per-database max</strong>, so one tenant starves the rest.</li>
+    <li><strong>Serverless for user-facing traffic</strong>, exposing cold starts to users.</li>
+    <li><strong>"Allow Azure services" left enabled.</strong></li>
+    <li><strong>Passwords in connection strings</strong> instead of Managed Identity.</li>
+    <li><strong>Scaling up to fix a query problem</strong> — now you pay for it monthly.</li>
+    <li><strong>Expecting SQL Agent</strong> in SQL Database.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What changes in your application when you move from SQL Server to Azure SQL? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The biggest one, and the one that catches teams out, is <strong>transient faults</strong>. Azure SQL
+          patches and reconfigures continuously and can move your database between nodes, so brief connection
+          failures are normal operation rather than incidents. Code written against a stable on-prem instance
+          assumes the connection just works."</p>
+        <p>"So retry logic isn't optional. With EF Core that's <code>EnableRetryOnFailure</code>, which knows
+          the transient error numbers — 40613 when the database is moving, 40501 when it's throttled, the
+          resource-limit ones. And importantly it does <em>not</em> retry things like login failures, which
+          would just mask a configuration problem."</p>
+        <p>"The subtlety there: retry works per operation, so if I have an <strong>explicit transaction</strong>
+          spanning several <code>SaveChanges</code> calls, EF Core throws rather than retrying — because
+          retrying one call inside a dead transaction would be wrong. I have to wrap the whole unit in an
+          execution strategy so the entire transaction retries as one block. And that block must be idempotent,
+          because it can run more than once."</p>
+        <p>"Second: <strong>feature gaps</strong> if it's SQL Database rather than Managed Instance. No SQL
+          Agent, so scheduled jobs move to Elastic Jobs, a Function or a background service. No cross-database
+          queries. No CLR, Service Broker or linked servers. If the existing app relies on those, Managed
+          Instance is the migration target — that's what it exists for."</p>
+        <p>"Third: <strong>connection handling matters more</strong>. Connections are more expensive and there
+          are hard limits per tier, so pooling has to be right, and connections shouldn't be held open across
+          long operations. Latency is also higher than a database on the same LAN, which makes chatty access
+          patterns and N+1 queries hurt considerably more."</p>
+        <p>"Fourth: <strong>things you no longer do</strong>. Backups, patching and HA are managed. That's
+          genuinely less work, but it also means you can't tune what you can't see — no filegroup layout, no
+          instance-level trace flags."</p>
+        <p>"And I'd change two things deliberately as part of the move: <strong>Managed Identity</strong>
+          instead of a password in the connection string, since it removes the secret entirely rather than
+          protecting it, and <strong>enabling Query Store</strong> if it isn't already, because performance
+          troubleshooting without server access is much harder and Query Store is most of what you get."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know transient faults are the headline change?</li>
+        <li>Do you know the transaction + retry interaction?</li>
+        <li>Do you know the SQL Database feature gaps?</li>
+        <li>Do you mention Managed Identity?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which errors are transient and which aren't?</li>
+          <li>How would you replace SQL Agent jobs?</li>
+          <li>How do you troubleshoot performance without server access?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Design the Azure SQL setup for a SaaS product with 500 tenants. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The first decision is the <strong>tenancy model</strong>, because everything else follows from it,
+          and I'd want to know the customer profile before choosing — are these 500 similar small tenants, or
+          20 large enterprises and 480 small ones?"</p>
+        <p>"<strong>Database per tenant</strong> gives the strongest isolation, per-tenant restore, per-tenant
+          scaling, and it makes data residency and 'delete all our data' requests trivial. The cost is 500
+          schemas to keep in sync and 500 databases to provision and monitor."</p>
+        <p>"<strong>Shared database with a tenant column</strong> is the cheapest and simplest to deploy, but a
+          single missing <code>WHERE TenantId</code> is a cross-tenant data leak, and you can't restore one
+          tenant without affecting everyone."</p>
+        <p>"For 500 tenants my default would be <strong>database-per-tenant inside elastic pools</strong>, which
+          is close to what elastic pools were built for. Each tenant gets isolation; the pool means I'm not
+          paying for 500 idle databases sized for their individual peaks."</p>
+        <p>"That works because tenant peaks are usually <strong>uncorrelated</strong> — different time zones,
+          different working patterns. If they were all busy simultaneously, a pool wouldn't help and I'd need
+          provisioned capacity instead. That's the question I'd check the metrics for rather than assume."</p>
+        <p>"Two pool details I'd get right: set a <strong>per-database max</strong> so one tenant running a bad
+          report can't consume the whole pool — that's the noisy-neighbour problem and it's a configuration
+          you have to remember. And set a <strong>min</strong> for tenants with contractual performance
+          commitments. I'd also plan for large tenants to graduate out of the pool onto their own database, so
+          growth doesn't require re-architecting."</p>
+        <p>"On <strong>tier</strong>: General Purpose for the pool by default. I'd consider Business Critical
+          if latency matters, partly because it includes a free readable secondary — so per-tenant reporting can
+          go to <code>ApplicationIntent=ReadOnly</code> and stop competing with live traffic."</p>
+        <p>"<strong>Schema management</strong> is the real operational cost of this model and I'd design for it
+          from the start: idempotent migrations applied by an automated rolling job, version tracking per
+          database, canary tenants first, and — critically — every migration must work with both the old and
+          new application code, because 500 databases don't upgrade instantly. Backward-compatible migrations
+          aren't a nice-to-have here, they're structural."</p>
+        <p>"<strong>Routing</strong>: a catalog database mapping tenant to connection string, cached in the
+          application. That's also what lets me move a tenant to a different pool or region without a code
+          change."</p>
+        <p>"<strong>HA and DR</strong>: built-in HA with zone redundancy, geo-redundant backup storage — which
+          I'd verify rather than assume, since backups are region-local by default. Auto-failover groups for
+          the pool if the RTO justifies the cost. Point-in-time restore per database is a genuine advantage
+          here: I can restore one tenant to 3pm yesterday without touching the other 499, which is impossible
+          in the shared-database model and is exactly the kind of request that actually arrives."</p>
+        <p>"<strong>Security</strong>: Managed Identity so there's no credential to rotate, private endpoints,
+          and I'd still add Row-Level Security as defence in depth even with separate databases — belt and
+          braces on the thing that would be a breach."</p>
+        <p>"The thing I'd flag as the main risk: <strong>operational tooling has to be built up front</strong>.
+          With 500 databases, anything manual becomes impossible. Provisioning, migration, monitoring,
+          per-tenant cost attribution and de-provisioning all need automating early, and teams routinely
+          underestimate that because it works fine at 10 tenants."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you start from the tenancy model?</li>
+        <li>Do you know elastic pools need uncorrelated peaks?</li>
+        <li>Do you set per-database caps for noisy neighbours?</li>
+        <li>Do you plan for schema rollout across many databases?</li>
+        <li>Do you raise per-tenant restore as an advantage?</li>
+        <li>Do you recognise operational tooling as the real cost?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> picking a tenancy model with no reasoning.</li>
+        <li><span class="redflag">Red flag:</span> no mention of how 500 schemas stay in sync.</li>
+        <li><span class="redflag">Red flag:</span> elastic pools with no per-database limits.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you migrate a schema across 500 databases safely?</li>
+          <li>What happens when one tenant becomes 40% of your load?</li>
+          <li>How do you attribute cost per tenant?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

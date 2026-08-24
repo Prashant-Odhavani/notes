@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Querying &amp; Loading Strategies — EF Core</title>
+<meta name="description" content="Eager, lazy and explicit loading, split queries, cartesian explosion, projection, deferred execution and when to drop to raw SQL.">
+<meta name="keywords" content="Include ThenInclude eager loading lazy loading explicit loading Load Entry Collection split query AsSplitQuery cartesian explosion projection Select deferred execution IQueryable client evaluation FromSql ExecuteSql global query filter">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="11-ef-core/querying.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Querying &amp; Loading Strategies</h1>
+    <p class="subtitle">How you load related data determines whether a page takes 50ms or 8 seconds. This is
+      the highest-value EF Core page.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Three loading strategies:</strong> eager (<code>Include</code>), lazy (on property access),
+        explicit (<code>Load</code>).</li>
+      <li><strong>Lazy loading causes N+1</strong> — the single biggest EF performance problem.</li>
+      <li><strong>Two or more collection <code>Include</code>s cause a cartesian explosion.</strong> Fix with
+        <code>AsSplitQuery</code>.</li>
+      <li><strong><code>IQueryable</code> is deferred.</strong> Nothing executes until you enumerate it.</li>
+      <li><strong>Project into a DTO</strong> instead of <code>Include</code>-ing whole entities where you
+        can.</li>
+      <li><strong>EF Core 3.0+ throws</strong> rather than silently evaluating a <code>WHERE</code> clause in
+        memory.</li>
+      <li><strong>Global query filters</strong> handle soft delete and multi-tenancy in one place.</li>
+    </ul>
+  </div>
+
+  <h2 id="deferred">Deferred execution <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An <code>IQueryable</code> is a <strong>description of a query</strong>, not a result.</p>
+    <p>Nothing runs until you enumerate it — <code>ToList</code>, <code>First</code>, <code>Count</code>,
+      <code>Any</code>, or a <code>foreach</code>.</p>
+  </div>
+
+  <pre data-label="csharp — one query, built up in pieces"><code class="language-csharp">var query = db.Orders.Where(o =&gt; o.Status == OrderStatus.Open);   // no SQL yet
+
+if (customerId.HasValue)
+    query = query.Where(o =&gt; o.CustomerId == customerId);          // still no SQL
+
+if (from.HasValue)
+    query = query.Where(o =&gt; o.CreatedUtc &gt;= from);                // still no SQL
+
+var results = await query
+    .OrderByDescending(o =&gt; o.CreatedUtc)
+    .Take(50)
+    .ToListAsync();          // NOW one SQL statement with all of it</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">The trap: enumerating too early</div>
+    <pre data-label="csharp" class="code-bad"><code class="language-csharp">var orders = db.Orders.ToList()                    // loads the WHOLE table
+                     .Where(o =&gt; o.Total &gt; 1000)   // filters in memory
+                     .ToList();</code></pre>
+    <pre data-label="csharp" class="code-good"><code class="language-csharp">var orders = await db.Orders
+    .Where(o =&gt; o.Total &gt; 1000)      // filters in SQL
+    .ToListAsync();</code></pre>
+    <p style="margin:0">Once you call <code>ToList</code>, you're holding <code>List&lt;T&gt;</code> —
+      everything after that is LINQ to Objects running in your process.
+      <br><br>
+      Same trap with <code>AsEnumerable()</code>, and with returning <code>IEnumerable&lt;T&gt;</code> from a
+      repository method: the caller adding <code>.Where(...)</code> is now filtering in memory, and there is no
+      warning at all. <strong>Return <code>IQueryable&lt;T&gt;</code> or a finished result — not
+      <code>IEnumerable&lt;T&gt;</code>.</strong></p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>The question to ask about every LINQ line: is this running in SQL Server or in my process?</strong></p>
+    <p><code>IQueryable</code> → database. <code>IEnumerable</code> → memory. That's the whole distinction, and
+      it explains most EF performance surprises.</p>
+  </div>
+
+  <h2 id="loading-strategies">The three loading strategies <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>How</th><th>Queries</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Eager</strong></td><td><code>.Include(...)</code></td><td>One (or one per include with split queries)</td><td><strong>The default choice</strong> — explicit and predictable</td></tr>
+        <tr><td><strong>Lazy</strong></td><td>Proxies load on property access</td><td><strong>One per access</strong></td><td>Avoid. Causes N+1 invisibly</td></tr>
+        <tr><td><strong>Explicit</strong></td><td><code>.Entry(x).Collection(...).LoadAsync()</code></td><td>One, when you ask</td><td>Useful when loading is conditional</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="eager">Eager loading</h3>
+
+  <pre data-label="csharp"><code class="language-csharp">var order = await db.Orders
+    .Include(o =&gt; o.Customer)                 // reference
+    .Include(o =&gt; o.Lines)                    // collection
+        .ThenInclude(l =&gt; l.Product)          // nested
+    .FirstOrDefaultAsync(o =&gt; o.Id == id);</code></pre>
+
+  <pre data-label="csharp — filtered include (EF Core 5+)"><code class="language-csharp">var customer = await db.Customers
+    .Include(c =&gt; c.Orders.Where(o =&gt; o.CreatedUtc &gt;= cutoff)
+                          .OrderByDescending(o =&gt; o.CreatedUtc)
+                          .Take(10))
+    .FirstAsync(c =&gt; c.Id == id);</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Filtered include gotcha</div>
+    <p style="margin:0">The collection on the returned entity contains <strong>only the filtered
+      subset</strong>, but it's marked as loaded. So any code that later treats
+      <code>customer.Orders</code> as "all this customer's orders" is now silently wrong.
+      <br><br>
+      Fine when the entity is going straight into a response. Risky if it flows into domain logic that
+      calculates a total. In that situation, project instead.</p>
+  </div>
+
+  <h3 id="lazy">Lazy loading, and why to avoid it</h3>
+
+  <pre data-label="csharp — enabling it (don't)"><code class="language-csharp">// requires Microsoft.EntityFrameworkCore.Proxies
+options.UseLazyLoadingProxies();
+
+// and every navigation must be virtual
+public virtual Customer Customer { get; set; } = null!;</code></pre>
+
+  <pre data-label="csharp — 1001 queries, and nothing in the code says so" class="code-bad"><code class="language-csharp">var orders = await db.Orders.Take(1000).ToListAsync();   // 1 query
+
+foreach (var o in orders)
+    Console.WriteLine(o.Customer.Name);                  // 1000 more queries</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Why lazy loading is genuinely dangerous</div>
+    <p style="margin:0"><strong>The database access is invisible.</strong> <code>o.Customer.Name</code> is a
+      property read. Nothing in the code suggests a network round trip, so it survives every code review.
+      <br><br>
+      <strong>It's fine in development.</strong> 20 test rows means 20 fast queries. Production has 10,000 rows
+      and the endpoint times out.
+      <br><br>
+      <strong>It breaks after disposal.</strong> Access a navigation after the <code>DbContext</code> is
+      disposed — very easy if entities are returned from a service — and you get
+      <code>ObjectDisposedException</code>.
+      <br><br>
+      <strong>It serialises unpredictably.</strong> A JSON serializer walking navigations triggers loads for
+      everything it touches, so one response can fire hundreds of queries.
+      <br><br>
+      <strong>My position: leave it off.</strong> An explicit <code>Include</code> that's slightly verbose beats
+      an invisible query. If a navigation is null when you needed it, you get a clear
+      <code>NullReferenceException</code> at development time rather than a silent performance cliff in
+      production.</p>
+  </div>
+
+  <h3 id="explicit">Explicit loading</h3>
+
+  <pre data-label="csharp — load only when you actually need it"><code class="language-csharp">var order = await db.Orders.FindAsync(id);
+
+if (includeLines)
+    await db.Entry(order).Collection(o =&gt; o.Lines).LoadAsync();
+
+if (includeCustomer)
+    await db.Entry(order).Reference(o =&gt; o.Customer).LoadAsync();
+
+// Or query the navigation without materialising it
+var lineCount = await db.Entry(order).Collection(o =&gt; o.Lines).Query().CountAsync();</code></pre>
+
+  <p>Useful for conditional loading driven by a request parameter, and the <code>.Query()</code> form lets you
+    count or filter a navigation without loading it into memory at all.</p>
+
+  <h2 id="cartesian">Cartesian explosion <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The problem in one sentence</span>
+    <p>Two collection <code>Include</code>s in one query produce <strong>rows × rows</strong>, because SQL has
+      no way to return two independent lists in one result set.</p>
+  </div>
+
+  <pre data-label="csharp — looks completely reasonable" class="code-bad"><code class="language-csharp">var order = await db.Orders
+    .Include(o =&gt; o.Lines)        // 50 lines
+    .Include(o =&gt; o.Payments)     // 10 payments
+    .Include(o =&gt; o.Shipments)    // 5 shipments
+    .FirstAsync(o =&gt; o.Id == id);
+
+// The JOIN returns 50 x 10 x 5 = 2,500 rows.
+// Every Order column is repeated 2,500 times.
+// EF de-duplicates them back to 65 objects - after transferring all of it.</code></pre>
+
+  <div class="analogy">
+    <span class="an-label">Why SQL does this</span>
+    <p>You ask for one customer's phone numbers and their email addresses in a single table.</p>
+    <p>The only way to fit both lists into one flat grid is to pair every phone number with every email
+      address. Three phones and four emails become twelve rows.</p>
+    <p>The data is all there — but you've transferred twelve rows to convey seven facts.</p>
+  </div>
+
+  <pre data-label="csharp — split queries" class="code-good"><code class="language-csharp">var order = await db.Orders
+    .Include(o =&gt; o.Lines)
+    .Include(o =&gt; o.Payments)
+    .Include(o =&gt; o.Shipments)
+    .AsSplitQuery()               // 4 queries, 66 rows total
+    .FirstAsync(o =&gt; o.Id == id);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Single query</th><th>Split query</th></tr></thead>
+      <tbody>
+        <tr><td>Round trips</td><td><strong>One</strong></td><td>One per collection</td></tr>
+        <tr><td>Rows transferred</td><td>Multiplied</td><td><strong>Sum, not product</strong></td></tr>
+        <tr><td>Consistency</td><td><strong>Atomic snapshot</strong></td><td>Separate queries — data can change between them</td></tr>
+        <tr><td>Best for</td><td>One collection, or small ones</td><td>Multiple or large collections</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the consistency trade-off</div>
+    <p style="margin:0">Split queries aren't strictly better. They run as <strong>separate
+      statements</strong>, so unless you're inside an explicit transaction with a suitable isolation level,
+      another transaction can modify the data between them — giving you an order whose lines and payments come
+      from different moments.
+      <br><br>
+      In practice that's rarely material for display data, and I'd default to split for multiple collections
+      because the row multiplication is a much bigger practical risk. But knowing the trade exists, and that
+      it's fixable with a transaction where it matters, is the discriminating answer.
+      <br><br>
+      You can set it globally with <code>o.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery)</code>
+      and opt out per query with <code>AsSingleQuery()</code>.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Often the better answer: don't include at all</div>
+    <pre data-label="csharp" class="code-good"><code class="language-csharp">var vm = await db.Orders
+    .Where(o =&gt; o.Id == id)
+    .Select(o =&gt; new OrderViewModel
+    {
+        Id           = o.Id,
+        CustomerName = o.Customer.Name,            // JOIN, one column
+        LineCount    = o.Lines.Count(),            // aggregate in SQL
+        Total        = o.Lines.Sum(l =&gt; l.Total),  // aggregate in SQL
+        Lines        = o.Lines.Select(l =&gt; new LineDto(l.Sku, l.Quantity)).ToList()
+    })
+    .FirstOrDefaultAsync();</code></pre>
+    <p style="margin:0">This selects exactly the columns needed, computes the aggregates in the database
+      instead of loading rows to count them, and returns nothing tracked.
+      <br><br>
+      <strong>Most cartesian-explosion problems are really "we loaded entities when we needed a view
+      model".</strong> Projection is the fix that also solves three other problems at once.</p>
+  </div>
+
+  <h2 id="translation">What EF can and can't translate <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — won't translate" class="code-bad"><code class="language-csharp">// A custom C# method - EF has no idea what it does
+var results = await db.Orders
+    .Where(o =&gt; IsHighValue(o))          // InvalidOperationException
+    .ToListAsync();
+
+// Some framework methods have no SQL equivalent
+.Where(o =&gt; o.Sku.Equals(sku, StringComparison.OrdinalIgnoreCase))   // throws</code></pre>
+
+  <pre data-label="csharp — expressed so it can translate" class="code-good"><code class="language-csharp">// Inline the predicate
+.Where(o =&gt; o.Total &gt; 1000 &amp;&amp; o.Status == OrderStatus.Open)
+
+// Or a reusable expression
+private static readonly Expression&lt;Func&lt;Order, bool&gt;&gt; HighValue =
+    o =&gt; o.Total &gt; 1000 &amp;&amp; o.Status == OrderStatus.Open;
+
+var results = await db.Orders.Where(HighValue).ToListAsync();</code></pre>
+
+  <div class="note info">
+    <div class="note-title">EF Core 3.0 changed this deliberately</div>
+    <p style="margin:0">EF Core 2.x would silently give up, load the whole table, and evaluate your
+      <code>WHERE</code> clause in memory. Correct results, catastrophic performance, no warning at all.
+      <br><br>
+      EF Core 3.0 <strong>throws</strong> instead. That felt like a regression to some teams and was absolutely
+      the right call — a loud failure at development time beats a silent table scan in production.
+      <br><br>
+      Client evaluation is still allowed in the final <code>Select</code> projection, where it's harmless
+      because the data has already been reduced. So
+      <code>.Select(o =&gt; new { Label = FormatLabel(o.Total) })</code> works fine.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Translates</th><th>Doesn't</th></tr></thead>
+      <tbody>
+        <tr><td><code>Where</code>, <code>OrderBy</code>, <code>Skip</code>, <code>Take</code></td><td>Your own methods and properties</td></tr>
+        <tr><td><code>Sum</code>, <code>Count</code>, <code>Min</code>, <code>Max</code>, <code>Average</code></td><td><code>string.Equals</code> with a comparison option</td></tr>
+        <tr><td><code>string.Contains/StartsWith/EndsWith</code></td><td>Most <code>DateTime</code> formatting</td></tr>
+        <tr><td><code>Any</code>, <code>All</code>, <code>Contains</code> on a list</td><td>Constructors with logic inside them</td></tr>
+        <tr><td><code>GroupBy</code> with aggregates</td><td><code>GroupBy</code> returning full entity groups</td></tr>
+        <tr><td><code>EF.Functions.Like</code>, <code>DateDiffDay</code> etc.</td><td>Culture-sensitive comparisons</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="raw-sql">Dropping to SQL <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — parameterised, safe" class="code-good"><code class="language-csharp">// Returns mapped entities; composable with LINQ
+var orders = await db.Orders
+    .FromSql($"SELECT * FROM [Order] WHERE Total &gt; {threshold}")
+    .Where(o =&gt; o.Status == OrderStatus.Open)      // added as an outer query
+    .ToListAsync();
+
+// Non-entity result type (EF Core 8+)
+var report = await db.Database
+    .SqlQuery&lt;RevenueRow&gt;($"EXEC dbo.usp_Revenue @from = {from}, @to = {to}")
+    .ToListAsync();
+
+// Set-based command, no entities involved
+var affected = await db.Database.ExecuteSqlAsync(
+    $"UPDATE [Order] SET Status = 'Archived' WHERE CreatedUtc &lt; {cutoff}");</code></pre>
+
+  <div class="note danger">
+    <div class="note-title"><code>FromSql</code> vs <code>FromSqlRaw</code> — this matters</div>
+    <p style="margin:0"><code>FromSql</code> takes a <code>FormattableString</code>. The interpolated values
+      become <strong>SQL parameters automatically</strong>, so it's injection-safe by construction — the
+      interpolation syntax is a little misleading here, but the values never become part of the SQL text.
+      <br><br>
+      <code>FromSqlRaw</code> takes a plain string. Interpolating user input into it is a
+      <strong>SQL injection vulnerability</strong>, exactly as in ADO.NET.
+      <br><br>
+      <strong>Use <code>FromSql</code> unless you genuinely need dynamic SQL</strong>, and if you do, pass
+      values as explicit <code>SqlParameter</code>s and whitelist any identifiers.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title"><code>ExecuteSql</code> bypasses the change tracker</div>
+    <p style="margin:0">A raw <code>UPDATE</code> or <code>DELETE</code> doesn't go through EF's tracking, so
+      entities already loaded in the context still hold the <strong>old</strong> values — and a subsequent
+      <code>SaveChanges</code> can write them back over your change.
+      <br><br>
+      Same applies to <code>ExecuteUpdate</code> and <code>ExecuteDelete</code>. Use them on a context that
+      hasn't loaded the affected entities, or reload afterwards. This is a genuinely confusing bug when you hit
+      it.</p>
+  </div>
+
+  <h2 id="query-filters">Global query filters <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="csharp — soft delete and tenancy in one place" class="code-good"><code class="language-csharp">protected override void OnModelCreating(ModelBuilder b)
+{
+    b.Entity&lt;Order&gt;().HasQueryFilter(o =&gt; !o.IsDeleted &amp;&amp; o.TenantId == _tenantId);
+}
+
+// Every query on Order now includes those predicates automatically.
+// To bypass for an admin or repair tool:
+var all = await db.Orders.IgnoreQueryFilters().ToListAsync();</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Good for</th><th>Watch out for</th></tr></thead>
+      <tbody>
+        <tr><td>Soft delete — no more forgotten <code>!IsDeleted</code></td><td>The filter is invisible, so "the row exists but the query returns nothing" is confusing until you know</td></tr>
+        <tr><td>Multi-tenancy — a missed filter is a data leak, so centralising it is a security win</td><td>Filters don't apply to <code>Find</code> by key, or to raw SQL</td></tr>
+        <tr><td>Consistency across every query</td><td>A required navigation to a filtered-out row can throw</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the tenant-id capture bug</div>
+    <p style="margin:0">The filter expression is compiled into the <strong>model</strong>, and the model is
+      cached per context <em>type</em> — not per instance.
+      <br><br>
+      So capturing <code>_tenantId</code> in the filter only works if the field is read at query time rather
+      than baked in at model build. Get this wrong and one tenant's filter gets applied to another tenant's
+      requests — a cross-tenant data leak that appears only under concurrency.
+      <br><br>
+      The safe pattern is to reference a <em>field on the context instance</em> (EF re-reads it per query), and
+      to configure the model cache key with <code>IModelCacheKeyFactory</code> if the filter shape itself
+      varies. Being aware that model caching interacts with this is exactly the kind of detail that separates
+      people who've shipped multi-tenant EF from people who've read about it.
+      <br><br>
+      And I'd still enforce tenancy at the database level too — <a href="../10-sql/azure-sql.html#security">Row-Level
+      Security</a> — because a filter you can call <code>IgnoreQueryFilters()</code> on isn't a security
+      boundary.</p>
+  </div>
+
+  <h2 id="pagination">Pagination <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — offset paging" class="code-good"><code class="language-csharp">var page = await db.Orders
+    .Where(o =&gt; o.CustomerId == id)
+    .OrderByDescending(o =&gt; o.CreatedUtc)
+    .ThenByDescending(o =&gt; o.Id)               // tiebreaker - mandatory
+    .Skip((pageNumber - 1) * pageSize)
+    .Take(pageSize)
+    .Select(o =&gt; new OrderListItem(o.Id, o.CreatedUtc, o.Total))
+    .ToListAsync();</code></pre>
+
+  <pre data-label="csharp — keyset paging: constant cost" class="code-good"><code class="language-csharp">var page = await db.Orders
+    .Where(o =&gt; o.CustomerId == id)
+    .Where(o =&gt; o.CreatedUtc &lt; lastCreated
+             || (o.CreatedUtc == lastCreated &amp;&amp; o.Id &lt; lastId))
+    .OrderByDescending(o =&gt; o.CreatedUtc).ThenByDescending(o =&gt; o.Id)
+    .Take(pageSize)
+    .ToListAsync();</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Two pagination requirements people forget</div>
+    <p style="margin:0"><strong>A tiebreaker in <code>OrderBy</code> is mandatory.</strong> Without it, rows
+      with equal sort values can appear on two pages or on none — and it's intermittent, so it passes testing.
+      <br><br>
+      <strong><code>Skip</code> gets slower as the offset grows</strong>, because the database reads and
+      discards every skipped row. Page 5,000 reads 100,000 rows to return 20. For feeds and infinite scroll,
+      use keyset. See <a href="../10-sql/querying.html#pagination">the SQL page</a> for the mechanics.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li><code>IQueryable</code> is deferred and runs in SQL; <code>IEnumerable</code> runs in memory.</li>
+      <li>Never return <code>IEnumerable&lt;T&gt;</code> from a data-access method.</li>
+      <li>Eager loading by default. Lazy loading hides queries and causes N+1.</li>
+      <li>Multiple collection includes multiply rows. <code>AsSplitQuery</code>, or better, project.</li>
+      <li>Split queries lose the atomic snapshot — usually acceptable, worth knowing.</li>
+      <li>Projection solves row bloat, tracking cost and over-fetching at once.</li>
+      <li>EF Core 3.0+ throws on untranslatable <code>WHERE</code> clauses rather than silently scanning.</li>
+      <li><code>FromSql</code> parameterises; <code>FromSqlRaw</code> does not.</li>
+      <li><code>ExecuteUpdate</code>/<code>ExecuteDelete</code> bypass the change tracker.</li>
+      <li>Global query filters centralise soft delete and tenancy, but aren't a security boundary.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Lazy loading enabled</strong>, producing N+1 that nothing in the code reveals.</li>
+    <li><strong><code>ToList()</code> then <code>Where()</code></strong> — filtering in memory.</li>
+    <li><strong>Returning <code>IEnumerable&lt;T&gt;</code> from a repository.</strong></li>
+    <li><strong>Several collection <code>Include</code>s</strong> with no <code>AsSplitQuery</code>.</li>
+    <li><strong><code>Include</code>-ing whole entities</strong> to render three fields.</li>
+    <li><strong>Loading a collection to <code>.Count</code> it</strong> instead of counting in SQL.</li>
+    <li><strong><code>FromSqlRaw</code> with interpolated user input</strong> — SQL injection.</li>
+    <li><strong><code>ExecuteUpdate</code> on entities the context has already loaded.</strong></li>
+    <li><strong>No tiebreaker in paged <code>OrderBy</code>.</strong></li>
+    <li><strong>Deep <code>Skip</code></strong> on large tables.</li>
+    <li><strong>Returning entities from a controller</strong>, letting the serializer walk navigations.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Explain the N+1 problem and how you'd fix it. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"N+1 is one query to fetch a list, then one more query per item in that list to fetch related
+          data. So 1,000 orders plus their customers is 1,001 queries."</p>
+        <p>"The reason it's dangerous is that <strong>each individual query is fast</strong>. Nothing shows up
+          in a slow-query log; they're all 2ms. But 1,001 round trips at a millisecond of network latency each
+          is a full second of pure waiting before the database has done any real work. And the plan cache looks
+          perfectly healthy."</p>
+        <p>"The classic cause is <strong>lazy loading</strong>. <code>order.Customer.Name</code> is a property
+          read — nothing in that line suggests a database round trip, so it survives code review, and it works
+          fine in development with 20 test rows. Then production has 10,000 and the endpoint times out."</p>
+        <p>"The fix depends on what I actually need."</p>
+        <p>"If I need the entities, <strong>eager loading</strong>: <code>.Include(o =&gt; o.Customer)</code>.
+          One query with a join."</p>
+        <p>"If I only need a few fields — which is usually the case — <strong>projection</strong>:
+          <code>.Select(o =&gt; new { o.Id, CustomerName = o.Customer.Name })</code>. That's better than
+          <code>Include</code> because it selects only the columns needed, doesn't materialise or track
+          entities, and can potentially be served entirely from a covering index."</p>
+        <p>"The mistake to avoid when fixing it is <strong>swapping N+1 for a cartesian explosion</strong>. If
+          I add several collection <code>Include</code>s to one query — lines, payments, shipments — SQL has no
+          way to return three independent lists in one flat result, so it pairs every combination.
+          50 × 10 × 5 is 2,500 rows to convey 65 objects, with every parent column repeated. Fix that with
+          <code>AsSplitQuery()</code>, which issues one query per collection so rows add rather than
+          multiply."</p>
+        <p>"How I'd catch it: <strong>log the SQL in development</strong> and count queries per request. Most
+          N+1 is obvious the moment you see the same statement repeated with different parameters, and
+          completely invisible otherwise. I'd also consider an assertion in integration tests that a given
+          endpoint issues no more than N queries — that stops it regressing."</p>
+        <p>"And the structural prevention: <strong>leave lazy loading off</strong>. Then a navigation you forgot
+          to include is null and fails loudly in development, rather than quietly costing a round trip in
+          production."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know why it's invisible — each query is fast?</li>
+        <li>Do you know projection is usually better than <code>Include</code>?</li>
+        <li>Do you know the cartesian explosion you can create while fixing it?</li>
+        <li>Do you know how to detect it?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add <code>Include</code>" with no mention of split
+          queries or projection.</li>
+        <li><span class="redflag">Red flag:</span> no idea how you'd detect it.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What SQL does <code>AsSplitQuery</code> generate?</li>
+          <li>When is a single query still better?</li>
+          <li>How do you enforce this in CI?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Eager vs lazy vs explicit loading — which do you use? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>Eager</strong> is <code>Include</code> — related data comes back with the main query. My
+          default, because it's explicit: reading the code tells you exactly what's loaded and roughly what SQL
+          runs."</p>
+        <p>"<strong>Lazy</strong> loads on property access via proxies. I'd leave it disabled."</p>
+        <p>"<strong>Explicit</strong> is <code>db.Entry(x).Collection(...).LoadAsync()</code> — you load when
+          you decide to. Useful when loading is genuinely conditional, like an <code>?include=lines</code>
+          query parameter, or when you want to <em>query</em> a navigation without materialising it:
+          <code>.Collection(o =&gt; o.Lines).Query().CountAsync()</code> gets a count without pulling the
+          rows."</p>
+        <p>"On lazy loading specifically, my objection isn't that it's slow in principle — it's that the cost
+          is <strong>invisible</strong>. A property read triggering a network round trip isn't visible at the
+          call site, so it passes review, and it's fine in dev with small data. That combination is what makes
+          it a production problem rather than a design preference."</p>
+        <p>"Two other concrete failure modes. It throws <code>ObjectDisposedException</code> if a navigation is
+          touched after the context is disposed, which happens easily when entities are returned from a service
+          layer. And a JSON serializer walking navigations will trigger loads for everything it touches, so a
+          single response can fire hundreds of queries — which is also a good argument for never returning
+          entities directly from a controller."</p>
+        <p>"In practice though, my most common answer is <strong>none of the three — project</strong>. If I
+          need an order number, customer name and line count, I don't want entities at all. A
+          <code>Select</code> into a DTO gets exactly those columns, computes the count in SQL rather than
+          loading rows to count them, returns nothing tracked, and sidesteps the whole loading-strategy
+          question."</p>
+        <p>"So: project for reads, <code>Include</code> when I need real entities to modify, explicit when
+          loading is conditional, lazy never."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you state all three accurately?</li>
+        <li>Is your objection to lazy loading about visibility, not just speed?</li>
+        <li>Do you reach for projection first?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does lazy loading work — what are proxies doing?</li>
+          <li>When would you accept lazy loading?</li>
+          <li>What's a filtered include, and what's the risk?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>An endpoint returns 200 orders with lines and payments. It's taking 12 seconds. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd <strong>look at the generated SQL and count the queries</strong>. That immediately tells
+          me which of three very different problems this is, and they have different fixes."</p>
+        <p>"<strong>If it's hundreds of queries</strong> — N+1, almost certainly lazy loading or a
+          <code>foreach</code> touching navigations. Fix with <code>Include</code> or, better, projection."</p>
+        <p>"<strong>If it's one enormous query</strong> — cartesian explosion. Two collection includes on 200
+          orders with, say, 20 lines and 5 payments each is 200 × 20 × 5 = 20,000 rows, with every order column
+          repeated 100 times. EF de-duplicates back to the right objects, but only after transferring all of
+          it. Fix with <code>AsSplitQuery()</code>."</p>
+        <p>"<strong>If it's one reasonable query that's just slow</strong> — that's a database problem, so I'd
+          get the execution plan and look for a missing index or a non-SARGable predicate."</p>
+        <p>"But before optimising, I'd ask the more useful question: <strong>does the client actually need
+          200 fully-hydrated orders with all their lines and payments?</strong> Usually not. A list view needs
+          an order number, date, customer name, total and status. That's a projection returning 200 small rows
+          instead of an object graph."</p>
+        <p>"So my likely fix is a projection with the aggregates computed in SQL —
+          <code>Total = o.Lines.Sum(l =&gt; l.Total)</code>, <code>LineCount = o.Lines.Count()</code> — plus
+          <code>AsNoTracking</code>, which the projection gives me for free. That typically turns 12 seconds
+          into tens of milliseconds, because it's a fundamentally smaller amount of work rather than the same
+          work done faster."</p>
+        <p>"Then the API design question: <strong>is 200 even bounded?</strong> If that number can grow, this
+          endpoint has an unbounded query surface and will break again at 2,000. I'd add pagination with a
+          maximum page size, and keyset paging if it's a feed rather than numbered pages."</p>
+        <p>"Then I'd verify: SQL logging to confirm the query count dropped, and I'd add an integration test
+          asserting the endpoint issues no more than a handful of queries — because this is exactly the kind of
+          fix that regresses the next time someone adds a field to the response."</p>
+        <p>"One thing I'd flag if the numbers stay large: at some point the right answer isn't a better EF
+          query, it's a <strong>read model</strong> — a denormalized table or view built for this screen. But
+          I'd only go there after projection and pagination, because those are hours of work and a read model
+          is weeks plus ongoing consistency concerns."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you diagnose by looking at the SQL first?</li>
+        <li>Can you distinguish N+1 from cartesian explosion from a slow query?</li>
+        <li>Do you question whether the payload should be that large at all?</li>
+        <li>Do you address the unbounded query surface?</li>
+        <li>Do you verify and guard against regression?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> guessing without looking at the SQL.</li>
+        <li><span class="redflag">Red flag:</span> "add caching" as the first move.</li>
+        <li><span class="redflag">Red flag:</span> no mention of pagination.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you write the projection?</li>
+          <li>What's the consistency risk with split queries?</li>
+          <li>When would you build a read model instead?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

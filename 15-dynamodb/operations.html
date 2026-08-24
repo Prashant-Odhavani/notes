@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capacity, Streams &amp; Operations — DynamoDB</title>
+<meta name="description" content="On-demand vs provisioned capacity, hot partitions and adaptive capacity, transactions, TTL, DynamoDB Streams and global tables.">
+<meta name="keywords" content="DynamoDB on-demand provisioned capacity auto scaling RCU WCU adaptive capacity hot partition throttling TransactWriteItems TTL DynamoDB Streams Lambda trigger global tables DAX backup PITR reserved capacity">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="15-dynamodb/operations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Capacity, Streams &amp; Operations</h1>
+    <p class="subtitle">Capacity is the cost lever, streams are how you build anything reactive, and hot
+      partitions are the failure mode that survives good capacity planning.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>On-demand</strong> for unpredictable load, <strong>provisioned + auto scaling</strong> for
+        steady. Provisioned is much cheaper at consistent volume.</li>
+      <li><strong>1 WCU</strong> = one 1 KB write. <strong>1 RCU</strong> = one 4 KB strongly consistent read,
+        or two eventually consistent.</li>
+      <li><strong>Per-partition caps: 3,000 RCU / 1,000 WCU.</strong> The hot-partition ceiling.</li>
+      <li><strong>Adaptive capacity helps automatically</strong> but doesn't fix a genuinely skewed key.</li>
+      <li><strong>Transactions span partitions and tables</strong> — up to 100 items, at 2× cost.</li>
+      <li><strong>TTL deletion is free</strong> and asynchronous, up to 48 hours late.</li>
+      <li><strong>Streams</strong> give a 24-hour ordered change log per partition key.</li>
+    </ul>
+  </div>
+
+  <h2 id="capacity">Capacity modes <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>On-demand</th><th>Provisioned</th></tr></thead>
+      <tbody>
+        <tr><td>You set</td><td>Nothing</td><td>RCU and WCU, or auto-scaling bounds</td></tr>
+        <tr><td>Billing</td><td>Per request</td><td>Per capacity-hour, whether used or not</td></tr>
+        <tr><td>Cost at steady load</td><td><strong>Several times more</strong></td><td><strong>Much cheaper</strong></td></tr>
+        <tr><td>Cost when idle</td><td><strong>Near zero</strong></td><td>Full provisioned rate</td></tr>
+        <tr><td>Handles sudden spikes</td><td><strong>Yes</strong>, up to double the previous peak instantly</td><td>Auto scaling reacts in minutes — too slow for a real spike</td></tr>
+        <tr><td>Reserved capacity discount</td><td>No</td><td><strong>Yes</strong></td></tr>
+        <tr><td>Best for</td><td>New, spiky, or unpredictable workloads</td><td>Steady, known load</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — auto scaling doesn't handle spikes</div>
+    <p style="margin:0">This is the trap. Provisioned auto scaling watches CloudWatch metrics and adjusts —
+      which takes <strong>minutes</strong>. A traffic spike that arrives in seconds gets
+      <strong>throttled</strong> while auto scaling catches up.
+      <br><br>
+      So auto scaling handles <em>gradual</em> changes — daily cycles, weekly patterns. It does not handle a
+      marketing email going out, or a viral moment.
+      <br><br>
+      On-demand absorbs an instant doubling of the previous peak with no throttling. Beyond double, it also
+      needs a moment to adapt — which is why AWS suggests pre-warming by ramping traffic if you know a large
+      spike is coming.
+      <br><br>
+      <strong>The practical strategy:</strong> on-demand while you're learning the traffic shape, then switch
+      to provisioned with reserved capacity once it's predictable. You can change mode once every 24 hours,
+      so this is a reversible decision — unlike most things in DynamoDB.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Unit</th><th>Buys</th></tr></thead>
+      <tbody>
+        <tr><td><strong>1 WCU</strong></td><td>One write of up to 1 KB per second</td></tr>
+        <tr><td><strong>1 RCU</strong></td><td>One <em>strongly consistent</em> read of up to 4 KB, or <strong>two</strong> eventually consistent</td></tr>
+        <tr><td>Transactional write</td><td><strong>2 WCU</strong> per 1 KB</td></tr>
+        <tr><td>Transactional read</td><td><strong>2 RCU</strong> per 4 KB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Item size rounds up, and that matters</div>
+    <p style="margin:0">A 1.1 KB write costs 2 WCU. A 4.1 KB read costs 2 RCU. Rounding is per operation, so
+      items sitting just over a boundary double their cost.
+      <br><br>
+      On a high-volume table, trimming items from 1.1 KB to just under 1 KB <strong>halves the write
+      cost</strong>. That's a real optimisation and an unusually direct one — shorter attribute names genuinely
+      help, because attribute names are stored with every item.
+      <br><br>
+      That's why DynamoDB tables often have terse attribute names. It looks like premature optimisation and
+      it's measurable at scale.</p>
+  </div>
+
+  <h2 id="hot-partitions">Hot partitions <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The limit that survives good capacity planning</span>
+    <p>Each physical partition is capped at <strong>3,000 RCU and 1,000 WCU</strong>, regardless of what the
+      table is provisioned for.</p>
+    <p>So a single partition key taking heavy traffic throttles at those numbers even if the table has 40,000
+      WCU available.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Low-cardinality partition key</strong></td><td><code>status</code>, <code>country</code>, <code>tenantType</code></td></tr>
+        <tr><td><strong>One dominant value</strong></td><td>A tenant that's 60% of your traffic</td></tr>
+        <tr><td><strong>Time-based key</strong></td><td>Today's date takes every write</td></tr>
+        <tr><td><strong>A hot GSI key</strong></td><td>Throttles the index, which <strong>throttles base-table writes</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Adaptive capacity helps, and isn't a fix</div>
+    <p style="margin:0">DynamoDB automatically detects imbalance and does two things: it <strong>borrows unused
+      capacity</strong> from other partitions to serve a hot one, and it can <strong>isolate a persistently hot
+      key</strong> onto its own partition.
+      <br><br>
+      That handles moderate skew transparently, and it's why hot partitions are less catastrophic than they were
+      years ago.
+      <br><br>
+      But the hard per-partition ceiling still applies. If a single partition key genuinely needs more than
+      3,000 RCU or 1,000 WCU, no amount of adaptive capacity helps — <strong>you cannot split a single key's
+      traffic</strong>, because all items with that key live together by definition.
+      <br><br>
+      So the fix is always in the key design: <a href="data-modeling.html#write-sharding">write sharding</a>, a
+      higher-cardinality key, or caching in front.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Finding a hot partition</div>
+    <p style="margin:0">Enable <strong>CloudWatch Contributor Insights</strong> on the table. It reports the most
+      frequently accessed and most throttled partition keys directly — which is far better than inferring it
+      from aggregate metrics.
+      <br><br>
+      The signature to recognise: <strong>throttling while consumed capacity is well below provisioned</strong>.
+      Same signature as <a href="../14-cosmos-db/fundamentals.html#hot-partitions">Cosmos hot partitions</a>, and
+      the same wrong conclusion — raising capacity adds headroom to partitions that weren't busy.</p>
+  </div>
+
+  <h2 id="transactions">Transactions <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — atomic across partitions and tables" class="code-good"><code class="language-csharp">var request = new TransactWriteItemsRequest
+{
+    TransactItems = new List&lt;TransactWriteItem&gt;
+    {
+        // Debit - only if sufficient funds
+        new() { Update = new Update
+        {
+            TableName = "accounts",
+            Key = Key("ACCOUNT#from"),
+            UpdateExpression    = "SET balance = balance - :amt",
+            ConditionExpression = "balance &gt;= :amt",
+            ExpressionAttributeValues = amounts
+        }},
+        // Credit
+        new() { Update = new Update
+        {
+            TableName = "accounts",
+            Key = Key("ACCOUNT#to"),
+            UpdateExpression = "SET balance = balance + :amt",
+            ExpressionAttributeValues = amounts
+        }},
+        // Idempotency guard - fails if this transfer was already recorded
+        new() { Put = new Put
+        {
+            TableName = "transfers",
+            Item = transferRecord,
+            ConditionExpression = "attribute_not_exists(PK)"
+        }}
+    },
+    ClientRequestToken = idempotencyKey     // safe to retry for ~10 minutes
+};</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Scope</strong></td><td><strong>Across partitions and tables</strong> — better than Cosmos</td></tr>
+        <tr><td><strong>Limit</strong></td><td>100 items, 4 MB</td></tr>
+        <tr><td><strong>Cost</strong></td><td>2× — it's a two-phase commit</td></tr>
+        <tr><td><strong>Conditions</strong></td><td>Any item can carry a condition; one failure aborts everything</td></tr>
+        <tr><td><strong>Same item twice</strong></td><td><strong>Not allowed</strong> in one transaction</td></tr>
+        <tr><td><strong><code>ClientRequestToken</code></strong></td><td>Makes the transaction idempotent for ~10 minutes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — <code>ClientRequestToken</code> is the detail people miss</div>
+    <p style="margin:0">The <a href="../08-http-web-apis/reliability.html#the-ambiguous-timeout">ambiguous
+      timeout</a> problem: a client times out and doesn't know whether the transaction committed. Retrying might
+      apply it twice.
+      <br><br>
+      <code>ClientRequestToken</code> makes the transaction <strong>idempotent at the service level</strong> —
+      the same token within about ten minutes returns the original result rather than re-executing.
+      <br><br>
+      That's built-in idempotency for a multi-item write, which is genuinely useful and rarely mentioned. It's
+      the same guarantee you'd otherwise build with an
+      <a href="../08-http-web-apis/reliability.html#idempotency-keys">idempotency key table</a> — here the
+      service does it.
+      <br><br>
+      Note the window is limited, so it protects against retries, not against a duplicate submission an hour
+      later. For that you still need your own record — which is why the example above <em>also</em> writes a
+      transfer row with <code>attribute_not_exists</code>.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Prefer a conditional write to a transaction</div>
+    <p style="margin:0">Transactions cost 2× and are slower. A single-item <strong>conditional write</strong> is
+      atomic on its own and costs 1×.
+      <br><br>
+      So "decrement stock if sufficient" needs no transaction — it's one
+      <code>UpdateItem</code> with a <code>ConditionExpression</code>. Reach for a transaction only when
+      <em>several items</em> must change together.
+      <br><br>
+      Same principle as everywhere: <a href="../10-sql/transactions.html#atomic-update">put the condition in the
+      write</a> before reaching for heavier machinery.</p>
+  </div>
+
+  <h2 id="ttl">TTL <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — an epoch-seconds attribute"><code class="language-csharp">// TTL attribute must be a NUMBER holding Unix epoch SECONDS
+item["expiresAt"] = new AttributeValue
+{
+    N = DateTimeOffset.UtcNow.AddDays(30).ToUnixTimeSeconds().ToString()
+};</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Cost</strong></td><td><strong>Free</strong> — deletion consumes no write capacity</td></tr>
+        <tr><td><strong>Timing</strong></td><td>Asynchronous, typically within hours, <strong>up to 48</strong></td></tr>
+        <tr><td><strong>Format</strong></td><td>Number, epoch <strong>seconds</strong> — milliseconds silently never expire</td></tr>
+        <tr><td><strong>Streams</strong></td><td>TTL deletes <em>do</em> appear in Streams, marked as system deletes</td></tr>
+        <tr><td><strong>Visibility</strong></td><td>Expired items may still be <strong>returned by reads</strong> until actually deleted</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Two TTL traps</div>
+    <p style="margin:0"><strong>Expired items are still readable.</strong> Deletion is asynchronous, so an item
+      past its TTL can be returned by a query for hours. If expiry is security-relevant — a session, a token —
+      you <strong>must check the timestamp in code</strong>. TTL is a storage-cleanup mechanism, not an access
+      control.
+      <br><br>
+      <strong>Epoch seconds, not milliseconds.</strong> Writing milliseconds gives a timestamp roughly fifty
+      thousand years in the future, so nothing ever expires. There's no error and no warning — the table just
+      grows. This is a genuinely common bug because .NET's
+      <code>ToUnixTimeMilliseconds()</code> is right there next to the correct method.</p>
+  </div>
+
+  <p>Free deletion makes TTL the right answer for sessions, caches, event data and audit logs — millions of
+    explicit deletes would consume real WCU and can throttle live traffic.</p>
+
+  <h2 id="streams">DynamoDB Streams <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An ordered log of item-level changes, retained for <strong>24 hours</strong>. Ordering is guaranteed
+      <strong>per partition key</strong>, not globally.</p>
+    <p>Typically consumed by Lambda, which polls the stream and invokes your function in batches.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th><code>StreamViewType</code></th><th>Record contains</th></tr></thead>
+      <tbody>
+        <tr><td><code>KEYS_ONLY</code></td><td>Just the keys</td></tr>
+        <tr><td><code>NEW_IMAGE</code></td><td>The item after the change</td></tr>
+        <tr><td><code>OLD_IMAGE</code></td><td>The item before</td></tr>
+        <tr><td><strong><code>NEW_AND_OLD_IMAGES</code></strong></td><td><strong>Both</strong> — needed to know what actually changed</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">What streams are for</span>
+    <ul>
+      <li><strong>Maintaining aggregates</strong> — counters and totals, since DynamoDB has no aggregation.</li>
+      <li><strong>Keeping denormalized copies in sync</strong> when a duplicated field changes.</li>
+      <li><strong>Publishing domain events</strong> — a built-in outbox, no dual write.</li>
+      <li><strong>Feeding a search index</strong> or a data warehouse.</li>
+      <li><strong>Cross-region replication</strong> — how global tables work internally.</li>
+      <li><strong>Audit trails</strong>, using <code>OLD_IMAGE</code> and <code>NEW_IMAGE</code>.</li>
+    </ul>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — streams are how you get aggregation at all</div>
+    <p style="margin:0">DynamoDB has no <code>COUNT</code>, no <code>SUM</code>, no <code>GROUP BY</code>. So
+      "how many orders does this customer have?" has no query answer.
+      <br><br>
+      The pattern is to <strong>maintain the aggregate on write</strong>: a stream handler increments a counter
+      item when an order is created. The read becomes a single item get.
+      <br><br>
+      Doing it via the stream rather than in application code matters, because the stream sees
+      <em>every</em> write — including from other services, scripts and migrations. Incrementing in the
+      application means any code path that forgets silently corrupts the count.
+      <br><br>
+      "DynamoDB can't aggregate, so I'd maintain counters via Streams" is the answer that shows you've actually
+      built on it.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Stream handlers must be idempotent, and the counter case isn't</div>
+    <p style="margin:0">Lambda retries a failed batch, so <strong>at-least-once delivery</strong>. A handler that
+      does <code>ADD orderCount 1</code> will over-count on redelivery.
+      <br><br>
+      Two fixes. Record processed sequence numbers and skip duplicates — reliable, more machinery. Or make the
+      operation idempotent by recomputing rather than incrementing where feasible.
+      <br><br>
+      Also: <strong>a failing batch blocks its shard</strong>. Lambda retries the same batch, so one poison
+      record stops everything behind it for up to 24 hours. Configure a
+      <strong>failure destination</strong> (an SQS dead-letter queue), <code>MaximumRetryAttempts</code>, and
+      <code>BisectBatchOnFunctionError</code> so a single bad record doesn't take out the whole
+      partition's processing. That's the operational detail people discover during an incident.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Streams vs Kinesis Data Streams</div>
+    <p style="margin:0">DynamoDB can also stream to <strong>Kinesis Data Streams</strong>, which gives longer
+      retention (up to a year), multiple independent consumers, and the wider Kinesis ecosystem.
+      <br><br>
+      The trade: Kinesis does <strong>not</strong> guarantee ordering or exactly-once, where native Streams
+      guarantee ordering per partition key. So native Streams for anything order-sensitive, Kinesis when you
+      need long retention or fan-out to many consumers.</p>
+  </div>
+
+  <h2 id="global-tables">Global tables <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td>Model</td><td><strong>Multi-region, multi-active</strong> — every region accepts writes</td></tr>
+        <tr><td>Mechanism</td><td>Built on Streams, replicating asynchronously</td></tr>
+        <tr><td>Lag</td><td>Typically under a second</td></tr>
+        <tr><td>Conflicts</td><td><strong>Last writer wins</strong>, by timestamp. No alternative</td></tr>
+        <tr><td>Cost</td><td>Replicated writes are charged in each region</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Last writer wins is the only option</div>
+    <p style="margin:0">Unlike <a href="../14-cosmos-db/change-feed-global.html#conflicts">Cosmos</a>, which
+      offers custom merge procedures and a manual conflicts feed, DynamoDB global tables give you
+      <strong>last writer wins and nothing else</strong>.
+      <br><br>
+      Two regions update the same item; the later timestamp wins and the other update is silently discarded.
+      There's no hook, no conflict log, no merge.
+      <br><br>
+      So the design has to make conflicts impossible: <strong>route each item's writes to one region</strong>
+      (region affinity by user or tenant), or model append-only so two regions insert distinct items rather
+      than updating a shared one.
+      <br><br>
+      Conditional writes also behave differently than you'd expect — the condition is evaluated
+      <em>locally</em>, so two regions can both satisfy the same condition simultaneously. That breaks the
+      atomicity guarantee people rely on, and it's the detail that makes global tables genuinely harder than
+      they look.</p>
+  </div>
+
+  <h2 id="dax">DAX and caching <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>DAX</th><th>ElastiCache / in-process</th></tr></thead>
+      <tbody>
+        <tr><td>Integration</td><td><strong>Drop-in</strong> — a different client, same API</td><td>Application code changes</td></tr>
+        <tr><td>Invalidation</td><td>Write-through plus TTL</td><td>Your responsibility</td></tr>
+        <tr><td>Latency</td><td>Microseconds</td><td>Sub-millisecond</td></tr>
+        <tr><td>Consistency</td><td><strong>Eventually consistent reads only</strong></td><td>Whatever you build</td></tr>
+        <tr><td>Best for</td><td>Read-heavy with hot keys, minimal code change</td><td>Fine-grained control, non-AWS portability</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">DAX's real use case is a hot partition you can't redesign</div>
+    <p style="margin:0">If one item is read enormously — a global config document, a leaderboard, a popular
+      product — you'll hit the 3,000 RCU per-partition cap no matter how the table is keyed, because it's a
+      single item.
+      <br><br>
+      DAX absorbs those reads, and it's a client swap rather than an application redesign. That's the situation
+      where it's clearly the right tool.
+      <br><br>
+      The caveat: <strong>DAX serves eventually consistent reads</strong>, and a strongly consistent read
+      bypasses the cache entirely. So code that requests strong consistency gets no benefit — worth checking
+      before concluding DAX will help.</p>
+  </div>
+
+  <h2 id="backup">Backup and recovery <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mechanism</th><th>Gives you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Point-in-time recovery</strong></td><td>Restore to any second in the last 35 days. <strong>Enable this</strong></td></tr>
+        <tr><td><strong>On-demand backup</strong></td><td>A named snapshot, retained indefinitely</td></tr>
+        <tr><td><strong>Export to S3</strong></td><td>For analytics — no capacity consumed</td></tr>
+        <tr><td><strong>Deletion protection</strong></td><td>Prevents accidental table deletion. Also enable this</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Restore always creates a new table</div>
+    <p style="margin:0">You cannot restore over an existing table. A restore produces a <strong>new</strong>
+      table, so recovery means restoring, verifying, then repointing the application — which is a deployment,
+      not a database operation.
+      <br><br>
+      That's the RTO people underestimate: the restore itself can take a while on a large table, and then
+      there's a cutover.
+      <br><br>
+      Also note the restored table has <strong>no indexes configured the same way by default</strong> — you
+      specify them at restore time. Worth having the restore procedure written down and tested rather than
+      improvised during an incident.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Export to S3 is how you do analytics</div>
+    <p style="margin:0">DynamoDB has no aggregation, and scanning for reporting consumes real capacity that
+      competes with production traffic.
+      <br><br>
+      <strong>Export to S3 consumes no table capacity at all</strong> — it reads from the continuous backup, not
+      the table. Then query it with Athena, or load it into a warehouse.
+      <br><br>
+      That's the structurally correct answer to "how do we report on DynamoDB data?", and it's much better than
+      a scheduled scan. Same reasoning as
+      <a href="../14-cosmos-db/throughput-consistency.html#cost-control">Cosmos's analytical store</a>.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>On-demand for unpredictable load; provisioned plus reserved capacity for steady. Switchable daily.</li>
+      <li>Auto scaling reacts in minutes — it does not handle sudden spikes.</li>
+      <li>Capacity units round up per operation, so item size trimming is a direct saving.</li>
+      <li>3,000 RCU / 1,000 WCU per partition. Adaptive capacity softens skew, doesn't remove the ceiling.</li>
+      <li>Transactions span partitions and tables at 2× cost; prefer a conditional write for one item.</li>
+      <li><code>ClientRequestToken</code> gives service-level transaction idempotency for ~10 minutes.</li>
+      <li>TTL is free, up to 48 hours late, epoch <em>seconds</em>, and expired items stay readable.</li>
+      <li>Streams: 24 hours, ordered per partition key, at-least-once, and a failing batch blocks its
+        shard.</li>
+      <li>Streams are how you get aggregation, since DynamoDB has none.</li>
+      <li>Global tables are last-writer-wins only, and conditions evaluate locally.</li>
+      <li>DAX for a hot single item; it only serves eventually consistent reads.</li>
+      <li>Export to S3 for analytics — no capacity consumed.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Relying on auto scaling for spikes</strong>, then getting throttled.</li>
+    <li><strong>On-demand at steady high volume</strong>, paying several times more than necessary.</li>
+    <li><strong>Ignoring item size rounding</strong> on high-volume tables.</li>
+    <li><strong>Raising table capacity to fix a hot partition.</strong></li>
+    <li><strong>Transactions where a conditional write would do</strong>, at double the cost.</li>
+    <li><strong>No <code>ClientRequestToken</code></strong>, so a client retry re-applies a transaction.</li>
+    <li><strong>TTL in milliseconds</strong> — nothing ever expires, silently.</li>
+    <li><strong>Trusting TTL for security expiry</strong> instead of checking in code.</li>
+    <li><strong>Non-idempotent stream handlers</strong> that over-count on retry.</li>
+    <li><strong>No dead-letter destination on a stream consumer</strong>, so one bad record blocks a shard.</li>
+    <li><strong>Global tables with concurrent same-item writes</strong>, silently losing updates.</li>
+    <li><strong>Scanning for reports</strong> instead of exporting to S3.</li>
+    <li><strong>PITR not enabled.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>On-demand or provisioned capacity? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It depends on how predictable the traffic is, and the deciding factor people get wrong is
+          <strong>how fast each one reacts</strong> rather than the cost."</p>
+        <p>"<strong>Provisioned is substantially cheaper at steady volume</strong> — several times cheaper — and
+          it's the only mode eligible for reserved capacity discounts. So for a known, consistent workload
+          that's the answer."</p>
+        <p>"<strong>But auto scaling does not handle spikes.</strong> It watches CloudWatch metrics and adjusts
+          over minutes. A spike that arrives in seconds — a marketing email, a viral post — gets throttled while
+          auto scaling catches up. So provisioned plus auto scaling handles <em>gradual</em> variation like daily
+          and weekly cycles, and nothing sudden."</p>
+        <p>"<strong>On-demand absorbs an instant doubling of the previous peak</strong> with no throttling, and
+          costs almost nothing when idle. Beyond double it also needs a moment, which is why AWS suggests
+          pre-warming by ramping traffic if you know something big is coming."</p>
+        <p>"So my practical strategy: <strong>start on-demand</strong> while the traffic shape is unknown, and
+          switch to provisioned with reserved capacity once it's predictable and the savings are real. Capacity
+          mode can be changed once every 24 hours, so that's a reversible decision — which is unusual for
+          DynamoDB, where most things aren't."</p>
+        <p>"On-demand also suits genuinely spiky or intermittent workloads permanently — a table that's busy for
+          two hours a day would waste most of a provisioned allocation."</p>
+        <p>"Two things worth adding."</p>
+        <p>"<strong>Neither mode fixes a hot partition.</strong> Each physical partition is capped at 3,000 RCU
+          and 1,000 WCU regardless of table capacity. So if throttling appears while consumed capacity is well
+          below provisioned, that's key skew and changing capacity mode won't help — the fix is in the key
+          design."</p>
+        <p>"<strong>Capacity units round up per operation.</strong> A 1.1 KB write costs 2 WCU. On a
+          high-volume table, getting items just under a KB boundary halves the write cost — which is why
+          DynamoDB tables often have terse attribute names, since attribute names are stored with every item.
+          That's a real optimisation regardless of which mode you're on."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know auto scaling is too slow for spikes?</li>
+        <li>Do you know provisioned is much cheaper at steady load?</li>
+        <li>Do you know neither fixes a hot partition?</li>
+        <li>Do you know about rounding?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you handle a known traffic spike?</li>
+          <li>How do you detect a hot partition?</li>
+          <li>What's reserved capacity?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>You need a count of orders per customer, and DynamoDB has no aggregation. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"DynamoDB has no <code>COUNT</code>, <code>SUM</code> or <code>GROUP BY</code>, so this has to be
+          <strong>maintained on write rather than computed on read</strong>."</p>
+        <p>"The naive option is querying all of a customer's orders and counting them in the application. That
+          works and it's linear in their order count — fine for ten orders, expensive for ten thousand, and the
+          cost grows forever. Worth mentioning that <code>Select = COUNT</code> reduces the data transferred
+          but <strong>still consumes the same read capacity</strong>, because DynamoDB reads the items to count
+          them. So it's not an optimisation."</p>
+        <p>"<strong>My answer is a counter item maintained by DynamoDB Streams.</strong>"</p>
+        <p>"A stream handler on the orders table increments an <code>orderCount</code> attribute on the
+          customer item — or a dedicated counter item — when an order is created, and decrements on delete.
+          Reading the count then becomes a single item get, ~0.5 RCU, constant regardless of order volume."</p>
+        <p>"<strong>Why via the stream rather than in the application code that creates the order:</strong> the
+          stream sees <em>every</em> write, including from other services, admin scripts and migrations. If I
+          increment in application code, any path that forgets silently corrupts the count — and you won't
+          notice for months."</p>
+        <p>"The critical detail: <strong>Streams are at-least-once, so the handler is retried</strong>, and
+          <code>ADD orderCount 1</code> is <em>not</em> idempotent. A redelivered batch over-counts. Two ways to
+          handle it. Record the processed sequence number on the counter item and skip duplicates with a
+          conditional write. Or attach the increment to a marker: conditionally write a 'counted' flag on the
+          order item itself, and only increment if that write succeeds — so the increment happens exactly once
+          per order."</p>
+        <p>"<strong>Watch for a hot counter.</strong> If this is a global counter rather than per-customer, a
+          single item takes every increment and caps at 1,000 WCU. Per-customer is naturally partitioned so
+          that's fine, but for a global total I'd use
+          <a href="data-modeling.html#write-sharding">write sharding</a> — increment one of N shard items and
+          sum them on read."</p>
+        <p>"<strong>Operational details I'd get right.</strong> A failing batch blocks its shard and Lambda
+          retries it, so one poison record stops everything behind it for up to 24 hours. I'd configure a
+          dead-letter destination, <code>MaximumRetryAttempts</code>, and
+          <code>BisectBatchOnFunctionError</code> so a single bad record doesn't halt processing."</p>
+        <p>"And I'd add a <strong>reconciliation job</strong>. Derived counters drift — a missed event, a bug, a
+          manual data fix. A periodic job that recomputes and corrects is not optional; without it you have a
+          number nobody trusts, and 'the count is wrong' becomes unfixable because you don't know when it
+          diverged."</p>
+        <p>"If the requirement were richer than a count — aggregations across customers, arbitrary date ranges —
+          I'd stop trying to do it in DynamoDB and <strong>export to S3</strong> and query with Athena. That
+          consumes no table capacity, and DynamoDB is simply the wrong tool for analytical queries."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know there's no aggregation, and that <code>COUNT</code> still costs full reads?</li>
+        <li>Do you maintain the aggregate via Streams rather than application code, and know why?</li>
+        <li>Do you handle at-least-once making increments unsafe?</li>
+        <li>Do you consider a hot counter?</li>
+        <li>Do you add reconciliation?</li>
+        <li>Do you know when to leave DynamoDB for analytics?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a scan or query-and-count on the request path.</li>
+        <li><span class="redflag">Red flag:</span> incrementing in application code with no stream.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that retries over-count.</li>
+        <li><span class="redflag">Red flag:</span> no reconciliation.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Write the conditional expression for the exactly-once increment.</li>
+          <li>How would the reconciliation job work?</li>
+          <li>What if you needed counts by status as well?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

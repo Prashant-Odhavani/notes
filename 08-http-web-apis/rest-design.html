@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>REST &amp; API Design — HTTP &amp; Web APIs</title>
+<meta name="description" content="REST constraints, resource modelling, pagination that scales, filtering and sorting, and how to design for the client you actually have.">
+<meta name="keywords" content="REST constraints stateless HATEOAS richardson maturity model resource design pagination offset keyset cursor filtering sorting sparse fieldsets bulk operations api design">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="08-http-web-apis/rest-design.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>REST &amp; API Design</h1>
+    <p class="subtitle">What REST actually requires, why almost nothing is fully RESTful, and the design
+      decisions that matter more than the label.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>REST is a set of <strong>constraints</strong>, not "JSON over HTTP". Most APIs called REST are
+        HTTP APIs, and that's usually fine.</li>
+      <li><strong>Stateless</strong> is the constraint that actually buys you something: any server can
+        handle any request, so you can scale horizontally.</li>
+      <li><strong>HATEOAS</strong> is the constraint almost nobody implements — and be able to say why.</li>
+      <li>Model <strong>resources</strong> (nouns), not operations. Let the method be the verb.</li>
+      <li><strong>Offset pagination breaks at scale.</strong> Use keyset/cursor pagination for large or
+        live data.</li>
+      <li>Design for the client you have. A chatty design is elegant and awful on mobile.</li>
+    </ul>
+  </div>
+
+  <h2 id="rest-constraints">What REST actually is <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>REST is an <strong>architectural style</strong> defined by six constraints. Follow them and you get
+      specific properties — scalability, cacheability, independent evolution.</p>
+    <p>It is not a synonym for "an HTTP API that returns JSON".</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Constraint</th><th>Means</th><th>Do real APIs follow it?</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Client–server</strong></td><td>Separate concerns; they evolve independently</td><td>Yes, universally</td></tr>
+        <tr><td><strong>Stateless</strong></td><td>Every request carries everything needed; no server session</td><td>Mostly yes — and it's the valuable one</td></tr>
+        <tr><td><strong>Cacheable</strong></td><td>Responses say whether they can be cached</td><td>Often ignored</td></tr>
+        <tr><td><strong>Uniform interface</strong></td><td>Standard methods, resource identification, self-describing messages</td><td>Partly</td></tr>
+        <tr><td><strong>Layered system</strong></td><td>Proxies, gateways and caches can sit in between</td><td>Yes, by default</td></tr>
+        <tr><td><strong>Code on demand</strong></td><td>Server can send executable code (optional constraint)</td><td>Essentially never</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="stateless">Stateless — the one that pays for itself <span class="pill pill-must">🔥 Must know</span></h3>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>Stateful:</strong> a conversation with a receptionist who remembers you. Great — until they go
+      to lunch and their replacement has no idea what you were discussing.</p>
+    <p><strong>Stateless:</strong> every request is a complete written form. Any receptionist can process it,
+      so you can add ten more and they all work.</p>
+  </div>
+
+  <p>That's the whole scaling argument. If the server holds session state, requests must go back to the same
+    instance — sticky sessions — and losing that instance loses the session. Stateless means any instance
+    handles any request, so you scale by adding instances.</p>
+
+  <p>It's also why <a href="auth-security.html#jwt-structure">JWTs</a> are popular for APIs: the token carries the
+    identity, so no server needs to look up a session.</p>
+
+  <div class="note info">
+    <div class="note-title">Stateless doesn't mean no state anywhere</div>
+    <p style="margin:0">The database obviously holds state. What "stateless" rules out is
+      <strong>per-client conversational state on the server</strong> — a shopping cart in an in-memory
+      session, a multi-step wizard that only works if you hit the same instance.
+      <br><br>
+      Put that state in the database or in the client, and you've satisfied the constraint.</p>
+  </div>
+
+  <h3 id="hateoas">HATEOAS, and why nobody does it <span class="pill pill-good">💡 Good to know</span></h3>
+
+  <pre data-label="json — a HATEOAS response"><code class="language-json">{
+  "id": "42",
+  "status": "Paid",
+  "total": 99.99,
+  "_links": {
+    "self":   { "href": "/api/orders/42" },
+    "cancel": { "href": "/api/orders/42/cancel", "method": "POST" },
+    "ship":   { "href": "/api/orders/42/ship",   "method": "POST" }
+  }
+}</code></pre>
+
+  <p>The idea: the client discovers what it can do from the links, rather than hard-coding URLs. If an order
+    can't be cancelled, the <code>cancel</code> link simply isn't there — so the client's UI is driven by the
+    server's state machine.</p>
+
+  <p><strong>Why it's rare in practice:</strong></p>
+
+  <ul>
+    <li>Clients hard-code URLs anyway, because it's simpler and they're written against a known version.</li>
+    <li>It roughly doubles payload size for a benefit most clients don't use.</li>
+    <li>Tooling is poor — code generators mostly ignore link relations.</li>
+    <li>A generated OpenAPI client already gives you discoverability at <em>build</em> time, which is what
+      teams actually want.</li>
+  </ul>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">The honest position is worth stating plainly: <em>"Most APIs, including mine, sit at
+      Richardson maturity level 2 — resources plus proper HTTP methods and status codes. Level 3, HATEOAS, is
+      rarely worth it because clients don't consume the links and OpenAPI already gives us discoverability at
+      build time."</em>
+      <br><br>
+      That answer shows you know the model <em>and</em> have judgement about it. Claiming your API is fully
+      RESTful invites a follow-up you probably can't defend.</p>
+  </div>
+
+  <h2 id="resource-design">Modelling resources <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>URLs name <strong>things</strong>. HTTP methods supply the <strong>verbs</strong>.</p>
+    <p>If your URL contains a verb, you're probably doing RPC with extra steps.</p>
+  </div>
+
+  <div class="vs-grid">
+    <div class="bad">
+      <span class="vs-label">Verbs in the URL</span>
+      <p><code>POST /api/getOrders</code><br>
+         <code>POST /api/createOrder</code><br>
+         <code>POST /api/deleteOrder?id=42</code><br>
+         <code>POST /api/updateOrderStatus</code></p>
+    </div>
+    <div class="good">
+      <span class="vs-label">Resources plus methods</span>
+      <p><code>GET /api/orders</code><br>
+         <code>POST /api/orders</code><br>
+         <code>DELETE /api/orders/42</code><br>
+         <code>PATCH /api/orders/42</code></p>
+    </div>
+  </div>
+
+  <p><strong>Conventions worth being consistent about:</strong></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rule</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td>Plural collection nouns</td><td><code>/orders</code>, not <code>/order</code></td></tr>
+        <tr><td>Lowercase, hyphens not underscores</td><td><code>/purchase-orders</code></td></tr>
+        <tr><td>Nest only to show ownership</td><td><code>/orders/42/lines</code></td></tr>
+        <tr><td>Don't nest more than two levels</td><td>Not <code>/customers/1/orders/42/lines/7/notes</code></td></tr>
+        <tr><td>Filters in the query string</td><td><code>/orders?status=paid&amp;from=2025-01-01</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="actions">When an action doesn't fit a resource</h3>
+
+  <p>Some operations genuinely aren't CRUD. "Cancel this order" isn't setting a field — it may refund a
+    payment, release stock and send an email.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>Looks like</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td>Sub-resource action</td><td><code>POST /orders/42/cancellation</code></td><td>Most defensible — the cancellation <em>is</em> a thing</td></tr>
+        <tr><td>Verb endpoint</td><td><code>POST /orders/42/cancel</code></td><td>Pragmatic, extremely common, perfectly readable</td></tr>
+        <tr><td>State field patch</td><td><code>PATCH /orders/42 { "status": "Cancelled" }</code></td><td>Hides the side effects; lets clients set states they shouldn't</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Why the third option is the risky one</div>
+    <p style="margin:0">Exposing <code>status</code> as a writable field means the client is driving your
+      state machine. There's nothing stopping them setting <code>Shipped</code> directly, skipping payment
+      entirely — that's the <a href="../07-aspnet-core/apis.html#over-posting">over-posting</a> problem again.
+      <br><br>
+      An explicit action endpoint makes the legal transitions <em>the API surface</em>. If there's no
+      <code>/ship</code> endpoint for an unpaid order, it can't happen.</p>
+  </div>
+
+  <h2 id="pagination">Pagination <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <h3 id="offset">Offset pagination — and why it breaks</h3>
+
+  <pre data-label="http — the familiar form"><code class="language-http">GET /api/orders?page=3&amp;pageSize=50
+# → SELECT ... ORDER BY CreatedUtc OFFSET 100 ROWS FETCH NEXT 50 ROWS ONLY</code></pre>
+
+  <p>Simple, and everyone understands it. Two problems appear at scale:</p>
+
+  <ol class="steps">
+    <li><strong>It gets slower the deeper you go.</strong> <code>OFFSET 100000</code> means the database
+      reads and discards 100,000 rows before returning any. Page 1 is instant; page 2,000 times out.</li>
+    <li><strong>Items shift between pages.</strong> If a new order is inserted while the user is paging,
+      everything moves down one — so they see a row twice, or miss one entirely. On a live dataset this is
+      guaranteed, not theoretical.</li>
+  </ol>
+
+  <h3 id="keyset">Keyset (cursor) pagination — what to use instead</h3>
+
+  <pre data-label="http — page by 'after this item', not 'skip N'" class="code-good"><code class="language-http">GET /api/orders?limit=50
+→ { "items": [...], "nextCursor": "eyJjIjoiMjAyNS0wMS0xMCIsImkiOiI0MiJ9" }
+
+GET /api/orders?limit=50&amp;cursor=eyJjIjoiMjAyNS0wMS0xMCIsImkiOiI0MiJ9</code></pre>
+
+  <pre data-label="sql — the query stays fast at any depth" class="code-good"><code class="language-sql">-- No OFFSET. Uses the index to seek straight to the position.
+SELECT TOP (50) *
+FROM Orders
+WHERE (CreatedUtc, Id) &lt; (@lastCreatedUtc, @lastId)   -- composite tiebreak
+ORDER BY CreatedUtc DESC, Id DESC;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Offset</th><th>Keyset / cursor</th></tr></thead>
+      <tbody>
+        <tr><td>Performance at depth</td><td>Degrades linearly</td><td><strong>Constant</strong></td></tr>
+        <tr><td>Stable with inserts</td><td>No — items shift</td><td><strong>Yes</strong></td></tr>
+        <tr><td>Jump to page 50</td><td>Yes</td><td>No — only next/previous</td></tr>
+        <tr><td>Total count available</td><td>Easily</td><td>Needs a separate query</td></tr>
+        <tr><td>Best for</td><td>Small, stable admin tables</td><td>Large or live data, infinite scroll, APIs</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to choose</span>
+    <p>Does the user need to <strong>jump to an arbitrary page number</strong>? Then offset — and cap how deep
+      they can go.</p>
+    <p>Otherwise use keyset. Infinite scroll, API consumers and event feeds never need page numbers.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The tiebreaker is not optional</div>
+    <p style="margin:0">Keyset pagination needs a <strong>unique</strong> sort key. If you order by
+      <code>CreatedUtc</code> alone and two rows share a timestamp, the cursor is ambiguous — you'll skip or
+      repeat rows.
+      <br><br>
+      Always append a unique column, usually the primary key:
+      <code>ORDER BY CreatedUtc DESC, Id DESC</code>. And index that exact composite, or you've traded an
+      offset scan for a sort.</p>
+  </div>
+
+  <h2 id="filtering">Filtering, sorting and shaping <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="http — a conventional query surface"><code class="language-http">GET /api/orders
+      ?status=paid,shipped          # multiple values
+      &amp;createdAfter=2025-01-01
+      &amp;minTotal=100
+      &amp;sort=-createdUtc,total       # '-' prefix = descending
+      &amp;fields=id,total,status       # sparse fieldset
+      &amp;limit=50</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — unbounded query surfaces</div>
+    <p style="margin:0">Letting clients sort or filter on <strong>any</strong> field seems generous and is a
+      denial-of-service vector. A sort on an unindexed column over ten million rows is a table scan and a
+      sort — one request can saturate your database.
+      <br><br>
+      Three defences: <strong>allowlist</strong> the sortable and filterable fields, make sure each has a
+      supporting index, and <strong>always enforce a maximum page size</strong> server-side. A client asking
+      for <code>limit=1000000</code> should get 100, not a timeout.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">On exposing OData or raw query languages</div>
+    <p style="margin:0">It's tempting — one endpoint, infinite flexibility. But you've now published your
+      schema as your API contract, you can't reason about which queries are possible, and you can't index
+      for them. Renaming a column becomes a breaking change.
+      <br><br>
+      It works for genuinely analytical, internal, admin-facing endpoints. For a public API, an explicit
+      allowlisted query surface is far easier to operate.</p>
+  </div>
+
+  <h2 id="design-for-client">Design for the client you have <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A perfectly normalised resource-per-entity API can require twelve round trips to render one screen.</p>
+    <p>On a mobile network, that's a slow app — and no amount of design purity fixes it.</p>
+  </div>
+
+  <p>Say a mobile order-detail screen needs the order, the customer, the lines, the product names and the
+    shipment status. Strict resource design gives you:</p>
+
+  <pre data-label="the chatty version" class="code-bad"><code class="language-text" data-nohl>GET /orders/42                    →  1 request
+GET /customers/{customerId}       →  1
+GET /orders/42/lines              →  1
+GET /products/{id}  × 5           →  5
+GET /shipments?orderId=42         →  1
+                                    ───
+                                     9 round trips</code></pre>
+
+  <p><strong>Three legitimate answers, and which to pick:</strong></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>How</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td>Expansion parameter</td><td><code>GET /orders/42?expand=customer,lines.product</code></td><td>Stays one resource model; the expansion logic can get complex</td></tr>
+        <tr><td>Purpose-built endpoint</td><td><code>GET /orders/42/detail-view</code></td><td>One fast call; couples the API to a UI screen</td></tr>
+        <tr><td><a href="../19-architecture/integration-patterns.html#bff">BFF</a></td><td>A backend per client type that aggregates</td><td>Cleanest separation; another service to own</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>For one or two clients, an <code>expand</code> parameter is usually enough. Once you have genuinely
+    different clients — mobile, web, a partner API — with different needs and different teams, a BFF is the
+    honest answer.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Naming the trade-off rather than picking a side. <em>"A purpose-built endpoint
+      couples my API to a UI screen, which I'd normally avoid — but nine round trips on a mobile connection
+      is a worse problem than that coupling. I'd add the endpoint and be explicit that it exists for that
+      screen."</em>
+      <br><br>
+      That's an engineering decision. "It wouldn't be RESTful" is not.</p>
+  </div>
+
+  <h2 id="bulk">Bulk operations <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Sending 500 individual <code>POST</code>s to import data is slow and hard to make transactional. But
+    bulk endpoints raise a question people forget: <strong>what does partial failure return?</strong></p>
+
+  <pre data-label="json — 207-style per-item results" class="code-good"><code class="language-json">POST /api/orders/bulk
+{ "items": [ {...}, {...}, {...} ] }
+
+→ 207 Multi-Status
+{
+  "results": [
+    { "index": 0, "status": 201, "id": "a1" },
+    { "index": 1, "status": 400, "error": { "type": "validation", "detail": "..." } },
+    { "index": 2, "status": 201, "id": "a3" }
+  ]
+}</code></pre>
+
+  <p>The design decision to make explicitly: <strong>all-or-nothing, or best-effort?</strong> All-or-nothing
+    is simpler to reason about but one bad row rejects 499 good ones. Best-effort needs per-item results and
+    the client must handle them. Either is fine — silently doing one while documenting the other is not.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>REST is six constraints. Statelessness is the one that buys you horizontal scaling.</li>
+      <li>Most APIs are Richardson level 2. Saying so is more credible than claiming level 3.</li>
+      <li>URLs are nouns; methods are verbs. Verb endpoints for genuine actions are fine and common.</li>
+      <li>Don't expose <code>status</code> as a writable field — use explicit action endpoints.</li>
+      <li>Offset pagination degrades with depth and shifts with inserts. Keyset fixes both.</li>
+      <li>Keyset needs a unique tiebreaker column and a matching composite index.</li>
+      <li>Allowlist sortable and filterable fields, and cap page size server-side.</li>
+      <li>Design for the client. Nine round trips beats no coupling only in theory.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Verbs in URLs</strong> for plain CRUD — <code>POST /getOrders</code>.</li>
+    <li><strong>Deep nesting</strong>: <code>/customers/1/orders/42/lines/7/notes/3</code>.</li>
+    <li><strong>Offset pagination on a large live table</strong> — slow and unstable.</li>
+    <li><strong>No unique tiebreaker</strong> in a keyset cursor, so rows repeat or vanish.</li>
+    <li><strong>No maximum page size</strong>, so a client can request a million rows.</li>
+    <li><strong>Sorting on arbitrary unindexed columns.</strong></li>
+    <li><strong>Exposing <code>status</code> as writable</strong>, letting clients skip your state machine.</li>
+    <li><strong>Bulk endpoints with undefined partial-failure behaviour.</strong></li>
+    <li><strong>Inconsistent conventions</strong> — snake_case here, camelCase there.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>Is your API RESTful? What does that actually mean? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Honestly — mostly, not fully. REST is six constraints from Fielding's thesis, and the one almost
+          nobody implements is HATEOAS, where the server sends links telling the client what it can do next.
+          So I'd say my APIs sit at Richardson maturity level 2: resources, proper HTTP methods, meaningful
+          status codes."</p>
+        <p>"The constraint I <em>do</em> care about is <strong>statelessness</strong>, because it's the one
+          that buys something concrete. If no server holds per-client conversational state, any instance can
+          handle any request — so I scale by adding instances rather than needing sticky sessions. That's
+          also why JWTs are common for APIs: the token carries the identity so there's no session lookup."</p>
+        <p>"On HATEOAS I'd be direct about why I skip it. Clients hard-code URLs anyway because they're
+          written against a known version. It roughly doubles payload size for a benefit most clients don't
+          consume. And tooling largely ignores link relations — whereas a generated OpenAPI client already
+          gives us discoverability at build time, which is what teams actually want."</p>
+        <p>"I'd also say that being 'RESTful' isn't the goal. What matters is consistency, correct HTTP
+          semantics so infrastructure behaves, useful errors, and designing for the client you have. I'd
+          happily add a purpose-built endpoint that collapses nine round trips into one for a mobile screen,
+          even though it's less pure — nine round trips on a mobile connection is a worse problem than that
+          coupling."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know REST is constraints, not a synonym for HTTP+JSON?</li>
+        <li>Are you honest about HATEOAS rather than overclaiming?</li>
+        <li>Do you know <em>why</em> statelessness matters?</li>
+        <li>Can you prioritise pragmatism over labels?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "yes, fully RESTful" — the follow-up on HATEOAS will expose it.</li>
+        <li><span class="redflag">Red flag:</span> "REST means using JSON and HTTP verbs."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does stateless actually rule out?</li>
+          <li>How would you model "cancel an order"?</li>
+          <li>When would you choose gRPC or GraphQL instead?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you paginate an endpoint over 50 million rows? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Not with offset pagination — that's the key point. <code>OFFSET</code> makes the database read and
+          discard every row before the offset, so page one is instant and page ten thousand times out.
+          Performance degrades linearly with depth."</p>
+        <p>"There's a correctness problem too, which people notice less. If rows are being inserted while a
+          user pages through, everything shifts — so they see the same row twice or skip one entirely. On a
+          live table that's guaranteed, not a corner case."</p>
+        <p>"So I'd use <strong>keyset pagination</strong>. Instead of 'skip 100,000 rows', the cursor says
+          'give me rows after this one'. The query becomes a <code>WHERE</code> on the sort key, which uses
+          the index to seek straight to position — constant time regardless of depth. And because it's
+          anchored to a value rather than a count, inserts don't shift the window."</p>
+        <p>"Two implementation details that matter. The sort key must be <strong>unique</strong>, so I'd use a
+          composite — <code>ORDER BY CreatedUtc DESC, Id DESC</code> — because two rows sharing a timestamp
+          would make the cursor ambiguous. And I'd need an index on that exact composite, otherwise I've
+          traded an offset scan for a sort."</p>
+        <p>"I'd encode the cursor as an opaque base64 token rather than exposing the raw values. That way it's
+          clearly not something clients should construct, and I can change the internal representation later
+          without breaking them."</p>
+        <p>"The trade-off I'd state: keyset gives up jumping to an arbitrary page number and cheap total
+          counts. For an API, infinite scroll, or an event feed, nobody needs those. If a UI genuinely needs
+          page numbers — an admin table someone navigates by page — I'd use offset but cap the depth and
+          require a filter first, so nobody pages to row 500,000."</p>
+        <p>"And regardless of approach, a server-enforced maximum page size. A client asking for a million
+          rows gets 100."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <em>why</em> offset is slow — the read-and-discard mechanism?</li>
+        <li>Do you know about the shifting-rows correctness problem?</li>
+        <li>Do you mention the unique tiebreaker and the index?</li>
+        <li>Do you state what keyset gives up?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> offset pagination with no caveats.</li>
+        <li><span class="redflag">Red flag:</span> no mention of a maximum page size.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you give the user a total count?</li>
+          <li>What if they want to sort by a different column?</li>
+          <li>What index would you create?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

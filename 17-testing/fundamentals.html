@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fundamentals &amp; Test Doubles — Testing</title>
+<meta name="description" content="The pyramid and its limits, arrange-act-assert, mocks vs stubs vs fakes, what to mock and what not to, and testing time and randomness.">
+<meta name="keywords" content="test pyramid testing trophy arrange act assert test doubles mock stub fake spy dummy over-mocking london school detroit school TimeProvider deterministic tests test data builder">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="17-testing/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Fundamentals &amp; Test Doubles</h1>
+    <p class="subtitle">The pyramid is a useful lie. What to mock is the decision that determines whether your
+      suite helps or hinders.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>The pyramid is about cost and speed</strong>, not about what's valuable.</li>
+      <li><strong>Arrange, Act, Assert</strong> — one action per test.</li>
+      <li><strong>Stub</strong> provides input. <strong>Mock</strong> verifies interaction.
+        <strong>Fake</strong> is a working implementation.</li>
+      <li><strong>Mock at boundaries</strong> — network, clock, file system. Not at class edges.</li>
+      <li><strong>Verifying interactions couples you to implementation.</strong> Prefer asserting state.</li>
+      <li><strong>Never use <code>DateTime.Now</code> in testable code</strong> — inject
+        <code>TimeProvider</code>.</li>
+      <li><strong>Builders beat shared fixtures</strong> for readable, independent tests.</li>
+    </ul>
+  </div>
+
+  <h2 id="pyramid">The pyramid, honestly <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What it actually says</span>
+    <p>Many fast cheap tests at the bottom, few slow expensive ones at the top. It's a statement about
+      <strong>cost and feedback speed</strong>, not about where value lives.</p>
+    <p>Which matters, because the value is often higher up — an integration test that exercises real SQL catches
+      things no unit test can.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>Speed</th><th>Catches</th><th>Misses</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Unit</strong></td>
+          <td>Milliseconds</td>
+          <td>Logic, branches, edge cases, calculations</td>
+          <td><strong>Everything about integration</strong> — SQL translation, serialisation, config, wiring</td>
+        </tr>
+        <tr>
+          <td><strong>Integration</strong></td>
+          <td>Seconds</td>
+          <td>Real queries, migrations, DI wiring, serialisation</td>
+          <td>Cross-service behaviour; browser behaviour</td>
+        </tr>
+        <tr>
+          <td><strong>End-to-end</strong></td>
+          <td>Minutes</td>
+          <td>The system genuinely works together</td>
+          <td>Nothing — but slowly, flakily, and ambiguously</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — where the pyramid misleads in .NET</div>
+    <p style="margin:0">Taken literally, the pyramid pushes you toward maximising unit tests. In a .NET codebase
+      that produces a specific pathology: <strong>heavily mocked unit tests that pass while the application is
+      broken.</strong>
+      <br><br>
+      Because the things that actually fail are frequently at the seams — an EF Core query that can't translate to
+      SQL and throws at runtime, a missing DI registration, a JSON property name mismatch, a migration that fails
+      on real data, a nullable reference the in-memory provider tolerated.
+      <br><br>
+      <strong>None of those are catchable by a unit test with mocked dependencies</strong>, by construction.
+      <br><br>
+      Which is why the "testing trophy" framing is a better fit for modern .NET: fewer heavily-mocked unit tests,
+      <strong>substantially more integration tests</strong> — real database via Testcontainers, real DI container,
+      real serialisation — and a handful of end-to-end tests. Integration tests are slower and they catch a
+      qualitatively different class of bug.
+      <br><br>
+      Being able to say "I'd weight toward integration tests because the failures that reach production are
+      integration failures" is a stronger answer than reciting the pyramid.</p>
+  </div>
+
+  <h2 id="aaa">Arrange, Act, Assert <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the shape" class="code-good"><code class="language-csharp">[Fact]
+public async Task Discount_applies_above_the_volume_threshold()
+{
+    // Arrange - set up the world
+    var customer = ACustomer.OnPlan(CustomerTier.Standard);
+    var order = AnOrder.For(customer).WithSubtotal(1_200m);
+    var sut = new PricingService(_policies);
+
+    // Act - exactly ONE action
+    var price = await sut.PriceAsync(order);
+
+    // Assert - the observable outcome
+    price.Amount.Should().Be(1_140m);      // 5% off above 1000
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rule</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>One action per test</strong></td><td>Two actions means a failure doesn't tell you which one broke</td></tr>
+        <tr><td><strong>Name it as a behaviour</strong></td><td><code>Discount_applies_above_the_volume_threshold</code>, not <code>TestPrice1</code></td></tr>
+        <tr><td><strong>No logic in the test</strong></td><td>An <code>if</code> or a loop means the test itself can be wrong</td></tr>
+        <tr><td><strong>Assert one behaviour</strong></td><td>Several assertions about one outcome is fine; several unrelated ones isn't</td></tr>
+        <tr><td><strong>Independent of other tests</strong></td><td>Shared mutable state makes failures order-dependent</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The name is the documentation</div>
+    <p style="margin:0">A good test name means a CI failure is diagnosable from the report alone, without opening
+      the file.
+      <br><br>
+      <code>Placing_an_order_with_insufficient_stock_is_rejected</code> tells you what broke.
+      <code>TestPlaceOrder_2</code> tells you to go and read it.
+      <br><br>
+      The useful pattern is <em>scenario and expected outcome</em>: what's the situation, what should happen. Some
+      teams use <code>Method_Scenario_Expectation</code>; the specific convention matters much less than whether
+      the name states the behaviour.
+      <br><br>
+      A related benefit: if you can't name the test clearly, the test is usually doing too much — the difficulty
+      naming it is the signal.</p>
+  </div>
+
+  <h2 id="doubles">The five test doubles <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Double</th><th>Purpose</th><th>Verifies?</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Dummy</strong></td><td>Fills a parameter; never used</td><td>No</td></tr>
+        <tr><td><strong>Stub</strong></td><td><strong>Provides canned input</strong></td><td>No</td></tr>
+        <tr><td><strong>Spy</strong></td><td>Records what happened, for later inspection</td><td>After the fact</td></tr>
+        <tr><td><strong>Mock</strong></td><td><strong>Verifies an interaction occurred</strong></td><td><strong>Yes</strong></td></tr>
+        <tr><td><strong>Fake</strong></td><td><strong>A working lightweight implementation</strong></td><td>No</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — the distinction in practice"><code class="language-csharp">// STUB - supplies input so the code under test can run
+_rates.Setup(r =&gt; r.GetAsync("USD")).ReturnsAsync(1.27m);
+
+// MOCK - asserts that an interaction happened. Couples to implementation.
+_publisher.Verify(p =&gt; p.Publish(It.IsAny&lt;OrderPlaced&gt;()), Times.Once);
+
+// FAKE - a real implementation, simplified
+public sealed class InMemoryOrderRepository : IOrderRepository
+{
+    private readonly Dictionary&lt;Guid, Order&gt; _orders = new();
+
+    public Task&lt;Order?&gt; GetAsync(Guid id, CancellationToken ct) =&gt;
+        Task.FromResult(_orders.GetValueOrDefault(id));
+
+    public Task AddAsync(Order order, CancellationToken ct)
+    {
+        _orders[order.Id] = order;      // actually works
+        return Task.CompletedTask;
+    }
+}</code></pre>
+
+  <div class="remember">
+    <span class="r-label">The distinction that matters</span>
+    <p><strong>A stub answers a question. A mock is an assertion.</strong></p>
+    <p>Stubbing <code>GetAsync</code> to return a value is arranging the world — it doesn't constrain how your
+      code works.</p>
+    <p>Verifying that <code>Publish</code> was called once <strong>is a test assertion about the
+      implementation</strong>. It fails if you achieve the same outcome differently.</p>
+    <p>Which is why "stub liberally, mock sparingly" is a good default.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Fakes are underused and often the best option</div>
+    <p style="margin:0">A fake repository is more work to write once and then <strong>dramatically better than
+      mocks across dozens of tests</strong>.
+      <br><br>
+      With mocks, each test sets up its own <code>Setup</code> calls describing exactly which methods are called
+      with what — so the test knows the implementation. With a fake, the test stores an order and later reads it
+      back, and <strong>asserts on state rather than interactions</strong>.
+      <br><br>
+      That makes tests read like the behaviour they describe, and it means refactoring the code under test doesn't
+      touch the tests.
+      <br><br>
+      The caveat: a fake must be <em>faithful</em>. An in-memory repository that doesn't enforce a unique
+      constraint the real database does will let bugs through. So a fake is right for straightforward collection
+      semantics and wrong when the real thing's behaviour is subtle — which is exactly why
+      <a href="dotnet-practice.html#ef-testing">EF Core's in-memory provider is a poor substitute for a real
+      database</a>.</p>
+  </div>
+
+  <h2 id="what-to-mock">What to mock, and what not to <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mock or fake it</th><th>Use the real thing</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Network calls</strong> — HTTP, third-party APIs</td><td><strong>Domain objects and value types</strong></td></tr>
+        <tr><td><strong>The clock</strong> — <code>TimeProvider</code></td><td><strong>Internal collaborators</strong> within the same behaviour</td></tr>
+        <tr><td><strong>Randomness</strong></td><td>Pure functions and calculations</td></tr>
+        <tr><td><strong>The file system</strong></td><td>Mappers and validators</td></tr>
+        <tr><td><strong>Message brokers</strong></td><td><strong>The database</strong> — use a real one via Testcontainers</td></tr>
+        <tr><td><strong>Email, SMS, payments</strong></td><td>The DI container</td></tr>
+        <tr><td>Anything slow or non-deterministic</td><td>Anything you own and that's fast</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — over-mocked: the test knows the implementation" class="code-bad"><code class="language-csharp">public class OrderServiceTests
+{
+    private readonly Mock&lt;IOrderRepository&gt; _repo = new();
+    private readonly Mock&lt;IInventoryService&gt; _inventory = new();
+    private readonly Mock&lt;IPricingCalculator&gt; _pricing = new();     // internal
+    private readonly Mock&lt;IDiscountResolver&gt; _discounts = new();    // internal
+    private readonly Mock&lt;ITaxCalculator&gt; _tax = new();             // internal
+    private readonly Mock&lt;IOrderValidator&gt; _validator = new();      // internal
+    private readonly Mock&lt;ILogger&lt;OrderService&gt;&gt; _logger = new();
+
+    // Seven mocks. Extract an eighth collaborator and every test needs editing,
+    // even though nothing about the behaviour changed.
+    // And the pricing logic is never actually exercised - it's mocked away.
+}</code></pre>
+
+  <pre data-label="csharp — real internals, doubles at boundaries only" class="code-good"><code class="language-csharp">public class PlacingAnOrderTests
+{
+    // Real: these are internal implementation detail of "placing an order"
+    private readonly PricingCalculator _pricing = new(new DiscountResolver(), new TaxCalculator());
+    private readonly OrderValidator _validator = new();
+
+    // Doubled: genuine boundaries
+    private readonly FakeOrderRepository _repo = new();          // fake
+    private readonly Mock&lt;IPaymentGateway&gt; _payments = new();    // network
+    private readonly FakeTimeProvider _clock = new(new DateTime(2024, 6, 1));
+
+    [Fact]
+    public async Task An_order_over_the_threshold_receives_the_volume_discount()
+    {
+        var sut = new OrderService(_repo, _pricing, _validator, _payments.Object, _clock);
+
+        await sut.PlaceAsync(AnOrder.WithSubtotal(1_200m));
+
+        // Real pricing logic actually ran, and we assert the outcome
+        (await _repo.GetSingleAsync()).Total.Should().Be(1_368m);
+    }
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — over-mocking produces tests that verify nothing</div>
+    <p style="margin:0">This is the most consequential testing mistake in .NET, and it's easy to make because
+      mocking every constructor parameter feels rigorous.
+      <br><br>
+      Two problems. <strong>The tests are welded to the current structure</strong>, so extracting a class breaks a
+      dozen passing tests that were all still correct — which is the false-positive tax that eventually kills the
+      suite.
+      <br><br>
+      And more seriously: <strong>if you mock the pricing calculator, the pricing logic is never
+      tested.</strong> The test asserts that the service called a mock that returned a value you specified. It
+      would pass if the real calculator were completely wrong.
+      <br><br>
+      So a suite can have high coverage, all green, and verify very little — because every interesting computation
+      was mocked away and only the wiring was exercised.
+      <br><br>
+      The fix is to <strong>define the unit as a behaviour rather than a class</strong>, let internal collaborators
+      be real, and double only at genuine boundaries. Then the test exercises the actual logic and survives
+      restructuring.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Never mock what you don't own</div>
+    <p style="margin:0">Mocking a third-party client directly — <code>Mock&lt;SqlConnection&gt;</code>,
+      <code>Mock&lt;HttpClient&gt;</code>, a cloud SDK type — bakes your <em>assumptions</em> about that library's
+      behaviour into the test.
+      <br><br>
+      If the assumption is wrong, the test passes and production fails. And when the library updates, the mock
+      still reflects the old behaviour, so the test keeps passing while the real integration breaks.
+      <br><br>
+      <strong>Wrap it in your own interface</strong> and mock that instead. Then the interface expresses what
+      <em>you</em> need, the wrapper is thin enough to verify by integration test, and library changes surface in
+      one place.
+      <br><br>
+      For <code>HttpClient</code> specifically the right seam is a custom
+      <code>HttpMessageHandler</code> — you're then testing against real HTTP semantics with a controlled
+      response, rather than mocking a class that wasn't designed to be mocked.</p>
+  </div>
+
+  <h2 id="determinism">Time, randomness and other non-determinism <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — untestable" class="code-bad"><code class="language-csharp">public bool IsExpired() =&gt; DateTime.UtcNow &gt; ExpiresAt;
+
+// The test can only pass by also calling DateTime.UtcNow, so it either
+// tests nothing meaningful or fails at midnight / in another timezone /
+// on the last day of the month.</code></pre>
+
+  <pre data-label="csharp — TimeProvider (.NET 8+)" class="code-good"><code class="language-csharp">public sealed class Subscription(TimeProvider clock)
+{
+    public DateTimeOffset ExpiresAt { get; init; }
+    public bool IsExpired() =&gt; clock.GetUtcNow() &gt; ExpiresAt;
+}
+
+// In the test - control time exactly
+var clock = new FakeTimeProvider(new DateTimeOffset(2024, 6, 1, 12, 0, 0, TimeSpan.Zero));
+var sub = new Subscription(clock) { ExpiresAt = new DateTimeOffset(2024, 6, 2, 0, 0, 0, TimeSpan.Zero) };
+
+sub.IsExpired().Should().BeFalse();
+
+clock.Advance(TimeSpan.FromDays(2));        // move time forward deliberately
+sub.IsExpired().Should().BeTrue();</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Source of non-determinism</th><th>Make it injectable</th></tr></thead>
+      <tbody>
+        <tr><td><code>DateTime.Now</code> / <code>UtcNow</code></td><td><strong><code>TimeProvider</code></strong> — and <code>FakeTimeProvider</code> in tests</td></tr>
+        <tr><td><code>Guid.NewGuid()</code></td><td>An <code>IIdGenerator</code>, or accept it and don't assert on the value</td></tr>
+        <tr><td><code>Random</code></td><td>Inject a seeded instance</td></tr>
+        <tr><td><code>Environment.MachineName</code>, env vars</td><td>Configuration or options</td></tr>
+        <tr><td>Culture-dependent formatting</td><td>Set the culture explicitly in the test</td></tr>
+        <tr><td><code>Task.Delay</code> in production code</td><td><code>TimeProvider.Delay</code>, which the fake controls</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — <code>TimeProvider</code> also fixes slow tests</div>
+    <p style="margin:0"><code>TimeProvider</code> abstracts timers and delays, not just the current time. So
+      <code>TimeProvider.Delay</code> and timer callbacks can be <strong>advanced instantly</strong> in a
+      test.
+      <br><br>
+      That turns a test of retry-with-backoff — which would genuinely wait thirty seconds — into one that runs in
+      milliseconds by calling <code>clock.Advance(TimeSpan.FromSeconds(30))</code>.
+      <br><br>
+      Which matters because tests involving <code>Thread.Sleep</code> or real delays are the ones that make a suite
+      slow enough to skip, and they're frequently the flakiest — a five-second wait that's occasionally not long
+      enough on a loaded CI machine.
+      <br><br>
+      So "inject <code>TimeProvider</code>" isn't only about determinism; it's how you test time-dependent
+      behaviour — expiry, backoff, scheduling, debouncing — <em>at all</em>, without waiting.</p>
+  </div>
+
+  <h2 id="test-data">Test data <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — a shared fixture: obscure and coupled" class="code-bad"><code class="language-csharp">// Every test uses this. Nobody knows which fields their test depends on.
+private static readonly Order StandardOrder = new()
+{
+    Id = Guid.Parse("..."), CustomerId = Guid.Parse("..."),
+    Subtotal = 100m, Status = OrderStatus.Draft, /* 20 more fields */
+};
+
+// Changing Subtotal to 150 breaks four unrelated tests, and it's not obvious why.</code></pre>
+
+  <pre data-label="csharp — a builder: explicit about what matters" class="code-good"><code class="language-csharp">public sealed class AnOrder
+{
+    private decimal _subtotal = 100m;               // sensible defaults
+    private CustomerTier _tier = CustomerTier.Standard;
+
+    public static AnOrder Default =&gt; new();
+    public static AnOrder WithSubtotal(decimal v) =&gt; new AnOrder { _subtotal = v };
+
+    public AnOrder ForTier(CustomerTier t) { _tier = t; return this; }
+
+    public Order Build() =&gt; new() { Subtotal = _subtotal, /* ... */ };
+    public static implicit operator Order(AnOrder b) =&gt; b.Build();
+}
+
+// The test states ONLY what it cares about. Everything else is a default.
+var order = AnOrder.WithSubtotal(1_200m).ForTier(CustomerTier.Gold);</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Builders make tests self-documenting</div>
+    <p style="margin:0">The value isn't saving keystrokes. It's that <strong>the test states exactly which values
+      are relevant to it</strong> and hides the rest.
+      <br><br>
+      Reading <code>AnOrder.WithSubtotal(1_200m)</code> in a discount test tells you the subtotal is what matters.
+      Reading <code>StandardOrder</code> tells you nothing, so you have to go and look — and when someone changes
+      a field in the shared fixture, unrelated tests break for reasons nobody can see.
+      <br><br>
+      Builders also keep tests <strong>independent</strong>, since each constructs its own data rather than
+      sharing mutable state. That removes order-dependent failures, which are among the most frustrating to
+      debug.
+      <br><br>
+      AutoFixture does something similar by generating values automatically. It's useful and I'd be careful with
+      it in assertions — generated values make failures harder to read, and a test asserting on an autogenerated
+      string tells you little when it fails.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The pyramid describes cost and speed, not value. In .NET, weight toward integration tests.</li>
+      <li>The failures that reach production are integration failures — SQL translation, DI, serialisation,
+        migrations.</li>
+      <li>One action per test; name it as a behaviour; no logic in the test.</li>
+      <li>Stub to provide input; mock to verify interaction. Stub liberally, mock sparingly.</li>
+      <li>Fakes are underused — they let you assert state instead of interactions.</li>
+      <li>Mock at genuine boundaries: network, clock, file system, brokers. Not at class edges.</li>
+      <li>Over-mocking means the logic is never tested — only the wiring.</li>
+      <li>Never mock a type you don't own; wrap it in your own interface.</li>
+      <li>Inject <code>TimeProvider</code> — it makes time-dependent behaviour testable and fast.</li>
+      <li>Builders over shared fixtures: tests state only what matters and stay independent.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Mocking every constructor parameter</strong>, welding tests to the current structure.</li>
+    <li><strong>Mocking the class that contains the logic</strong>, so the logic is never exercised.</li>
+    <li><strong>Verifying interactions</strong> where asserting state would do.</li>
+    <li><strong>Mocking <code>HttpClient</code> or an SDK type</strong> directly.</li>
+    <li><strong><code>DateTime.UtcNow</code> in testable code.</strong></li>
+    <li><strong><code>Thread.Sleep</code> in tests</strong> — slow and flaky.</li>
+    <li><strong>Shared mutable fixtures</strong>, causing order-dependent failures.</li>
+    <li><strong>Several actions in one test</strong>, so failures are ambiguous.</li>
+    <li><strong>Logic in the test</strong> — an <code>if</code> or a loop that can itself be wrong.</li>
+    <li><strong>Names like <code>Test1</code></strong>, so CI failures require opening the file.</li>
+    <li><strong>Asserting on autogenerated values.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What's the difference between a mock, a stub and a fake — and when do you use each? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They're all test doubles, and the distinction that matters practically is <strong>whether it's part of
+          the arrangement or part of the assertion</strong>."</p>
+        <p>"A <strong>stub</strong> provides canned input so the code under test can run. Setting an exchange-rate
+          service to return 1.27 is arranging the world — it doesn't constrain how my code works."</p>
+        <p>"A <strong>mock</strong> verifies that an interaction happened.
+          <code>Verify(p =&gt; p.Publish(...), Times.Once)</code> <em>is a test assertion</em>, and specifically an
+          assertion about the implementation."</p>
+        <p>"A <strong>fake</strong> is a working lightweight implementation — an in-memory repository that
+          genuinely stores and retrieves."</p>
+        <p>"The other two are less commonly discussed: a <strong>dummy</strong> just fills a parameter that's never
+          used, and a <strong>spy</strong> records calls for later inspection rather than asserting up front."</p>
+        <p>"My default is <strong>stub liberally, mock sparingly, and reach for fakes more than most people
+          do</strong>."</p>
+        <p>"The reason to be sparing with mocks is that <strong>verifying an interaction couples the test to the
+          implementation</strong>. If I assert that the repository was called and then the publisher was called, I
+          have documented the current implementation — and that test fails when I achieve the same outcome a
+          different way, including a legitimate improvement. So I'd rather assert on the outcome: what state
+          resulted, what was returned."</p>
+        <p>"I'd use a mock where the interaction <em>is</em> the observable behaviour and there's no state to
+          check — 'an email was sent', 'the payment gateway was charged exactly once'. There the call crossing the
+          boundary is genuinely what I care about, so verifying it is asserting behaviour rather than
+          implementation."</p>
+        <p>"<strong>Fakes are underused.</strong> A fake repository is more work to write once and dramatically
+          better across dozens of tests, because each test stores something and reads it back — asserting state
+          rather than interactions. That makes tests read like the behaviour they describe, and refactoring the
+          code under test doesn't touch them."</p>
+        <p>"The caveat is that <strong>a fake must be faithful</strong>. An in-memory repository that doesn't
+          enforce a unique constraint the real database does will let bugs through. Which is exactly why EF Core's
+          in-memory provider is a poor substitute for a real database — it doesn't enforce constraints, doesn't
+          translate LINQ to SQL, and happily accepts queries that fail against SQL Server. I'd use Testcontainers
+          for a real database instead."</p>
+        <p>"And one rule regardless: <strong>never mock a type you don't own.</strong> Mocking
+          <code>HttpClient</code> or a cloud SDK type bakes my assumptions about that library into the test — if
+          the assumption is wrong the test passes and production fails, and when the library updates the mock still
+          reflects the old behaviour. I'd wrap it in my own interface and mock that. For
+          <code>HttpClient</code> specifically the right seam is a custom <code>HttpMessageHandler</code>, so I'm
+          testing real HTTP semantics with a controlled response."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you state the distinction usefully rather than by definition?</li>
+        <li>Do you know mocks couple you to implementation?</li>
+        <li>Do you know when a mock <em>is</em> right?</li>
+        <li>Do you consider fakes?</li>
+        <li>Do you know not to mock what you don't own?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you test something that sends an email?</li>
+          <li>Why not use EF Core's in-memory provider?</li>
+          <li>How do you test <code>HttpClient</code> code?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A team's tests break on every refactor. What's wrong and how do you fix it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That's a diagnosis, not an annoyance: <strong>the tests are coupled to implementation rather than
+          behaviour.</strong> And it matters because it means the suite is actively preventing the thing it was
+          written to enable."</p>
+        <p>"I'd look for three specific causes, in the order I'd expect to find them."</p>
+        <p>"<strong>One — interaction verification everywhere.</strong> Tests full of
+          <code>Verify</code> calls asserting that the repository was called, then the publisher, then the logger.
+          Each of those is an assertion about <em>how</em> the code works, so any change to how breaks them even
+          when what it does is identical."</p>
+        <p>"<strong>Two — mocking every constructor parameter.</strong> This is the root cause in most .NET
+          codebases. If every class is treated as a unit and every collaborator is mocked, each test is welded to
+          one class's exact dependency list. So extracting a helper — the most ordinary refactor there is —
+          breaks a dozen tests that were all passing and all still correct."</p>
+        <p>"<strong>Three — asserting on internal state</strong> rather than observable outcomes. Reflecting into
+          private fields, or asserting on a property that exists only to make the test pass."</p>
+        <p>"There's a worse consequence of the second one that I'd raise, because it usually hasn't been noticed:
+          <strong>if you mock the class that contains the logic, the logic is never tested.</strong> A test that
+          mocks the pricing calculator asserts that the service called a mock which returned the value you
+          specified. It would pass if the real calculator were completely wrong. So the suite can be green with
+          high coverage and verify almost nothing — only the wiring."</p>
+        <p>"For the fix, I wouldn't propose rewriting the suite — that's a large project with no visible
+          deliverable and it won't get funded. I'd do it incrementally."</p>
+        <p>"<strong>Change the default for new tests</strong> first: define the unit as a <em>behaviour</em>
+          exercised through a stable entry point — an application service or handler — with real internal
+          collaborators and doubles only at genuine boundaries: network, clock, file system, brokers. Write one
+          exemplar test that demonstrates the pattern, because a concrete example moves a team more than a
+          guideline."</p>
+        <p>"<strong>Then use failures as the trigger.</strong> When a brittle test breaks during a refactor, don't
+          just fix it — replace it with a behavioural one at the right level. The pain is already there, so the
+          work is already justified, and over a few months the worst tests get replaced by attrition."</p>
+        <p>"<strong>And add integration tests</strong>, because the over-mocked suite almost certainly isn't
+          catching the failures that reach production — EF Core queries that can't translate to SQL, missing DI
+          registrations, serialisation mismatches, migrations failing on real data. None of those are catchable by
+          a mocked unit test, by construction. Testcontainers with a real database plus
+          <code>WebApplicationFactory</code> catches a class of bug the existing suite can't see, so it adds value
+          immediately rather than duplicating coverage."</p>
+        <p>"The test I'd give the team as a rule of thumb: <strong>if I restructure the internals without changing
+          what the system does, should this test fail?</strong> If yes, it's the wrong test. That's a question
+          anyone can apply in review without needing to remember a taxonomy."</p>
+        <p>"And I'd be honest that some churn is legitimate — if you change a public contract, tests
+          <em>should</em> break. The problem is specifically tests breaking on changes that don't alter
+          behaviour."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you identify implementation coupling as the cause?</li>
+        <li>Do you spot that over-mocking means the logic isn't tested?</li>
+        <li>Do you propose incremental change rather than a rewrite?</li>
+        <li>Do you add integration tests to cover the real gap?</li>
+        <li>Do you give the team a usable rule?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "write better tests" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> proposing a full rewrite of the suite.</li>
+        <li><span class="redflag">Red flag:</span> no recognition that the suite may be verifying nothing.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you convince the team the current tests are weak?</li>
+          <li>Where exactly do you draw the unit boundary?</li>
+          <li>How do you keep integration tests fast enough for CI?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

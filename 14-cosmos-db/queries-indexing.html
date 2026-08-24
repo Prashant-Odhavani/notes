@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indexing &amp; Query Execution — Cosmos DB</title>
+<meta name="description" content="Indexing policy and why the default costs write RU, point reads vs queries, cross-partition fan-out, pagination and reading the RU charge.">
+<meta name="keywords" content="Cosmos DB indexing policy included paths excluded paths composite index range index point read query cross partition fan out continuation token pagination query metrics RU charge integrated cache">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="14-cosmos-db/queries-indexing.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Indexing &amp; Query Execution</h1>
+    <p class="subtitle">Cosmos indexes everything by default, which makes reads safe and writes expensive.
+      Tuning that is a direct cost saving.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Everything is indexed by default.</strong> Safe reads, expensive writes.</li>
+      <li><strong>Excluding unqueried paths reduces write RU</strong> — the main Cosmos-specific
+        optimisation.</li>
+      <li><strong>A point read is ~1 RU</strong>; the same item fetched by query costs several times more.</li>
+      <li><strong>Composite indexes</strong> are needed for multi-property <code>ORDER BY</code>.</li>
+      <li><strong>Cross-partition queries fan out</strong> and multiply RU by partition count.</li>
+      <li><strong>Continuation tokens, not <code>OFFSET</code></strong>. Offset still reads what it skips.</li>
+      <li><strong><code>SELECT *</code> costs more</strong> — RU scales with returned bytes.</li>
+    </ul>
+  </div>
+
+  <h2 id="point-read">Point reads vs queries <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — these are not the same operation"><code class="language-csharp">// POINT READ - ~1 RU. Direct lookup by partition key + id.
+var order = await container.ReadItemAsync&lt;Order&gt;(
+    id: "order-123",
+    partitionKey: new PartitionKey("tenant-acme"));
+
+// QUERY for the same item - ~3-5 RU. Goes through the query engine.
+var query = new QueryDefinition("SELECT * FROM c WHERE c.id = @id")
+    .WithParameter("@id", "order-123");
+var iterator = container.GetItemQueryIterator&lt;Order&gt;(query,
+    requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey("tenant-acme") });</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>If you know the partition key and the id, use <code>ReadItemAsync</code>.</strong></p>
+    <p>A point read bypasses the query engine entirely — it's a direct key lookup. Same result, a fraction of
+      the RU, and lower latency.</p>
+    <p>Querying by id is one of the most common avoidable costs in Cosmos codebases, because the query version
+      looks more familiar to anyone coming from SQL.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Operation</th><th>RU</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Point read</strong></td><td><strong>~1</strong></td><td>Needs partition key + id. Cheapest possible</td></tr>
+        <tr><td>Single-partition query</td><td>~3+</td><td>Partition key supplied, filter on other fields</td></tr>
+        <tr><td><strong>Cross-partition query</strong></td><td><strong>~3 × partitions</strong></td><td>No partition key in the filter</td></tr>
+        <tr><td>Cross-partition with <code>ORDER BY</code></td><td>Higher still</td><td>Each partition sorts, then results merge</td></tr>
+        <tr><td><code>COUNT</code> / aggregate across partitions</td><td>Can be enormous</td><td>Touches every item matching the filter</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="cross-partition">Cross-partition queries <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — always scope by partition key when you can" class="code-good"><code class="language-csharp">// TARGETED - one partition
+var iterator = container.GetItemQueryIterator&lt;Order&gt;(
+    new QueryDefinition("SELECT * FROM c WHERE c.status = @s").WithParameter("@s", "open"),
+    requestOptions: new QueryRequestOptions
+    {
+        PartitionKey = new PartitionKey(tenantId)      // this is the important line
+    });</code></pre>
+
+  <pre data-label="csharp — fans out across every physical partition" class="code-bad"><code class="language-csharp">// No PartitionKey supplied and no partition key in the WHERE clause
+var iterator = container.GetItemQueryIterator&lt;Order&gt;(
+    new QueryDefinition("SELECT * FROM c WHERE c.status = 'open'"));
+// RU cost multiplies by partition count. Latency = the slowest partition.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Single-partition</th><th>Cross-partition</th></tr></thead>
+      <tbody>
+        <tr><td>Partitions touched</td><td>One</td><td><strong>All</strong></td></tr>
+        <tr><td>RU cost</td><td>Base</td><td><strong>× partition count</strong></td></tr>
+        <tr><td>Latency</td><td>One partition's</td><td><strong>The slowest partition's</strong></td></tr>
+        <tr><td>Scales with growth</td><td>Yes</td><td><strong>No — worsens as partitions multiply</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Cross-partition queries get worse over time</div>
+    <p style="margin:0">This is what makes them insidious. At launch with one physical partition, a
+      cross-partition query is indistinguishable from a targeted one — same cost, same latency.
+      <br><br>
+      As data grows, Cosmos splits into more physical partitions. The same query now costs proportionally more
+      RU and its latency becomes the maximum across all of them. <strong>Nothing in the code changed.</strong>
+      <br><br>
+      So a query that was fine in testing and fine for the first six months degrades steadily and
+      inexplicably. That's why "does this query include the partition key?" is a review question, not just a
+      tuning one.
+      <br><br>
+      You can bound the damage with <code>MaxConcurrency</code> and <code>MaxItemCount</code> on
+      <code>QueryRequestOptions</code>, but that limits parallelism rather than fixing the fan-out.</p>
+  </div>
+
+  <h2 id="policy">Indexing policy <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The default, and why it's backwards</span>
+    <p>Cosmos indexes <strong>every property, at every nesting level</strong>, unless you say otherwise. Every
+      other database indexes nothing by default.</p>
+    <p>That's a good default for reads — nothing is ever accidentally a full scan. But every indexed path is
+      maintained on every write, so <strong>writes cost more RU than they need to</strong>.</p>
+  </div>
+
+  <pre data-label="json — the default policy"><code class="language-json">{
+  "indexingMode": "consistent",
+  "includedPaths": [ { "path": "/*" } ],
+  "excludedPaths": [ { "path": "/\"_etag\"/?" } ]
+}</code></pre>
+
+  <pre data-label="json — index only what you actually filter on" class="code-good"><code class="language-json">{
+  "indexingMode": "consistent",
+  "includedPaths": [
+    { "path": "/tenantId/?" },
+    { "path": "/status/?" },
+    { "path": "/createdAt/?" },
+    { "path": "/customer/email/?" }
+  ],
+  "excludedPaths": [
+    { "path": "/*" },                        // exclude everything else
+    { "path": "/payload/*" },                // large nested blob, never filtered
+    { "path": "/auditTrail/*" }              // array we only ever read whole
+  ],
+  "compositeIndexes": [
+    [ { "path": "/status", "order": "ascending" },
+      { "path": "/createdAt", "order": "descending" } ]
+  ]
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this is a cost optimisation with no equivalent elsewhere</div>
+    <p style="margin:0">On a write-heavy container with large nested documents, switching from
+      <code>"/*"</code> to an explicit include list is frequently a <strong>large reduction in write
+      RU</strong> — because you stop maintaining index entries for fields nobody ever filters on.
+      <br><br>
+      The biggest wins are large nested objects and arrays. An <code>auditTrail</code> array with 200 entries
+      generates index entries for every property of every element on every write, and if you only ever read it
+      as a whole, all of that is wasted.
+      <br><br>
+      The trade-off to state honestly: <strong>an excluded path cannot be filtered on</strong>. If someone
+      later needs to query it, you must add it back and Cosmos reindexes the container — which is online but
+      consumes RU while it runs. So this is an optimisation for containers whose access patterns have settled,
+      not for something still in flux.
+      <br><br>
+      "I'd index the paths we filter on and exclude the rest" is a specific, quantifiable answer to "how would
+      you reduce Cosmos costs?" — much stronger than "reduce RU/s".</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Path syntax</th><th>Means</th></tr></thead>
+      <tbody>
+        <tr><td><code>/tenantId/?</code></td><td>That scalar property only</td></tr>
+        <tr><td><code>/customer/*</code></td><td>Everything under <code>customer</code>, recursively</td></tr>
+        <tr><td><code>/lines/[]/sku/?</code></td><td><code>sku</code> in every element of the <code>lines</code> array</td></tr>
+        <tr><td><code>/*</code></td><td>Everything</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Indexing mode: consistent vs none</div>
+    <p style="margin:0"><code>"indexingMode": "consistent"</code> updates the index synchronously with the
+      write. That's the default and almost always what you want.
+      <br><br>
+      <code>"none"</code> disables indexing entirely — point reads still work (they don't use the index), but
+      queries can't. The legitimate use is a <strong>bulk import</strong>: set it to <code>none</code>, load the
+      data cheaply, then switch back to <code>consistent</code> and let it index once. That can cut the RU cost
+      of a large migration substantially.
+      <br><br>
+      There's also a <code>lazy</code> mode, which is deprecated and shouldn't be used — it gave no consistency
+      guarantee on query results.</p>
+  </div>
+
+  <h3 id="composite">Composite indexes</h3>
+
+  <pre data-label="sql — needs a composite index to work at all"><code class="language-sql">SELECT * FROM c
+WHERE c.tenantId = @tenant
+ORDER BY c.status ASC, c.createdAt DESC</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>A multi-property <code>ORDER BY</code> requires a composite index.</strong> Without one the query
+      <em>fails</em> — it doesn't just run slowly.</p>
+    <p>And the composite index must match the <strong>order and direction</strong>. An index defined as
+      <code>(status ASC, createdAt DESC)</code> serves that exact ordering and its complete
+      reverse — <code>(status DESC, createdAt ASC)</code> — but not other combinations.</p>
+    <p>Single-property <code>ORDER BY</code> works with the default range index, which is why this only bites
+      when you add a second sort field.</p>
+  </div>
+
+  <h2 id="pagination">Pagination <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — continuation tokens" class="code-good"><code class="language-csharp">// Return the token to the client; they send it back for the next page
+var iterator = container.GetItemQueryIterator&lt;Order&gt;(
+    query,
+    continuationToken: incomingToken,
+    requestOptions: new QueryRequestOptions
+    {
+        MaxItemCount = 20,
+        PartitionKey = new PartitionKey(tenantId)
+    });
+
+var page = await iterator.ReadNextAsync();
+return new PagedResult&lt;Order&gt;(page.Resource, page.ContinuationToken);</code></pre>
+
+  <pre data-label="sql — OFFSET exists and doesn't help much" class="code-bad"><code class="language-sql">SELECT * FROM c WHERE c.tenantId = @t
+ORDER BY c.createdAt DESC
+OFFSET 10000 LIMIT 20
+-- Still reads and charges for the 10,000 skipped items.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Continuation token</th><th><code>OFFSET</code>/<code>LIMIT</code></th></tr></thead>
+      <tbody>
+        <tr><td>Cost at page 500</td><td><strong>Constant</strong></td><td>Charges for everything skipped</td></tr>
+        <tr><td>Jump to page N</td><td>No — sequential only</td><td>Yes</td></tr>
+        <tr><td>Total count</td><td>Not available</td><td>Not without a separate query</td></tr>
+        <tr><td>Stable under inserts</td><td>Yes</td><td>No — items shift between pages</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Continuation tokens have two practical constraints</div>
+    <p style="margin:0"><strong>They can be large</strong> — up to a few KB, especially for cross-partition
+      queries where the token encodes progress through every partition. That's too big for a URL query string
+      in some cases, so you may need to return it in a response body or header. The
+      <code>ResponseContinuationTokenLimitInKb</code> option can cap it, at the cost of some efficiency.
+      <br><br>
+      <strong>They're opaque and version-bound.</strong> Don't parse them, don't store them long-term, and
+      don't assume one survives an SDK upgrade. They're for immediate next-page use.
+      <br><br>
+      Also: an empty page with a non-null token is normal on cross-partition queries — it means "no results
+      from this batch, keep going". Treating a null result set as "end of data" is a bug; the token being null
+      is the only end-of-data signal.</p>
+  </div>
+
+  <h2 id="query-cost">Reducing query cost <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Point read instead of query</strong></td><td>1 RU vs 3–5+. Biggest single win</td></tr>
+        <tr><td><strong>Always supply the partition key</strong></td><td>Avoids multiplying by partition count</td></tr>
+        <tr><td><strong>Project only needed fields</strong></td><td>RU scales with returned bytes — <code>SELECT c.id, c.total</code> beats <code>SELECT *</code></td></tr>
+        <tr><td><strong>Filter on indexed paths</strong></td><td>An unindexed filter means a scan within the partition</td></tr>
+        <tr><td><strong><code>MaxItemCount</code> tuning</strong></td><td>Fewer, larger pages reduce per-request overhead</td></tr>
+        <tr><td><strong>Avoid cross-partition aggregates</strong></td><td><code>COUNT</code> across partitions is expensive; maintain a counter instead</td></tr>
+        <tr><td><strong>Integrated cache</strong></td><td>Repeated point reads and queries become <strong>0 RU</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The integrated cache is underused</div>
+    <p style="margin:0">A dedicated gateway with an integrated cache serves repeat reads from memory at
+      <strong>0 RU</strong>. For read-heavy workloads with hot items — product catalogues, configuration,
+      reference data — that can be a large saving.
+      <br><br>
+      Requirements: the client must use <strong>Gateway</strong> connection mode (not Direct), and you set a
+      staleness window via <code>DedicatedGatewayRequestOptions.MaxIntegratedCacheStaleness</code>.
+      <br><br>
+      The trade is Gateway mode's slightly higher latency versus Direct, plus the cost of the dedicated
+      gateway. So it wins when the hit rate is high, and it's worth measuring rather than assuming.</p>
+  </div>
+
+  <pre data-label="csharp — read the query metrics, not just the total"><code class="language-csharp">var iterator = container.GetItemQueryIterator&lt;Order&gt;(query,
+    requestOptions: new QueryRequestOptions { PopulateIndexMetrics = true });
+
+var page = await iterator.ReadNextAsync();
+logger.LogInformation("RU {RU}, index metrics: {Metrics}",
+    page.RequestCharge, page.IndexMetrics);
+// IndexMetrics tells you which indexes were used and which were RECOMMENDED
+// but missing - the closest equivalent to a missing-index suggestion.</code></pre>
+
+  <div class="note tip">
+    <div class="note-title"><code>PopulateIndexMetrics</code> is the diagnostic to know</div>
+    <p style="margin:0">It reports which index the query used, and — more usefully — which
+      <strong>composite index it would have benefited from</strong>. That's the Cosmos equivalent of SQL
+      Server's <a href="../10-sql/indexing.html#missing-index-dmv">missing-index DMV</a>.
+      <br><br>
+      Same caveat applies: treat it as evidence about which queries are struggling, not a list to apply
+      verbatim, because every index you add costs write RU.
+      <br><br>
+      Enable it in development and for investigation, not permanently — it adds overhead.</p>
+  </div>
+
+  <h2 id="patterns">Query patterns to avoid <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pattern</th><th>Problem</th><th>Instead</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>COUNT(*)</code> for a UI badge</td>
+          <td>Scans every matching item, every page load</td>
+          <td>Maintain a counter document, updated by the <a href="change-feed-global.html">change feed</a></td>
+        </tr>
+        <tr>
+          <td><code>WHERE CONTAINS(c.name, 'x')</code></td>
+          <td>Cannot use an index — scans the partition</td>
+          <td>Azure AI Search, or store a normalised prefix field</td>
+        </tr>
+        <tr>
+          <td><code>JOIN</code> across containers</td>
+          <td>Not supported — Cosmos <code>JOIN</code> is intra-document only</td>
+          <td>Denormalize, or two queries</td>
+        </tr>
+        <tr>
+          <td><code>ORDER BY</code> on a cross-partition query</td>
+          <td>Every partition sorts, then merges</td>
+          <td>Scope to a partition, or pre-sort with a synthetic key</td>
+        </tr>
+        <tr>
+          <td>Large <code>IN</code> lists</td>
+          <td>Can fan out across partitions</td>
+          <td>Parallel point reads, or <code>ReadManyItemsAsync</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title"><code>ReadManyItemsAsync</code> for batch lookups</div>
+    <pre data-label="csharp"><code class="language-csharp">var keys = new List&lt;(string id, PartitionKey pk)&gt;
+{
+    ("order-1", new PartitionKey("tenant-a")),
+    ("order-2", new PartitionKey("tenant-b"))
+};
+var results = await container.ReadManyItemsAsync&lt;Order&gt;(keys);</code></pre>
+    <p style="margin:0">This batches point reads efficiently across partitions — much cheaper than a query with
+      a large <code>IN</code> clause, and cheaper than N separate round trips.
+      <br><br>
+      It's the right answer when you have a list of ids and their partition keys, which happens constantly when
+      resolving references between denormalized documents.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title"><code>JOIN</code> in Cosmos means something different</div>
+    <p style="margin:0">Cosmos SQL has a <code>JOIN</code> keyword, and it only joins <strong>within a single
+      document</strong> — it flattens nested arrays, closer to <code>CROSS APPLY</code> over an array than a
+      relational join.
+      <br><br>
+      There is no cross-container or cross-document join at all. So relationships are resolved by denormalizing
+      the fields you need, or by issuing a second query.
+      <br><br>
+      That's a real constraint on modelling, and it's why the
+      <a href="../13-mongodb/fundamentals.html#extended-reference">extended reference pattern</a> is even more
+      important here than in MongoDB — where at least <code>$lookup</code> exists as a fallback.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Point read (partition key + id) is ~1 RU. Never query by id.</li>
+      <li>Always supply the partition key, or the query fans out and multiplies RU.</li>
+      <li>Cross-partition queries degrade over time as partitions split — nothing in the code changes.</li>
+      <li>Everything is indexed by default; excluding unqueried paths cuts write RU.</li>
+      <li>An excluded path can't be filtered on, and re-adding it triggers a reindex.</li>
+      <li><code>indexingMode: none</code> during a bulk import, then switch back.</li>
+      <li>Multi-property <code>ORDER BY</code> requires a matching composite index or it fails.</li>
+      <li>Continuation tokens, not <code>OFFSET</code>. A null token is the only end-of-data signal.</li>
+      <li>Project specific fields — RU scales with returned bytes.</li>
+      <li><code>PopulateIndexMetrics</code> tells you which composite index would help.</li>
+      <li>No cross-container joins. Denormalize, or use <code>ReadManyItemsAsync</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Querying by id</strong> instead of a point read.</li>
+    <li><strong>Omitting the partition key</strong> from queries that could include it.</li>
+    <li><strong>Leaving the default <code>/*</code> indexing policy</strong> on a write-heavy container.</li>
+    <li><strong>Indexing large nested arrays</strong> nobody filters on.</li>
+    <li><strong><code>SELECT *</code></strong> when three fields are needed.</li>
+    <li><strong><code>OFFSET</code> pagination</strong>, paying for everything skipped.</li>
+    <li><strong>Treating an empty page as end-of-data</strong> instead of checking the token.</li>
+    <li><strong>Storing continuation tokens long-term.</strong></li>
+    <li><strong><code>COUNT(*)</code> on every page load.</strong></li>
+    <li><strong>Expecting cross-container joins to exist.</strong></li>
+    <li><strong>Never logging <code>RequestCharge</code></strong>, so cost is invisible.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How would you reduce the RU cost of a Cosmos container? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by measuring, because RU cost is invisible unless you look. Every response carries a
+          <code>RequestCharge</code>, so I'd log it in development and check the expensive operations —
+          accumulating across pages for queries, since <strong>each page is charged separately</strong> and
+          measuring only the first page badly understates the cost."</p>
+        <p>"Then, roughly in order of impact:"</p>
+        <p>"<strong>Point reads instead of queries.</strong> If I know the partition key and the id,
+          <code>ReadItemAsync</code> is about 1 RU. The same item fetched with
+          <code>SELECT * FROM c WHERE c.id = @id</code> goes through the query engine and costs three to five
+          times more. Querying by id is extremely common because it looks familiar coming from SQL, and it's
+          pure waste."</p>
+        <p>"<strong>Make sure queries include the partition key.</strong> Without it the query fans out to every
+          physical partition and the RU multiplies by the partition count. What makes this particularly nasty is
+          that it <em>gets worse over time</em> — at launch with one physical partition it's indistinguishable
+          from a targeted query, and as data grows and Cosmos splits, the same unchanged code costs
+          proportionally more and its latency becomes the slowest partition's."</p>
+        <p>"<strong>Tune the indexing policy.</strong> This is the Cosmos-specific one with no equivalent
+          elsewhere. Cosmos indexes <em>every</em> property by default, and writes cost about 5× reads precisely
+          because every indexed path is maintained on every write. So switching from <code>/*</code> to an
+          explicit include list — just the paths we actually filter on — directly reduces write RU. The biggest
+          wins are large nested objects and arrays: an audit-trail array with 200 entries generates index
+          entries for every property of every element, and if we only ever read it whole, all of that is
+          wasted."</p>
+        <p>"I'd state the trade-off honestly: an excluded path <strong>can't be filtered on</strong>, and adding
+          it back triggers a container reindex which consumes RU. So it's right for containers whose access
+          patterns have settled, not something still in flux."</p>
+        <p>"<strong>Project only the fields needed.</strong> RU scales with returned bytes, so
+          <code>SELECT c.id, c.total</code> beats <code>SELECT *</code> on large documents."</p>
+        <p>"<strong>Replace cross-partition aggregates.</strong> A <code>COUNT(*)</code> for a UI badge scans
+          everything matching, on every page load. Maintaining a counter document updated by the change feed
+          turns that into a 1 RU point read."</p>
+        <p>"<strong>TTL instead of delete jobs</strong>, because TTL deletion uses leftover RU rather than my
+          provisioned budget — expiry is effectively free, where millions of explicit deletes cost real RU and
+          can throttle live traffic."</p>
+        <p>"Two structural options beyond query tuning. The <strong>integrated cache</strong> serves repeat
+          reads at 0 RU, which is significant for hot reference data — it needs Gateway connection mode and a
+          dedicated gateway. And the <strong>analytical store</strong> via Synapse Link moves reporting off the
+          RU budget entirely, billed on storage and scan instead. If analytics is what's consuming throughput,
+          that's the structurally correct fix rather than trying to make aggregations cheap."</p>
+        <p>"And on the provisioning side: if average utilisation is below roughly 66%, autoscale is cheaper than
+          provisioned despite the 1.5× per-RU premium, because you stop paying for idle headroom."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you measure first?</li>
+        <li>Do you know point reads vs queries?</li>
+        <li>Do you know the indexing policy affects <em>write</em> cost?</li>
+        <li>Do you know cross-partition cost grows over time?</li>
+        <li>Do you know about the analytical store and integrated cache?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the downside of excluding paths?</li>
+          <li>How would you maintain that counter document?</li>
+          <li>When is autoscale cheaper?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>A list endpoint costs 800 RU per call and the team wants to raise throughput. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"800 RU for a list endpoint is very high, so I'd push back on raising throughput and find out what
+          it's actually doing first. Adding RU/s here would be paying monthly for a bug."</p>
+        <p>"I'd get the query and check <code>PopulateIndexMetrics</code>, which tells me which indexes were
+          used and which composite index would have helped. Then I'd look for four specific things."</p>
+        <p>"<strong>Is it cross-partition?</strong> That's the most likely explanation for 800 RU. If the query
+          doesn't include the partition key it fans out to every physical partition and the cost multiplies. If
+          this is a tenant-scoped list and the partition key is <code>tenantId</code>, supplying it should
+          collapse the cost dramatically — and it's a one-line change."</p>
+        <p>"<strong>Is it doing <code>SELECT *</code>?</strong> RU scales with returned bytes. If the documents
+          are large and the list only displays five fields, projecting just those can cut it substantially."</p>
+        <p>"<strong>Is it using <code>OFFSET</code>?</strong> Cosmos still reads and charges for skipped items,
+          so a deep page is expensive. Continuation tokens make it constant-cost."</p>
+        <p>"<strong>Is there a <code>COUNT</code> for a total?</strong> An exact count across partitions is
+          often more expensive than the page itself, and it's frequently there just to render 'showing 20 of
+          1,432'."</p>
+        <p>"My expectation is that fixing those gets it to a small fraction of 800 RU. If it's still high after
+          that, the question becomes structural."</p>
+        <p>"<strong>Is the container modelled for this query?</strong> If the list is a genuinely important
+          screen and the query can't be made single-partition — because it legitimately spans tenants, say —
+          then the answer isn't tuning, it's <strong>maintaining a purpose-built read document</strong>. A
+          single document per tenant holding the list projection, updated by the change feed, turns an 800 RU
+          fan-out into a 1 RU point read. That's the Cosmos version of a read model."</p>
+        <p>"<strong>Is it the same list repeatedly?</strong> If many users request identical data, the
+          integrated cache serves it at 0 RU. Needs Gateway mode and a dedicated gateway, but for a hot list
+          endpoint the arithmetic usually works."</p>
+        <p>"<strong>Is it actually a reporting query?</strong> If the endpoint is really analytics wearing a
+          list's clothing — aggregations, arbitrary filters, large ranges — it belongs in the analytical store
+          via Synapse Link, which is billed on storage and scan rather than RU. That removes it from the
+          throughput budget completely."</p>
+        <p>"The framing I'd bring to the team: in Cosmos, <strong>cost and performance are the same
+          conversation</strong>. An 800 RU endpoint isn't just expensive — once it's called frequently it
+          consumes the throughput budget and starts throttling unrelated features with 429s. So this is a
+          reliability issue, not only a billing one, and raising RU/s postpones it rather than fixing it."</p>
+        <p>"I'd also want to know the call rate before deciding urgency. 800 RU called twice a day is
+          irrelevant; 800 RU called 50 times a second is 40,000 RU/s and the dominant cost in the account.
+          Same query, completely different priority."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you refuse to just raise throughput?</li>
+        <li>Do you check cross-partition first — the most likely cause?</li>
+        <li>Do you know <code>PopulateIndexMetrics</code>?</li>
+        <li>Do you reach for a change-feed-maintained read document?</li>
+        <li>Do you connect RU cost to throttling other features?</li>
+        <li>Do you ask about call rate?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "increase RU/s."</li>
+        <li><span class="redflag">Red flag:</span> no mention of the partition key.</li>
+        <li><span class="redflag">Red flag:</span> treating it purely as a cost problem, not a reliability
+          one.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you keep that read document consistent?</li>
+          <li>What if the list genuinely must span all tenants?</li>
+          <li>How do you show a total count cheaply?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

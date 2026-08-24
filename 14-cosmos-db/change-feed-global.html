@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Change Feed &amp; Global Distribution — Cosmos DB</title>
+<meta name="description" content="The change feed processor and lease container, multi-region writes, conflict resolution strategies, and failover behaviour.">
+<meta name="keywords" content="Cosmos DB change feed processor lease container Azure Functions trigger all versions and deletes multi-region writes conflict resolution last writer wins custom stored procedure automatic failover manual failover availability zones">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="14-cosmos-db/change-feed-global.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Change Feed &amp; Global Distribution</h1>
+    <p class="subtitle">The change feed is how you build anything reactive on Cosmos. Global distribution is
+      the reason to choose it at all.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>The change feed is a persistent, ordered log of changes</strong> per partition. Not a queue —
+        you can re-read it.</li>
+      <li><strong>Ordering is guaranteed within a logical partition only</strong>, never globally.</li>
+      <li><strong>The default feed doesn't include deletes.</strong> Use soft deletes with TTL, or the
+        all-versions mode.</li>
+      <li><strong>The lease container tracks progress</strong> and distributes work across instances.</li>
+      <li><strong>At-least-once delivery</strong> — handlers must be idempotent.</li>
+      <li><strong>Multi-region writes mean conflicts</strong>, and you choose the resolution policy.</li>
+      <li><strong>Strong consistency is incompatible with multi-region writes.</strong></li>
+    </ul>
+  </div>
+
+  <h2 id="change-feed">The change feed <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Every insert and update to a container is recorded in a persistent, ordered log. You can read that log
+      from any point — the beginning, now, or a saved position.</p>
+    <p>It isn't a message queue. The log <strong>persists</strong>, so multiple independent consumers can read
+      it at their own pace, and you can replay history.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Ordering</strong></td><td>Guaranteed <strong>within a logical partition</strong>. No global ordering</td></tr>
+        <tr><td><strong>Content</strong></td><td>The <em>latest</em> version of each changed item, not every intermediate version</td></tr>
+        <tr><td><strong>Deletes</strong></td><td><strong>Not included</strong> in the default (latest-version) mode</td></tr>
+        <tr><td><strong>Retention</strong></td><td>As long as the data exists — it's derived from the items themselves</td></tr>
+        <tr><td><strong>Delivery</strong></td><td><strong>At-least-once.</strong> Handlers must be idempotent</td></tr>
+        <tr><td><strong>Cost</strong></td><td>Reading it consumes RU from the container's budget</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Two properties that cause real design mistakes</div>
+    <p style="margin:0"><strong>1. Deletes are invisible.</strong> The default change feed shows inserts and
+      updates only. So a downstream search index or cache built on the change feed will
+      <strong>never remove anything</strong> — deleted items live on forever in your derived stores.
+      <br><br>
+      The standard fix is a <strong>soft delete</strong>: set <code>isDeleted: true</code> plus a short TTL. The
+      update appears in the feed so consumers can remove it, and TTL cleans up the item afterwards for free.
+      There's also an <em>all versions and deletes</em> mode which does surface deletes, with a limited
+      retention window.
+      <br><br>
+      <strong>2. Only the latest version appears.</strong> If an item is updated three times before your
+      consumer reads the feed, you see the final state once — not three events. So the change feed tells you
+      <em>what something is now</em>, not <em>what happened to it</em>. Any logic that depends on the sequence
+      of intermediate states won't work, and that's a genuine architectural constraint versus a real event
+      log.</p>
+  </div>
+
+  <h2 id="processor">The change feed processor <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — a distributed, resumable consumer" class="code-good"><code class="language-csharp">var processor = container
+    .GetChangeFeedProcessorBuilder&lt;Order&gt;("order-projections", HandleChangesAsync)
+    .WithInstanceName(Environment.MachineName)     // must be unique per instance
+    .WithLeaseContainer(leaseContainer)            // separate container for progress
+    .WithMaxItems(100)
+    .WithPollInterval(TimeSpan.FromSeconds(1))
+    .WithStartTime(DateTime.MinValue.ToUniversalTime())   // from the beginning
+    .Build();
+
+await processor.StartAsync();
+
+async Task HandleChangesAsync(
+    ChangeFeedProcessorContext ctx,
+    IReadOnlyCollection&lt;Order&gt; changes,
+    CancellationToken ct)
+{
+    foreach (var order in changes)
+    {
+        // MUST be idempotent - this can be called twice for the same item
+        await UpsertProjectionAsync(order, ct);
+    }
+    // Returning without throwing checkpoints the lease.
+    // Throwing means the batch is retried - so partial work must be safe.
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Component</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Lease container</strong></td><td>Stores one lease document per partition range, holding the continuation position and owner</td></tr>
+        <tr><td><strong>Instance name</strong></td><td>Identifies this consumer. <strong>Must be unique</strong> per running instance</td></tr>
+        <tr><td><strong>Processor name</strong></td><td>Identifies the <em>logical consumer</em>. Different names = independent progress</td></tr>
+        <tr><td><strong>Checkpointing</strong></td><td>Automatic when the delegate returns without throwing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — how the lease container gives you scale-out for free</div>
+    <p style="margin:0">Leases are how the processor distributes work. Each physical partition range has a lease
+      document; an instance <strong>acquires</strong> leases it can handle and renews them.
+      <br><br>
+      Start a second instance and it acquires some of the leases from the first — work rebalances automatically.
+      If an instance dies, its leases expire and another picks them up, resuming from the checkpointed position.
+      No coordination code, no leader election.
+      <br><br>
+      Two consequences worth stating. <strong>Parallelism is bounded by the number of partition ranges</strong>
+      — running 20 instances against 4 ranges means 16 sit idle, so scaling consumers past the partition count
+      does nothing. And <strong>the lease container needs its own throughput</strong>; under-provisioning it
+      throttles the processor itself, which looks like the consumer being mysteriously slow.
+      <br><br>
+      Also: a <strong>different processor name gives an entirely independent consumer</strong>. That's how you
+      run a search-index projection and an analytics pipeline off the same container without them interfering —
+      each has its own leases and its own position.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Idempotency isn't optional here</div>
+    <p style="margin:0">Checkpointing happens <em>after</em> the delegate returns. So if the process dies
+      mid-batch, the whole batch is redelivered — items already handled will be handled again.
+      <br><br>
+      That's <strong>at-least-once</strong> delivery, and it's the correct trade: the alternative would be
+      checkpointing first and losing changes on a crash.
+      <br><br>
+      So handlers must be safe to run twice. Upserts are naturally idempotent; "increment a counter" is not, and
+      needs either a version check or a separate dedupe record. This is the same requirement as
+      <a href="../19-architecture/distributed-data.html#idempotency">idempotent message consumers</a>.</p>
+  </div>
+
+  <h3 id="functions">With Azure Functions</h3>
+
+  <pre data-label="csharp — the trigger manages leases for you"><code class="language-csharp">[Function("ProjectOrders")]
+public async Task Run(
+    [CosmosDBTrigger(
+        databaseName: "shop",
+        containerName: "orders",
+        Connection = "CosmosConnection",
+        LeaseContainerName = "leases",
+        CreateLeaseContainerIfNotExists = true,
+        MaxItemsPerInvocation = 100)]
+    IReadOnlyList&lt;Order&gt; changes,
+    FunctionContext ctx)
+{
+    foreach (var order in changes) await UpsertProjectionAsync(order);
+}</code></pre>
+
+  <p>The trigger wraps the same processor, so all the same rules apply — idempotency, lease container
+    throughput, partition-bounded parallelism. It's the least-code option, and it hides the lease mechanics,
+    which is worth understanding anyway when something goes wrong.</p>
+
+  <h2 id="change-feed-uses">What to use it for <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Use case</th><th>Why the change feed fits</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Materialised views / read models</strong></td><td>Turn an expensive cross-partition query into a 1 RU point read</td></tr>
+        <tr><td><strong>Maintaining denormalized copies</strong></td><td>Update the copies when the source changes, without the writer knowing</td></tr>
+        <tr><td><strong>Search index sync</strong></td><td>Feed Azure AI Search without dual writes</td></tr>
+        <tr><td><strong>Publishing domain events</strong></td><td>A built-in outbox — no dual write</td></tr>
+        <tr><td><strong>Counters and aggregates</strong></td><td>Replace <code>COUNT(*)</code> with a maintained value</td></tr>
+        <tr><td><strong>Archiving to cheaper storage</strong></td><td>Copy to Blob or a warehouse as items change</td></tr>
+        <tr><td><strong>Cross-region or cross-service replication</strong></td><td>Derived stores stay current</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the change feed solves the dual-write problem</div>
+    <p style="margin:0">The classic <a href="../19-architecture/distributed-data.html#outbox">dual-write
+      problem</a>: write to the database, then publish an event. If the publish fails, the data changed and
+      nothing downstream knows.
+      <br><br>
+      The change feed inverts it. You write only to Cosmos, and the event stream is <strong>derived</strong> from
+      the committed data. There's nothing to keep in sync because there's one write.
+      <br><br>
+      That's effectively a built-in outbox with no table to maintain and no publisher to run — genuinely one of
+      Cosmos's better features, and the same argument as
+      <a href="../13-mongodb/scaling-operations.html#change-streams">MongoDB change streams</a>.
+      <br><br>
+      The honest limitation: because only the latest version appears, it gives you <em>state changed</em>
+      notifications rather than a true event log. If downstream consumers need semantic events — "order
+      cancelled" versus "order shipped" — you either infer them from the state, or write explicit event
+      documents to a separate container and put the change feed on that instead. The second is usually
+      cleaner.</p>
+  </div>
+
+  <h2 id="global">Global distribution <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Adding a region is a checkbox. Cosmos replicates the data and the SDK routes reads to the nearest
+      region.</p>
+    <p>The interesting decision is whether those regions can <strong>accept writes</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Single-region writes</th><th>Multi-region writes</th></tr></thead>
+      <tbody>
+        <tr><td>Writes go to</td><td>One primary region</td><td><strong>Any region</strong></td></tr>
+        <tr><td>Write latency</td><td>Cross-region for distant users</td><td><strong>Local everywhere</strong></td></tr>
+        <tr><td>Conflicts</td><td>Impossible</td><td><strong>Possible — you must handle them</strong></td></tr>
+        <tr><td>Strong consistency</td><td>Available</td><td><strong>Not available</strong></td></tr>
+        <tr><td>Cost</td><td>Baseline</td><td>Roughly 2× RU</td></tr>
+        <tr><td>Write availability on region loss</td><td>Needs failover</td><td>Continues elsewhere</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Multi-region writes buy local write latency and write availability, and cost you conflict
+      handling, Strong consistency, and roughly double the RU.</strong></p>
+    <p>Single-region writes with multi-region <em>reads</em> is the more common and often better configuration —
+      most applications read far more than they write, so you get local read latency without any of the
+      conflict complexity.</p>
+    <p>Enabling multi-region writes because it sounds more capable is a real and common mistake.</p>
+  </div>
+
+  <h3 id="conflicts">Conflict resolution</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Policy</th><th>Behaviour</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Last Writer Wins</strong> <em>(default)</em></td>
+          <td>Highest value of <code>_ts</code>, or a numeric property you nominate, wins</td>
+          <td>Independent updates where losing one is acceptable</td>
+        </tr>
+        <tr>
+          <td><strong>Custom (stored procedure)</strong></td>
+          <td>Your merge logic runs server-side</td>
+          <td>You can genuinely merge — set union, additive counters</td>
+        </tr>
+        <tr>
+          <td><strong>Custom (manual)</strong></td>
+          <td>Conflicts land in a <strong>conflicts feed</strong> for the application to resolve</td>
+          <td>Conflicts need human or domain judgement</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Last Writer Wins silently discards data</div>
+    <p style="margin:0">It's the default and it's the least safe. Two regions update the same item; the one with
+      the later timestamp wins and <strong>the other update is gone</strong> — no error, no notification,
+      nothing in a log by default.
+      <br><br>
+      For a user profile edit that's probably fine. For a shopping cart, one region's added item vanishes. For a
+      balance or a counter, you've lost a transaction.
+      <br><br>
+      Worse, clock skew between regions means "later" isn't strictly reliable — <code>_ts</code> has
+      second-level granularity, so simultaneous updates resolve arbitrarily.
+      <br><br>
+      <strong>If losing an update matters, don't use the default.</strong> Either nominate a version property
+      you control, use a custom merge procedure, or take manual resolution and handle the conflicts feed.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — design so conflicts can't happen</div>
+    <p style="margin:0">The strongest answer isn't a resolution policy, it's avoiding the situation.
+      <br><br>
+      <strong>Partition by region affinity.</strong> If a user's data is only ever written from their home
+      region — which is usually true — two regions never write the same item and conflicts don't arise. That's
+      free, and it makes the policy question moot for most of your data.
+      <br><br>
+      <strong>Model as append-only where you can.</strong> Two regions each inserting a new event document with
+      distinct ids cannot conflict. Conflicts only happen on <em>updates to the same item</em>. So an
+      event-sourced or ledger-style shape sidesteps the problem entirely, and you derive current state from the
+      events.
+      <br><br>
+      "I'd design so the same item isn't written from two regions" is a much better answer than any conflict
+      policy — because every policy is a choice about which data to lose or how much complexity to accept.</p>
+  </div>
+
+  <h2 id="failover">Failover <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mechanism</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Automatic failover</strong></td><td>Cosmos promotes the next region by your configured priority. No application change</td></tr>
+        <tr><td><strong>Manual failover</strong></td><td>You trigger it. Used for testing and planned maintenance</td></tr>
+        <tr><td><strong>Availability zones</strong></td><td>Zone-redundancy within a region. Costs more, protects against a datacentre failure</td></tr>
+        <tr><td><strong>Failover priority</strong></td><td>The order regions are promoted. Configure deliberately</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Automatic failover can lose recent writes</div>
+    <p style="margin:0">With single-region writes and anything short of Strong consistency, replication to other
+      regions is asynchronous. So an unplanned regional failover can lose whatever hadn't replicated —
+      typically a small window, but non-zero.
+      <br><br>
+      <strong>Bounded staleness</strong> is the level that gives you a stated guarantee on that window, which is
+      why it exists. Strong eliminates it and costs 2× read RU plus cross-region write latency.
+      <br><br>
+      A planned <em>manual</em> failover is graceful and doesn't lose data — which is why it's worth using
+      manual failover in a game day to test that your application handles a region change, rather than
+      discovering the behaviour during a real incident.</p>
+  </div>
+
+  <pre data-label="csharp — let the SDK handle regional routing" class="code-good"><code class="language-csharp">new CosmosClientOptions
+{
+    // Preferred read regions, in order. The SDK fails over automatically
+    // and routes reads to the first available.
+    ApplicationPreferredRegions = new List&lt;string&gt;
+    {
+        Regions.WestEurope,
+        Regions.NorthEurope
+    }
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Set the preferred region, always</div>
+    <p style="margin:0">Without <code>ApplicationRegion</code> or <code>ApplicationPreferredRegions</code>, the
+      SDK uses the account's default write region — which may be on another continent from the compute.
+      <br><br>
+      That's a silent, permanent latency penalty on every read: a service in West Europe reading from an
+      account whose primary is East US pays 80–100ms per read for no reason.
+      <br><br>
+      It's one line of configuration and it's frequently missing, because everything works — just slowly.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The change feed is a persistent log, ordered within a logical partition only.</li>
+      <li>Deletes aren't in the default feed — soft delete plus TTL, or the all-versions mode.</li>
+      <li>Only the latest version appears, so it's state-change notification, not an event log.</li>
+      <li>The lease container gives automatic scale-out and resumption; provision it properly.</li>
+      <li>Parallelism is bounded by partition range count.</li>
+      <li>A different processor name gives an independent consumer.</li>
+      <li>At-least-once delivery — handlers must be idempotent.</li>
+      <li>The change feed removes the dual-write problem.</li>
+      <li>Multi-region writes cost conflict handling, Strong consistency and ~2× RU.</li>
+      <li>Last Writer Wins silently discards updates. Don't default into it.</li>
+      <li>Better: partition by region affinity, or model append-only, so conflicts can't occur.</li>
+      <li>Always set the preferred region on the client.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Expecting deletes in the change feed</strong>, so derived stores grow forever.</li>
+    <li><strong>Expecting every intermediate version</strong> when only the latest appears.</li>
+    <li><strong>Non-idempotent change feed handlers.</strong></li>
+    <li><strong>An under-provisioned lease container</strong>, throttling the processor.</li>
+    <li><strong>Duplicate instance names</strong>, so instances fight over leases.</li>
+    <li><strong>Scaling consumers beyond the partition count</strong> and expecting more throughput.</li>
+    <li><strong>Enabling multi-region writes without needing them</strong>, then hitting conflicts.</li>
+    <li><strong>Leaving Last Writer Wins</strong> on data where losing an update matters.</li>
+    <li><strong>Assuming Strong consistency works with multi-region writes.</strong></li>
+    <li><strong>Not setting the preferred region</strong>, paying cross-continent latency silently.</li>
+    <li><strong>Never testing a failover.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>You need to maintain a search index and a summary view from a Cosmos container. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The change feed, with <strong>two independent processors</strong> — and that second point is the one
+          people miss."</p>
+        <p>"A change feed consumer is identified by its <strong>processor name</strong>, and each name gets its
+          own set of leases and its own position. So I'd run one processor called something like
+          <code>search-index</code> and another called <code>summary-view</code>. They read the same feed
+          completely independently — if the search indexer falls behind or fails, the summary view keeps
+          going, and I can replay one without touching the other."</p>
+        <p>"Why the change feed rather than dual writes: with dual writes, the application writes to Cosmos and
+          then to the search index, and if the second call fails they diverge silently with no recovery
+          mechanism. It also puts the burden on every code path that writes, so one forgotten path is a
+          permanent inconsistency. The change feed derives the event stream from the committed data — one
+          write, nothing to keep in sync."</p>
+        <p>"Implementation details that matter."</p>
+        <p>"<strong>Idempotency is mandatory.</strong> Checkpointing happens after the handler returns, so a
+          crash mid-batch redelivers the whole batch. For a search index that's naturally fine — indexing the
+          same document twice is idempotent. For the summary view it depends: if it's an upsert of a computed
+          projection, fine. If it's 'increment a counter', that <em>will</em> double-count on redelivery, so I'd
+          either recompute from source rather than increment, or keep a processed-version marker on the
+          summary document."</p>
+        <p>"<strong>Deletes need handling explicitly.</strong> This is the trap — the default change feed
+          contains inserts and updates only, <em>not deletes</em>. So a search index built naively on it never
+          removes anything and slowly fills with items that no longer exist. The fix is a soft delete: set
+          <code>isDeleted: true</code> with a short TTL. The update appears in the feed so consumers can remove
+          the entry, and TTL cleans up the item afterwards using spare RU. There's also an all-versions-and-deletes
+          mode, with a shorter retention window."</p>
+        <p>"<strong>Provision the lease container.</strong> It's a real container consuming RU, and
+          under-provisioning it throttles the processor — which presents as the consumer being inexplicably
+          slow, and it's not an obvious place to look."</p>
+        <p>"<strong>Scale-out is bounded by partition ranges.</strong> The lease mechanism distributes work per
+          partition range, so running 20 instances against 4 ranges leaves 16 idle. Worth knowing before
+          concluding that more replicas will fix a backlog."</p>
+        <p>"<strong>Monitor lag.</strong> I'd track the gap between the newest change and the consumer's
+          position, and alert on it — because a stalled consumer means the search index and summary quietly
+          drift from reality, and nothing errors."</p>
+        <p>"For the summary view specifically, the payoff is worth naming: it turns an expensive
+          cross-partition aggregate — which would cost hundreds of RU on every page load and get worse as
+          partitions split — into a <strong>1 RU point read</strong>. That's usually the strongest argument for
+          building it at all."</p>
+        <p>"On hosting: Azure Functions with a Cosmos DB trigger is the least-code option and wraps the same
+          processor. I'd use it unless I needed finer control over batching or error handling, in which case a
+          hosted service with the processor builder directly. Either way I'd want a <strong>replay
+          path</strong> — the ability to reset a lease and rebuild from the beginning — because schema changes
+          to the index will need it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know separate processor names give independent consumers?</li>
+        <li>Do you catch that deletes aren't in the feed?</li>
+        <li>Do you require idempotency and know which operations aren't?</li>
+        <li>Do you know the lease container needs throughput?</li>
+        <li>Do you monitor lag and plan for replay?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> dual writes from the application.</li>
+        <li><span class="redflag">Red flag:</span> one processor doing both jobs, coupling their failures.</li>
+        <li><span class="redflag">Red flag:</span> no plan for deletes.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you rebuild the index from scratch?</li>
+          <li>How do you make a counter update idempotent?</li>
+          <li>What if ordering across partitions mattered?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Should you enable multi-region writes? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Usually no, and I'd want a specific reason — because it sounds like a straightforward upgrade and it
+          changes the correctness model of the application."</p>
+        <p>"What you gain: <strong>local write latency everywhere</strong>, and <strong>write availability if a
+          region is lost</strong> — no failover needed, other regions keep accepting writes."</p>
+        <p>"What you give up is more significant than people expect."</p>
+        <p>"<strong>Conflicts become possible</strong>, and you have to decide what happens. The default is Last
+          Writer Wins, which is the least safe option: two regions update the same item, the later timestamp
+          wins, and the other update is <em>silently discarded</em> — no error, nothing logged by default. For a
+          profile edit that's tolerable. For a shopping cart, someone's added item vanishes. For a counter or
+          balance, you've lost a transaction. And <code>_ts</code> has second-level granularity with clock skew
+          between regions, so 'later' isn't strictly reliable for near-simultaneous updates."</p>
+        <p>"<strong>Strong consistency becomes unavailable.</strong> That's not a Cosmos limitation, it's CAP
+          arithmetic — you can't have linearizability while independent regions accept writes without
+          coordinating."</p>
+        <p>"<strong>Roughly double the RU cost.</strong>"</p>
+        <p>"So the question I'd ask is: <strong>do users actually write from multiple regions?</strong> Most
+          applications read far more than they write. Multi-region <em>reads</em> with single-region writes gets
+          you local read latency — which is what users experience — with zero conflict complexity and normal
+          cost. That's the configuration I'd default to, and it covers most global deployments."</p>
+        <p>"I'd enable multi-region writes when write latency is genuinely a product requirement for
+          geographically distributed users, or when write availability during a full regional outage is a hard
+          requirement — a system that must keep accepting orders even if a region is gone."</p>
+        <p>"And if I do enable it, the design work is <strong>making conflicts impossible rather than
+          resolvable</strong>."</p>
+        <p>"<strong>Region affinity in the partitioning</strong>: if a user's data is only ever written from
+          their home region — which is usually naturally true — two regions never write the same item, so
+          conflicts don't arise regardless of the policy."</p>
+        <p>"<strong>Append-only modelling</strong>: conflicts only occur on updates to the same item. Two
+          regions each inserting a new document with distinct ids cannot conflict. So an event or ledger shape,
+          with current state derived from the entries, sidesteps the problem entirely — and that's often the
+          right model for globally-distributed data anyway."</p>
+        <p>"Where I genuinely can't avoid concurrent updates to one item, I'd use a <strong>custom merge
+          procedure</strong> if the data can be merged — set union, additive counters — or <strong>manual
+          resolution</strong> with the conflicts feed if it needs domain judgement. What I wouldn't do is leave
+          Last Writer Wins on data where losing an update matters, which is the common failure."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you default to no, with reasons?</li>
+        <li>Do you know Last Writer Wins loses data silently?</li>
+        <li>Do you know Strong is unavailable, and why?</li>
+        <li>Do you distinguish multi-region reads from writes?</li>
+        <li>Do you design conflicts out rather than resolving them?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "yes, for high availability" with no conflict
+          discussion.</li>
+        <li><span class="redflag">Red flag:</span> not knowing conflicts are possible.</li>
+        <li><span class="redflag">Red flag:</span> assuming Strong consistency still works.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Write a custom conflict resolution procedure.</li>
+          <li>How would you detect that conflicts are occurring?</li>
+          <li>What's the RPO on an unplanned regional failover?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

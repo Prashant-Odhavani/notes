@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Boundaries &amp; Decomposition — Microservices</title>
+<meta name="description" content="How to find a real service boundary, database-per-service, the shared-data problem, and why data ownership is the actual test.">
+<meta name="keywords" content="microservices boundaries bounded context decomposition database per service shared database anti-pattern data ownership entity service nanoservice conway's law aggregate coupling cohesion">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="20-microservices/boundaries.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Boundaries &amp; Decomposition</h1>
+    <p class="subtitle">The only decision that really matters. Get boundaries wrong and everything downstream is
+      damage control.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Split by business capability</strong>, never by technical layer or by entity.</li>
+      <li><strong>A service owns its data.</strong> Nobody else reads its tables. That's the actual test.</li>
+      <li><strong>A shared database means you don't have microservices</strong> — you have a distributed
+        monolith.</li>
+      <li><strong>Chatty services are a boundary error</strong> — the wrong seam was cut.</li>
+      <li><strong>Bounded contexts from DDD are the best available guide.</strong></li>
+      <li><strong>The same word can mean different things</strong> in different contexts. That's a boundary
+        signal, not a modelling failure.</li>
+      <li><strong>Prefer too few, larger services.</strong> Merging is easy; splitting isn't.</li>
+    </ul>
+  </div>
+
+  <h2 id="wrong-ways">The wrong ways to split <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Split by</th><th>Why it fails</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Technical layer</strong> — an API service, a business-logic service, a data service</td>
+          <td><strong>Every feature crosses every service.</strong> You've distributed the layers of a
+              monolith, so nothing can be deployed independently</td>
+        </tr>
+        <tr>
+          <td><strong>Entity</strong> — a Customer service, an Order service, a Product service</td>
+          <td>Sounds right and usually isn't. Entities are used <em>by</em> capabilities, not owned by them.
+              Leads to anaemic CRUD services that everything else calls constantly</td>
+        </tr>
+        <tr>
+          <td><strong>Team convenience</strong> — one per developer</td>
+          <td>Boundaries follow staffing rather than the domain, and change when people leave</td>
+        </tr>
+        <tr>
+          <td><strong>Technology</strong> — everything Redis touches in one service</td>
+          <td>Infrastructure isn't a domain concern</td>
+        </tr>
+        <tr>
+          <td><strong>Size</strong> — "services should be small"</td>
+          <td>Produces nanoservices. Ten services that must be called in sequence to do one thing</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The entity-service trap is the most seductive one</div>
+    <p style="margin:0">"A Customer service, an Order service, a Product service" is the split almost every team
+      reaches for first, because it maps to the database tables and feels tidy.
+      <br><br>
+      The problem is that <strong>entities aren't capabilities</strong>. Placing an order needs customer data,
+      product data, pricing, inventory and payment — so the Order service calls four others synchronously for
+      every request. That's five network hops, five failure modes, and a latency floor that's the sum of all of
+      them.
+      <br><br>
+      And the services end up anaemic: a Customer service that only does CRUD isn't a business capability, it's a
+      <strong>distributed data access layer</strong>. All the logic lives in whoever orchestrates it, so the
+      boundaries deliver nothing.
+      <br><br>
+      The tell is a service whose API is <code>Get</code>, <code>Create</code>, <code>Update</code>,
+      <code>Delete</code> and nothing else. That's a table with HTTP in front of it.</p>
+  </div>
+
+  <h2 id="right-way">Split by business capability <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A good service does <strong>one thing the business would recognise as a thing</strong>, and does all of
+      it.</p>
+    <p>"Fulfilment" — picking, packing, shipping, tracking. "Billing" — invoicing, payment collection, dunning.
+      Not "the Order table".</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Test</th><th>A good boundary</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Can it be deployed alone?</strong></td><td>Yes, without coordinating other services</td></tr>
+        <tr><td><strong>Does it own its data?</strong></td><td>Yes — nothing else reads its store directly</td></tr>
+        <tr><td><strong>Can it complete its work locally?</strong></td><td>Mostly, without synchronous calls to others</td></tr>
+        <tr><td><strong>Would a business person name it?</strong></td><td>Yes — "billing", "fulfilment", "search"</td></tr>
+        <tr><td><strong>Does one team own it?</strong></td><td>Yes, end to end</td></tr>
+        <tr><td><strong>Do changes stay inside it?</strong></td><td>Most feature work touches one service</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A restaurant isn't organised into a "plate department", a "food department" and a "customer department".</p>
+    <p>It's organised into <strong>kitchen</strong>, <strong>front of house</strong> and <strong>bar</strong> —
+      each of which handles plates, food and customers as needed to do its own job completely.</p>
+    <p>Splitting by <em>noun</em> gives you departments that can't function alone. Splitting by
+      <em>capability</em> gives you teams that can.</p>
+  </div>
+
+  <h2 id="bounded-contexts">Bounded contexts <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The idea that makes boundaries findable</span>
+    <p>A <strong>bounded context</strong> is a region where a term has one specific, consistent meaning.</p>
+    <p>The insight: <strong>the same word usually means different things in different parts of a
+      business</strong> — and where the meaning changes is where the boundary is.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>"Customer" in…</th><th>Actually means</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Sales</strong></td><td>A lead with a pipeline stage, an owner and a probability</td></tr>
+        <tr><td><strong>Billing</strong></td><td>A payer with a payment method, a billing address and a credit limit</td></tr>
+        <tr><td><strong>Support</strong></td><td>A contact with a ticket history and an entitlement level</td></tr>
+        <tr><td><strong>Fulfilment</strong></td><td>A delivery address and a set of delivery preferences</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — resist the single shared Customer model</div>
+    <p style="margin:0">The instinct is to build one canonical Customer that every service shares, because
+      duplication looks wrong.
+      <br><br>
+      What happens is that the model accumulates <strong>every field any context needs</strong> — pipeline stage,
+      credit limit, ticket history, delivery preferences — so it becomes enormous and nobody can change it,
+      because a change affects every service. It becomes the coupling point the whole architecture was meant to
+      avoid.
+      <br><br>
+      The correct answer is that <strong>each context has its own model of Customer</strong>, containing only
+      what it needs, linked by a shared identifier. Billing's Customer has a credit limit; Fulfilment's has a
+      delivery address. Neither knows about the other's fields.
+      <br><br>
+      That looks like duplication and isn't — they're <em>different concepts</em> that happen to share a name.
+      Being able to make that argument is one of the clearest DDD signals, because the instinct to unify is
+      strong and unifying is what creates the distributed monolith.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Practical ways to find the seams</div>
+    <ul style="margin:8px 0 0">
+      <li><strong>Listen for language changes.</strong> When the same word means something different in another
+        conversation, you've crossed a boundary.</li>
+      <li><strong>Follow the org chart, cautiously.</strong> Conway's law means your architecture will resemble
+        your communication structure anyway — so existing team boundaries are evidence, though not if the org is
+        itself badly structured.</li>
+      <li><strong>Look at change history.</strong> Files that always change together belong together. That's
+        measurable from git rather than a matter of opinion.</li>
+      <li><strong>Event storming.</strong> Map the domain events in time order; clusters of events with the same
+        actors and data tend to be contexts.</li>
+      <li><strong>Follow transaction boundaries.</strong> Things that must be atomic together should live
+        together — this is the strongest technical constraint.</li>
+    </ul>
+  </div>
+
+  <h2 id="data-ownership">Data ownership is the real test <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Database-per-service is not an implementation detail. It's the definition.</strong></p>
+    <p>If two services read the same tables, they're coupled at the schema — so neither can change its schema
+      independently, and therefore neither can be deployed independently.</p>
+    <p>At which point you've paid for distribution and kept the coupling. <strong>The database is where
+      microservices actually succeed or fail.</strong></p>
+  </div>
+
+  <pre data-label="text — shared database: the coupling survives the split" class="code-bad"><code class="language-text">  Orders Service  ──┐
+  Billing Service ──┼──►  [ One shared database ]
+  Support Service ──┘
+
+  - Adding a column risks breaking two other services
+  - Nobody can migrate without coordinating with everyone
+  - A slow query in Support degrades Orders
+  - "Who is allowed to write to this table?" has no answer
+  - You cannot deploy independently, which was the entire point</code></pre>
+
+  <pre data-label="text — data ownership: each service owns its store" class="code-good"><code class="language-text">  Orders Service  ──►  [ Orders DB ]
+  Billing Service ──►  [ Billing DB ]
+  Support Service ──►  [ Support DB ]
+
+  Data crosses boundaries by API call or by event -
+  never by reading another service's tables.</code></pre>
+
+  <h3 id="shared-data">The three hard shared-data problems</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Problem</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Service B needs some of A's data</strong></td>
+          <td><strong>Replicate what it needs</strong> via events, keeping a local read-only copy. B queries its
+              own store, so it works when A is down</td>
+        </tr>
+        <tr>
+          <td><strong>A report spanning several services</strong></td>
+          <td>A dedicated <strong>reporting store</strong> fed by events from all of them. Do not join across
+              service databases</td>
+        </tr>
+        <tr>
+          <td><strong>Reference data everyone needs</strong> — countries, currencies</td>
+          <td>Publish it and let each service cache a copy. It changes rarely, so staleness is harmless</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — data replication is the answer, and it needs to be defended</div>
+    <p style="margin:0">"Copy the data you need into your own store" sounds wrong to anyone with relational
+      instincts — it's denormalisation across a network, with eventual consistency.
+      <br><br>
+      But the alternative is worse. If Billing calls Orders synchronously every time it needs order data, then
+      <strong>Billing is down whenever Orders is down</strong>, and its latency includes Orders' latency. You've
+      created a runtime dependency where you wanted an ownership boundary.
+      <br><br>
+      With replication, Billing holds the order fields it cares about, updated by events. It queries locally, so
+      it's <strong>available independently</strong> — which is the fault isolation microservices are supposed to
+      provide.
+      <br><br>
+      The costs to state honestly: the copy is <strong>eventually consistent</strong>, you need the
+      <a href="../19-architecture/distributed-data.html#outbox">outbox pattern</a> so events aren't lost, and you
+      need <strong>reconciliation</strong> because copies drift. Anyone proposing replication without a
+      reconciliation plan hasn't run it in production.
+      <br><br>
+      This is the same reasoning as
+      <a href="../14-cosmos-db/modeling-cost.html">duplicating a document under two partition keys</a> — pay on
+      write to make reads independent.</p>
+  </div>
+
+  <h2 id="granularity">How big should a service be? <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Too small (nanoservices)</th><th>Too large</th></tr></thead>
+      <tbody>
+        <tr><td>One operation needs five services in sequence</td><td>Several teams contend over one service</td></tr>
+        <tr><td>Latency is dominated by network hops</td><td>Deployments are risky because scope is broad</td></tr>
+        <tr><td>Sagas needed for what should be one transaction</td><td>Unrelated concerns change for unrelated reasons</td></tr>
+        <tr><td>More time in serialisation than in logic</td><td>Scaling means scaling things that don't need it</td></tr>
+        <tr><td>A change touches four repositories</td><td>Slow test suite, slow pipeline</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Err on the side of too few</div>
+    <p style="margin:0">The asymmetry matters: <strong>merging two services is straightforward; splitting one is
+      hard.</strong>
+      <br><br>
+      Merging means moving code into one deployable and combining two schemas — unpleasant but bounded. Splitting
+      means finding a boundary that may not exist, separating entangled data, introducing a saga where a
+      transaction was, and doing it without downtime.
+      <br><br>
+      So when uncertain, keep it together. A service that turns out to be two is a manageable problem; two that
+      should have been one is a permanent tax on every feature that spans them.
+      <br><br>
+      The useful heuristic is <strong>the transaction boundary</strong>: if two things must change atomically,
+      they belong in the same service. Splitting across a transaction boundary is the decision that generates
+      sagas, and sagas are the most expensive thing on <a href="data-consistency.html">the consistency
+      page</a>.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Split by business capability. Never by layer, and be suspicious of splitting by entity.</li>
+      <li>A service whose API is only CRUD is a distributed data access layer, not a capability.</li>
+      <li>Bounded contexts: where a word's meaning changes is where the boundary is.</li>
+      <li>Resist a single shared model — each context keeps its own view, linked by identifier.</li>
+      <li>Data ownership is the definition, not a detail. A shared database means no independent
+        deployment.</li>
+      <li>Replicate the data you need via events, so you stay available when the source is down.</li>
+      <li>Replication requires an outbox and a reconciliation plan.</li>
+      <li>Don't join across service databases — use a reporting store fed by events.</li>
+      <li>Prefer fewer, larger services. Merging is easy; splitting isn't.</li>
+      <li>Things that must be atomic together belong in the same service.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Splitting by technical layer</strong>, so every feature crosses every service.</li>
+    <li><strong>Entity services</strong> that only do CRUD.</li>
+    <li><strong>A shared database</strong> across services.</li>
+    <li><strong>Direct database reads</strong> into another service's tables.</li>
+    <li><strong>One canonical shared model</strong> that nobody can change.</li>
+    <li><strong>Synchronous calls for data</strong> that could be replicated.</li>
+    <li><strong>Replication with no reconciliation job.</strong></li>
+    <li><strong>Joining across service databases</strong> for reporting.</li>
+    <li><strong>Nanoservices</strong> requiring five hops per operation.</li>
+    <li><strong>Splitting across a transaction boundary</strong>, forcing a saga.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>How would you decide where the service boundaries go in an e-commerce system? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by ruling out the two splits people usually reach for."</p>
+        <p>"<strong>Not by technical layer</strong> — an API service, a logic service, a data service. That
+          distributes the layers of a monolith, so every feature crosses every service and nothing can be
+          deployed independently."</p>
+        <p>"<strong>And I'd be very cautious about splitting by entity</strong> — a Customer service, an Order
+          service, a Product service. It's the most seductive option because it maps to the tables, and it
+          usually produces anaemic CRUD services. Placing an order then needs customer, product, pricing,
+          inventory and payment data, so the Order service calls four others synchronously for every request:
+          five hops, five failure modes, and a latency floor that's the sum of all of them. The tell is a service
+          whose whole API is Get/Create/Update/Delete — that's a table with HTTP in front of it, and all the real
+          logic ends up in whoever orchestrates them."</p>
+        <p>"<strong>What I'd split by is business capability</strong> — something the business would recognise as
+          a thing, that does all of that thing. For e-commerce that's more like <em>Catalogue</em>,
+          <em>Basket</em>, <em>Ordering</em>, <em>Payments</em>, <em>Fulfilment</em>, <em>Identity</em>.
+          Fulfilment owns picking, packing, shipping and tracking — not 'the Shipment table'."</p>
+        <p>"To find those boundaries I'd use <strong>bounded contexts</strong>, and the practical technique is
+          listening for where language changes meaning. 'Customer' in Sales is a lead with a pipeline stage. In
+          Billing it's a payer with a credit limit. In Fulfilment it's a delivery address and preferences. Where
+          the meaning shifts is where the boundary is."</p>
+        <p>"That leads to the point I'd emphasise: <strong>resist building one canonical Customer model.</strong>
+          The instinct is to unify because duplication looks wrong. What happens is the model accumulates every
+          field any context needs, becomes enormous, and then nobody can change it without affecting every
+          service — so it becomes the exact coupling point the architecture was meant to remove. Each context
+          should hold its own view of Customer with only the fields it needs, linked by a shared id. Those are
+          different concepts sharing a name, not duplication."</p>
+        <p>"Then the test that actually decides whether a boundary is real: <strong>does the service own its
+          data?</strong> Database-per-service isn't an implementation detail, it's the definition. If Orders and
+          Billing read the same tables, neither can migrate its schema without coordinating — so neither can
+          deploy independently, and that was the whole point."</p>
+        <p>"For data that legitimately crosses boundaries, I'd <strong>replicate rather than call
+          synchronously</strong>. Billing keeps a local copy of the order fields it needs, updated by events, so
+          it queries its own store and stays available when Ordering is down. That's the fault isolation you're
+          supposedly buying. It's eventually consistent, it needs an outbox so events aren't lost, and it needs a
+          reconciliation job because copies drift — I'd state all three rather than presenting it as free."</p>
+        <p>"For reporting across services, a <strong>separate reporting store</strong> fed by events. Never a
+          join across service databases."</p>
+        <p>"Two practical constraints I'd apply. <strong>Follow transaction boundaries</strong>: if two things
+          must change atomically, they belong in the same service — splitting across a transaction is what
+          generates sagas, which are the most expensive thing here. And <strong>err on the side of fewer, larger
+          services</strong>, because merging two is straightforward and splitting one is hard. A service that
+          turns out to be two is manageable; two that should have been one taxes every feature that spans
+          them."</p>
+        <p>"And honestly, for most e-commerce systems I'd start these as <strong>modules in one
+          deployable</strong> with those boundaries enforced, and extract only where a specific capability proves
+          it needs independent deployment."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reject layer-based splitting, and question entity-based?</li>
+        <li>Do you know bounded contexts and the language-change heuristic?</li>
+        <li>Will you argue against a canonical shared model?</li>
+        <li>Do you treat data ownership as the definitive test?</li>
+        <li>Do you prefer replication over synchronous calls, with its costs stated?</li>
+        <li>Do you respect transaction boundaries?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a service per entity with no reflection.</li>
+        <li><span class="redflag">Red flag:</span> a shared database "for simplicity".</li>
+        <li><span class="redflag">Red flag:</span> one canonical model shared by all services.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Basket and Ordering both need product prices. How?</li>
+          <li>How do you reconcile drifted replicas?</li>
+          <li>What if a report needs data from six services in real time?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

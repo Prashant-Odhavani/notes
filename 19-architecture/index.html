@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture &amp; Integration — Overview</title>
+<meta name="description" content="How to think about software architecture: what it decides, the questions that drive every architectural choice, and how the pieces of this section fit together.">
+<meta name="keywords" content="software architecture layered clean hexagonal modular monolith microservices event driven ddd resilience distributed data trade-offs">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="19-architecture/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Architecture &amp; Integration</h1>
+    <p class="subtitle">How systems get structured, how the pieces talk, and what keeps them alive when
+      parts of them fail.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>Architecture answers three questions: <strong>what are the pieces, how do they talk, and where
+        does the data live?</strong></li>
+      <li>Every architecture style is a different answer to "what do we want to be able to change
+        independently?"</li>
+      <li>The moment you split a system across a network, you inherit partial failure, latency and eventual
+        consistency. Everything in this section is about paying that bill.</li>
+      <li>Layered, Clean, Hexagonal and Onion are variations of one idea: <em>dependencies point inward,
+        toward the stable business rules</em>.</li>
+      <li>You almost never need distributed architecture for scale. You need it for
+        <strong>independent deployability</strong> — which is an organisational need.</li>
+      <li>Name the trade-off you're accepting. Every architecture makes something worse.</li>
+    </ul>
+  </div>
+
+  <h2 id="what-architecture-decides">What architecture actually decides <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Architecture is the set of decisions that are <strong>expensive to reverse</strong> — and almost all
+      of them are about <em>boundaries</em>.</p>
+  </div>
+
+  <p>Three questions cover most of it:</p>
+
+  <ol class="steps">
+    <li><strong>What are the pieces?</strong> Modules, services, layers. Where does one end and the next
+      begin? (<a href="application-architecture.html">Application architectures</a>,
+      <a href="ddd.html">DDD</a>.)</li>
+    <li><strong>How do they talk?</strong> Synchronous call or message? Request/reply or fire-and-forget?
+      Who knows about whom? (<a href="integration-patterns.html">Integration patterns</a>,
+      <a href="event-driven.html">event-driven architecture</a>.)</li>
+    <li><strong>Where does the data live, and who owns it?</strong> One database or many? What happens when
+      two components need the same data? (<a href="distributed-data.html">Distributed data</a>.)</li>
+  </ol>
+
+  <p>And then a fourth question that only shows up in production:
+    <strong>what happens when a piece fails?</strong> (<a href="resilience-patterns.html">Resilience
+    patterns</a>.)</p>
+
+  <h2 id="the-central-trade-off">The trade-off underneath everything <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>Almost every architectural argument reduces to one axis:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Fewer, larger pieces</th><th>More, smaller pieces</th></tr></thead>
+      <tbody>
+        <tr><td>Change spanning components</td><td>One commit, one deploy, one transaction</td><td>Coordinated across teams and releases</td></tr>
+        <tr><td>Consistency</td><td>Transactions do it for you</td><td>You implement it — sagas, outbox, idempotency</td></tr>
+        <tr><td>Debugging</td><td>One stack trace</td><td>Distributed tracing, correlation IDs, several dashboards</td></tr>
+        <tr><td>Independent deployment</td><td>No</td><td>Yes — this is the actual reason to split</td></tr>
+        <tr><td>Independent scaling</td><td>Scale the whole thing</td><td>Scale the hot part only</td></tr>
+        <tr><td>Failure isolation</td><td>One bad component can take everything down</td><td>Contained — <em>if</em> you built bulkheads and timeouts</td></tr>
+        <tr><td>Team autonomy</td><td>Coordination on shared code</td><td>Teams own their service end to end</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Saying that <strong>splitting is primarily an organisational decision, not a
+      technical one</strong>. Most systems that "need microservices for scale" could scale fine as a
+      monolith on bigger hardware. What they actually can't do is let eight teams deploy independently.
+      <br><br>
+      Getting that distinction right is one of the clearest markers of architectural experience.</p>
+  </div>
+
+  <h2 id="what-changes-across-the-network">What changes the moment you cross a network <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p>This is the bill you pay for distribution, and it's worth being able to list:</p>
+
+  <ul>
+    <li><strong>Partial failure.</strong> An in-process call either works or throws. A network call can also
+      hang, time out, succeed-but-you-didn't-hear, or succeed twice.</li>
+    <li><strong>No shared transaction.</strong> You can't roll back a call another service already committed.
+      That's why <a href="distributed-data.html#saga">sagas</a> exist.</li>
+    <li><strong>Latency stops being free.</strong> A method call is nanoseconds. A network call is
+      milliseconds. Do it in a loop and you've built an N+1 across the network.</li>
+    <li><strong>Ordering isn't guaranteed.</strong> Messages arrive out of order, or twice.</li>
+    <li><strong>Contracts become versioned.</strong> You can't change a shared type and recompile — the other
+      side is already deployed.</li>
+  </ul>
+
+  <p>Every pattern in this section exists because of one of those five.</p>
+
+  <h2 id="how-to-choose">How to choose an architecture</h2>
+
+  <p>A practical order of questions, rather than starting from a diagram:</p>
+
+  <ol class="steps">
+    <li><strong>How many teams need to deploy independently?</strong> One team → a modular monolith is
+      almost always right. Many teams with separate release cadences → the case for services starts to
+      exist.</li>
+    <li><strong>What must be strongly consistent?</strong> Anything that must be transactionally consistent
+      should live in one service, in one database. Splitting it is how you end up implementing distributed
+      transactions by hand.</li>
+    <li><strong>What actually needs to scale differently?</strong> Usually one or two components. Those are
+      candidates for extraction — not everything.</li>
+    <li><strong>What's the team's operational maturity?</strong> Distributed systems require tracing,
+      centralised logging, deployment automation and on-call. Without those, splitting makes things worse,
+      not better.</li>
+    <li><strong>What's genuinely likely to change?</strong> Put boundaries where change happens, not where
+      the layers diagram suggests.</li>
+  </ol>
+
+  <h2 id="contents">Section contents</h2>
+  <div class="card-grid" data-section-index></div>
+
+  <h2 id="related">Where the rest lives</h2>
+
+  <p>This section covers architecture as a discipline. Some closely related material has its own section:</p>
+
+  <ul>
+    <li><a href="../20-microservices/index.html">Microservices</a> — boundaries, communication, migration,
+      and the operational cost in detail.</li>
+    <li><a href="../21-messaging/index.html">Messaging &amp; Pub/Sub</a> — queue vs topic semantics, delivery
+      guarantees, DLQs.</li>
+    <li><a href="../23-multi-tenant-saas/index.html">Multi-tenant SaaS</a> — the tenancy dimension, which
+      cuts across every architectural decision.</li>
+    <li><a href="../36-system-design/index.html">System design exercises</a> — all of this applied to full
+      designs.</li>
+  </ul>
+
+  <h2 id="interview-questions">Cross-cutting interview questions</h2>
+
+  <details class="qa">
+    <summary>How do you decide on an architecture for a new system?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I start from constraints rather than from a style. The questions that actually determine the
+          answer are: how many teams will work on this, what has to be strongly consistent, what needs to
+          scale differently, and what's the team's operational maturity."</p>
+        <p>"For most new systems my default is a <strong>modular monolith</strong> — one deployable, but with
+          hard internal boundaries between modules, each owning its own data and talking through explicit
+          interfaces. That gives me most of the design benefits of services with none of the distributed
+          cost, and it keeps the option open: if a module later needs independent deployment, the seam is
+          already there."</p>
+        <p>"I'd only start distributed if there's a concrete reason on day one — several teams with
+          conflicting release cadences, a component with wildly different scaling needs, or a regulatory
+          requirement to isolate something."</p>
+        <p>"The thing I try hardest to get right early is <em>where the boundaries are</em>, because that's
+          the expensive decision. Anything that must be transactionally consistent stays together. Boundaries
+          go where the business language changes, which is really the bounded context idea from DDD."</p>
+        <p>"And I'd name what I'm trading away. A monolith means the whole thing deploys together and one
+          bad component can affect the rest, so I'd want good module isolation and testing. Saying that out
+          loud matters — an architecture presented with no downsides is usually one that hasn't been thought
+          through."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reason from constraints, or arrive with a favourite style?</li>
+        <li>Do you understand that boundaries are the expensive decision?</li>
+        <li>Do you state trade-offs unprompted?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "microservices" as a default for a new system with one team.</li>
+        <li><span class="redflag">Red flag:</span> naming a layered diagram without mentioning data ownership or failure.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you stop a modular monolith turning into a big ball of mud?</li>
+          <li>When would you extract the first service, and which one?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What changes when two components are separated by a network? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Five things, and each one creates work you didn't have before."</p>
+        <p>"<strong>Partial failure.</strong> An in-process call either returns or throws. A network call can
+          also hang, time out, or succeed without you hearing the response. That last one is the nasty case,
+          because retrying might duplicate the effect — which is why idempotency stops being optional."</p>
+        <p>"<strong>No shared transaction.</strong> You can't roll back something the other service already
+          committed. So you either keep the things that must be consistent together, or you accept eventual
+          consistency and implement compensation — a saga."</p>
+        <p>"<strong>Latency becomes real.</strong> A method call is nanoseconds; a network call is
+          milliseconds. If you call it inside a loop you've built an N+1 across the network, and that's one
+          of the most common performance failures in service architectures."</p>
+        <p>"<strong>Ordering isn't guaranteed.</strong> Messages can arrive out of order or twice, so
+          handlers have to tolerate both."</p>
+        <p>"<strong>Contracts become versioned.</strong> You can't change a shared type and recompile — the
+          other side is already deployed and running. Every change has to be backwards compatible for at
+          least one release."</p>
+        <p>"So my summary would be: distribution is not a free way to organise code. It converts compiler
+          errors into runtime failures, and it converts transactions into engineering work."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Have you actually operated a distributed system, or only drawn one?</li>
+        <li>Do you connect each consequence to the pattern that addresses it?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you make a handler idempotent?</li>
+          <li>What's the difference between a saga and a distributed transaction?</li>
+          <li>How would you find an N+1 across services?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

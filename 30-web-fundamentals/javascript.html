@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JavaScript — Web Fundamentals</title>
+<meta name="description" content="Types and coercion, scope and closures, this, prototypes, promises and the event loop — explained for developers who already know C#.">
+<meta name="keywords" content="JavaScript event loop microtask macrotask call stack closures this binding arrow function prototype promise async await == vs === coercion hoisting let const var TDZ Web Worker memory leak">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="30-web-fundamentals/javascript.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>JavaScript</h1>
+    <p class="subtitle">The highest-value page in this section. The event loop and closures explain most of what
+      surprises a C# developer.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>One thread.</strong> Synchronous work blocks rendering, input and everything else.</li>
+      <li><strong>Microtasks drain completely before the next macrotask.</strong> That's the ordering rule.</li>
+      <li><strong>Promises are microtasks; <code>setTimeout</code> is a macrotask.</strong> So a promise always
+        wins.</li>
+      <li><strong>A closure captures the variable, not its value.</strong></li>
+      <li><strong><code>this</code> depends on the call site</strong> — except in arrow functions, which capture
+        it.</li>
+      <li><strong><code>===</code> always.</strong> <code>==</code> coerces, with surprising results.</li>
+      <li><strong><code>let</code>/<code>const</code>, never <code>var</code>.</strong></li>
+    </ul>
+  </div>
+
+  <h2 id="event-loop">The event loop <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>JavaScript has <strong>one call stack</strong>. When it's empty, the event loop takes the next queued
+      piece of work and runs it to completion.</p>
+    <p>Nothing interrupts running code. There is no pre-emption, so there are no data races — and no
+      parallelism either.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A single chef in a kitchen. They work on one dish at a time, start to finish, and never abandon a dish
+      halfway.</p>
+    <p>Orders queue up. Some orders are marked urgent (microtasks) and jump ahead of the normal queue
+      (macrotasks) — but only <em>between</em> dishes, never during one.</p>
+    <p>So one dish that takes twenty minutes blocks every other order, urgent or not.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Queue</th><th>Contains</th><th>Priority</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Call stack</strong></td>
+          <td>Currently executing code</td>
+          <td>Runs to completion, uninterruptible</td>
+        </tr>
+        <tr>
+          <td><strong>Microtask queue</strong></td>
+          <td><code>Promise.then</code>, <code>await</code> continuations,
+              <code>queueMicrotask</code>, <code>MutationObserver</code></td>
+          <td><strong>Drained completely</strong> after each task</td>
+        </tr>
+        <tr>
+          <td><strong>Macrotask queue</strong></td>
+          <td><code>setTimeout</code>, <code>setInterval</code>, I/O, DOM events</td>
+          <td>One per loop iteration</td>
+        </tr>
+        <tr>
+          <td><strong>Render</strong></td>
+          <td>Style, layout, paint</td>
+          <td>Between macrotasks, when the browser chooses</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The rule that answers every ordering question</span>
+    <p><strong>Run the current task to completion → drain <em>all</em> microtasks → maybe render → take
+      <em>one</em> macrotask → repeat.</strong></p>
+    <p>"Drain all microtasks" is the part people miss. If a microtask queues another microtask, that runs too,
+      <em>before</em> any timer.</p>
+  </div>
+
+  <pre data-label="javascript — the classic ordering question"><code class="language-javascript">console.log('1 sync');
+
+setTimeout(() =&gt; console.log('2 timeout'), 0);      // macrotask
+
+Promise.resolve().then(() =&gt; console.log('3 promise'));   // microtask
+
+queueMicrotask(() =&gt; console.log('4 microtask'));
+
+console.log('5 sync');
+
+// Output:
+//   1 sync
+//   5 sync        <- all synchronous code first
+//   3 promise     <- microtasks, in queue order
+//   4 microtask
+//   2 timeout     <- macrotask last, despite the 0ms delay</code></pre>
+
+  <div class="note warn">
+    <div class="note-title"><code>setTimeout(fn, 0)</code> does not mean "now"</div>
+    <p style="margin:0">It means "queue this as a macrotask". It runs after all synchronous code
+      <em>and</em> after every pending microtask — and browsers clamp nested timeouts to a minimum of about 4ms
+      anyway.
+      <br><br>
+      So <code>setTimeout(fn, 0)</code> is a way to <strong>yield to the event loop</strong>, letting rendering
+      and input happen. It is not a way to run something soon.
+      <br><br>
+      If you want "after the current work but before anything else", that's <code>queueMicrotask</code> or
+      <code>Promise.resolve().then()</code>.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A microtask loop starves the page permanently</div>
+    <pre data-label="javascript" class="code-bad"><code class="language-javascript">function spin() {
+  Promise.resolve().then(spin);   // queues another microtask, forever
+}
+spin();
+// The microtask queue never empties, so the browser NEVER renders again.
+// The tab is frozen and must be killed.</code></pre>
+    <p style="margin:0">Because microtasks are drained <em>completely</em> before anything else, a microtask
+      that queues another microtask creates an infinite queue. No rendering, no input, no timers — ever.
+      <br><br>
+      An equivalent <code>setInterval</code> loop is harmless by comparison, because macrotasks yield between
+      iterations.
+      <br><br>
+      This is a good thing to know because it's a real production hazard in recursive promise code, and it
+      demonstrates you understand <em>why</em> the drain rule matters rather than just reciting it.</p>
+  </div>
+
+  <h3 id="async-ordering">Where <code>async</code>/<code>await</code> fits</h3>
+
+  <pre data-label="javascript — await is a microtask boundary"><code class="language-javascript">async function run() {
+  console.log('A');            // synchronous - runs immediately
+  await null;                  // yields; the rest becomes a microtask
+  console.log('B');            // microtask
+}
+
+console.log('start');
+run();
+console.log('end');
+
+// Output: start, A, end, B
+//   Everything before the first await runs SYNCHRONOUSLY.
+//   Everything after it is a microtask continuation.</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The C# comparison worth holding onto</div>
+    <p style="margin:0">This is <strong>exactly</strong> like
+      <a href="../05-csharp-advanced/async-await.html">C#'s async state machine</a>: code before the first
+      <code>await</code> runs synchronously on the calling thread, and the continuation is scheduled.
+      <br><br>
+      The difference is where it resumes. In .NET the continuation may run on a different thread. In
+      JavaScript it always resumes on <strong>the same and only thread</strong>, as a microtask.
+      <br><br>
+      Which means: <strong>no locks are ever needed, and no work is ever offloaded.</strong> You get thread
+      safety for free and parallelism not at all.</p>
+  </div>
+
+  <h2 id="closures">Closures <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A closure is a function that <strong>remembers the variables where it was defined</strong>, and keeps
+      them alive after that scope has finished.</p>
+    <p>The critical detail: it captures <strong>the variable itself</strong>, not a snapshot of its value.</p>
+  </div>
+
+  <pre data-label="javascript — the interview classic" class="code-bad"><code class="language-javascript">for (var i = 0; i &lt; 3; i++) {
+  setTimeout(() =&gt; console.log(i), 100);
+}
+// Prints: 3, 3, 3
+//
+// `var` is FUNCTION-scoped, so there is exactly ONE `i`.
+// All three closures captured the same variable.
+// By the time the timers fire, the loop has finished and i === 3.</code></pre>
+
+  <pre data-label="javascript — let creates a binding per iteration" class="code-good"><code class="language-javascript">for (let i = 0; i &lt; 3; i++) {
+  setTimeout(() =&gt; console.log(i), 100);
+}
+// Prints: 0, 1, 2
+// `let` is BLOCK-scoped, so each iteration gets its own binding.</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>A closure captures the variable, not the value.</strong></p>
+    <p>That one sentence explains the loop puzzle, stale values in React effects, and why
+      <code>let</code> replaced <code>var</code>.</p>
+    <p>C# has the identical issue with <code>foreach</code> captures in older versions — so the concept isn't
+      foreign, just more visible here.</p>
+  </div>
+
+  <pre data-label="javascript — closures used deliberately" class="code-good"><code class="language-javascript">// Private state - the module pattern, before classes existed
+function createCounter() {
+  let count = 0;                              // not accessible from outside
+  return {
+    increment: () =&gt; ++count,
+    get value() { return count; }
+  };
+}
+
+// Debounce - the closure holds the pending timer between calls
+function debounce(fn, ms) {
+  let timer;                                  // survives across invocations
+  return (...args) =&gt; {
+    clearTimeout(timer);
+    timer = setTimeout(() =&gt; fn(...args), ms);
+  };
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Closures are the main cause of front-end memory leaks</div>
+    <p style="margin:0">A closure keeps its captured scope alive for as long as the function is reachable. So an
+      event listener that captures a large object keeps that object in memory <strong>until the listener is
+      removed</strong>.
+      <br><br>
+      In a single-page application, components mount and unmount constantly. A listener added on mount and never
+      removed leaks the entire captured scope every single time — including DOM nodes that are no longer in the
+      document.
+      <br><br>
+      That's why every framework has a cleanup mechanism: React's effect return function, Angular's
+      <code>ngOnDestroy</code> or <code>takeUntilDestroyed</code>. <strong>Every subscription and listener needs
+      a matching teardown.</strong>
+      <br><br>
+      It's the browser equivalent of not disposing an <code>IDisposable</code> — same category of bug, and
+      harder to spot because nothing errors.</p>
+  </div>
+
+  <h2 id="this">The <code>this</code> keyword <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The rule</span>
+    <p>In a normal function, <code>this</code> is determined by <strong>how the function is called</strong>, not
+      where it was defined.</p>
+    <p>In an <strong>arrow function</strong>, <code>this</code> is captured from the enclosing scope and can't
+      be changed.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Call form</th><th><code>this</code> is</th></tr></thead>
+      <tbody>
+        <tr><td><code>obj.method()</code></td><td><code>obj</code></td></tr>
+        <tr><td><code>fn()</code></td><td><code>undefined</code> in strict mode / modules; <code>window</code> otherwise</td></tr>
+        <tr><td><code>new Fn()</code></td><td>The new instance</td></tr>
+        <tr><td><code>fn.call(x)</code> / <code>apply</code> / <code>bind</code></td><td><code>x</code></td></tr>
+        <tr><td>Arrow function</td><td><strong>Whatever it was in the enclosing scope</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="javascript — the bug this causes" class="code-bad"><code class="language-javascript">class OrderService {
+  constructor() { this.orders = []; }
+
+  load() {
+    fetch('/api/orders')
+      .then(function (response) {
+        this.orders = response;        // `this` is NOT the OrderService
+      });                              // TypeError: cannot set property of undefined
+  }
+}</code></pre>
+
+  <pre data-label="javascript — arrow function captures this" class="code-good"><code class="language-javascript">load() {
+  fetch('/api/orders')
+    .then(response =&gt; {
+      this.orders = response;          // `this` is the OrderService
+    });
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why this bites .NET developers specifically</div>
+    <p style="margin:0">In C#, <code>this</code> inside an instance method is always the instance. There is no
+      way for it to be anything else, so there's no habit of thinking about it.
+      <br><br>
+      In JavaScript, extracting a method breaks it:
+      <code>const m = obj.method; m();</code> — <code>this</code> is now <code>undefined</code>, because the
+      call site has no receiver. Passing <code>obj.method</code> as a callback does exactly that.
+      <br><br>
+      <strong>Practical rule: use arrow functions for callbacks.</strong> Then <code>this</code> is
+      lexical, like every other variable, and behaves the way a C# developer expects.</p>
+  </div>
+
+  <h2 id="types">Types and coercion <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="javascript — why === always"><code class="language-javascript">'1' == 1          // true  - string coerced to number
+0 == false        // true
+'' == false       // true
+null == undefined // true
+[] == false       // true  - [] -> '' -> 0
+'0' == false      // true
+null == 0         // FALSE - null only loosely equals undefined
+
+'1' === 1         // false - no coercion. Use this.
+
+// The famous one:
+NaN === NaN       // false. Use Number.isNaN(x) or Object.is(x, NaN)
+typeof NaN        // 'number'</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Value</th><th>Falsy?</th></tr></thead>
+      <tbody>
+        <tr><td><code>false</code>, <code>0</code>, <code>-0</code>, <code>0n</code>, <code>""</code>, <code>null</code>, <code>undefined</code>, <code>NaN</code></td><td><strong>Falsy</strong> — that's the complete list</td></tr>
+        <tr><td><code>"0"</code>, <code>"false"</code>, <code>[]</code>, <code>{}</code></td><td><strong>Truthy</strong> — all of them</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The empty-array trap</div>
+    <p style="margin:0"><code>[]</code> is <strong>truthy</strong>, so <code>if (items)</code> is true even when
+      the array is empty. To check for content you need <code>items.length</code>.
+      <br><br>
+      Related: <code>0</code> and <code>""</code> are falsy, which breaks the common default-value idiom.
+      <code>count || 10</code> returns 10 when <code>count</code> is 0 — almost certainly a bug.
+      <br><br>
+      <strong>Use <code>??</code> instead</strong>: <code>count ?? 10</code> only falls back on
+      <code>null</code> or <code>undefined</code>. That's the same distinction as C#'s null-coalescing operator,
+      and it's the correct default choice.</p>
+  </div>
+
+  <h2 id="declarations"><code>var</code>, <code>let</code>, <code>const</code> <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>var</code></th><th><code>let</code></th><th><code>const</code></th></tr></thead>
+      <tbody>
+        <tr><td>Scope</td><td><strong>Function</strong></td><td>Block</td><td>Block</td></tr>
+        <tr><td>Hoisted</td><td>Yes, initialised to <code>undefined</code></td><td>Hoisted but in the TDZ</td><td>Same</td></tr>
+        <tr><td>Redeclarable</td><td>Yes — silently</td><td>No</td><td>No</td></tr>
+        <tr><td>Reassignable</td><td>Yes</td><td>Yes</td><td><strong>No</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title"><code>const</code> prevents reassignment, not mutation</div>
+    <pre data-label="javascript"><code class="language-javascript">const user = { name: 'Anita' };
+user.name = 'Ravi';          // FINE - the object is mutable
+user = { name: 'Ravi' };      // TypeError - can't rebind
+
+const items = [];
+items.push(1);                // fine
+Object.freeze(items);         // shallow immutability, if you need it</code></pre>
+    <p style="margin:0">Exactly like C#'s <code>readonly</code> field holding a mutable class instance. Use
+      <code>const</code> by default and <code>let</code> only when you genuinely reassign — it documents intent
+      and prevents a category of bug.</p>
+  </div>
+
+  <h2 id="prototypes">Prototypes <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Every object has a hidden link to another object, its <strong>prototype</strong>. Property lookups walk
+      that chain until they find the property or reach <code>null</code>.</p>
+    <p><code>class</code> is syntax over this. There's no separate class system underneath.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Why you rarely need this in practice</div>
+    <p style="margin:0">Use <code>class</code> syntax and it behaves close enough to C# that the prototype
+      chain is invisible.
+      <br><br>
+      Where it surfaces: reading library source, understanding that
+      <strong>methods live on the prototype and are shared</strong> between instances while fields are
+      per-instance, and knowing that adding to a built-in prototype (<code>Array.prototype.foo = ...</code>)
+      affects every array in the application — which is why "don't extend built-ins" is a firm rule.
+      <br><br>
+      For an interview, being able to say "<code>class</code> is sugar over prototypal inheritance, and method
+      lookup walks the prototype chain" is sufficient depth unless the role is front-end specialist.</p>
+  </div>
+
+  <h2 id="promises">Promises <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="javascript — the combinators worth knowing"><code class="language-javascript">// All must succeed; rejects on the FIRST failure
+const [user, orders] = await Promise.all([fetchUser(), fetchOrders()]);
+
+// Never rejects - reports per-promise outcome
+const results = await Promise.allSettled([a(), b(), c()]);
+results.forEach(r =&gt; r.status === 'fulfilled' ? use(r.value) : log(r.reason));
+
+// First to SETTLE wins, success or failure
+const fastest = await Promise.race([fetchPrimary(), timeout(5000)]);
+
+// First to SUCCEED; rejects only if all fail
+const any = await Promise.any([mirrorA(), mirrorB()]);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Combinator</th><th>Use for</th><th>C# equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>Promise.all</code></td><td>Parallel calls where all are required</td><td><code>Task.WhenAll</code></td></tr>
+        <tr><td><code>Promise.allSettled</code></td><td><strong>Partial success is acceptable</strong></td><td>No direct equivalent</td></tr>
+        <tr><td><code>Promise.race</code></td><td>Timeouts</td><td><code>Task.WhenAny</code></td></tr>
+        <tr><td><code>Promise.any</code></td><td>Fallback mirrors</td><td>No direct equivalent</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Sequential awaits in a loop — the performance bug</div>
+    <pre data-label="javascript" class="code-bad"><code class="language-javascript">const results = [];
+for (const id of ids) {
+  results.push(await fetchOne(id));      // 100 ids x 50ms = 5 seconds
+}</code></pre>
+    <pre data-label="javascript" class="code-good"><code class="language-javascript">const results = await Promise.all(ids.map(fetchOne));   // ~50ms total</code></pre>
+    <p style="margin:0">Identical to the <a href="../05-csharp-advanced/async-await.html">sequential-await
+      mistake in C#</a>, and just as common.
+      <br><br>
+      Two caveats. <code>Promise.all</code> issues <em>all</em> requests at once, so 10,000 ids means 10,000
+      simultaneous requests — you may need to batch. And it <strong>rejects on the first failure</strong>, losing
+      the successful results; use <code>allSettled</code> when partial success matters.
+      <br><br>
+      Also worth knowing: <code>array.forEach</code> does not await. An <code>async</code> callback passed to
+      <code>forEach</code> returns promises that nobody observes, so the loop completes immediately and errors
+      are swallowed. Use <code>for...of</code> with <code>await</code>, or <code>map</code> plus
+      <code>Promise.all</code>.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>One thread. Synchronous work blocks rendering and input entirely.</li>
+      <li>Run task → drain <strong>all</strong> microtasks → maybe render → one macrotask.</li>
+      <li>Promises are microtasks, timers are macrotasks — so a promise always resolves before a
+        <code>setTimeout(0)</code>.</li>
+      <li>A microtask that queues microtasks freezes the page permanently.</li>
+      <li>Code before the first <code>await</code> is synchronous; the rest is a microtask.</li>
+      <li>Closures capture variables, not values — hence the <code>var</code> loop puzzle.</li>
+      <li>Unremoved listeners and subscriptions leak the whole captured scope.</li>
+      <li><code>this</code> comes from the call site; arrow functions capture it lexically.</li>
+      <li><code>===</code> always, <code>??</code> rather than <code>||</code> for defaults.</li>
+      <li><code>[]</code> and <code>{}</code> are truthy; <code>0</code> and <code>""</code> are falsy.</li>
+      <li><code>Promise.all</code> for parallel work; <code>allSettled</code> when partial success is fine.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Expecting <code>async</code> to give parallelism.</strong> It only helps with waiting.</li>
+    <li><strong>Sequential awaits in a loop.</strong></li>
+    <li><strong><code>async</code> callback in <code>forEach</code></strong> — nothing awaits it.</li>
+    <li><strong><code>var</code> in a loop with closures.</strong></li>
+    <li><strong>Not removing listeners or subscriptions</strong>, leaking scope.</li>
+    <li><strong>A non-arrow callback</strong> losing <code>this</code>.</li>
+    <li><strong><code>==</code></strong> and its coercion surprises.</li>
+    <li><strong><code>value || default</code></strong> when <code>0</code> or <code>""</code> is valid.</li>
+    <li><strong><code>if (array)</code></strong> to test for content.</li>
+    <li><strong><code>Promise.all</code> over thousands of items</strong> with no batching.</li>
+    <li><strong>Treating a TypeScript type as runtime validation.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Explain the event loop. What order does this code print? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"JavaScript has a single call stack, so only one thing runs at a time and nothing interrupts running
+          code. The event loop's job is to decide what runs next when the stack empties."</p>
+        <p>"The cycle is: <strong>run the current task to completion, then drain the entire microtask queue,
+          then optionally render, then take exactly one macrotask</strong> — and repeat."</p>
+        <p>"<strong>Microtasks</strong> are promise callbacks, <code>await</code> continuations,
+          <code>queueMicrotask</code>. <strong>Macrotasks</strong> are <code>setTimeout</code>,
+          <code>setInterval</code>, DOM events, network callbacks."</p>
+        <p>"So for the classic example — a synchronous log, a <code>setTimeout</code> with zero delay, a
+          resolved promise's <code>.then</code>, and another synchronous log — the order is: both synchronous
+          logs first, then the promise callback, then the timeout. The promise beats the timer
+          <strong>even though the timer says zero milliseconds</strong>, because microtasks are drained before
+          any macrotask is taken."</p>
+        <p>"The part people miss is the word <strong>drain</strong>. It's not one microtask per iteration — it's
+          all of them, including any queued <em>by</em> those microtasks. Which has a real consequence: a
+          microtask that recursively queues another microtask means the queue never empties, so the browser
+          never renders again and the tab is frozen permanently. An equivalent <code>setInterval</code> loop is
+          harmless, because macrotasks yield between iterations."</p>
+        <p>"On <code>async</code>/<code>await</code> specifically: everything before the first
+          <code>await</code> runs <strong>synchronously</strong>, and everything after it becomes a microtask
+          continuation. That's structurally identical to C#'s async state machine — the difference being that
+          in .NET the continuation might resume on a different thread, whereas here it's always the same thread.
+          Which is why you never need a lock in JavaScript, and never get parallelism either."</p>
+        <p>"The practical implication I'd emphasise: <strong><code>setTimeout(fn, 0)</code> doesn't mean
+          'now'</strong>, it means 'yield to the event loop'. It's how you let rendering and input happen during
+          a long operation. And a synchronous loop over a large array blocks everything — rendering, clicks,
+          timers — because there's no other thread to pick up the slack."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know microtasks are drained fully, not one at a time?</li>
+        <li>Can you predict the ordering and explain <em>why</em>?</li>
+        <li>Do you know where the <code>await</code> boundary falls?</li>
+        <li>Do you connect it to UI responsiveness?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "the callback queue" with no microtask/macrotask
+          distinction.</li>
+        <li><span class="redflag">Red flag:</span> thinking <code>setTimeout(fn, 0)</code> runs immediately.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where does rendering fit in?</li>
+          <li>What's <code>requestAnimationFrame</code>?</li>
+          <li>How would you break up a long computation?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does this print, and why? <code>for (var i = 0; i &lt; 3; i++) setTimeout(() =&gt; console.log(i))</code> <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It prints <strong>3, 3, 3</strong>."</p>
+        <p>"Two things combine to cause it."</p>
+        <p>"<strong>First, <code>var</code> is function-scoped, not block-scoped.</strong> So there is exactly
+          one <code>i</code> for the whole loop, not one per iteration. All three arrow functions close over
+          <em>the same variable</em>."</p>
+        <p>"<strong>Second, closures capture the variable, not its value at capture time.</strong> So when the
+          callbacks eventually run, they read whatever <code>i</code> currently holds."</p>
+        <p>"And because <code>setTimeout</code> queues a macrotask, none of the callbacks run until the
+          synchronous loop has completely finished — at which point <code>i</code> is 3, the value that failed
+          the loop condition. Hence three 3s."</p>
+        <p>"The fix is <code>let</code>, which is <strong>block-scoped</strong> — each iteration gets a fresh
+          binding, so the closures capture three different variables and it prints 0, 1, 2. That's the main
+          practical reason <code>let</code> replaced <code>var</code>."</p>
+        <p>"Before <code>let</code> existed you'd use an IIFE to create a scope per iteration, and you'll still
+          see that in older code — an immediately-invoked function taking <code>i</code> as a parameter, so the
+          parameter is a per-call copy."</p>
+        <p>"The reason this matters beyond the puzzle: <strong>it's the same mechanism behind stale values in
+          React effects</strong>. If an effect closes over a state variable and the dependency array doesn't
+          include it, the effect keeps reading the value from the render it was created in. Same closure
+          semantics, much harder to spot. Recognising it as one concept rather than two separate gotchas is the
+          useful part."</p>
+        <p>"C# has the identical issue with loop-variable capture — it was fixed for <code>foreach</code> in C#
+          5 but <code>for</code> loops still capture a single variable. So the concept isn't foreign, it's just
+          more visible in JavaScript because callbacks are everywhere."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the answer <em>and</em> the two reasons?</li>
+        <li>Do you know closures capture variables, not values?</li>
+        <li>Can you connect it to a real framework bug?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Fix it without changing <code>var</code>.</li>
+          <li>What's the temporal dead zone?</li>
+          <li>How does this cause a memory leak?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How do closures cause memory leaks in a single-page application? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A closure keeps its entire captured scope alive for as long as the function itself is reachable. So
+          the leak happens when something holds a reference to a function longer than intended."</p>
+        <p>"The canonical case is an <strong>event listener that's never removed</strong>. If a component adds a
+          <code>window</code> resize listener on mount, and the handler closes over the component's state or a
+          DOM node, then <code>window</code> holds the handler, the handler holds the scope, and the scope holds
+          the component. Unmounting the component doesn't help — <code>window</code> outlives it."</p>
+        <p>"In a single-page application that's severe, because components mount and unmount continuously. Every
+          navigation leaks another copy. The page gets slower over an hour of use and nothing errors."</p>
+        <p>"<strong>Detached DOM nodes</strong> are the specific symptom to look for: nodes removed from the
+          document but still referenced by a closure, so they can't be collected. DevTools' memory profiler
+          reports them explicitly, which makes this diagnosable."</p>
+        <p>"Other common sources: <strong>uncleared intervals</strong> — <code>setInterval</code> holds its
+          callback forever until <code>clearInterval</code>; <strong>unsubscribed observables</strong> in
+          Angular, where the subject holds the subscriber; and <strong>caches or arrays that only grow</strong>,
+          where each entry captures a scope."</p>
+        <p>"The fix is always symmetry: <strong>every subscription needs a matching teardown.</strong> React's
+          effect cleanup function, Angular's <code>ngOnDestroy</code> or <code>takeUntilDestroyed</code>.
+          Frameworks provide these precisely because this is the default failure mode."</p>
+        <p>"Coming from .NET, the mental model that helps is that <strong>this is the
+          <code>IDisposable</code> problem</strong> — an unmanaged resource acquired without a matching release.
+          The difference is that C# gives you <code>using</code> and analyser warnings, whereas here nothing
+          warns you at all."</p>
+        <p>"For diagnosis I'd take heap snapshots in DevTools before and after repeating an action — navigate to
+          a page and back ten times — and compare. If retained size grows monotonically and detached nodes
+          accumulate, the retainer path in the snapshot shows exactly which closure is holding on. That's a
+          reliable process rather than guesswork, which matters because these are invisible in normal
+          testing."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand the retention chain — listener → closure → scope?</li>
+        <li>Do you know detached DOM nodes as the symptom?</li>
+        <li>Do you know the framework cleanup hooks?</li>
+        <li>Do you have a diagnostic process?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does <code>WeakMap</code> help?</li>
+          <li>Show the cleanup in a React effect.</li>
+          <li>Why doesn't the GC collect it?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

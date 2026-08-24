@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Querying — SQL</title>
+<meta name="description" content="Joins, subqueries, CTEs, window functions, grouping and pagination — with the semantics that catch people out in interviews.">
+<meta name="keywords" content="INNER JOIN LEFT JOIN CROSS APPLY OUTER APPLY subquery correlated EXISTS IN CTE recursive window function ROW_NUMBER RANK DENSE_RANK LAG LEAD PARTITION BY GROUP BY HAVING keyset pagination OFFSET FETCH UNION EXCEPT INTERSECT MERGE">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/querying.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Querying</h1>
+    <p class="subtitle">Joins, CTEs and window functions. Most SQL interview questions are really testing
+      whether you understand logical processing order.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Logical order:</strong> <code>FROM → WHERE → GROUP BY → HAVING → SELECT → ORDER BY</code>.
+        This explains almost every "why can't I…" question.</li>
+      <li><strong><code>WHERE</code> filters rows; <code>HAVING</code> filters groups.</strong></li>
+      <li><strong>A filter on the right table in a <code>WHERE</code> clause turns a <code>LEFT JOIN</code>
+        into an <code>INNER JOIN</code>.</strong> Put it in the <code>ON</code> instead.</li>
+      <li><strong>Window functions don't collapse rows.</strong> That's the whole point of them versus
+        <code>GROUP BY</code>.</li>
+      <li><strong><code>ROW_NUMBER</code> vs <code>RANK</code> vs <code>DENSE_RANK</code></strong> differ only
+        in how they handle ties.</li>
+      <li><strong>A CTE is not a temp table.</strong> It's usually inlined, and it can be evaluated more than
+        once.</li>
+      <li><strong><code>OFFSET</code> pagination degrades as the offset grows.</strong> Keyset doesn't.</li>
+    </ul>
+  </div>
+
+  <h2 id="logical-order">Logical processing order <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>SQL isn't executed in the order you write it. It's evaluated in this order:</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Clause</th><th>What exists at this point</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>FROM</code> / <code>JOIN</code></td><td>Rows are combined</td></tr>
+        <tr><td>2</td><td><code>WHERE</code></td><td>Individual rows filtered. No groups yet, no aliases from <code>SELECT</code></td></tr>
+        <tr><td>3</td><td><code>GROUP BY</code></td><td>Rows collapse into groups</td></tr>
+        <tr><td>4</td><td><code>HAVING</code></td><td>Groups filtered. Aggregates now available</td></tr>
+        <tr><td>5</td><td><code>SELECT</code></td><td>Output columns and aliases <em>created here</em></td></tr>
+        <tr><td>6</td><td><code>ORDER BY</code></td><td>Aliases available, because <code>SELECT</code> already ran</td></tr>
+        <tr><td>7</td><td><code>OFFSET</code> / <code>FETCH</code></td><td>The window of rows is taken</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this — it answers three separate interview questions</span>
+    <ul>
+      <li><strong>Why can't I use a <code>SELECT</code> alias in <code>WHERE</code>?</strong> — the alias
+        doesn't exist yet (step 5 vs step 2).</li>
+      <li><strong>But it works in <code>ORDER BY</code>?</strong> — yes, that's step 6, after
+        <code>SELECT</code>.</li>
+      <li><strong>Why can't I use <code>COUNT(*)</code> in <code>WHERE</code>?</strong> — grouping hasn't
+        happened. Use <code>HAVING</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="joins">Joins <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Join</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>INNER JOIN</code></strong></td><td>Only rows matching on both sides</td></tr>
+        <tr><td><strong><code>LEFT JOIN</code></strong></td><td>All left rows; <code>NULL</code>s where no match</td></tr>
+        <tr><td><strong><code>RIGHT JOIN</code></strong></td><td>Same, mirrored. Rare — people rewrite as <code>LEFT</code> for readability</td></tr>
+        <tr><td><strong><code>FULL OUTER JOIN</code></strong></td><td>Everything from both sides</td></tr>
+        <tr><td><strong><code>CROSS JOIN</code></strong></td><td>Cartesian product — every combination</td></tr>
+        <tr><td><strong><code>CROSS APPLY</code></strong></td><td>Like <code>INNER JOIN</code>, but the right side can reference the left row</td></tr>
+        <tr><td><strong><code>OUTER APPLY</code></strong></td><td>Like <code>LEFT JOIN</code> with that same capability</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The classic trap — the <code>LEFT JOIN</code> that isn't</div>
+    <pre data-label="sql — silently an INNER JOIN" class="code-bad"><code class="language-sql">SELECT c.Name, o.Total
+FROM      Customer c
+LEFT JOIN [Order]  o ON o.CustomerId = c.Id
+WHERE o.Status = 'Shipped';           -- ← destroys the LEFT JOIN</code></pre>
+    <p style="margin:0">Customers with no orders get <code>NULL</code> for <code>o.Status</code>, and
+      <code>NULL = 'Shipped'</code> is unknown — so those rows are filtered out. You've written a
+      <code>LEFT JOIN</code> and got an <code>INNER JOIN</code>.</p>
+    <pre data-label="sql — filter in the ON clause" class="code-good"><code class="language-sql">SELECT c.Name, o.Total
+FROM      Customer c
+LEFT JOIN [Order]  o ON o.CustomerId = c.Id
+                    AND o.Status     = 'Shipped';</code></pre>
+    <p style="margin:0"><strong>The rule:</strong> conditions on the <em>outer</em> (right) table belong in
+      <code>ON</code>. Conditions on the preserved (left) table belong in <code>WHERE</code>.
+      <br><br>
+      This is asked constantly, because it separates people who've memorised join diagrams from people who
+      understand what the filter is doing.</p>
+  </div>
+
+  <h3 id="apply">APPLY — the underused one <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>APPLY</code> runs the right-hand expression <strong>once per left row</strong>, and the
+      expression can reference that row's columns.</p>
+    <p>A normal <code>JOIN</code> can't do that. This is how you do "top N per group" cleanly.</p>
+  </div>
+
+  <pre data-label="sql — three most recent orders per customer" class="code-good"><code class="language-sql">SELECT c.Name, o.OrderId, o.CreatedUtc, o.Total
+FROM Customer c
+CROSS APPLY (
+    SELECT TOP (3) OrderId, CreatedUtc, Total
+    FROM   [Order]
+    WHERE  CustomerId = c.Id          -- references the outer row
+    ORDER BY CreatedUtc DESC
+) o;</code></pre>
+
+  <div class="note tip">
+    <div class="note-title"><code>APPLY</code> vs <code>ROW_NUMBER</code> for top-N-per-group</div>
+    <p style="margin:0">Both work. The difference is <em>where the work happens</em>.
+      <br><br>
+      <code>ROW_NUMBER</code> numbers <strong>every</strong> row, then discards all but the top few.
+      <code>CROSS APPLY</code> does a small seek per customer and stops at 3.
+      <br><br>
+      With a supporting index on <code>(CustomerId, CreatedUtc DESC)</code>, <code>APPLY</code> is usually
+      much faster on large tables. With few groups and many rows each, or no useful index,
+      <code>ROW_NUMBER</code> can win. Knowing there's a choice — and why — is the senior answer.</p>
+  </div>
+
+  <h3 id="join-fanout">Fan-out: the duplicate-rows surprise</h3>
+
+  <pre data-label="sql — Total is now wrong" class="code-bad"><code class="language-sql">SELECT c.Name, SUM(o.Total) AS Revenue
+FROM Customer c
+JOIN [Order]     o ON o.CustomerId = c.Id
+JOIN OrderLine   l ON l.OrderId    = o.Id      -- one row per LINE
+GROUP BY c.Name;                                -- Total counted once per line</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">What happened</span>
+    <p>Joining to <code>OrderLine</code> multiplied each order row by its number of lines. An order with 4
+      lines now contributes its <code>Total</code> four times.</p>
+    <p><strong>Any time you join to a "many" table and then aggregate, check for fan-out.</strong> Aggregate in
+      a subquery or <code>APPLY</code> before joining.</p>
+  </div>
+
+  <h2 id="subqueries">Subqueries: <code>EXISTS</code>, <code>IN</code>, <code>JOIN</code> <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Form</th><th>Semantics</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><code>EXISTS</code></td><td>True on the first match; handles nulls correctly</td><td><strong>Default choice</strong> for "does a related row exist?"</td></tr>
+        <tr><td><code>IN</code></td><td>Value in a set. <strong>Breaks with nulls when negated</strong></td><td>Small literal lists</td></tr>
+        <tr><td><code>JOIN</code></td><td>Combines rows — <strong>can duplicate</strong> the left side</td><td>You need columns from the other table</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Need columns from the other table? <code>JOIN</code>. Just checking existence?
+      <code>EXISTS</code>.</strong></p>
+    <p>Using a <code>JOIN</code> for existence checks is how you get accidental duplicates and reach for
+      <code>DISTINCT</code> to hide them.</p>
+  </div>
+
+  <pre data-label="sql — the DISTINCT smell" class="code-bad"><code class="language-sql">SELECT DISTINCT c.Id, c.Name          -- DISTINCT is hiding a bug
+FROM Customer c
+JOIN [Order] o ON o.CustomerId = c.Id;</code></pre>
+
+  <pre data-label="sql — no duplicates to remove" class="code-good"><code class="language-sql">SELECT c.Id, c.Name
+FROM Customer c
+WHERE EXISTS (SELECT 1 FROM [Order] o WHERE o.CustomerId = c.Id);</code></pre>
+
+  <div class="note warn">
+    <div class="note-title"><code>NOT IN</code> with nullable columns</div>
+    <p style="margin:0">If the subquery returns even one <code>NULL</code>, <code>NOT IN</code> returns
+      <strong>zero rows</strong> — no error, no warning. Covered in detail on the
+      <a href="fundamentals.html#nulls">fundamentals page</a>.
+      <br><br>
+      <strong>Habit: use <code>NOT EXISTS</code>.</strong></p>
+  </div>
+
+  <h2 id="ctes">CTEs <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A CTE (<code>WITH ... AS</code>) is a named subquery that makes a query readable by naming its steps.</p>
+    <p>It is <strong>not</strong> a temp table. In SQL Server the definition is usually inlined into the outer
+      query.</p>
+  </div>
+
+  <pre data-label="sql — readable multi-step logic" class="code-good"><code class="language-sql">WITH MonthlyRevenue AS (
+    SELECT CustomerId,
+           DATEFROMPARTS(YEAR(CreatedUtc), MONTH(CreatedUtc), 1) AS Month,
+           SUM(Total) AS Revenue
+    FROM   [Order]
+    WHERE  CreatedUtc &gt;= '2024-01-01'
+    GROUP BY CustomerId, DATEFROMPARTS(YEAR(CreatedUtc), MONTH(CreatedUtc), 1)
+),
+Ranked AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY Month ORDER BY Revenue DESC) AS rn
+    FROM   MonthlyRevenue
+)
+SELECT Month, CustomerId, Revenue
+FROM   Ranked
+WHERE  rn &lt;= 5
+ORDER BY Month, Revenue DESC;</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">The CTE misconception that causes real bugs</div>
+    <p style="margin:0">Referencing a CTE twice can execute it <strong>twice</strong>.</p>
+    <pre data-label="sql" class="code-bad"><code class="language-sql">WITH Expensive AS (SELECT ... /* heavy aggregation */ ...)
+SELECT * FROM Expensive a JOIN Expensive b ON b.Month = a.Month;
+-- The heavy work may run twice, not once</code></pre>
+    <p style="margin:0">Worse, if the CTE contains a non-deterministic expression such as
+      <code>NEWID()</code> or <code>GETDATE()</code>, the two evaluations can return <em>different
+      values</em> — which produces genuinely baffling bugs.
+      <br><br>
+      If you need it materialised once, use a <code>#temp</code> table.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>CTE</th><th><code>#temp</code> table</th><th>Table variable</th></tr></thead>
+      <tbody>
+        <tr><td>Materialised</td><td>No — usually inlined</td><td><strong>Yes</strong></td><td>Yes (in tempdb)</td></tr>
+        <tr><td>Statistics</td><td>From the base tables</td><td><strong>Yes — real statistics</strong></td><td>None (estimates 1 row)</td></tr>
+        <tr><td>Indexable</td><td>No</td><td>Yes</td><td>PK/unique only</td></tr>
+        <tr><td>Best for</td><td>Readability, recursion</td><td>Large intermediate sets, reuse</td><td>Small sets, table-valued params</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">"I'd switch that CTE to a <code>#temp</code> table" is a strong, specific tuning move —
+      because a temp table gets <strong>real statistics</strong>, so the optimiser knows how many rows it
+      actually holds.
+      <br><br>
+      A chain of five CTEs over millions of rows often produces a terrible plan for exactly this reason: the
+      estimates compound and drift further from reality at every level. Breaking the chain with one temp table
+      gives the optimiser a fresh, accurate starting point.
+      <br><br>
+      Table variables are the opposite trap — they estimate one row regardless of content, which is fine for
+      10 rows and catastrophic for 100,000.</p>
+  </div>
+
+  <h3 id="recursive-cte">Recursive CTEs</h3>
+
+  <pre data-label="sql — walk an org hierarchy"><code class="language-sql">WITH OrgChart AS (
+    -- Anchor: the starting point
+    SELECT Id, Name, ManagerId, 0 AS Depth
+    FROM   Employee
+    WHERE  ManagerId IS NULL
+
+    UNION ALL
+
+    -- Recursive part: references the CTE itself
+    SELECT e.Id, e.Name, e.ManagerId, o.Depth + 1
+    FROM   Employee e
+    JOIN   OrgChart o ON e.ManagerId = o.Id
+)
+SELECT * FROM OrgChart
+ORDER BY Depth, Name
+OPTION (MAXRECURSION 100);          -- guard against cycles</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Always set <code>MAXRECURSION</code></div>
+    <p style="margin:0">The default is 100, and hitting it raises an error mid-result. But the important case
+      is <strong>cyclic data</strong> — employee A manages B who manages A. Without a bound that recurses
+      forever, and <code>MAXRECURSION 0</code> means unlimited, which is how you hang a production server.
+      <br><br>
+      Set an explicit sensible bound, and if hierarchies get deep or hot, consider storing a materialised path
+      instead of recursing on every read.</p>
+  </div>
+
+  <h2 id="window-functions">Window functions <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A window function computes a value <strong>across a set of related rows without collapsing them</strong>.</p>
+    <p><code>GROUP BY</code> gives you one row per group. A window function keeps every row and adds the
+      group's answer alongside.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><code>GROUP BY</code> is a summary report: one line per department.</p>
+    <p>A window function is the full staff list with an extra column showing each person's department average
+      next to their own salary — so you can compare.</p>
+  </div>
+
+  <pre data-label="sql — the difference, side by side"><code class="language-sql">-- GROUP BY: 5 departments -> 5 rows
+SELECT Department, AVG(Salary) AS DeptAvg
+FROM   Employee
+GROUP BY Department;
+
+-- Window: 500 employees -> 500 rows, each with its department average
+SELECT Name, Department, Salary,
+       AVG(Salary) OVER (PARTITION BY Department)            AS DeptAvg,
+       Salary - AVG(Salary) OVER (PARTITION BY Department)   AS VsAvg
+FROM   Employee;</code></pre>
+
+  <h3 id="ranking">Ranking functions — the tie question</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Function</th><th>Ties</th><th>Sequence with a tie at 2nd</th></tr></thead>
+      <tbody>
+        <tr><td><code>ROW_NUMBER()</code></td><td>Broken arbitrarily — always unique</td><td>1, 2, 3, 4</td></tr>
+        <tr><td><code>RANK()</code></td><td>Same rank, then <strong>skips</strong></td><td>1, 2, 2, <strong>4</strong></td></tr>
+        <tr><td><code>DENSE_RANK()</code></td><td>Same rank, <strong>no gap</strong></td><td>1, 2, 2, <strong>3</strong></td></tr>
+        <tr><td><code>NTILE(4)</code></td><td>Splits into buckets</td><td>Quartiles</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong><code>RANK</code> skips, <code>DENSE_RANK</code> doesn't, <code>ROW_NUMBER</code> never
+      ties.</strong></p>
+    <p>Olympic medals are <code>RANK</code> — two silvers means no bronze. "Distinct salary levels" is
+      <code>DENSE_RANK</code>. "Pick exactly one row per group" is <code>ROW_NUMBER</code>.</p>
+  </div>
+
+  <pre data-label="sql — deduplicate, keeping the newest row" class="code-good"><code class="language-sql">WITH Dupes AS (
+    SELECT Id,
+           ROW_NUMBER() OVER (PARTITION BY Email ORDER BY CreatedUtc DESC) AS rn
+    FROM   Customer
+)
+DELETE FROM Dupes WHERE rn &gt; 1;      -- deletes through the CTE</code></pre>
+
+  <p>This is the canonical deduplication query, and a common interview task. <code>ROW_NUMBER</code> is
+    essential here — <code>RANK</code> would tie both duplicates at 1 and delete neither.</p>
+
+  <h3 id="lag-lead">LAG and LEAD</h3>
+
+  <pre data-label="sql — compare each row with the previous one"><code class="language-sql">SELECT
+    CreatedUtc,
+    Total,
+    LAG(Total)  OVER (ORDER BY CreatedUtc) AS PrevTotal,
+    Total - LAG(Total) OVER (ORDER BY CreatedUtc) AS Change,
+    LEAD(CreatedUtc) OVER (ORDER BY CreatedUtc) AS NextOrderDate
+FROM [Order]
+WHERE CustomerId = @customerId;</code></pre>
+
+  <p>Month-over-month change, gap detection, time between events, state transitions — all of these are
+    <code>LAG</code>/<code>LEAD</code>. Before window functions this required a self-join on a computed row
+    number, which was slow and unreadable.</p>
+
+  <h3 id="frames">Running totals and frames <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <pre data-label="sql — running total and moving average"><code class="language-sql">SELECT
+    CreatedUtc, Total,
+
+    -- Running total: start of partition to current row
+    SUM(Total) OVER (ORDER BY CreatedUtc
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotal,
+
+    -- 7-row moving average
+    AVG(Total) OVER (ORDER BY CreatedUtc
+                     ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS MovingAvg7
+FROM [Order];</code></pre>
+
+  <div class="note warn">
+    <div class="note-title"><code>ROWS</code> vs <code>RANGE</code> — a real correctness difference</div>
+    <p style="margin:0">With an <code>ORDER BY</code> and no explicit frame, the default is
+      <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>.
+      <br><br>
+      <code>RANGE</code> includes <strong>all peer rows with the same ordering value</strong>. So if three
+      orders share a timestamp, a "running total" using the default jumps by all three at once and shows the
+      same value on all three rows — not what a running total should look like.
+      <br><br>
+      <code>ROWS</code> counts physical rows and behaves as expected. <strong>Be explicit and prefer
+      <code>ROWS</code></strong> unless you specifically want peer-inclusive behaviour.
+      <br><br>
+      <code>RANGE</code> is also generally slower.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Where window functions can and can't go</div>
+    <p style="margin:0">They're evaluated at <code>SELECT</code> time, so you <strong>cannot</strong> reference
+      one in <code>WHERE</code>, <code>GROUP BY</code> or <code>HAVING</code> of the same query level.
+      <br><br>
+      Wrap it in a CTE or subquery and filter outside — which is exactly why the top-N-per-group pattern always
+      has two levels.</p>
+  </div>
+
+  <h2 id="grouping">Grouping <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="sql — WHERE vs HAVING"><code class="language-sql">SELECT   CustomerId, COUNT(*) AS Orders, SUM(Total) AS Revenue
+FROM     [Order]
+WHERE    CreatedUtc &gt;= '2024-01-01'   -- filters ROWS, before grouping
+GROUP BY CustomerId
+HAVING   COUNT(*) &gt; 5                  -- filters GROUPS, after
+ORDER BY Revenue DESC;</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Performance note that's easy to state and easy to forget</div>
+    <p style="margin:0">Filter in <code>WHERE</code> whenever you can. It removes rows <em>before</em>
+      grouping, so there's less to group.
+      <br><br>
+      A condition in <code>HAVING</code> that doesn't involve an aggregate is a mistake — it groups everything
+      and then throws groups away.</p>
+  </div>
+
+  <pre data-label="sql — subtotals with GROUPING SETS" class="code-good"><code class="language-sql">SELECT   Region, Product, SUM(Total) AS Revenue
+FROM     Sales
+GROUP BY GROUPING SETS (
+    (Region, Product),   -- detail
+    (Region),            -- per-region subtotal
+    ()                   -- grand total
+);</code></pre>
+
+  <p>One pass instead of three queries and a <code>UNION</code>. <code>ROLLUP</code> is the shorthand for a
+    hierarchy; <code>CUBE</code> gives every combination. <code>GROUPING()</code> tells you whether a
+    <code>NULL</code> is a subtotal marker or real data.</p>
+
+  <h3 id="string-agg">Aggregating strings</h3>
+
+  <pre data-label="sql — STRING_AGG (SQL Server 2017+)" class="code-good"><code class="language-sql">SELECT o.Id,
+       STRING_AGG(l.Sku, ', ') WITHIN GROUP (ORDER BY l.Sku) AS Skus
+FROM   [Order] o
+JOIN   OrderLine l ON l.OrderId = o.Id
+GROUP BY o.Id;</code></pre>
+
+  <p>Before 2017 this needed the <code>FOR XML PATH</code> trick, which you'll still see in older codebases —
+    and which breaks on data containing <code>&amp;</code> or <code>&lt;</code>.</p>
+
+  <h2 id="pagination">Pagination <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="sql — OFFSET: correct, but degrades" class="code-bad"><code class="language-sql">SELECT Id, CreatedUtc, Total
+FROM   [Order]
+ORDER BY CreatedUtc DESC
+OFFSET 100000 ROWS FETCH NEXT 20 ROWS ONLY;
+-- Reads and discards 100,000 rows to return 20</code></pre>
+
+  <pre data-label="sql — keyset: constant cost" class="code-good"><code class="language-sql">SELECT TOP (20) Id, CreatedUtc, Total
+FROM   [Order]
+WHERE  (CreatedUtc &lt; @lastCreatedUtc)
+   OR  (CreatedUtc = @lastCreatedUtc AND Id &lt; @lastId)   -- tiebreak
+ORDER BY CreatedUtc DESC, Id DESC;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>OFFSET</code></th><th>Keyset</th></tr></thead>
+      <tbody>
+        <tr><td>Cost at page 5000</td><td>Grows linearly — reads everything skipped</td><td><strong>Constant</strong></td></tr>
+        <tr><td>Jump to page N</td><td>Yes</td><td>No — next/previous only</td></tr>
+        <tr><td>Total page count</td><td>Yes</td><td>Not without a separate count</td></tr>
+        <tr><td>Stable under inserts</td><td><strong>No</strong> — rows shift, items are skipped or repeated</td><td>Yes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Numbered page links → <code>OFFSET</code>. Infinite scroll or an API feed → keyset.</strong></p>
+    <p>The tiebreaker column is mandatory. Without it, rows sharing a timestamp get skipped or duplicated at
+      page boundaries.</p>
+  </div>
+
+  <h2 id="set-operations">Set operations <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Operator</th><th>Does</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><code>UNION</code></td><td>Combines and removes duplicates</td><td>Requires a sort or hash — costs more</td></tr>
+        <tr><td><code>UNION ALL</code></td><td>Combines, keeps duplicates</td><td><strong>Faster.</strong> Default choice when duplicates are impossible</td></tr>
+        <tr><td><code>INTERSECT</code></td><td>Rows in both</td><td>Also de-duplicates</td></tr>
+        <tr><td><code>EXCEPT</code></td><td>In the first, not the second</td><td>Excellent for comparing two datasets</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Reconciliation trick worth remembering</div>
+    <p style="margin:0">To check two tables hold the same data:
+      <br><br>
+      <code>(SELECT * FROM A EXCEPT SELECT * FROM B) UNION ALL (SELECT * FROM B EXCEPT SELECT * FROM A)</code>
+      <br><br>
+      Empty result means identical. Very useful when validating a migration or a denormalized copy — and
+      <code>EXCEPT</code> compares <code>NULL</code>s as equal, which is exactly what you want here and what a
+      join comparison gets wrong.</p>
+  </div>
+
+  <h2 id="merge">MERGE — use with caution <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p><code>MERGE</code> does insert/update/delete in one statement. It reads well, and it has a long history of
+    bugs and concurrency problems.</p>
+
+  <div class="note warn">
+    <div class="note-title">Why many teams avoid it</div>
+    <p style="margin:0"><code>MERGE</code> is <strong>not atomic against concurrent writers by
+      default</strong> — two concurrent merges on the same key can deadlock or both attempt an insert, giving
+      a primary-key violation. You need <code>HOLDLOCK</code>/<code>SERIALIZABLE</code> on the target to make
+      it safe.
+      <br><br>
+      It also has a documented history of incorrect-results bugs with filtered indexes and partitioned tables.
+      <br><br>
+      For a single-row upsert, an explicit <code>UPDATE</code> then <code>INSERT IF NOT EXISTS</code> inside a
+      transaction — or an insert that catches the unique violation — is easier to reason about. Being aware of
+      this is a good senior signal, because <code>MERGE</code> looks like the obvious right answer.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Logical order explains alias scope, <code>WHERE</code> vs <code>HAVING</code>, and where window
+        functions can go.</li>
+      <li>Filtering the outer table in <code>WHERE</code> silently converts <code>LEFT JOIN</code> to
+        <code>INNER</code>. Filter in <code>ON</code>.</li>
+      <li><code>CROSS APPLY</code> can reference the outer row — the clean top-N-per-group tool.</li>
+      <li>Joining to a "many" table then aggregating causes fan-out and wrong totals.</li>
+      <li><code>EXISTS</code> for existence, <code>JOIN</code> for columns. <code>DISTINCT</code> is often
+        hiding a fan-out.</li>
+      <li>A CTE isn't materialised and may run twice. <code>#temp</code> gives real statistics.</li>
+      <li>Window functions keep rows; <code>GROUP BY</code> collapses them.</li>
+      <li><code>RANK</code> skips, <code>DENSE_RANK</code> doesn't, <code>ROW_NUMBER</code> is always unique.</li>
+      <li>Be explicit with frames — <code>ROWS</code>, not the <code>RANGE</code> default.</li>
+      <li>Keyset pagination for feeds; <code>OFFSET</code> only for numbered pages.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Filtering the right table of a <code>LEFT JOIN</code> in <code>WHERE</code>.</strong></li>
+    <li><strong><code>DISTINCT</code> to hide join duplicates</strong> instead of fixing the join.</li>
+    <li><strong>Aggregating after joining to a child table</strong>, so sums are multiplied.</li>
+    <li><strong><code>NOT IN</code> with a nullable subquery.</strong></li>
+    <li><strong>Assuming a CTE is materialised</strong>, or that it runs once.</li>
+    <li><strong>Table variables for large sets</strong> — the optimiser estimates one row.</li>
+    <li><strong>Non-aggregate conditions in <code>HAVING</code></strong> that belong in <code>WHERE</code>.</li>
+    <li><strong>Relying on the default <code>RANGE</code> frame</strong> for running totals.</li>
+    <li><strong><code>OFFSET</code> pagination on deep pages</strong>, and with no tiebreaker column.</li>
+    <li><strong><code>UNION</code> where <code>UNION ALL</code> would do</strong>, paying for a needless sort.</li>
+    <li><strong><code>ORDER BY</code> in a view or subquery</strong> — it isn't guaranteed to be preserved.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>Difference between <code>WHERE</code> and <code>HAVING</code>? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<code>WHERE</code> filters individual rows before grouping. <code>HAVING</code> filters groups
+          after grouping."</p>
+        <p>"The reason comes from the logical processing order —
+          <code>FROM</code>, <code>WHERE</code>, <code>GROUP BY</code>, <code>HAVING</code>,
+          <code>SELECT</code>, <code>ORDER BY</code>. At <code>WHERE</code> time there are no groups yet, so
+          you can't reference an aggregate. By <code>HAVING</code> time the groups exist, so you can."</p>
+        <p>"So 'orders since January' goes in <code>WHERE</code>, and 'customers with more than five orders'
+          goes in <code>HAVING</code>."</p>
+        <p>"There's a performance point too: put anything you <em>can</em> in <code>WHERE</code>, because it
+          removes rows before the grouping work happens. A non-aggregate condition sitting in
+          <code>HAVING</code> is a mistake — you group everything and then throw groups away."</p>
+        <p>"That same processing order answers two related questions, incidentally. You can't use a
+          <code>SELECT</code> alias in <code>WHERE</code> because <code>SELECT</code> runs later — but you
+          <em>can</em> in <code>ORDER BY</code>, because that's after <code>SELECT</code>. And you can't
+          reference a window function in <code>WHERE</code> either, for the same reason, which is why
+          top-N-per-group always needs a CTE or subquery wrapper."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the logical order, or just memorise the rule?</li>
+        <li>Do you mention the performance implication?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why can't you use an alias in <code>WHERE</code>?</li>
+          <li>Can <code>HAVING</code> work without <code>GROUP BY</code>?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>You wrote a <code>LEFT JOIN</code> but customers with no orders are missing. Why? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Almost certainly there's a filter on the right-hand table in the <code>WHERE</code> clause, which
+          converts the <code>LEFT JOIN</code> into an <code>INNER JOIN</code>."</p>
+        <p>"The mechanism: the join does produce a row for the customer with no orders — with
+          <code>NULL</code> in every order column. Then <code>WHERE o.Status = 'Shipped'</code> evaluates
+          <code>NULL = 'Shipped'</code>, which is <em>unknown</em>, not true. So the row is filtered out. The
+          join worked; the <code>WHERE</code> undid it."</p>
+        <p>"The fix is to move the condition into the <code>ON</code> clause. There it's part of deciding what
+          counts as a match, so unmatched customers are still preserved with nulls."</p>
+        <p>"The rule I keep in mind: <strong>conditions on the outer table go in <code>ON</code>; conditions on
+          the preserved table go in <code>WHERE</code>.</strong>"</p>
+        <p>"There's a legitimate use of the same mechanism, worth mentioning: <code>LEFT JOIN ... WHERE
+          o.Id IS NULL</code> is the standard 'anti-join' — find customers with <em>no</em> orders. That's
+          deliberately exploiting the null rows. Though these days I'd write it as <code>NOT EXISTS</code>,
+          which says what it means and usually gets the same or a better plan."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand <em>why</em>, in terms of nulls and three-valued logic?</li>
+        <li>Do you know the <code>ON</code> vs <code>WHERE</code> rule?</li>
+        <li>Bonus: do you know the anti-join pattern?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Write me an anti-join.</li>
+          <li>What if the filter is on the left table instead?</li>
+          <li>Does this apply to <code>FULL OUTER JOIN</code>?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary><code>ROW_NUMBER</code> vs <code>RANK</code> vs <code>DENSE_RANK</code>? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They differ only in how they treat ties."</p>
+        <p>"<code>ROW_NUMBER</code> always gives distinct sequential numbers — ties are broken arbitrarily, so
+          you get 1, 2, 3, 4."</p>
+        <p>"<code>RANK</code> gives tied rows the same rank and then <strong>skips</strong>: 1, 2, 2, 4.
+          That's Olympic medals — two silvers means no bronze."</p>
+        <p>"<code>DENSE_RANK</code> gives tied rows the same rank with <strong>no gap</strong>: 1, 2, 2, 3.
+          That's what you want for 'how many distinct salary levels are above this person'."</p>
+        <p>"Which to use depends on what you're doing. For picking exactly one row per group — deduplication,
+          latest-record-per-key, top-N-per-group — it has to be <code>ROW_NUMBER</code>, because it's the only
+          one guaranteed to produce a single row with the value 1. If you used <code>RANK</code> for
+          deduplication and two rows tied, both would get rank 1 and you'd delete neither."</p>
+        <p>"One practical note: because <code>ROW_NUMBER</code> breaks ties arbitrarily, the result isn't
+          deterministic unless the <code>ORDER BY</code> inside the <code>OVER</code> clause is unique. So for
+          deduplication I always add a tiebreaker like the primary key — otherwise re-running the same query
+          can pick a different survivor, which makes it non-reproducible and awkward to test."</p>
+        <p>"And all three are evaluated at <code>SELECT</code> time, so you can't filter on them in the same
+          query level — the <code>rn &lt;= 5</code> filter always needs a CTE or subquery around it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you state the tie behaviour precisely?</li>
+        <li>Do you know which one deduplication requires, and why?</li>
+        <li>Do you mention determinism and the tiebreaker?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Write a query deleting duplicate emails, keeping the newest.</li>
+          <li>How would you get the 2nd highest salary per department?</li>
+          <li>How does <code>CROSS APPLY</code> compare for top-N-per-group?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>A report query with five chained CTEs takes 4 minutes. How do you approach it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd get the actual execution plan first and compare <strong>estimated versus actual rows</strong> at
+          each operator. With chained CTEs that's usually where the answer is."</p>
+        <p>"The reason is that a CTE isn't materialised — it's inlined into the outer query, so the optimiser
+          produces one plan for the whole thing and has to estimate cardinality through five levels of
+          transformation. Estimation error compounds. By level five it might think 100 rows and actually be
+          handling 2 million, so it picks nested loops where it needed a hash join."</p>
+        <p>"So my first move is usually to <strong>break the chain with a <code>#temp</code> table</strong> at
+          the point where the estimate first diverges badly. A temp table has real statistics, so everything
+          downstream starts from an accurate row count. I've seen that alone take a query from minutes to
+          seconds, without changing any logic."</p>
+        <p>"I'd also check whether any CTE is <strong>referenced more than once</strong>. If it is, the work
+          may be executing twice — that's invisible in the SQL and obvious in the plan. Materialising it fixes
+          that too."</p>
+        <p>"Then the usual suspects: is anything non-SARGable — a function wrapped around an indexed column?
+          Any implicit conversions? Any spilling sorts or hash joins, which mean the memory grant was too
+          small because of those bad estimates? And is there fan-out — a join to a child table before an
+          aggregate, which both inflates the row count and can make the numbers wrong as well as slow."</p>
+        <p>"Something I'd raise beyond the query itself: if this is a report over transactional tables, the
+          real answer might not be query tuning. It may be that reporting shouldn't run against the OLTP
+          database at all — a read replica, a nightly denormalized table, or a proper read model. A 4-minute
+          report also holding locks on live tables is a bigger problem than its runtime."</p>
+        <p>"And I'd want to know whether it's always slow or only sometimes. Intermittent points at parameter
+          sniffing — a cached plan compiled for an unrepresentative parameter value — which is a completely
+          different fix from a structural one."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you start from evidence — the actual plan — rather than guessing?</li>
+        <li>Do you know why chained CTEs specifically cause estimation problems?</li>
+        <li>Do you know the temp-table-for-statistics move?</li>
+        <li>Do you consider whether the workload belongs there at all?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add indexes" with no diagnosis.</li>
+        <li><span class="redflag">Red flag:</span> thinking CTEs are temp tables.</li>
+        <li><span class="redflag">Red flag:</span> no mention of reading the plan.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why does a temp table have better statistics than a CTE?</li>
+          <li>When would a table variable be the wrong choice?</li>
+          <li>How do you stop the report blocking live writes?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

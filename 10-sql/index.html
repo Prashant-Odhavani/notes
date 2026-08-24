@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL &amp; Azure SQL — Overview</title>
+<meta name="description" content="How SQL is interviewed at senior level, what actually matters, and how this section is organised.">
+<meta name="keywords" content="sql server azure sql interview senior relational database indexing execution plan transactions isolation performance tuning">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>SQL &amp; Azure SQL</h1>
+    <p class="subtitle">The database is where most production performance problems actually live. This is
+      the section that pays off most in interviews and in the job.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>Most "slow API" problems are slow queries, missing indexes, or blocking — not application code.</li>
+      <li>Indexing is the highest-value SQL topic. If you know one thing deeply, make it this.</li>
+      <li>Know how to <strong>read an execution plan</strong> well enough to spot a scan, a lookup and a
+        bad estimate.</li>
+      <li>Isolation levels and locking explain almost every "it works alone but breaks under load" bug.</li>
+      <li>Interviewers care far more about <em>why a query is slow</em> than about exotic syntax.</li>
+      <li>Azure SQL questions are mostly about tiers, scaling and HA — the SQL itself is the same.</li>
+    </ul>
+  </div>
+
+  <h2 id="how-sql-is-interviewed">How SQL is actually interviewed <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>At mid-to-senior level, SQL questions fall into four buckets, and they're weighted very unevenly:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Bucket</th><th>Typical question</th><th>How much it matters</th></tr></thead>
+      <tbody>
+        <tr><td>Writing a query</td><td>"Find the second-highest salary per department"</td><td>Screening only — table stakes</td></tr>
+        <tr><td><strong>Why is this slow?</strong></td><td>"This query was fine, now it takes 40 seconds"</td><td><strong>The main event</strong></td></tr>
+        <tr><td>Concurrency</td><td>"Two users update the same row — what happens?"</td><td>High. Separates experience from theory</td></tr>
+        <tr><td>Design &amp; operations</td><td>"How would you model this?", "How do you scale it?"</td><td>High at senior level</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>The question behind almost every senior SQL question is: <strong>do you understand what the database
+      is actually doing?</strong></p>
+    <p>Someone who can read a plan, explain why an index wasn't used, and reason about locking will
+      out-perform someone who knows more syntax.</p>
+  </div>
+
+  <h2 id="what-matters-most">What to prioritise</h2>
+
+  <p>If you're short on preparation time, in this order:</p>
+
+  <ol class="steps">
+    <li><strong><a href="indexing.html">Indexing</a></strong> — clustered vs non-clustered, column order,
+      covering indexes, and why an index sometimes isn't used.</li>
+    <li><strong><a href="performance.html">Execution plans and tuning</a></strong> — reading a plan,
+      SARGability, parameter sniffing.</li>
+    <li><strong><a href="transactions.html">Transactions and concurrency</a></strong> — isolation levels,
+      blocking, deadlocks.</li>
+    <li><strong><a href="querying.html">Querying</a></strong> — joins, CTEs, window functions, pagination
+      that scales.</li>
+    <li><strong><a href="fundamentals.html">Fundamentals</a></strong> — normalization and when to break it.</li>
+    <li><strong><a href="azure-sql.html">Azure SQL</a></strong> — if the role is Azure-based.</li>
+  </ol>
+
+  <h2 id="mental-model">One mental model to carry <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>Nearly every SQL performance answer comes back to the same idea:</p>
+
+  <blockquote><strong>How many pages does the database have to read to answer this question?</strong></blockquote>
+
+  <p>Everything follows from that:</p>
+
+  <ul>
+    <li>An index exists so the engine reads a few pages instead of all of them.</li>
+    <li>A covering index means it doesn't have to go back to the table for extra columns.</li>
+    <li>A wrong column order in a composite index means the engine can't seek, so it scans.</li>
+    <li>A non-SARGable predicate (a function on the column) means the index can't be used at all.</li>
+    <li>Bad statistics mean the optimiser guesses the wrong row count and picks the wrong plan.</li>
+  </ul>
+
+  <p>If you can trace a slow query back to "it's reading too many pages, and here's why", you can answer most
+    tuning questions without memorising anything.</p>
+
+  <h2 id="contents">Section contents</h2>
+  <div class="card-grid" data-section-index></div>
+
+  <h2 id="related">Related sections</h2>
+  <ul>
+    <li><a href="../11-ef-core/index.html">EF Core</a> — how these queries get generated, and the
+      performance traps specific to the ORM.</li>
+    <li><a href="../12-postgresql/index.html">PostgreSQL</a> — same concepts, different engine. MVCC and the
+      planner differ meaningfully.</li>
+    <li><a href="../35-scaling-scenarios/database.html">Database scaling scenarios</a> — the production
+      problems, with diagnosis order.</li>
+  </ul>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

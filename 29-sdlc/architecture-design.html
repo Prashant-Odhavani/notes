@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture &amp; Technical Design — SDLC</title>
+<meta name="description" content="Design docs, ADRs, one-way vs two-way doors, trade-off axes, spikes and how to tell which decisions deserve the effort.">
+<meta name="keywords" content="technical design document ADR architecture decision record trade-off analysis one-way door reversible decisions spike proof of concept design review over-engineering YAGNI">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="29-sdlc/architecture-design.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Architecture &amp; Technical Design</h1>
+    <p class="subtitle">How design decisions get made, recorded and defended — and how to tell which ones
+      actually deserve the effort.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>Architecture = the decisions that are <strong>expensive to reverse</strong>. Everything else is
+        just design, and should be decided as late and cheaply as possible.</li>
+      <li>Classify every decision as a <strong>one-way</strong> or <strong>two-way door</strong>. Two-way:
+        decide fast. One-way: slow down and write it up.</li>
+      <li>A design doc's value is in the <strong>alternatives you rejected and why</strong>.</li>
+      <li>ADRs — context, decision, consequences — are the cheapest useful documentation that exists.</li>
+      <li>Over-engineering isn't "too much code". It's <strong>flexibility bought before it's needed</strong>,
+        paid for daily.</li>
+      <li>The senior move is naming the trade-off out loud and choosing anyway.</li>
+    </ul>
+  </div>
+
+  <h2 id="what-is-architecture">What counts as architecture <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Architecture is the subset of design decisions that are <strong>hard to change later</strong> —
+      because other decisions rest on them, they're embedded in data, or other teams depend on them.</p>
+    <p>Whether you use a repository per aggregate is design. Whether orders and payments share a database is
+      architecture.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Decision</th><th>How reversible?</th><th>Effort it deserves</th></tr></thead>
+      <tbody>
+        <tr><td>Naming, file layout, internal class structure</td><td>Trivial</td><td>Almost none — decide in the PR</td></tr>
+        <tr><td>Library for JSON, validation, mapping</td><td>Cheap if isolated behind your own types</td><td>Minutes; pick the boring one</td></tr>
+        <tr><td>Sync HTTP call vs message queue between two components</td><td>Moderate — changes error handling and testing</td><td>A discussion; write down why</td></tr>
+        <tr><td>Public API contract shape</td><td>Hard — external consumers, versioning</td><td>Design doc + review</td></tr>
+        <tr><td>Database engine and data model</td><td>Very hard — migration with downtime risk</td><td>Design doc, spike, explicit sign-off</td></tr>
+        <tr><td>Service boundaries / splitting a monolith</td><td>Extremely hard — organisational too</td><td>The most expensive decision here — see <a href="../20-microservices/boundaries.html">boundaries</a></td></tr>
+        <tr><td>Tenancy model (shared vs isolated data)</td><td>Extremely hard — touches every query and migration</td><td>Decide early and deliberately — see <a href="../23-multi-tenant-saas/isolation-models.html">isolation models</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Saying "that's a two-way door, let's pick one and move on" in a meeting that's been
+      circling for twenty minutes is one of the highest-leverage things a senior engineer does.
+      <br><br>
+      Equally: recognising that an apparently small decision — a column type, an ID format, an event schema —
+      is actually a <em>one-way</em> door, because data will accumulate under it.</p>
+  </div>
+
+  <h2 id="design-doc">The design document <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>A design doc exists to get disagreement to happen <em>before</em> the code is written, when it costs a
+    comment instead of a rewrite.</p>
+
+  <p>Its second value: writing it forces you to discover the parts you hadn't thought about. The outline
+    below is ordered so the hard parts can't be skipped.</p>
+
+  <pre data-label="design doc skeleton — one to four pages, never more" class="code-good"><code class="language-text" data-nohl>1. Context and problem
+   What is broken or needed, for whom, and what happens if we do nothing.
+   Include numbers: current volume, growth, error rates, cost.
+
+2. Goals / non-goals
+   Non-goals are the more valuable half. They stop scope drift in review.
+
+3. Constraints and assumptions
+   Deadlines, existing systems, team skills, budget, compliance.
+   Assumptions listed explicitly so a reviewer can challenge one.
+
+4. Proposed design
+   Components, data model changes, key flows INCLUDING failure flows,
+   contract changes. Enough that someone else could implement it.
+
+5. Alternatives considered
+   At least two, each with why it lost. If you can't name a real
+   alternative, you haven't designed - you've described your first idea.
+
+6. Trade-offs accepted
+   What gets worse. Every design makes something worse.
+
+7. Risks and mitigations
+   What could go wrong, how we'd detect it, what we'd do.
+
+8. Rollout and rollback
+   Migration steps, backwards compatibility, flags, how to undo it.
+
+9. Observability
+   What metrics/logs/traces are added, and what "healthy" looks like.
+
+10. Open questions
+    What you want the review to answer.</code></pre>
+
+  <p><strong>Two sections are the seniority tell:</strong></p>
+
+  <ul>
+    <li><strong>Non-goals</strong> — shows you're managing scope rather than being pushed by it.</li>
+    <li><strong>Trade-offs accepted</strong> — shows you know the design has costs. A doc that presents a
+      solution with no downside reads as naive, and experienced reviewers immediately start hunting for
+      what you missed.</li>
+  </ul>
+
+  <h3 id="adr">Architecture Decision Records</h3>
+
+  <p>ADRs are the lightweight persistent version: one short file per significant decision, stored next to
+    the code, numbered, and never edited — superseded instead.</p>
+
+  <pre data-label="adr — 0007-outbox-for-order-events.md" class="code-good"><code class="language-text" data-nohl># 7. Use a transactional outbox for order events
+
+Status: Accepted  (supersedes ADR-0004)
+Date:   2025-03-11
+
+## Context
+Order state changes must reach the fulfilment service. Today we publish to
+Service Bus inside the same method that saves the order. Last quarter we had
+3 incidents where the DB commit succeeded and the publish failed, leaving
+orders fulfilment never saw. Dual writes can't be made atomic across SQL and
+Service Bus.
+
+## Decision
+Write the event to an Outbox table in the same SQL transaction as the order.
+A background dispatcher polls the table and publishes, marking rows sent.
+Consumers must be idempotent, keyed on event id.
+
+## Consequences
++ No lost events: committed atomically with the state change.
++ Publish failures become retryable rather than data loss.
+- Added latency: events land ~1s after commit, not instantly.
+- New moving part: the dispatcher must be monitored (queue depth, age of
+  oldest unsent row) and can itself fail.
+- At-least-once delivery becomes explicit; every consumer now needs
+  idempotency, which is work we previously avoided thinking about.</code></pre>
+
+  <p>Notice the consequences section contains <strong>negatives</strong>. An ADR with only benefits is
+    marketing.</p>
+
+  <p>Also notice the date and supersession. Six months later, "why is there a polling dispatcher in here?"
+    has a permanent answer — which is what stops someone "simplifying" it back into the original bug. The
+    pattern itself is covered in <a href="../19-architecture/distributed-data.html">distributed data</a>.</p>
+
+  <h2 id="trade-offs">Reasoning about trade-offs <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p>Every architectural choice trades along a small number of recurring axes. Naming the axis is what turns
+    a preference fight into a productive argument.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Axis</th><th>You buy</th><th>You pay with</th></tr></thead>
+      <tbody>
+        <tr><td>Consistency ↔ availability</td><td>Always-correct reads</td><td>Unavailability during partitions; higher latency</td></tr>
+        <tr><td>Latency ↔ durability</td><td>Fast acknowledgement</td><td>Risk of losing recent writes on failure</td></tr>
+        <tr><td>Coupling ↔ autonomy</td><td>Independent deployability</td><td>Duplicated data, eventual consistency, more ops</td></tr>
+        <tr><td>Simplicity ↔ flexibility</td><td>Ability to vary later</td><td>Indirection everyone pays to read, today</td></tr>
+        <tr><td>Performance ↔ maintainability</td><td>Speed</td><td>Caching layers, denormalization, invalidation bugs</td></tr>
+        <tr><td>Build ↔ buy</td><td>Fit and control</td><td>Maintenance, security patching, the team's attention</td></tr>
+        <tr><td>Cost ↔ resilience</td><td>Multi-region, redundancy</td><td>Money and operational complexity</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note compare">
+    <div class="note-title">Trade-off — the one that causes most over-engineering</div>
+    <p style="margin:0">Flexibility is <strong>not</strong> free capacity held in reserve. It's complexity
+      you pay for on every read, every debug session and every onboarding, in exchange for an option you may
+      never exercise.
+      <br><br>
+      The rule that holds up: <strong>build the abstraction on the second concrete case, not the first.</strong>
+      The first case can't tell you which axis will actually vary, so the abstraction you invent is usually
+      the wrong one — and a wrong abstraction costs more than duplication.</p>
+  </div>
+
+  <h3 id="over-engineering">What over-engineering actually looks like</h3>
+
+  <p>It rarely looks like showing off. It looks like reasonable caution:</p>
+
+  <ul>
+    <li>An interface with exactly one implementation, created "for testability" — when the concrete class was
+      already injectable.</li>
+    <li>A repository over an ORM that's already an abstraction over the database, so every query passes
+      through two layers that add nothing.</li>
+    <li>A message queue between two components that are always deployed together and always need a
+      synchronous answer.</li>
+    <li>A plugin system for the one variation that exists.</li>
+    <li>Microservices at a team size where a modular monolith would ship faster and fail less.</li>
+  </ul>
+
+  <div class="remember">
+    <span class="r-label">The counter-test</span>
+    <p>"What specific, named, currently-plausible change does this make cheaper — and what is it costing me
+      until then?"</p>
+    <p>If the answer is "any future change", it's speculative and probably wrong.</p>
+  </div>
+
+  <h2 id="spikes">Spikes and prototypes <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>A spike is a timeboxed experiment answering a specific question. The discipline that makes it work:
+    write the question and the timebox <em>before</em> starting, and agree the code is disposable.</p>
+
+  <div class="vs-grid">
+    <div class="bad">
+      <span class="vs-label">Bad spike</span>
+      <p>"Investigate caching options."<br>No end date. Becomes a side project.</p>
+    </div>
+    <div class="good">
+      <span class="vs-label">Good spike</span>
+      <p>"Can Redis sustain 8k reads/sec at p99 &lt; 5ms on the smallest tier? One day, answer goes in the
+        ticket."</p>
+    </div>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap</div>
+    <p style="margin:0">Prototype code shipping to production because "it already works" is one of the most
+      reliable sources of long-term pain in this industry. Prototypes deliberately skip error handling,
+      security, tests and edge cases — that's what made them fast.
+      <br><br>
+      If a prototype must be productionised, treat it as a <strong>rewrite with the prototype as the
+      specification</strong>, and say so explicitly in the plan.</p>
+  </div>
+
+  <h2 id="design-review">Running a design review</h2>
+
+  <p>Reviews fail two ways: rubber-stamping, and bikeshedding the easy parts while the risky part goes
+    unexamined. Both are avoidable:</p>
+
+  <ol class="steps">
+    <li><strong>Circulate before the meeting.</strong> Reading live gets shallow feedback.</li>
+    <li><strong>Ask for specific feedback.</strong> "I'm most unsure about the migration path" directs
+      attention at the real risk.</li>
+    <li><strong>Separate blocking from non-blocking comments.</strong> Naming preferences should never hold
+      up a design.</li>
+    <li><strong>Invite the people who'll operate it</strong>, not just build it. The best feedback often
+      comes from whoever carries the pager.</li>
+    <li><strong>Record the decision and the date.</strong> Undocumented outcomes get re-litigated.</li>
+  </ol>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Sort decisions by reversibility first. That determines how much process they deserve.</li>
+      <li>The alternatives-rejected section is what makes a design doc worth writing.</li>
+      <li>An ADR without negative consequences isn't an ADR.</li>
+      <li>Name the trade-off axis out loud — it converts preference fights into design discussions.</li>
+      <li>Abstract on the second case, not the first.</li>
+      <li>Spikes need a written question and a timebox, or they become research projects.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Designing for scale the business has never approached</strong>, while the current bottleneck
+      goes unfixed.</li>
+    <li><strong>Choosing technology by novelty.</strong> Every unusual choice is a hiring, on-call and
+      support commitment for years.</li>
+    <li><strong>No rollback plan for schema changes.</strong> Adding a column is easy; discovering the deploy
+      can't be reverted because new code already wrote data old code can't read is a real outage.</li>
+    <li><strong>Designing only the happy path</strong>, then discovering the failure design <em>is</em> the
+      architecture.</li>
+    <li><strong>Treating the design as fixed after review.</strong> Implementation always finds something.
+      Update the doc; don't quietly diverge.</li>
+    <li><strong>No observability in the design.</strong> If you can't answer "how will we know this works?",
+      the design isn't finished.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>How do you decide whether something needs a design document?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I use reversibility and blast radius. If the decision is cheap to undo and contained in one
+          component, the pull request <em>is</em> the design document — writing a page first would just slow
+          the feedback loop."</p>
+        <p>"If it changes a contract other teams depend on, changes the data model, introduces new
+          infrastructure someone has to operate, or would be expensive to migrate away from — it gets
+          written up."</p>
+        <p>"There's a second trigger that's about coordination rather than risk: if more than one person
+          needs the same mental model to build it, or I expect disagreement, the document is the cheapest way
+          to surface that early. Ninety minutes of writing that prevents two engineers building incompatible
+          halves pays for itself many times over."</p>
+        <p>"Length should match the stakes. Most of what I write is one page — context, decision,
+          consequences, effectively an ADR. Full multi-page designs are for genuinely architectural changes,
+          maybe a handful a year."</p>
+        <p>"The failure mode I actively avoid is heavyweight process on small changes. That teaches the team
+          documentation is a tax, and then nobody writes anything when it actually matters."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you scale process to risk, or apply it uniformly?</li>
+        <li>Do you see documentation as coordination rather than compliance?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What do you do when the design changes during implementation?</li>
+          <li>How do you stop design docs going stale?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Describe a design decision you got wrong. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The structure that works here: what you chose, what made it seem right <em>at the time</em>, what
+          signal revealed it was wrong, what it cost, and what rule you now apply."</p>
+        <p>"For example: I introduced a generic rules engine so business users could configure pricing logic
+          without deployments. The reasoning was sound on paper — pricing changed often and each change was a
+          release."</p>
+        <p>"What actually happened was that the rules became a programming language with no debugger, no
+          tests and no version control. Nobody outside the team ever wrote a rule, so we got all of the
+          complexity and none of the benefit. Debugging a pricing bug meant reading data rows instead of
+          code, and it took three times as long."</p>
+        <p>"What I took from it, as a rule: I now ask <em>who specifically</em> will use the flexibility, by
+          name, and whether they've asked for it. If the answer is a hypothetical user, I build the concrete
+          thing and keep the code easy to change. And configuration that replaces code needs the same tooling
+          as code — otherwise you've built a worse programming language."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you admit a real mistake with real consequences?</li>
+        <li>Did you extract a transferable principle, or just "I should have tested more"?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a mistake that's secretly a virtue ("I cared too much about quality").</li>
+        <li><span class="redflag">Red flag:</span> blaming other people or changing requirements.</li>
+        <li><span class="redflag">Red flag:</span> a trivial example that carried no cost.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How did you unwind it? What did the migration look like?</li>
+          <li>Would you make the same call at a different company size?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A teammate proposes a design you think is over-engineered. How do you handle the review?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by assuming they know something I don't, because in a review that's often true — there
+          may be a roadmap item or a constraint that makes the flexibility justified. So my first move is a
+          question, not a verdict: 'what change is this designed to make cheap, and when do we expect it?'"</p>
+        <p>"If there's a concrete near-term answer, the design may be right and I've learned something."</p>
+        <p>"If the answer is speculative, I make the cost visible rather than arguing principles. Concretely:
+          this adds two indirections a new engineer has to traverse to follow a request, it makes stack traces
+          harder to read, it adds a configuration surface we have to test combinations of, and it'll take an
+          extra week we could spend on something we know is needed."</p>
+        <p>"Framing it as a cost paid <em>daily</em> against a benefit that's <em>uncertain</em> usually shifts
+          the conversation."</p>
+        <p>"Then I'd offer the alternative rather than just objecting — usually: build the direct version now,
+          keep the seam where variation would go, add the abstraction when the second case arrives. That
+          respects their concern without paying for it upfront."</p>
+        <p>"And I'd hold it loosely. If they still disagree and it's a two-way door, it's not worth blocking
+          on. Being right about a reversible decision is worth much less than the trust you spend winning the
+          argument."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you disagree technically without damaging the relationship?</li>
+        <li>Do you distinguish decisions worth fighting for from ones that aren't?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if it's a one-way door and you still disagree after discussion?</li>
+          <li>How do you review a design from someone much more senior than you?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

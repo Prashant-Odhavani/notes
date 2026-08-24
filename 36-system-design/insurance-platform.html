@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Insurance Management Platform — System Design Exercises</title>
+<meta name="description" content="A worked design for a regulated domain: temporal data, audit trails, versioned business rules, document retention and legacy integration.">
+<meta name="keywords" content="insurance platform design regulated domain temporal data bi-temporal audit trail event sourcing versioned rules engine policy lifecycle claims document retention legacy integration anti-corruption layer GDPR reporting">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/insurance-platform.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Insurance Management Platform</h1>
+    <p class="subtitle">A regulated domain, where the requirement that changes everything is being able to reconstruct
+      what you knew and decided at any past moment.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Assumed answer</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Retention?</td><td><strong>Policies and claims for 7+ years after expiry</strong></td><td>Data volume grows and never shrinks</td></tr>
+        <tr><td>Auditability?</td><td><strong>Who changed what, when, and why</strong> — for regulators</td><td>Append-only history, not a status column</td></tr>
+        <tr><td>Can a past decision be re-examined?</td><td><strong>Yes — years later, in a dispute</strong></td><td>Rules must be versioned, not just data</td></tr>
+        <tr><td>Backdating?</td><td>Yes — a policy change effective last month</td><td><strong>Two time dimensions</strong></td></tr>
+        <tr><td>Legacy systems?</td><td>A mainframe policy admin system and a broker feed</td><td>Anti-corruption layer, batch integration</td></tr>
+        <tr><td>Volume?</td><td>Modest — hundreds of thousands of policies</td><td><strong>Not a scale problem</strong></td></tr>
+        <tr><td>Out of scope</td><td>Actuarial pricing models, reinsurance, the broker portal UI</td><td>Focus on the domain model and audit</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the defining requirement is temporal, not technical</div>
+    <p style="margin:0">Most designs in this section are shaped by scale or consistency. This one is shaped by
+      <strong>time</strong>, and recognising that changes the whole model.
+      <br><br>
+      A regulator or a court can ask: <em>"on 14 March 2023, what did this policy cover, what did you know about the
+      customer, and what rules did you apply?"</em> Answering that requires more than an audit log of changes — it
+      requires that <strong>the state and the logic at that moment are both reconstructable</strong>.
+      <br><br>
+      Which rules out the default design. A <code>Policies</code> table with an <code>UPDATE</code> and an audit
+      trigger tells you a field changed; it doesn't let you reconstitute the policy as it stood, or apply the
+      underwriting rules that were in force then.
+      <br><br>
+      So the model is <strong>append-only, temporal, and version-aware about rules as well as data</strong>. That's
+      the decision everything else follows from, and stating it early is what distinguishes a design that meets the
+      requirement from one that meets it approximately.
+      <br><br>
+      The compensating good news: <strong>volume is modest</strong>. Hundreds of thousands of policies means a single
+      relational database is entirely adequate, so you can spend the complexity budget on correctness and history
+      rather than on distribution.</p>
+  </div>
+
+  <h2 id="temporal">Two dimensions of time <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — effective time versus recorded time"><code class="language-text">  A customer rings on 20 August to add a driver, effective from 1 August.
+
+  EFFECTIVE (valid) time   when the change applies in the real world  -> 1 Aug
+  RECORDED (system) time   when we learned about it                   -> 20 Aug
+
+  Both are needed, and they answer different questions:
+
+  "What did the policy cover on 10 August?"
+       -> as we understand it TODAY: the driver was covered
+       -> as we understood it ON 15 AUGUST: the driver was NOT covered
+
+  The second question is the one that matters in a dispute, because it is
+  what the premium was calculated on and what a claims handler saw.
+
+  A single "LastUpdated" column can answer NEITHER.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Gives</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Append-only versions</strong><br>(<code>ValidFrom</code>, <code>ValidTo</code>, <code>RecordedAt</code>)</td>
+          <td><strong>Both time dimensions; queryable as-of any point</strong></td>
+          <td>Every read needs temporal predicates</td>
+        </tr>
+        <tr>
+          <td>SQL Server temporal tables</td>
+          <td>System time automatically, with <code>AS OF</code> syntax</td>
+          <td><strong>Only one dimension</strong> — you still model effective time</td>
+        </tr>
+        <tr>
+          <td>Event sourcing</td>
+          <td>Complete history by construction; replayable</td>
+          <td>Significant complexity; projections to build and rebuild</td>
+        </tr>
+        <tr>
+          <td>Audit table via triggers</td>
+          <td>A record that something changed</td>
+          <td><strong>Cannot reconstruct state or answer as-of queries</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Bi-temporal versioning, and why not event sourcing</div>
+    <p style="margin:0">My choice would be <strong>explicit append-only versioned rows</strong> carrying both
+      <code>ValidFrom</code>/<code>ValidTo</code> (effective time) and <code>RecordedAt</code> (system time), rather
+      than full event sourcing.
+      <br><br>
+      The reasoning: this gives the regulator-facing capability — reconstruct any state as at any pair of times — while
+      keeping the model something a developer can query directly with SQL. The history is <em>data</em>, not a stream
+      requiring a projection to interpret.
+      <br><br>
+      <strong>Event sourcing would also work</strong> and it's a much larger commitment: projections to build, rebuild
+      and keep consistent, eventual consistency on every read model, schema evolution on events that must remain
+      readable for a decade, and a team that has to understand it. For hundreds of thousands of policies, that's
+      complexity without a proportionate benefit.
+      <br><br>
+      Being able to say <em>why not</em> event sourcing is a stronger signal than proposing it, because it's the
+      obvious thing to reach for in this domain and the trade-off is rarely examined.
+      <br><br>
+      What I would use it for is <strong>one bounded context where the history genuinely is the domain</strong> —
+      claims progression, perhaps — rather than for the whole system. That's the pragmatic middle: full history where
+      it earns its cost.
+      <br><br>
+      One honest cost of the versioned approach: <strong>every query needs temporal predicates</strong>, and
+      forgetting them returns duplicate rows or a superseded version. So access goes through a repository that applies
+      them by default — the same structural-enforcement argument as a tenant filter.</p>
+  </div>
+
+  <h2 id="audit">Audit trail <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Must capture</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Who</strong> — user, or system, or which integration</td><td>Accountability</td></tr>
+        <tr><td><strong>What</strong> — before and after, or the change intent</td><td>Reconstruction</td></tr>
+        <tr><td><strong>When</strong> — recorded and effective</td><td>Both time dimensions</td></tr>
+        <tr><td><strong>Why</strong> — reason code, or a free-text note</td><td><strong>The one usually missing, and the one regulators ask for</strong></td></tr>
+        <tr><td>On behalf of whom</td><td>Broker or agent acting for a customer</td></tr>
+        <tr><td>Correlation id</td><td>Ties a change to the request and the trace</td></tr>
+        <tr><td>Immutability</td><td><strong>Append-only; no update or delete permission</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">"Why" is the field that gets left out, and the one that's asked for</div>
+    <p style="margin:0">Most audit implementations capture who, what and when — usually via a trigger or an EF Core
+      interceptor diffing entities. That's mechanical and it misses the important part.
+      <br><br>
+      A regulator examining a declined claim doesn't primarily want to know that <code>CoverLevel</code> changed from
+      <code>Standard</code> to <code>Basic</code> on a Tuesday. They want to know <strong>why</strong>: was it a
+      customer request, an underwriting decision, a correction of a data-entry error, or a system migration?
+      <br><br>
+      Those have completely different implications, and a field-level diff cannot distinguish them.
+      <br><br>
+      Which means the audit should record <strong>the intent</strong>, not just the effect — the command that was
+      issued, with its reason code and any note. That's a genuine argument for capturing changes as domain operations
+      (<code>DriverAdded</code>, <code>CoverDowngraded</code>, <code>DataCorrected</code>) rather than as row
+      diffs.
+      <br><br>
+      Two structural requirements. <strong>Append-only, enforced by permissions</strong> — the application's database
+      user has INSERT but not UPDATE or DELETE on audit tables, so tampering isn't possible even through a bug or a
+      compromised credential. And <strong>capture system-initiated changes with the same rigour</strong>: a batch job
+      or an integration feed adjusting thousands of policies must be as attributable as a user click, or your audit
+      has a large hole exactly where bulk changes happen.</p>
+  </div>
+
+  <h2 id="rules">Versioned business rules <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — the requirement people miss"><code class="language-text">  A claim from March 2023 is disputed in 2026.
+
+  "Why was this declined?"
+     -> because the exclusion rules AS AT MARCH 2023 excluded it
+     -> the rules have since changed twice
+
+  If the rules only exist as TODAY's deployed code, you cannot answer.
+  Re-running the claim gives TODAY's answer, which is the wrong answer.
+
+  So:
+    - rule sets are DATA, versioned, with effective dates
+    - every decision records WHICH rule version produced it
+    - and ideally the INPUTS, so the decision is reproducible
+</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Reproducible?</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Record the decision and its inputs</strong></td>
+          <td><strong>Yes — the decision itself is the record</strong></td>
+          <td>Storage; must capture every relevant input</td>
+        </tr>
+        <tr>
+          <td><strong>Rule sets as versioned data</strong></td>
+          <td>Yes — re-evaluate against the version in force</td>
+          <td>A rules engine to build and test</td>
+        </tr>
+        <tr>
+          <td>Rules in code, with version tags in git</td>
+          <td>In principle, by checking out old code</td>
+          <td><strong>Not practical to run in production</strong></td>
+        </tr>
+        <tr>
+          <td>Rules in code, unversioned</td>
+          <td><strong>No</strong></td><td>Cannot answer the question at all</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — record the decision, not just the outcome</div>
+    <p style="margin:0">The simplest thing that satisfies the requirement, and the one I'd do first:
+      <strong>every automated decision writes an immutable record containing its inputs, the rule version applied, the
+      outcome, and the reasoning</strong> — which conditions matched.
+      <br><br>
+      That answers "why was this declined in March 2023?" directly, without needing to re-run anything. The decision
+      <em>is</em> the evidence.
+      <br><br>
+      It's also much cheaper than a full rules engine, and it composes with one: if rules are versioned data, the
+      record references a rule set version and the decision can be re-derived; if rules are still in code, the record
+      is at least self-contained.
+      <br><br>
+      The important discipline is <strong>capturing the inputs</strong>. A decision record saying "declined under
+      exclusion 4b" is useful; one that also captures the claim details and customer data the decision saw is
+      reproducible. Without inputs you're trusting that nothing else changed — and in a domain where the customer's
+      record has itself been amended since, that assumption is wrong.
+      <br><br>
+      Which connects back to bi-temporal data: <strong>the decision was made against the data as it was
+      recorded at that time</strong>, not as it appears now. Both mechanisms are needed for the same question, and
+      that's the insight worth articulating.
+      <br><br>
+      For rules as data, the honest caution: a rules engine is often <strong>sold as "the business can change
+      rules"</strong> and in practice needs the same testing and release discipline as code. So it's worth building
+      for <em>versioning and auditability</em>, and being sceptical of the self-service promise.</p>
+  </div>
+
+  <h2 id="legacy">Legacy integration <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Their model leaking into ours</strong></td><td><strong>An anti-corruption layer</strong> translating at the boundary</td></tr>
+        <tr><td><strong>Nightly batch, not real time</strong></td><td>Accept it; design for staleness rather than hiding it</td></tr>
+        <tr><td><strong>Who owns the truth?</strong></td><td><strong>Decide per entity, explicitly.</strong> Never both</td></tr>
+        <tr><td>Malformed or unexpected records</td><td>Quarantine the record, continue the batch, alert</td></tr>
+        <tr><td>Reprocessing a batch</td><td>Idempotent by natural key, so a re-run converges</td></tr>
+        <tr><td>Their system is unavailable</td><td>Queue outbound changes; never lose them</td></tr>
+        <tr><td>Cutting over eventually</td><td>Strangler pattern, entity by entity</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Decide who owns each entity, or you get a fight</div>
+    <p style="margin:0">The failure that costs the most in legacy integration is <strong>two systems both believing
+      they own the same data</strong>. Ours updates a policy, the nightly feed overwrites it with the mainframe's
+      version, a user re-enters the change, and it flips back the next night.
+      <br><br>
+      Nothing errors. The data oscillates, users lose confidence in both systems, and diagnosing it takes a
+      surprisingly long time because each system is behaving correctly by its own lights.
+      <br><br>
+      So ownership has to be explicit <strong>per entity, and written down</strong>: the mainframe owns policy
+      administration, we own claims. Data flowing from a non-owner is <em>read-only</em> in the receiving system,
+      enforced by not exposing an edit path — not by asking people to remember.
+      <br><br>
+      The <strong>anti-corruption layer</strong> is the second essential piece. Legacy systems have models shaped by
+      decades of constraints — flags with three meanings, dates as strings, codes nobody can decode. Translating at
+      the boundary keeps that out of your domain model, and it means the eventual migration changes one component
+      rather than every class.
+      <br><br>
+      And design for the <strong>batch reality</strong> rather than pretending: if the feed is nightly, the UI should
+      say when data was last synchronised. Showing a stale value as though it were current is worse than showing it
+      with a timestamp.</p>
+  </div>
+
+  <h2 id="documents">Documents and retention <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Requirement</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td><strong>The document as issued, forever</strong></td><td>Store the rendered PDF, not just the data</td></tr>
+        <tr><td><strong>Tamper evidence</strong></td><td>Hash on storage; <strong>immutability policy on the container</strong></td></tr>
+        <tr><td>Retention 7+ years</td><td>Lifecycle rules; cool or cold tier, not archive if it may be needed</td></tr>
+        <tr><td><strong>Legal hold</strong></td><td>Suspends deletion for specific items under dispute</td></tr>
+        <tr><td>GDPR erasure vs retention</td><td><strong>Regulatory retention usually overrides erasure</strong></td></tr>
+        <tr><td>Access audit</td><td>Who viewed which document, when</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — store the rendered document, and know why</div>
+    <p style="margin:0">The tempting approach is to store the data and regenerate the policy document on demand.
+      That's wrong here, and the reason is worth articulating.
+      <br><br>
+      <strong>The document the customer received is the contract.</strong> Regenerating it years later applies today's
+      template, today's wording, today's branding — and possibly a template bug fixed since. What you produce is
+      <em>not</em> what they were sent, which in a dispute is exactly the wrong answer.
+      <br><br>
+      So the rendered PDF is stored as issued, with a hash so tampering is detectable, in a container with an
+      <strong>immutability policy</strong> — time-based retention that even an account owner cannot delete within the
+      window. That's the only control an attacker with full credentials can't undo, and it's what makes the archive
+      defensible rather than merely present.
+      <br><br>
+      On <strong>archive tiering</strong>: Archive is genuinely cheaper and it is <em>not readable</em> — rehydration
+      takes hours. For documents a customer or a claims handler might request, Cool or Cold is the right tier. And the
+      minimum-retention charges mean moving data to a colder tier too early can cost <em>more</em>.
+      <br><br>
+      The conflict worth raising unprompted: <strong>GDPR erasure versus regulatory retention.</strong> A customer
+      asking to be forgotten does not override a statutory obligation to retain insurance records — Article 17 has
+      exemptions for legal obligations. So the design needs a documented position per data category, and the ability
+      to erase <em>marketing</em> data while retaining <em>contractual</em> records. Saying "we'd delete everything" is
+      the wrong answer, and so is "we can't delete anything".</p>
+  </div>
+
+  <h2 id="model">Domain model shape <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="text — aggregates drawn around what must be consistent"><code class="language-text">  POLICY aggregate            (append-only versions, bi-temporal)
+    identity, cover, insured parties, premium, endorsements
+    invariant: cover and premium must always be consistent with each other
+    -> one aggregate, one transaction
+
+  CLAIM aggregate             (its own lifecycle, its own history)
+    references a POLICY VERSION - the one in force at the incident date
+    invariant: reserve and payments must not exceed authority limits
+
+  CUSTOMER aggregate
+    identity, contact, relationships. Referenced by policies
+
+  DECISION RECORDS            (immutable, append-only, never an aggregate)
+    underwriting decisions, claims decisions - with inputs and rule version
+
+  Separate: DOCUMENTS (blob + metadata), AUDIT (append-only), REPORTING (projection)
+</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">A claim references a policy <em>version</em>, not a policy</div>
+    <p style="margin:0">This is the detail that shows the temporal model is understood rather than bolted on.
+      <br><br>
+      A claim is assessed against the cover <strong>in force on the incident date</strong> — not today's cover. If the
+      policy was amended after the incident, the claim must still be judged on what applied then. So the claim holds a
+      reference to a specific policy version, resolved by effective date at the time the claim is created.
+      <br><br>
+      Get this wrong and claims silently change outcome when a policy is amended, which is both incorrect and a
+      compliance problem — and it's the sort of bug that only surfaces during a dispute years later.
+      <br><br>
+      The related design point: <strong>the aggregate boundaries follow invariants.</strong> Cover and premium must be
+      consistent with each other, so they're in one aggregate updated in one transaction. A claim's reserve and
+      payments must respect authority limits, so those are one aggregate. Claims and policies are separate, because a
+      claim being created doesn't need to be atomic with a policy amendment.
+      <br><br>
+      That's the same "what must be transactional together" question as everywhere else, and here it produces a
+      relatively coarse-grained model — which is right for a domain where correctness matters far more than write
+      throughput.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Reporting must not run against the transactional model</div>
+    <p style="margin:0">A bi-temporal append-only model is <em>awful</em> for reporting. Every query needs temporal
+      predicates, there are many versions per entity, and an analyst writing SQL against it will get wrong answers —
+      double-counting superseded versions is the obvious trap.
+      <br><br>
+      So reporting gets a <strong>projection</strong>: a flattened, current-state (or as-at-a-chosen-date) model built
+      from the transactional data, in a separate database. Then analysts query something comprehensible and their
+      queries don't compete with transactional work.
+      <br><br>
+      That's CQRS at its most justified — not for scale, but because the write model's shape is genuinely unsuitable
+      for reading. Which is the honest reason to reach for it, and a better one than throughput.
+      <br><br>
+      The regulatory angle: <strong>reports must be reproducible.</strong> A report run today for last quarter should
+      match the one run last quarter — so either the projection is itself as-at-dated, or reports are archived when
+      produced. Otherwise a backdated amendment silently changes historical figures, and someone will notice during an
+      audit.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The defining requirement is temporal: reconstruct state <em>and</em> logic as at any past moment.</li>
+      <li>Two time dimensions — effective and recorded. A <code>LastUpdated</code> column answers neither.</li>
+      <li>Bi-temporal versioned rows over event sourcing, and be able to say why.</li>
+      <li>SQL temporal tables give system time only; effective time is still yours to model.</li>
+      <li>Enforce temporal predicates in a repository, not by remembering.</li>
+      <li>Audit must capture <em>why</em>, not just who/what/when.</li>
+      <li>Capture intent as domain operations rather than row diffs.</li>
+      <li>Audit tables append-only, enforced by database permissions.</li>
+      <li>Attribute system-initiated batch changes as rigorously as user actions.</li>
+      <li>Record every decision with its inputs and rule version — the decision is the evidence.</li>
+      <li>Be sceptical of the rules-engine self-service promise; build it for versioning.</li>
+      <li>Decide entity ownership explicitly, or the data oscillates.</li>
+      <li>An anti-corruption layer keeps the legacy model out of your domain.</li>
+      <li>Store the rendered document as issued, with immutability — don't regenerate.</li>
+      <li>Regulatory retention usually overrides GDPR erasure; document it per category.</li>
+      <li>A claim references a policy <em>version</em>, resolved by incident date.</li>
+      <li>Reporting needs a projection, and reports must be reproducible.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Design a policy administration system. It must satisfy a regulator. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by naming the requirement that shapes everything, because it isn't scale.
+          <strong>A regulator can ask: on 14 March 2023, what did this policy cover, what did we know about the
+          customer, and what rules did we apply?</strong>"</p>
+        <p>"Answering that needs more than an audit log — it needs the <strong>state and the logic at that moment to
+          both be reconstructable</strong>. Which rules out the default design of a Policies table with UPDATEs and an
+          audit trigger: that tells you a field changed, not what the policy was or what rules were in force."</p>
+        <p>"<strong>So the model is append-only and bi-temporal.</strong> Two time dimensions, and they answer
+          different questions."</p>
+        <p>"<strong>Effective time</strong> — when a change applies in the real world. <strong>Recorded time</strong> —
+          when we learned about it. If a customer rings on 20 August to add a driver effective from 1 August, then
+          'what did the policy cover on 10 August?' has <em>two</em> correct answers: as we understand it today, the
+          driver was covered; as we understood it on 15 August, they weren't."</p>
+        <p>"The second answer is the one that matters in a dispute, because it's what the premium was based on and what
+          a claims handler actually saw. A single <code>LastUpdated</code> column answers neither."</p>
+        <p>"<strong>I'd implement that as explicit versioned rows</strong> with <code>ValidFrom</code>,
+          <code>ValidTo</code> and <code>RecordedAt</code>, rather than full event sourcing."</p>
+        <p>"Event sourcing would also satisfy the requirement, and it's a much larger commitment: projections to build
+          and rebuild, eventual consistency on reads, event schema evolution that must stay readable for a decade, and
+          a team that understands it. For hundreds of thousands of policies that's complexity without proportionate
+          benefit — the volumes don't justify it. I might use it for <em>one</em> context where history genuinely is the
+          domain, like claims progression."</p>
+        <p>"I'd note that SQL Server temporal tables give system time automatically with nice <code>AS OF</code>
+          syntax — but only <em>one</em> dimension, so effective time is still mine to model."</p>
+        <p>"The cost I'd own: <strong>every query needs temporal predicates</strong>, and forgetting them returns
+          superseded versions. So access goes through a repository that applies them by default — the same structural
+          argument as a tenant filter."</p>
+        <p>"<strong>On audit, the field usually missing is 'why'.</strong> Most implementations diff entities and
+          capture who, what and when. A regulator examining a declined claim doesn't primarily want to know that
+          <code>CoverLevel</code> changed on a Tuesday — they want to know whether it was a customer request, an
+          underwriting decision, a correction of a data-entry error, or a migration. Those have completely different
+          implications and a field diff can't distinguish them."</p>
+        <p>"So I'd capture changes as <strong>domain operations with reason codes</strong> —
+          <code>DriverAdded</code>, <code>CoverDowngraded</code>, <code>DataCorrected</code> — rather than row diffs.
+          Audit tables append-only and <strong>enforced by database permissions</strong>: the application's user has
+          INSERT but not UPDATE or DELETE, so tampering isn't possible even through a bug. And system-initiated batch
+          changes attributed as rigorously as user actions, or the audit has a hole exactly where bulk changes
+          happen."</p>
+        <p>"<strong>The requirement people miss is versioned rules.</strong> A claim from March 2023 disputed in 2026:
+          'why was this declined?' Re-running it today gives today's answer, which is the wrong answer, because the
+          exclusion rules have changed twice since."</p>
+        <p>"The cheapest thing that satisfies this — and what I'd do first — is that <strong>every automated decision
+          writes an immutable record containing its inputs, the rule version applied, the outcome, and which
+          conditions matched.</strong> Then the decision <em>is</em> the evidence and nothing needs re-running."</p>
+        <p>"Capturing the <em>inputs</em> is the part that matters. 'Declined under exclusion 4b' is useful; also
+          recording the claim and customer data the decision saw makes it reproducible — which you need, because the
+          customer's record has itself been amended since. That's where the bi-temporal model and the decision record
+          meet: the decision was made against data as it was <em>recorded</em> then."</p>
+        <p>"<strong>On documents</strong>: store the rendered PDF as issued, not just the data. Regenerating years
+          later applies today's template and wording, possibly with a bug fixed since — so what you produce isn't what
+          the customer received, and in a dispute that's the wrong answer. With a hash for tamper evidence and an
+          <strong>immutability policy</strong> on the container, which is the only control an attacker with full
+          credentials can't undo."</p>
+        <p>"<strong>On legacy integration</strong>: an anti-corruption layer at the boundary, and — most importantly —
+          <strong>explicit ownership per entity</strong>. Two systems both believing they own a policy means the data
+          oscillates: we update it, the nightly feed overwrites it, a user re-enters it, and it flips back. Nothing
+          errors, users lose confidence in both systems, and it takes a long time to diagnose because each system is
+          behaving correctly."</p>
+        <p>"And two conflicts I'd raise unprompted. <strong>GDPR erasure versus regulatory retention</strong> —
+          statutory retention generally overrides a deletion request, so we need a documented position per data
+          category and the ability to erase marketing data while keeping contractual records. And
+          <strong>reporting</strong>, which must run against a projection rather than the bi-temporal model — partly
+          because that model is unusable for analysts, and partly because <em>reports must be reproducible</em>: a
+          report for last quarter run today should match the one run then, which means as-at dating or archiving
+          reports when produced."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you identify the temporal requirement as the defining one?</li>
+        <li>Do you know effective and recorded time are different?</li>
+        <li>Can you say why <em>not</em> event sourcing?</li>
+        <li>Does your audit capture intent and reason, not just diffs?</li>
+        <li>Do you version rules, or record decisions with inputs?</li>
+        <li>Do you store issued documents rather than regenerating?</li>
+        <li>Do you raise erasure-versus-retention and reproducible reporting?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> an audit table via triggers as the whole answer.</li>
+        <li><span class="redflag">Red flag:</span> event sourcing proposed with no cost analysis.</li>
+        <li><span class="redflag">Red flag:</span> regenerating documents on demand.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that rules change over time.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle a backdated amendment that changes a premium already collected?</li>
+          <li>How do you stop analysts double-counting versioned rows?</li>
+          <li>A customer requests erasure. What exactly do you delete?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

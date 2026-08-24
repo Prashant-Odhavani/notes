@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory Management &amp; GC — C# Advanced</title>
+<meta name="description" content="How the .NET garbage collector works, generations, the large object heap, IDisposable, finalizers, Span, and how to find a real memory leak.">
+<meta name="keywords" content="garbage collection generations gen0 gen1 gen2 large object heap LOH IDisposable using finalizer dispose pattern memory leak event handler leak Span ArrayPool server GC">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="05-csharp-advanced/memory-gc.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Memory Management &amp; GC</h1>
+    <p class="subtitle">Why "managed memory" doesn't mean "can't leak", how the collector actually decides
+      what to free, and how to diagnose growth in production.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>The GC frees anything <strong>not reachable</strong> from a root. Reachability, not scope, is what
+        matters.</li>
+      <li><strong>Three generations.</strong> Gen 0 collection is very cheap; Gen 2 is expensive and
+        collects everything.</li>
+      <li>Short-lived garbage is nearly free. The cost comes from objects <strong>surviving</strong> and
+        being promoted.</li>
+      <li>Objects over ~85 KB go on the <strong>Large Object Heap</strong>, which isn't compacted by default
+        — so it fragments.</li>
+      <li><code>IDisposable</code> is for <strong>unmanaged</strong> resources — handles, sockets,
+        connections. The GC doesn't know about those.</li>
+      <li>A .NET "leak" is almost always <strong>something long-lived holding something short-lived</strong>:
+        a static collection, an event handler, or a captured closure.</li>
+    </ul>
+  </div>
+
+  <h2 id="how-gc-works">How the collector decides <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>The GC starts from a set of <strong>roots</strong> — static fields, local variables on active call
+      stacks, CPU registers — and follows every reference it can reach.</p>
+    <p>Anything it reaches is kept. Everything else is garbage, and its memory is reclaimed.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Imagine a warehouse where every box is either tied by string to the front door, or tied to a box that
+      is.</p>
+    <p>The collector walks in, follows all the string, and marks what it reaches. Anything with no path back
+      to the door gets thrown out — <em>even if the box is full and looks important</em>.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>It's about <strong>reachability, not scope</strong>.</p>
+    <p>Setting a variable to <code>null</code> rarely helps — the variable was going out of scope anyway.
+      What keeps objects alive is a <em>long-lived</em> thing still pointing at them.</p>
+  </div>
+
+  <h3 id="generations">Generations — why this is fast <span class="lvl lvl-i">🟡 Intermediate</span></h3>
+
+  <p>Scanning the whole heap on every collection would be far too slow. So the GC exploits an empirical
+    observation: <strong>most objects die very young</strong>.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Generation</th><th>What's in it</th><th>Collection cost</th><th>Frequency</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Gen 0</strong></td><td>Brand new objects</td><td>Very cheap — small region, most of it is garbage</td><td>Often</td></tr>
+        <tr><td><strong>Gen 1</strong></td><td>Survived one collection</td><td>Cheap. Acts as a buffer</td><td>Less often</td></tr>
+        <tr><td><strong>Gen 2</strong></td><td>Survived twice+. Long-lived objects</td><td><strong>Expensive</strong> — scans everything</td><td>Rarely</td></tr>
+        <tr><td><strong>LOH</strong></td><td>Objects ≥ ~85 KB</td><td>Collected with Gen 2; not compacted by default</td><td>Rarely</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>A Gen 0 collection typically only has to look at a small nursery region, and since most of it is dead,
+    it reclaims a lot for very little work.</p>
+
+  <div class="simple">
+    <span class="sm-label">The counter-intuitive consequence</span>
+    <p>Allocating lots of short-lived objects is <strong>cheap</strong>. Gen 0 handles them efficiently.</p>
+    <p>What's expensive is objects that <strong>survive</strong> — they get promoted to Gen 1, then Gen 2,
+      and Gen 2 collections are the ones that hurt.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">"Avoid all allocation" is the wrong lesson. A million short-lived objects in a
+      request are handled fine by Gen 0.
+      <br><br>
+      The thing to actually avoid is <strong>mid-life crisis</strong>: objects that live just long enough to
+      get promoted to Gen 2 but then die — a cache with a short TTL, a buffer held across an await. Those
+      make Gen 2 grow and force expensive collections.</p>
+  </div>
+
+  <h3 id="loh">The Large Object Heap <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <p>Objects of roughly 85 KB or more go straight to the LOH. Two consequences:</p>
+
+  <ul>
+    <li><strong>They're effectively born in Gen 2.</strong> So they're only reclaimed by expensive
+      collections.</li>
+    <li><strong>The LOH isn't compacted by default.</strong> Freeing a 200 KB block leaves a 200 KB hole. If
+      the next request needs 300 KB it can't use that hole, so the heap grows even though there's free space
+      — <strong>fragmentation</strong>.</li>
+  </ul>
+
+  <p>The usual culprit is large arrays: a <code>byte[]</code> for a file upload, a
+    <code>List&lt;T&gt;</code> that grows past the threshold, or a large <code>string</code>.</p>
+
+  <pre data-label="csharp — rent a buffer instead of allocating one" class="code-good"><code class="language-csharp">// Bad in a hot path: a new 100 KB array per call, straight to the LOH
+var buffer = new byte[100_000];
+
+// Better: reuse pooled buffers
+var pool = ArrayPool&lt;byte&gt;.Shared;
+var buffer = pool.Rent(100_000);
+try
+{
+    // ...use buffer. Note: it may be LARGER than requested.
+}
+finally
+{
+    pool.Return(buffer);        // must return it, or the pool starves
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Two ArrayPool gotchas</div>
+    <ul style="margin:8px 0 0">
+      <li><code>Rent</code> can return a <strong>bigger</strong> array than you asked for. Always track your
+        own length — don't use <code>buffer.Length</code>.</li>
+      <li>The buffer may contain <strong>data from a previous use</strong>. Pass
+        <code>clearArray: true</code> to <code>Return</code> if it held anything sensitive.</li>
+    </ul>
+  </div>
+
+  <h2 id="idisposable">IDisposable — what the GC can't do <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>The GC manages <strong>memory</strong>. It knows nothing about file handles, sockets, database
+      connections or OS locks.</p>
+    <p><code>IDisposable</code> is how you release those <em>deterministically</em>, at a moment you choose.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>The GC is a cleaner who tidies up rubbish. It's very good at that.</p>
+    <p>But it has no idea you left the tap running or borrowed a library book. Those need you to
+      deliberately turn it off and hand it back — that's <code>Dispose</code>.</p>
+  </div>
+
+  <pre data-label="csharp — using guarantees Dispose, even on exception"><code class="language-csharp">// C# 8+ using declaration - disposed at the end of the enclosing scope
+using var conn = new SqlConnection(connectionString);
+await conn.OpenAsync(ct);
+// conn.Dispose() runs here, even if something throws</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — the connection leak</div>
+    <p style="margin:0">Forgetting <code>using</code> on a database connection doesn't leak <em>memory</em> —
+      the GC collects the object eventually. It leaks the <strong>connection</strong> back to the pool late,
+      or not at all.
+      <br><br>
+      The symptom is "Timeout expired. The timeout period elapsed prior to obtaining a connection from the
+      pool" under load. It looks like a database problem and it's actually a missing <code>using</code>.</p>
+  </div>
+
+  <h3 id="finalizers">Finalizers — and why you almost never write one <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <p>A finalizer (<code>~MyClass()</code>) is a last-resort safety net that the GC calls before reclaiming an
+    object. It exists in case someone forgot to call <code>Dispose</code>.</p>
+
+  <p><strong>Why you should avoid them:</strong></p>
+
+  <ul>
+    <li>An object with a finalizer <strong>survives an extra collection</strong>. It gets put on a queue,
+      the finalizer thread runs it, and only then can the memory be freed — so it's automatically promoted.</li>
+    <li><strong>You can't control when it runs.</strong> It could be seconds later, or at process exit.</li>
+    <li>If the finalizer throws or blocks, it <strong>stalls the finalizer queue</strong> for every other
+      object.</li>
+  </ul>
+
+  <div class="remember">
+    <span class="r-label">The rule</span>
+    <p>Only write a finalizer if you hold a <strong>raw unmanaged handle directly</strong> — a
+      <code>IntPtr</code> from a native API.</p>
+    <p>If you only hold other <code>IDisposable</code> objects, implement <code>IDisposable</code> and
+      <strong>no finalizer</strong>. That's the overwhelmingly common case.</p>
+  </div>
+
+  <pre data-label="csharp — the simple, correct case: no finalizer needed" class="code-good"><code class="language-csharp">public sealed class OrderRepository : IDisposable
+{
+    private readonly SqlConnection _conn;
+
+    public OrderRepository(string cs) =&gt; _conn = new SqlConnection(cs);
+
+    // We only hold a managed IDisposable, so this is all we need.
+    public void Dispose() =&gt; _conn.Dispose();
+}</code></pre>
+
+  <h2 id="leaks">Finding a real memory leak <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>In .NET a "leak" means: something the GC <em>can still reach</em> is keeping objects alive that you
+      thought were finished with.</p>
+    <p>So the question is always: <strong>what is still pointing at this?</strong></p>
+  </div>
+
+  <h3 id="leak-causes">The four causes, in order of how often they occur</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>What it looks like</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Event handlers</strong></td>
+          <td>A long-lived publisher holds a strong reference to every subscriber. Short-lived subscribers
+              that never unsubscribe can never be collected.</td>
+        </tr>
+        <tr>
+          <td><strong>2. Static collections</strong></td>
+          <td>A <code>static Dictionary</code> used as a cache with no eviction. It only ever grows.</td>
+        </tr>
+        <tr>
+          <td><strong>3. Captured closures</strong></td>
+          <td>A lambda stored somewhere long-lived captures <code>this</code> implicitly, pinning the whole
+              object.</td>
+        </tr>
+        <tr>
+          <td><strong>4. Captive dependencies</strong></td>
+          <td>A scoped service (like a <code>DbContext</code>) injected into a singleton. It now lives for
+              the process lifetime.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — the event handler leak, concretely" class="code-bad"><code class="language-csharp">public class OrderView            // created per request / per window
+{
+    public OrderView(IOrderNotifier notifier)   // notifier is a SINGLETON
+    {
+        notifier.OrderChanged += OnOrderChanged;   // subscribes...
+    }
+
+    private void OnOrderChanged(object? s, EventArgs e) { }
+    // ...and never unsubscribes. The singleton now holds this OrderView forever.
+}</code></pre>
+
+  <pre data-label="csharp — fixed: unsubscribe deterministically" class="code-good"><code class="language-csharp">public sealed class OrderView : IDisposable
+{
+    private readonly IOrderNotifier _notifier;
+
+    public OrderView(IOrderNotifier notifier)
+    {
+        _notifier = notifier;
+        _notifier.OrderChanged += OnOrderChanged;
+    }
+
+    public void Dispose() =&gt; _notifier.OrderChanged -= OnOrderChanged;
+}</code></pre>
+
+  <h3 id="diagnosing">How to actually diagnose it</h3>
+
+  <ol class="steps">
+    <li><strong>Confirm it's real.</strong> Memory rising isn't a leak — the GC is lazy and won't collect
+      until it needs to. A leak is memory that rises and <strong>never comes back down</strong> after a Gen 2
+      collection. Watch the trend over hours, not minutes.</li>
+    <li><strong>Take two dumps.</strong> One early, one after growth. On Linux/containers:
+      <code>dotnet-dump collect -p &lt;pid&gt;</code>.</li>
+    <li><strong>Compare object counts.</strong> In <code>dotnet-dump analyze</code>, use
+      <code>dumpheap -stat</code> on both and look for the type whose count grew. That type is usually the
+      symptom, not the cause.</li>
+    <li><strong>Find what's rooting it.</strong> <code>gcroot &lt;address&gt;</code> shows the chain of
+      references keeping it alive. This is the step that gives you the answer — it names the static, the
+      event, or the singleton.</li>
+    <li><strong>Fix the root, not the symptom.</strong> Unsubscribe, add eviction, or fix the lifetime.</li>
+  </ol>
+
+  <div class="note tip">
+    <div class="note-title">Best practice</div>
+    <p style="margin:0">Track <strong>Gen 2 heap size</strong> and <strong>time in GC</strong> as metrics,
+      not just total process memory. Total memory is noisy — the GC deliberately holds onto memory it might
+      reuse. A steadily climbing Gen 2 with no plateau is the real signal.</p>
+  </div>
+
+  <h2 id="spans">Span&lt;T&gt; and avoiding allocation <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>Span&lt;T&gt;</code> is a <strong>window onto memory you already have</strong> — an array, a
+      string, a stack buffer — without copying it.</p>
+  </div>
+
+  <pre data-label="csharp — substring allocates, slicing doesn't"><code class="language-csharp">var csv = "1234,5678,9012";
+
+// Allocates three new strings
+var partsAlloc = csv.Split(',');
+
+// Zero allocation: each slice is a view over the original string's memory
+ReadOnlySpan&lt;char&gt; span = csv;
+var first = span[..4];              // no new string
+var value = int.Parse(first);       // parses directly from the span</code></pre>
+
+  <p><strong>Where it earns its place:</strong> parsers, serializers, and hot paths processing lots of text
+    or binary data. It's the reason modern .NET JSON and HTTP handling got dramatically faster.</p>
+
+  <div class="note warn">
+    <div class="note-title">The constraint that catches people out</div>
+    <p style="margin:0"><code>Span&lt;T&gt;</code> is a <code>ref struct</code> — it can only live on the
+      stack. So you <strong>cannot</strong>:</p>
+    <ul style="margin:8px 0 0">
+      <li>store it in a field of a class</li>
+      <li>use it in an <code>async</code> method across an <code>await</code></li>
+      <li>capture it in a lambda</li>
+      <li>put it in a collection</li>
+    </ul>
+    <p style="margin:8px 0 0">If you need any of those, use <code>Memory&lt;T&gt;</code>, which is
+      heap-friendly and can be converted to a span when you need one.</p>
+  </div>
+
+  <h2 id="gc-modes">Workstation vs Server GC <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Workstation GC</th><th>Server GC</th></tr></thead>
+      <tbody>
+        <tr><td>Heaps</td><td>One</td><td>One per logical core</td></tr>
+        <tr><td>Optimised for</td><td>Low latency, low memory</td><td>Throughput</td></tr>
+        <tr><td>Default for</td><td>Desktop apps</td><td>ASP.NET Core apps</td></tr>
+        <tr><td>Memory use</td><td>Lower</td><td>Higher — multiple heaps</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The container gotcha</div>
+    <p style="margin:0">Server GC allocates a heap per core, so in a container with a low memory limit but
+      many visible cores, it can reserve far more memory than the limit allows — and get OOM-killed.
+      <br><br>
+      Modern .NET is container-aware and reads cgroup limits, but if you're seeing unexplained OOM kills in
+      Kubernetes, checking whether Server GC suits your CPU/memory ratio is a reasonable step. Setting
+      <code>ServerGarbageCollection=false</code> for small containers is a known tuning move — measure it,
+      don't assume.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The GC collects what's <em>unreachable</em>. Scope is irrelevant; roots are everything.</li>
+      <li>Gen 0 is cheap. Short-lived garbage is nearly free; surviving objects are what cost you.</li>
+      <li>Objects ≥ ~85 KB go to the LOH, are born effectively in Gen 2, and fragment.</li>
+      <li><code>IDisposable</code> is for unmanaged resources. Missing <code>using</code> leaks connections,
+        not memory.</li>
+      <li>Don't write finalizers unless you hold a raw handle. They delay collection.</li>
+      <li>Leaks are event handlers, static caches, closures capturing <code>this</code>, and captive
+        dependencies.</li>
+      <li>Diagnose with two dumps, <code>dumpheap -stat</code>, then <code>gcroot</code>.</li>
+      <li><code>Span&lt;T&gt;</code> avoids copies but can't cross an <code>await</code> or live in a field.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Subscribing to an event and never unsubscribing</strong> — the number one .NET leak.</li>
+    <li><strong>A <code>static</code> dictionary as a cache</strong> with no size limit or eviction.</li>
+    <li><strong>Injecting a <code>DbContext</code> into a singleton</strong> — captive dependency.</li>
+    <li><strong>Missing <code>using</code></strong> on connections, streams and <code>HttpResponseMessage</code>.</li>
+    <li><strong>Writing a finalizer</strong> when the class only holds managed disposables.</li>
+    <li><strong>Calling <code>GC.Collect()</code></strong> to "fix" memory. It forces an expensive full
+      collection and almost always makes things worse.</li>
+    <li><strong>Treating rising memory as a leak</strong> without checking whether it recovers after Gen 2.</li>
+    <li><strong>Large <code>byte[]</code> per request</strong> instead of pooling — LOH fragmentation.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>How does garbage collection work in .NET?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The GC works on reachability. It starts from a set of roots — statics, locals on active stacks,
+          registers — follows every reference it can reach, marks those objects as live, and reclaims
+          everything else."</p>
+        <p>"The key optimisation is generations. Scanning the whole heap every time would be too slow, so it
+          exploits the fact that most objects die young. New objects go in Gen 0, which is small and mostly
+          garbage — so collecting it is quick and reclaims a lot. Survivors get promoted to Gen 1, then Gen
+          2. Gen 2 collections scan everything and are expensive, but they're rare."</p>
+        <p>"The practical consequence people get backwards: allocating lots of short-lived objects is
+          <em>cheap</em>. What's expensive is objects <em>surviving</em> and being promoted. So the thing to
+          avoid isn't allocation generally — it's objects that live just long enough to reach Gen 2 and then
+          die."</p>
+        <p>"There's also the Large Object Heap for anything around 85 KB or more. Those effectively start in
+          Gen 2, and the LOH isn't compacted by default, so it fragments — free space exists but in the wrong
+          size holes. That's why large buffers are usually pooled rather than allocated per use."</p>
+        <p>"And the thing the GC explicitly doesn't do is unmanaged resources. It has no idea about file
+          handles or database connections, which is what <code>IDisposable</code> is for."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's reachability, not reference counting?</li>
+        <li>Do you know generations and why they exist?</li>
+        <li>Bonus: the "short-lived garbage is cheap" insight, and the LOH.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> describing reference counting — that's COM/Python, not .NET.</li>
+        <li><span class="redflag">Red flag:</span> "it frees objects when they go out of scope."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the difference between Workstation and Server GC?</li>
+          <li>Should you ever call <code>GC.Collect()</code>?</li>
+          <li>What's the LOH threshold and why does it matter?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Can you have a memory leak in C#? Give an example. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Absolutely — managed memory doesn't prevent leaks, it just changes what a leak <em>is</em>. In
+          .NET a leak means something reachable from a root is keeping objects alive that you thought were
+          done with."</p>
+        <p>"The most common cause I've hit is <strong>event handlers</strong>. A publisher holds a strong
+          reference to every subscriber. If the publisher is a singleton and subscribers are created per
+          request, and nobody unsubscribes, then every subscriber ever created stays alive for the process
+          lifetime. Memory grows steadily and never recovers."</p>
+        <p>"Second most common is a <strong>static collection used as a cache</strong> with no eviction. It
+          only ever grows. That one's obvious in hindsight and very easy to write."</p>
+        <p>"Third is <strong>closures capturing <code>this</code></strong>. If a lambda touches any instance
+          field, it captures the whole object implicitly — and if that lambda is stored in a timer, a static
+          registry or an event, the object can't be collected."</p>
+        <p>"And the ASP.NET Core–specific one: a <strong>captive dependency</strong> — injecting a scoped
+          <code>DbContext</code> into a singleton. Now that context lives forever, which leaks memory and
+          also gives you stale data and eventually a disposed-object exception."</p>
+        <p>"For diagnosis I'd take two dumps separated by the growth period, run
+          <code>dumpheap -stat</code> on both to see which type's count grew, then <code>gcroot</code> on an
+          instance to see the reference chain keeping it alive. That last step is what actually names the
+          culprit — the growing type is usually just the symptom."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know managed ≠ leak-proof?</li>
+        <li>Can you name specific, realistic causes?</li>
+        <li>Have you actually diagnosed one — do you know <code>gcroot</code>?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "no, the GC handles it."</li>
+        <li><span class="redflag">Red flag:</span> "you forget to call <code>Dispose</code>" — that leaks
+          resources, not usually memory.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you confirm it's a leak rather than the GC just being lazy?</li>
+          <li>What's a weak reference and when would you use one?</li>
+          <li>How do you prevent the event handler leak by design?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What's the difference between <code>Dispose</code> and a finalizer? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<code>Dispose</code> is deterministic — I call it, or <code>using</code> calls it, at a moment I
+          control. A finalizer is non-deterministic: the GC calls it at some unspecified point before
+          reclaiming the object, and possibly not until process exit."</p>
+        <p>"They exist for different jobs. <code>Dispose</code> is how you release unmanaged resources
+          promptly — connections, file handles, sockets. A finalizer is a safety net for when someone forgot
+          to call <code>Dispose</code>, so a native handle doesn't leak forever."</p>
+        <p>"The cost of a finalizer is the part people miss. An object with one <strong>survives an extra
+          collection</strong>: the GC can't free it immediately, it goes on the finalization queue, a
+          dedicated thread runs the finalizer, and only then is the memory reclaimable. So finalizable
+          objects are automatically promoted, which is exactly what you don't want. And if a finalizer blocks
+          or throws, it stalls the queue for everything else."</p>
+        <p>"So my rule is: only write a finalizer if the class holds a <strong>raw unmanaged handle
+          directly</strong>. If it only holds other <code>IDisposable</code> objects — which is the normal
+          case — implement <code>IDisposable</code> and no finalizer at all."</p>
+        <p>"If I do need both, that's the full dispose pattern: <code>Dispose()</code> does the cleanup and
+          calls <code>GC.SuppressFinalize(this)</code> so the finalizer is skipped when disposal happened
+          properly. And a <code>protected virtual Dispose(bool disposing)</code> distinguishes the two paths
+          — from the finalizer you must not touch other managed objects, because they may already be
+          collected."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know finalizers <em>delay</em> collection?</li>
+        <li>Do you know when a finalizer is actually needed (rarely)?</li>
+        <li>Bonus: <code>SuppressFinalize</code> and why the finalizer path can't touch managed objects.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why can't a finalizer safely use other managed objects?</li>
+          <li>What is <code>SafeHandle</code> and why is it preferred?</li>
+          <li>What does <code>IAsyncDisposable</code> add?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A service's memory grows 200 MB a day and never recovers. Walk me through diagnosing it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd confirm it's genuinely a leak rather than the GC being lazy. Rising memory on its own
+          proves nothing — the runtime holds onto memory it might reuse. What I want to see is whether it
+          comes back down after a Gen 2 collection. So I'd look at Gen 2 heap size as a metric rather than
+          total process memory, over hours. A steady climb with no plateau is a real leak."</p>
+        <p>"Then two dumps: one early, one after a day of growth. <code>dotnet-dump collect</code> works in
+          containers, which matters because that's usually where this is happening."</p>
+        <p>"I'd run <code>dumpheap -stat</code> on both and diff them. That gives me the type whose instance
+          count grew — but I'd treat that as the symptom. If a million <code>OrderView</code> objects are
+          alive, the question is what's holding them."</p>
+        <p>"So the important step is <code>gcroot</code> on one of those instances. That prints the reference
+          chain from a root down to the object, and it names the actual culprit — a static field, an event's
+          invocation list, a singleton's field."</p>
+        <p>"In my experience the answer is one of four things. An event handler that was never unsubscribed,
+          where the publisher is long-lived. A static collection used as a cache with no eviction. A closure
+          capturing <code>this</code> and being stored somewhere long-lived, like a timer callback. Or a
+          captive dependency — a scoped service injected into a singleton."</p>
+        <p>"Once I know the root, the fix is usually small: unsubscribe in <code>Dispose</code>, swap the
+          static dictionary for <code>MemoryCache</code> with a size limit and expiry, or fix the DI
+          lifetime."</p>
+        <p>"For prevention I'd add Gen 2 heap size and time-in-GC to the dashboard with an alert on a
+          sustained upward trend, so the next one gets caught in days rather than when the container starts
+          getting OOM-killed."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you validate the premise before investigating?</li>
+        <li>Do you know the actual tooling, or just talk about "profiling"?</li>
+        <li>Do you distinguish the growing type from the root cause?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "restart the service nightly."</li>
+        <li><span class="redflag">Red flag:</span> "call <code>GC.Collect()</code>."</li>
+        <li><span class="redflag">Red flag:</span> "use a profiler" with no idea what you'd look at.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the growing type is <code>byte[]</code> or <code>string</code>?</li>
+          <li>How would you do this in a container you can't attach a debugger to?</li>
+          <li>What's the difference between a leak and LOH fragmentation?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

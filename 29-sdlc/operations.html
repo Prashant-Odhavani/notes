@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operations &amp; Incident Management — SDLC</title>
+<meta name="description" content="Monitoring vs observability, SLIs SLOs and error budgets, alerting that works, incident response order, and blameless postmortems.">
+<meta name="keywords" content="observability monitoring logs metrics traces SLI SLO SLA error budget alerting on call incident management severity postmortem blameless RED USE golden signals MTTR runbook cardinality">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="29-sdlc/operations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Operations &amp; Incident Management</h1>
+    <p class="subtitle">Knowing your system is healthy, finding out fast when it isn't, and handling the
+      hour when it isn't.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Monitoring</strong> answers questions you knew to ask. <strong>Observability</strong> lets
+        you answer questions you didn't anticipate, from data already being emitted.</li>
+      <li>Metrics = cheap, aggregate, alertable. Logs = detailed, expensive. Traces = causality across
+        services. You need all three, for different jobs.</li>
+      <li>SLI = the measurement. SLO = your target. SLA = the contract. Error budget = 1 − SLO.</li>
+      <li>Alert on <strong>symptoms users feel</strong>, not causes. High CPU isn't an incident. Failing
+        checkouts are.</li>
+      <li>Every page must be actionable, urgent, and have a runbook. Otherwise it's a dashboard item.</li>
+      <li>Postmortems are blameless because good people make errors in badly-designed systems. Output: two
+        or three tracked actions.</li>
+    </ul>
+  </div>
+
+  <h2 id="observability">Monitoring vs observability <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Monitoring:</strong> "is the thing I predicted would break, broken?"</p>
+    <p><strong>Observability:</strong> "why is p99 latency doubled for one tenant, only on uploads over
+      10MB, only since Tuesday?" — answerable without shipping new code.</p>
+  </div>
+
+  <p>The practical difference is usually <strong>dimensionality and correlation</strong>.</p>
+
+  <ul>
+    <li>Record request duration → you can alert on it, but you can't decompose it.</li>
+    <li>Record duration <em>with tenant, endpoint, version and outcome as dimensions</em>, sharing a
+      correlation ID with logs and traces → you can slice your way to the cause.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Signal</th><th>Strengths</th><th>Limits</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td>Metrics</td><td>Cheap, long retention, fast queries, aggregate well</td><td>Low cardinality; can't explain one request</td><td>Alerting, SLOs, dashboards, capacity trends</td></tr>
+        <tr><td>Logs</td><td>Full detail, arbitrary context</td><td>Expensive at volume; noisy; costly to search</td><td>Diagnosis after an alert; audit</td></tr>
+        <tr><td>Traces</td><td>Causality and latency across services</td><td>Usually sampled; needs propagation everywhere</td><td>"Which of the nine services is slow?"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="what-to-instrument">What to instrument</h3>
+
+  <p>Two standard frameworks, both worth naming in an interview:</p>
+
+  <ul>
+    <li><strong>RED</strong> (request-driven services): <strong>R</strong>ate, <strong>E</strong>rrors,
+      <strong>D</strong>uration — per endpoint and per dependency call.</li>
+    <li><strong>USE</strong> (resources): <strong>U</strong>tilisation, <strong>S</strong>aturation,
+      <strong>E</strong>rrors — CPU, memory, connection pools, thread pools, queues.</li>
+  </ul>
+
+  <p><strong>Saturation is the one people miss.</strong> It tells you a system is <em>about to</em> fail
+    rather than that it already has: connection pool at 95%, thread pool queue growing, message lag
+    increasing. Those are the metrics worth paging on early.</p>
+
+  <pre data-label="csharp — instrumenting a handler so failures are diagnosable"><code class="language-csharp">// Histogram, not a gauge: percentiles matter, averages hide the tail.
+private static readonly Histogram&lt;double&gt; Duration =
+    Telemetry.Meter.CreateHistogram&lt;double&gt;("orders.submit.duration", "ms");
+
+public async Task&lt;IResult&gt; SubmitAsync(SubmitOrder cmd, CancellationToken ct)
+{
+    using var activity = Telemetry.Source.StartActivity("SubmitOrder");
+    activity?.SetTag("tenant.id", cmd.TenantId);
+
+    var sw = Stopwatch.GetTimestamp();
+    var outcome = "ok";
+    try
+    {
+        return Results.Ok(await orders.SubmitAsync(cmd, ct));
+    }
+    catch (InsufficientStockException ex)
+    {
+        outcome = "insufficient_stock";      // EXPECTED - not an error rate
+        log.LogInformation(ex, "Rejected order for {Tenant}", cmd.TenantId);
+        return Results.Conflict(ex.Message);
+    }
+    catch (Exception ex)
+    {
+        outcome = "error";
+        activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+        log.LogError(ex, "Order submit failed for {Tenant}", cmd.TenantId);
+        throw;
+    }
+    finally
+    {
+        Duration.Record(Stopwatch.GetElapsedTime(sw).TotalMilliseconds,
+            new KeyValuePair&lt;string, object?&gt;("outcome", outcome),
+            new KeyValuePair&lt;string, object?&gt;("tenant", cmd.TenantId));
+    }
+}</code></pre>
+
+  <p>Three decisions doing real work here:</p>
+
+  <ol class="steps">
+    <li><strong>A histogram</strong>, so you can compute p95/p99 rather than a mean that hides the tail.</li>
+    <li><strong>An <code>outcome</code> dimension</strong> separating expected business rejections from
+      unexpected failures — so a spike in out-of-stock doesn't look like an outage.</li>
+    <li><strong>Tenant as a dimension</strong>, which in a multi-tenant system is what lets you tell
+      "everything is broken" from "one tenant is broken".</li>
+  </ol>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake — cardinality explosion</div>
+    <p style="margin:0">Putting unbounded values into metric <em>dimensions</em>: user IDs, order IDs, raw
+      URLs with parameters. Every distinct combination creates a new time series. This will either bankrupt
+      your telemetry bill or get your metrics dropped.
+      <br><br>
+      High-cardinality identifiers belong in <strong>logs and traces</strong>. Tenant is usually acceptable
+      (hundreds). User usually isn't (millions).</p>
+  </div>
+
+  <h2 id="slo">SLIs, SLOs, SLAs and error budgets <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Term</th><th>What it is</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td>SLI</td><td>The measurement — a user-visible property</td><td>% of checkout requests returning 2xx within 800ms</td></tr>
+        <tr><td>SLO</td><td>Your internal target over a window</td><td>99.5% over 30 rolling days</td></tr>
+        <tr><td>SLA</td><td>The contractual promise, with consequences</td><td>99.0% monthly, or service credits apply</td></tr>
+        <tr><td>Error budget</td><td>1 − SLO: the failure you're allowed to spend</td><td>0.5% of 30 days ≈ 3.6 hours</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The SLA is always looser than the SLO — you want internal alarms firing well before contractual breach.</p>
+
+  <div class="remember">
+    <span class="r-label">Why the error budget is the useful idea</span>
+    <p>It turns "should we ship this risky change?" from an opinion into arithmetic.</p>
+    <p><strong>Budget remaining</strong> → take risks: ship the migration, deploy on Thursday.
+      <strong>Budget exhausted</strong> → reliability work takes priority over features until it recovers.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Choosing the right SLI matters more than choosing the right number. "Availability of
+      the API" measured by a health endpoint can read 100% while every real request fails.
+      <br><br>
+      A good SLI is measured as close to the user as possible and reflects something they care about:
+      successful checkouts, documents processed within the promised window, search results returned. If you
+      only say one thing about SLOs in an interview, say that.</p>
+  </div>
+
+  <h2 id="alerting">Alerting people don't learn to ignore <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p>Alert fatigue is the dominant operational failure mode. A team paged six times a night for things that
+    resolve themselves will eventually miss the one that matters — not through negligence, but through
+    entirely rational adaptation.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Alert on</th><th>Not on</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Checkout success rate below 99% for 5 min</td><td>CPU above 80%</td><td>High CPU may be perfectly healthy. Failing checkouts never are</td></tr>
+        <tr><td>p95 latency above the SLO threshold, sustained</td><td>A single slow request</td><td>Outliers are normal; a sustained shift isn't</td></tr>
+        <tr><td>Queue <em>age</em> (oldest unprocessed message) growing</td><td>Queue length</td><td>Length is meaningless without throughput. Age reflects user impact directly</td></tr>
+        <tr><td>Error budget burn rate — 2% of monthly budget in an hour</td><td>Any 5xx at all</td><td>Burn rate catches both fast outages and slow degradation with one rule</td></tr>
+        <tr><td>Certificate expiring in 14 days</td><td>Certificate expired</td><td>Predictable failures should be prevented, not alerted on</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Rules that survive a real on-call rotation:</strong></p>
+
+  <ul>
+    <li><strong>Every page must be actionable.</strong> If the only possible action is "watch it", it
+      shouldn't have woken anyone.</li>
+    <li><strong>Every page needs a runbook link</strong> in the alert: what it means, how to confirm, what to
+      try first, how to escalate.</li>
+    <li><strong>Two tiers.</strong> Page for user-impacting and urgent. Ticket for everything else. Most
+      alerts belong in tier two.</li>
+    <li><strong>Review alerts monthly.</strong> Delete any that fired and required no action. This one habit
+      does more for on-call health than any tooling.</li>
+    <li><strong>Alert on absence too.</strong> A nightly job that stops running produces no errors at all.
+      Only a "didn't complete by 03:00" alert catches it.</li>
+  </ul>
+
+  <h2 id="incidents">Incident management <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>The point of incident process is to stop smart people doing uncoordinated things under stress.</p>
+
+  <p><strong>Four roles</strong>, even if one person holds several on a small team:</p>
+
+  <ul>
+    <li><strong>Incident commander</strong> — owns the response, makes decisions, does <em>not</em> debug.
+      The common failure in small teams is that the best debugger becomes commander and then stops
+      commanding because they're deep in a stack trace.</li>
+    <li><strong>Investigators</strong> — the people changing things, one at a time, announcing each change.</li>
+    <li><strong>Communications</strong> — updates stakeholders on a fixed cadence so nobody has to interrupt
+      the responders.</li>
+    <li><strong>Scribe</strong> — timestamps what was observed and done. Invaluable for the postmortem;
+      nobody remembers accurately afterwards.</li>
+  </ul>
+
+  <h3 id="incident-order">The response order</h3>
+
+  <ol class="steps">
+    <li><strong>Stabilise before diagnosing.</strong> If a rollback or flag flip restores service, do it and
+      investigate afterwards. Understanding isn't required for recovery.</li>
+    <li><strong>Establish blast radius.</strong> Who's affected, which regions, which tenants, which
+      operations. This drives severity and communication.</li>
+    <li><strong>Look at what changed.</strong> The overwhelming majority of incidents follow a change — a
+      deploy, a config edit, a flag, a certificate, a threshold crossed by organic growth. Check the
+      deployment timeline before theorising.</li>
+    <li><strong>One change at a time.</strong> Parallel fixes make it impossible to know what worked, and can
+      compound the failure.</li>
+    <li><strong>Communicate on a timer</strong>, even with nothing new. "Still investigating, next update in
+      30 minutes" prevents the flood of individual questions.</li>
+  </ol>
+
+  <div class="note danger">
+    <div class="note-title">Production trap</div>
+    <p style="margin:0">Restarting the service because "it fixes it" — without capturing diagnostics first.
+      You've destroyed the evidence (memory dump, thread state, current connections) and guaranteed the
+      incident recurs with no more information than last time.
+      <br><br>
+      Capture first when it costs seconds: memory dump, metrics snapshot, thread dump. <em>Then</em> restart.</p>
+  </div>
+
+  <h3 id="severity">Severity levels</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Sev</th><th>Meaning</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Complete outage or data loss; core business stopped</td><td>Page immediately, all hands, exec comms, status page</td></tr>
+        <tr><td>2</td><td>Major degradation or key feature down; workaround exists</td><td>Page on-call, engage team, customer comms</td></tr>
+        <tr><td>3</td><td>Minor degradation, limited scope</td><td>Ticket, next business day</td></tr>
+        <tr><td>4</td><td>Cosmetic or single-user</td><td>Normal backlog</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Agreeing these <em>in advance</em> is what stops the argument about whether something is "really" a
+    Sev 1 while it's on fire. Err upward — downgrading an over-declared incident is cheap.</p>
+
+  <h2 id="postmortems">Postmortems <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">What blameless actually means</span>
+    <p>Not "nobody made a mistake". It means the analysis targets the <strong>conditions that let a normal
+      human error become an outage</strong> — because those are what you can change.</p>
+  </div>
+
+  <div class="vs-grid">
+    <div class="bad">
+      <span class="vs-label">Not actionable</span>
+      <p>"Priya ran the wrong script."</p>
+    </div>
+    <div class="good">
+      <span class="vs-label">Four actionable findings</span>
+      <p>"A destructive script could be run against production from a laptop, with no confirmation, no
+        dry-run, and nothing detected it for 40 minutes."</p>
+    </div>
+  </div>
+
+  <p><strong>A postmortem worth writing contains:</strong></p>
+
+  <ul>
+    <li><strong>Impact</strong> in user terms: how many users, which operations, how long, what data.</li>
+    <li><strong>Timeline</strong> with timestamps: started, detected, mitigated, resolved. Detection lag is
+      often the most damning number and the most fixable.</li>
+    <li><strong>Contributing factors</strong>, plural. Real incidents have several — a latent bug, a missing
+      alert, a misleading dashboard, a rushed change. A single "root cause" usually means the analysis
+      stopped early.</li>
+    <li><strong>What went well.</strong> Tells you which investments paid off.</li>
+    <li><strong>Actions</strong> — two or three, each with an owner and a date. Twenty actions means zero
+      actions.</li>
+  </ul>
+
+  <p>The metric to watch across postmortems isn't how many you write — it's whether
+    <strong>time-to-detect is falling</strong>. Prevention has diminishing returns. Detection and recovery
+    speed don't.</p>
+
+  <h2 id="oncall">On-call that's sustainable</h2>
+
+  <ul>
+    <li>The team that writes the code carries the pager. Nothing improves reliability faster than the author
+      being woken by their own alert.</li>
+    <li>Rotation large enough that on-call recurs no more than every 4–6 weeks.</li>
+    <li>Compensate it, and give time back after a bad night.</li>
+    <li>Track pages per shift with an explicit budget. More than one or two a night means fixing alerting or
+      reliability takes priority over features.</li>
+    <li>Handover at the end of each shift: what fired, what's still degraded, what to watch.</li>
+  </ul>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Metrics to alert, traces and logs to diagnose. Correlation ID ties them together.</li>
+      <li>Keep unbounded IDs out of metric dimensions.</li>
+      <li>Pick SLIs close to the user. A health endpoint is not availability.</li>
+      <li>Alert on symptoms and saturation, never on CPU alone.</li>
+      <li>Stabilise, then diagnose. Capture evidence before restarting.</li>
+      <li>Postmortems should produce 2–3 owned actions and drive down time-to-detect.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Dashboards nobody looks at, alerts everyone silences.</strong></li>
+    <li><strong>Logging everything at Information level</strong>, so the signal is unfindable and the bill is
+      enormous.</li>
+    <li><strong>No correlation ID</strong>, so a request can't be followed across services. Cheap to add,
+      transformative during an incident.</li>
+    <li><strong>Alerting on causes</strong> (CPU, memory) rather than symptoms (errors, latency).</li>
+    <li><strong>Postmortems ending in "be more careful"</strong> or a new mandatory review step.</li>
+    <li><strong>Secrets or PII in logs</strong> — a security incident created by the observability system.</li>
+    <li><strong>Measuring MTTR without time-to-detect</strong>, which is usually the larger half.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What's the difference between monitoring and observability?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Monitoring is checking known conditions. You decide in advance what to measure and what value is
+          bad, and you get alerted when it crosses. It handles the failure modes you anticipated."</p>
+        <p>"Observability is a property of the system: whether the telemetry it already emits is rich enough
+          to answer questions you <em>didn't</em> anticipate, without shipping new code."</p>
+        <p>"The practical test is a novel question — 'why is p99 latency doubled for one tenant, only on
+          uploads over 10MB, only since Tuesday?' With monitoring alone you can't answer that; you'd add
+          logging and wait for it to happen again. With good observability you slice existing telemetry by
+          tenant, size bucket and version and find it in minutes."</p>
+        <p>"Concretely the difference is dimensionality and correlation. Recording request duration gives you
+          an alert. Recording it with tenant, endpoint, outcome and version as dimensions, plus a correlation
+          ID shared with logs and traces, gives you the ability to decompose."</p>
+        <p>"I wouldn't present observability as replacing monitoring though. Metrics are what you alert on
+          because they're cheap and aggregate well. Traces and structured logs are what you use after the
+          alert fires, to find out why."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you distinguish them without reciting "three pillars" as a slogan?</li>
+        <li>Have you actually debugged something using telemetry?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "observability is metrics, logs and traces" — that lists the
+          inputs, not the property.</li>
+        <li><span class="redflag">Red flag:</span> naming vendors instead of explaining the concept.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What would you add to a service that currently has only logs?</li>
+          <li>How do you control telemetry cost at high volume?</li>
+          <li>What is cardinality and why does it matter?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>You're paged: the API is returning 500s for about 20% of requests. Walk me through it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I establish scope and impact, because that drives everything. Which endpoints, which
+          regions, which tenants — and is it 20% of all traffic, or 100% of one slice?"</p>
+        <p>"That distinction eliminates most of the hypothesis space in about a minute. A uniform 20% usually
+          means one unhealthy instance out of five, or a dependency failing intermittently. A concentrated
+          20% — one tenant, one endpoint — points at data or a specific code path."</p>
+        <p>"In parallel I check what changed. Most incidents follow a change, so: deployment timeline, feature
+          flags, config edits, infrastructure events. If a deploy went out in the window, that's my working
+          hypothesis and I'd seriously consider rolling back or flipping the flag <em>before</em> diagnosing
+          further. Restoring service is the priority; understanding can happen afterwards with the evidence I
+          capture on the way."</p>
+        <p>"If nothing changed on our side, I look at saturation and dependencies — connection pool
+          utilisation, thread pool queue length, database CPU, downstream error rates and latency."</p>
+        <p>"There's a common shape worth calling out: a slow dependency causes requests to pile up until the
+          thread or connection pool exhausts, and then the symptom is 500s on endpoints that have nothing to
+          do with the slow dependency. So I'd explicitly check whether the failing endpoints <em>share a
+          resource</em> with a slow one, rather than assuming they share a bug."</p>
+        <p>"Throughout: a running note with timestamps, communication on a fixed cadence, one change at a
+          time. Once service is restored, capture anything perishable — a dump if a process is misbehaving —
+          before recycling. Then the postmortem, where the question I most want answered is why we found out
+          from an alert about 500s rather than something that would have caught it earlier."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you stabilise first, or debug while customers are down?</li>
+        <li>Do you narrow systematically rather than guessing?</li>
+        <li>Do you know resource exhaustion produces symptoms far from its cause?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "check the logs" as the entire method.</li>
+        <li><span class="redflag">Red flag:</span> restarting everything immediately, destroying the evidence.</li>
+        <li><span class="redflag">Red flag:</span> no mention of communication or of what changed recently.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>The 500s are only from one tenant. Does that change your approach?</li>
+          <li>Logs show <code>TaskCanceledException</code> from an HTTP client. What now?</li>
+          <li>Rollback didn't fix it. What does that tell you?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you set an SLO for a service that's never had one?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I start from the user journey, not the infrastructure. Pick the two or three operations that
+          matter most — for a commerce API probably search, add-to-cart and checkout — and define an SLI for
+          each that reflects what the user experiences: proportion of requests succeeding within a latency
+          threshold, measured as close to the user as possible."</p>
+        <p>"Then I look at <em>current</em> performance before choosing a target. An SLO the service has never
+          met isn't a target, it's a permanent alarm the team learns to ignore. If we're at 99.3%, setting
+          99.9% means the error budget is exhausted forever and every rule attached to it becomes
+          meaningless."</p>
+        <p>"So I'd set the initial target slightly above recent actual performance, make it visible, and
+          tighten it deliberately as reliability work lands."</p>
+        <p>"I'd also want the target justified by what the business needs rather than by how many nines sound
+          impressive. Each extra nine costs disproportionately more — multi-region, redundancy, more
+          sophisticated failover — and for many internal or B2B systems 99.9% is genuinely enough. Asking
+          'what does an hour of downtime cost us, and when?' produces a more honest answer than asking what
+          target we want."</p>
+        <p>"Finally, an SLO only matters if something follows from breaching it. So I'd agree the consequence
+          up front: when the error budget is exhausted, reliability work takes priority over features until
+          it recovers. Without that, it's just a number on a dashboard."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you pick user-centric indicators over infrastructure metrics?</li>
+        <li>Do you understand the cost curve of additional nines?</li>
+        <li>Do you connect the SLO to a decision rule?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Your dependency offers 99.9%. What can you promise on top of it?</li>
+          <li>How do you set an SLO for an async pipeline where there's no request?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transactions &amp; Concurrency — EF Core</title>
+<meta name="description" content="SaveChanges transaction semantics, optimistic concurrency with rowversion, execution strategies with retry, and the outbox pattern.">
+<meta name="keywords" content="EF Core SaveChanges transaction BeginTransaction execution strategy EnableRetryOnFailure DbUpdateConcurrencyException rowversion Timestamp IsConcurrencyToken optimistic concurrency lost update outbox pattern TransactionScope ambient transaction">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="11-ef-core/transactions-concurrency.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Transactions &amp; Concurrency</h1>
+    <p class="subtitle">Getting atomicity right, and stopping two users from silently overwriting each other.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>One <code>SaveChanges</code> = one transaction</strong>, automatically. Two calls = two
+        transactions.</li>
+      <li><strong>Explicit transactions</strong> only when you need several <code>SaveChanges</code> calls, or
+        raw SQL, to be atomic together.</li>
+      <li><strong>Optimistic concurrency needs a token</strong> — a <code>rowversion</code> column is the
+        standard answer.</li>
+      <li><strong><code>DbUpdateConcurrencyException</code></strong> means somebody else got there first. You
+        must decide what to do.</li>
+      <li><strong>Retry plus an explicit transaction requires an execution strategy</strong>, or EF throws.</li>
+      <li><strong>Never do side effects inside a transaction</strong> — use the outbox pattern.</li>
+      <li><strong>Prefer an atomic <code>ExecuteUpdate</code></strong> over read-modify-write where you can.</li>
+    </ul>
+  </div>
+
+  <h2 id="implicit">The implicit transaction <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>SaveChanges</code> wraps everything it does in a transaction, whether you asked or not.</p>
+    <p>So one call is atomic across every insert, update and delete it produces — even across multiple
+      tables.</p>
+  </div>
+
+  <pre data-label="csharp — atomic without any transaction code" class="code-good"><code class="language-csharp">db.Orders.Add(order);              // INSERT Order
+db.OrderLines.AddRange(lines);     // INSERT OrderLine x N
+inventory.Stock -= qty;            // UPDATE Inventory
+
+await db.SaveChangesAsync();       // ONE transaction. All or nothing.</code></pre>
+
+  <pre data-label="csharp — two transactions, and a window where data is inconsistent" class="code-bad"><code class="language-csharp">db.Orders.Add(order);
+await db.SaveChangesAsync();       // transaction 1 - COMMITTED
+
+inventory.Stock -= qty;
+await db.SaveChangesAsync();       // transaction 2 - if this throws,
+                                   // the order exists with no stock deducted</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>The number of <code>SaveChanges</code> calls is the number of transactions.</strong></p>
+    <p>If two changes must succeed or fail together, they belong in <em>one</em> <code>SaveChanges</code> —
+      or inside an explicit transaction.</p>
+    <p>Most "we ended up with an orphaned record" bugs are a second <code>SaveChanges</code> that someone added
+      later without noticing what it did to atomicity.</p>
+  </div>
+
+  <h2 id="explicit">Explicit transactions <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — when you genuinely need several operations atomic"><code class="language-csharp">await using var tx = await db.Database.BeginTransactionAsync();
+try
+{
+    db.Orders.Add(order);
+    await db.SaveChangesAsync();          // need the generated Id below
+
+    await db.Database.ExecuteSqlAsync(
+        $"UPDATE Inventory SET Stock = Stock - {qty} WHERE Sku = {sku} AND Stock &gt;= {qty}");
+
+    audit.OrderId = order.Id;
+    db.AuditEntries.Add(audit);
+    await db.SaveChangesAsync();
+
+    await tx.CommitAsync();
+}
+catch
+{
+    await tx.RollbackAsync();             // dispose would roll back anyway
+    throw;
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>You need an explicit transaction when</th></tr></thead>
+      <tbody>
+        <tr><td>Several <code>SaveChanges</code> calls must be atomic — usually because a later step needs a generated key</td></tr>
+        <tr><td>You mix EF and raw SQL, or EF and Dapper</td></tr>
+        <tr><td>You need a specific isolation level</td></tr>
+        <tr><td>You need to read your own uncommitted writes before deciding whether to commit</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Sharing a transaction with Dapper</div>
+    <pre data-label="csharp"><code class="language-csharp">await using var tx = await db.Database.BeginTransactionAsync();
+
+var conn = db.Database.GetDbConnection();
+var raw  = tx.GetDbTransaction();          // the underlying DbTransaction
+
+var rows = await conn.QueryAsync&lt;Row&gt;(sql, param, transaction: raw);
+
+db.Orders.Add(order);
+await db.SaveChangesAsync();
+await tx.CommitAsync();                    // both participate</code></pre>
+    <p style="margin:0">This is why "EF for writes, Dapper for awkward reads" costs nothing architecturally —
+      they share the connection and the transaction. Worth knowing, because interviewers often expect the two
+      to be mutually exclusive.</p>
+  </div>
+
+  <h2 id="lost-update">Lost updates <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">The bug in plain terms</span>
+    <p>Two people open the same product edit form. Both see the price as £100.</p>
+    <p>One changes it to £120 and saves. The other changes the description and saves.</p>
+    <p>The price is back to £100. Nobody was told anything went wrong.</p>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">Why EF doesn't prevent this by default</span>
+    <p>EF only updates the columns that changed on <em>its</em> snapshot. So it isn't a whole-row overwrite —
+      which helps.</p>
+    <p>But if both users changed the <em>same</em> column, the second write wins with no detection at all. And
+      if the code uses <a href="fundamentals.html#update-trap"><code>Update()</code> on a detached
+      entity</a>, every column is overwritten.</p>
+  </div>
+
+  <h2 id="optimistic">Optimistic concurrency <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — rowversion: the standard solution" class="code-good"><code class="language-csharp">public class Product
+{
+    public int Id { get; set; }
+    public decimal Price { get; set; }
+    public string Description { get; set; } = null!;
+
+    [Timestamp]                                  // SQL Server rowversion
+    public byte[] Version { get; set; } = null!;
+}
+
+// Fluent equivalent:
+b.Property(p =&gt; p.Version).IsRowVersion();</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">What EF then does</span>
+    <p>The generated <code>UPDATE</code> gains <code>AND Version = @originalVersion</code>.</p>
+    <p>If somebody else changed the row, the database bumped <code>Version</code>, so <strong>zero rows are
+      affected</strong> — and EF turns that into <code>DbUpdateConcurrencyException</code>.</p>
+  </div>
+
+  <pre data-label="sql — the generated statement"><code class="language-sql">UPDATE Product
+SET    Price = @p0
+WHERE  Id = @p1 AND Version = @p2;      -- the guard
+-- 0 rows affected -> someone else won</code></pre>
+
+  <h3 id="handling">Handling the exception</h3>
+
+  <pre data-label="csharp — three strategies, chosen deliberately"><code class="language-csharp">try
+{
+    await db.SaveChangesAsync();
+}
+catch (DbUpdateConcurrencyException ex)
+{
+    var entry    = ex.Entries.Single();
+    var current  = entry.CurrentValues;                       // what we tried to save
+    var database = await entry.GetDatabaseValuesAsync();      // what's actually there
+
+    if (database is null)
+        return Conflict("This record was deleted by another user.");
+
+    // 1. LAST WRITER WINS - reload the token and retry
+    entry.OriginalValues.SetValues(database);
+    await db.SaveChangesAsync();
+
+    // 2. FIRST WRITER WINS - abandon our change
+    // return Conflict("Someone else updated this. Please reload.");
+
+    // 3. MERGE - keep theirs except for the fields we own
+    // foreach (var p in entry.Metadata.GetProperties()) { ... }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Last writer wins</strong></td><td>Low-stakes fields, or a background process where the newest value is correct</td></tr>
+        <tr><td><strong>First writer wins</strong> — tell the user</td><td><strong>Usually right for user-facing edits.</strong> Honest, and they can decide</td></tr>
+        <tr><td><strong>Merge</strong></td><td>Different users edit disjoint fields, and you can prove which is which</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this is a UX decision, not a technical one</div>
+    <p style="margin:0">EF can detect the conflict. It cannot know what should happen — that depends on what
+      the data means.
+      <br><br>
+      A stock count: last writer wins is probably wrong; you want an atomic decrement instead. A support
+      ticket's status: telling the user "someone else changed this, here's what they set" is right. A
+      background enrichment job: overwriting is fine.
+      <br><br>
+      The weak answer is "catch it and retry" for everything. The strong answer names the choice and ties it to
+      the domain — and says explicitly that a silent retry on a user-facing edit just reintroduces the lost
+      update you were preventing.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title"><code>rowversion</code> vs a concurrency token on a column</div>
+    <p style="margin:0"><code>rowversion</code> is a database-maintained 8-byte value that changes on
+      <strong>any</strong> update to the row. Nothing to remember, works for every column.
+      <br><br>
+      Alternatively mark a specific property with <code>IsConcurrencyToken()</code> — often a
+      <code>LastModified</code> timestamp. Narrower: two users editing genuinely different columns won't
+      conflict, which can be what you want.
+      <br><br>
+      For PostgreSQL the equivalent is the system <code>xmin</code> column
+      (<code>b.UseXminAsConcurrencyToken()</code>). Worth knowing, since <code>rowversion</code> is SQL
+      Server-specific.</p>
+  </div>
+
+  <h2 id="atomic">Better than detection: don't read first <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="csharp — read-modify-write has a window" class="code-bad"><code class="language-csharp">var inv = await db.Inventory.FirstAsync(i =&gt; i.Sku == sku);
+if (inv.Stock &gt;= qty)              // ← another request can pass this too
+{
+    inv.Stock -= qty;
+    await db.SaveChangesAsync();
+}</code></pre>
+
+  <pre data-label="csharp — atomic: the check is inside the statement" class="code-good"><code class="language-csharp">var affected = await db.Inventory
+    .Where(i =&gt; i.Sku == sku &amp;&amp; i.Stock &gt;= qty)
+    .ExecuteUpdateAsync(s =&gt; s.SetProperty(i =&gt; i.Stock, i =&gt; i.Stock - qty));
+
+if (affected == 0)
+    throw new InsufficientStockException(sku);</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>The best fix for a concurrency problem is often to remove the read.</strong></p>
+    <p>No read-modify-write means no window, no version token, no retry, and no exception handling. One
+      statement, one round trip.</p>
+    <p><code>ExecuteUpdate</code> arrived in EF Core 7. Before that this needed raw SQL — which is why a lot of
+      older code uses the pessimistic or optimistic patterns where this would now be simpler.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title"><code>ExecuteUpdate</code> bypasses the change tracker</div>
+    <p style="margin:0">It generates SQL directly, so entities already loaded in the context keep their
+      <strong>old</strong> values — and a later <code>SaveChanges</code> can write them back over your update.
+      <br><br>
+      It also doesn't fire interceptors, so audit stamps and soft-delete logic don't apply. And it isn't
+      included in <code>SaveChanges</code>' transaction — if you need both atomic, wrap them in an explicit
+      transaction.
+      <br><br>
+      So it's excellent for set-based work and wrong for anything relying on tracking behaviour.</p>
+  </div>
+
+  <h2 id="execution-strategy">Retry and transactions <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — enabling retry"><code class="language-csharp">options.UseSqlServer(cs, sql =&gt; sql.EnableRetryOnFailure(
+    maxRetryCount: 5,
+    maxRetryDelay: TimeSpan.FromSeconds(30),
+    errorNumbersToAdd: null));</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">This combination throws, and the message is confusing</div>
+    <p style="margin:0">With retry enabled, calling <code>BeginTransaction</code> gives you:
+      <br><br>
+      <em>"The configured execution strategy 'SqlServerRetryingExecutionStrategy' does not support
+      user-initiated transactions."</em>
+      <br><br>
+      That's deliberate. Retry works per operation — but retrying one <code>SaveChanges</code> inside a
+      transaction that already failed is meaningless, because the transaction is gone. EF refuses rather than
+      doing something incorrect.</p>
+  </div>
+
+  <pre data-label="csharp — the fix: retry the whole unit" class="code-good"><code class="language-csharp">var strategy = db.Database.CreateExecutionStrategy();
+
+await strategy.ExecuteAsync(async () =&gt;
+{
+    await using var tx = await db.Database.BeginTransactionAsync();
+
+    db.Orders.Add(order);
+    await db.SaveChangesAsync();
+
+    audit.OrderId = order.Id;
+    db.AuditEntries.Add(audit);
+    await db.SaveChangesAsync();
+
+    await tx.CommitAsync();
+});</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The requirement people miss</div>
+    <p style="margin:0">The block passed to <code>ExecuteAsync</code> <strong>can run more than once</strong>.
+      So it must be idempotent — and it must not depend on state mutated by a previous attempt.
+      <br><br>
+      Two concrete hazards. Entities added in a failed attempt are <em>still tracked</em>, so a naive retry can
+      insert duplicates; build the entity graph inside the block, not outside it. And anything non-database in
+      there — an email, an HTTP call, a message published — happens once per attempt.
+      <br><br>
+      Same requirement as <a href="../08-http-web-apis/reliability.html#idempotency-keys">HTTP retry-safety</a>. It's
+      the same problem in a different layer.</p>
+  </div>
+
+  <h2 id="outbox">Side effects and the outbox <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="csharp — the dual-write problem" class="code-bad"><code class="language-csharp">db.Orders.Add(order);
+await db.SaveChangesAsync();               // committed
+
+await _bus.PublishAsync(new OrderPlaced(order.Id));   // ← what if this fails?
+// Order exists. Nobody downstream knows. Silent inconsistency.</code></pre>
+
+  <pre data-label="csharp — and inside the transaction it's worse" class="code-bad"><code class="language-csharp">await using var tx = await db.Database.BeginTransactionAsync();
+db.Orders.Add(order);
+await db.SaveChangesAsync();
+
+await _bus.PublishAsync(new OrderPlaced(order.Id));   // published
+
+await tx.CommitAsync();                    // if THIS fails, the message is already out
+// Downstream reacts to an order that doesn't exist.</code></pre>
+
+  <pre data-label="csharp — outbox: one transaction, no dual write" class="code-good"><code class="language-csharp">db.Orders.Add(order);
+
+db.OutboxMessages.Add(new OutboxMessage
+{
+    Id       = Guid.CreateVersion7(),
+    Type     = nameof(OrderPlaced),
+    Payload  = JsonSerializer.Serialize(new OrderPlaced(order.Id)),
+    OccurredUtc = DateTime.UtcNow
+});
+
+await db.SaveChangesAsync();     // order AND message committed atomically
+
+// A background worker reads unsent rows, publishes, marks them sent.</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>You cannot atomically write to a database and a message broker.</strong> There's no shared
+      transaction.</p>
+    <p>So write the <em>intent</em> to the same database, in the same transaction, and publish afterwards from a
+      separate process.</p>
+    <p>You get at-least-once delivery, which means consumers must be
+      <a href="../19-architecture/distributed-data.html#idempotency">idempotent</a>. That's a real cost, and
+      it's much smaller than silent inconsistency.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Wiring it into an interceptor</div>
+    <p style="margin:0">Putting the outbox write in a <a href="fundamentals.html#interceptors">SaveChanges
+      interceptor</a> means domain code raises events on the entity and the infrastructure turns them into
+      outbox rows automatically — so no handler can forget.
+      <br><br>
+      That's the difference between the outbox being a pattern the team must remember, and a guarantee the
+      system provides.</p>
+  </div>
+
+  <h2 id="isolation">Isolation levels in EF <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="csharp"><code class="language-csharp">await using var tx = await db.Database
+    .BeginTransactionAsync(System.Data.IsolationLevel.Serializable);</code></pre>
+
+  <div class="note info">
+    <div class="note-title">You rarely need to change it</div>
+    <p style="margin:0">EF uses the database's default, which for SQL Server is <code>READ COMMITTED</code>.
+      <br><br>
+      Raising isolation to solve a concurrency bug is almost always the wrong instrument — it costs concurrency
+      across the whole application and often doesn't fix the actual problem.
+      <br><br>
+      Prefer, in order: an atomic <code>ExecuteUpdate</code>, then a <code>rowversion</code> token, then a
+      targeted lock. And if reads are blocking writes, the answer is
+      <a href="../10-sql/transactions.html#snapshot">RCSI at the database level</a> — which needs no
+      application change at all.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>One <code>SaveChanges</code> is one transaction. Two calls are two transactions.</li>
+      <li>Explicit transactions for multi-save units, mixed SQL, or a specific isolation level.</li>
+      <li>EF and Dapper can share a connection and transaction.</li>
+      <li>Lost updates aren't detected without a concurrency token.</li>
+      <li><code>rowversion</code> adds a guard to the <code>WHERE</code> clause; zero rows means conflict.</li>
+      <li>What to do on conflict is a domain decision, not a technical default.</li>
+      <li>Removing the read — <code>ExecuteUpdate</code> with the condition inline — beats detecting the
+        conflict.</li>
+      <li><code>ExecuteUpdate</code> bypasses tracking, interceptors and the <code>SaveChanges</code>
+        transaction.</li>
+      <li>Retry plus explicit transaction needs an execution strategy, and the block must be idempotent.</li>
+      <li>Never publish messages or send email inside a transaction. Use the outbox.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Two <code>SaveChanges</code> calls</strong> where atomicity was required.</li>
+    <li><strong>No concurrency token</strong>, so lost updates go undetected.</li>
+    <li><strong>Catching <code>DbUpdateConcurrencyException</code> and blindly retrying</strong> —
+      reintroducing the lost update.</li>
+    <li><strong>Read-modify-write</strong> where an atomic update would work.</li>
+    <li><strong><code>BeginTransaction</code> with retry enabled</strong> and no execution strategy.</li>
+    <li><strong>Building entities outside a retried block</strong>, causing duplicate inserts.</li>
+    <li><strong>Publishing messages inside a transaction.</strong></li>
+    <li><strong><code>ExecuteUpdate</code> on entities the context already tracks.</strong></li>
+    <li><strong>Raising the isolation level</strong> instead of fixing the operation.</li>
+    <li><strong>A transaction spanning user think-time.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Two users edit the same record. How do you handle it in EF Core? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Without anything in place, it's a <strong>lost update</strong> — the second save silently
+          overwrites the first, and nobody is told."</p>
+        <p>"EF helps a little by default: it only updates the columns that changed on its snapshot, so two users
+          editing genuinely different fields don't clobber each other. But if they touched the same column, the
+          second write wins with no detection. And if the code uses <code>Update()</code> on a detached entity,
+          every column gets overwritten regardless."</p>
+        <p>"The standard fix is <strong>optimistic concurrency</strong> with a <code>rowversion</code> column —
+          <code>[Timestamp]</code>, or <code>IsRowVersion()</code> in fluent config. SQL Server maintains it
+          automatically, changing it on any update to the row."</p>
+        <p>"EF then adds <code>AND Version = @original</code> to the <code>UPDATE</code>. If someone else has
+          saved since we loaded, the version differs, zero rows are affected, and EF raises
+          <code>DbUpdateConcurrencyException</code>."</p>
+        <p>"The important part is <strong>what you do with that exception, because that's a product decision,
+          not a technical one</strong>. EF can detect the conflict; it can't know what should happen."</p>
+        <p>"For a user-facing edit form I'd almost always go <strong>first writer wins</strong>: return a 409,
+          tell the user someone else changed it, and show them what changed so they can decide. That's honest.
+          Silently retrying with the new version is the one option I'd avoid, because it reintroduces exactly
+          the lost update I was trying to prevent."</p>
+        <p>"<strong>Last writer wins</strong> is reasonable for a background enrichment job where the newest
+          value is by definition correct. <strong>Merge</strong> works if users edit provably disjoint fields,
+          but it's more code and I'd want a real reason."</p>
+        <p>"For getting at the details: <code>ex.Entries</code> gives the failing entity, and
+          <code>GetDatabaseValuesAsync()</code> gives the current database state, so you can show a proper
+          diff. It returning null means the row was deleted, which needs a different message."</p>
+        <p>"And I'd ask whether this needs conflict detection at all. If it's really 'decrement stock', the
+          better answer is to remove the read: <code>ExecuteUpdate</code> with the condition in the
+          <code>WHERE</code> clause. No read-modify-write means no window, no token, no exception handling —
+          one statement. Detection is for cases where a human is editing something and there's genuinely a
+          decision to make."</p>
+        <p>"One portability note: <code>rowversion</code> is SQL Server-specific. On PostgreSQL the equivalent
+          is the system <code>xmin</code> column via <code>UseXminAsConcurrencyToken()</code>."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you name it as a lost update?</li>
+        <li>Do you know the mechanism — the guard in the <code>WHERE</code> clause?</li>
+        <li>Do you treat the resolution as a domain decision?</li>
+        <li>Do you know a blind retry defeats the purpose?</li>
+        <li>Bonus: do you suggest avoiding the read entirely?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "catch it and retry" with no discussion.</li>
+        <li><span class="redflag">Red flag:</span> reaching for <code>SERIALIZABLE</code> or a lock first.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What SQL does EF generate with a rowversion?</li>
+          <li>How would you show the user what changed?</li>
+          <li>What if the row was deleted rather than updated?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Placing an order must save to the database and publish an event. How do you make that reliable? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The core issue is that <strong>you cannot atomically write to a database and a message broker</strong>
+          — there's no shared transaction, so any ordering you pick has a failure mode."</p>
+        <p>"<strong>Save then publish:</strong> if the publish fails, the order exists and nothing downstream
+          knows. Silent inconsistency — no email, no fulfilment, and no error anywhere."</p>
+        <p>"<strong>Publish then save:</strong> if the save fails, downstream services react to an order that
+          doesn't exist. Worse, because now other systems have acted on fiction."</p>
+        <p>"<strong>Publish inside the transaction:</strong> looks tidier and is the same problem — the message
+          is already out when the commit fails. And it holds database locks for the duration of a network call
+          to the broker, which is its own problem."</p>
+        <p>"So I'd use the <strong>outbox pattern</strong>. In the same <code>SaveChanges</code> — therefore the
+          same transaction — I write the order <em>and</em> a row to an <code>OutboxMessages</code> table
+          containing the serialised event. Both commit atomically or neither does. There's no dual write at
+          all, because the message is just more rows in the same database."</p>
+        <p>"Then a background worker polls for unsent rows, publishes them to the broker, and marks them sent.
+          If publishing fails it retries; if the process dies the row is still there."</p>
+        <p>"The cost is that this gives <strong>at-least-once</strong> delivery, not exactly-once. The worker
+          can publish and then crash before marking the row sent, so the message goes out twice. That means
+          <strong>consumers must be idempotent</strong> — typically dedupe on a message ID they've recorded, an
+          inbox table. That's a real requirement and I'd state it explicitly rather than pretend the outbox
+          solves delivery semantics."</p>
+        <p>"Implementation details I'd get right. I'd put the outbox write in a <strong>SaveChanges
+          interceptor</strong>, so domain code raises events on the entity and the infrastructure turns them
+          into outbox rows automatically — otherwise it's a pattern someone will forget in one handler and
+          you're back to a dual write."</p>
+        <p>"The worker needs a <strong>claim step</strong> so multiple instances don't publish the same row —
+          an atomic update marking rows as being processed, or an <code>UPDLOCK, READPAST</code> read. And it
+          needs ordering if the events are causally related, which usually means partitioning by aggregate."</p>
+        <p>"I'd also add a <strong>filtered index</strong> on unsent rows so the poll is cheap on a big table,
+          and a cleanup job to archive sent messages — an outbox table nobody prunes becomes a problem in
+          itself."</p>
+        <p>"One alternative worth naming: if the database supports change data capture, you can tail the log
+          instead of polling — that's the transactional-outbox-via-CDC variant, lower latency and no polling
+          overhead, at the cost of more infrastructure. And if this is all within one service and the consumer
+          could just read the database, I'd question whether an event is needed at all."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you recognise the dual-write problem?</li>
+        <li>Can you explain why all three naive orderings fail?</li>
+        <li>Do you know the outbox pattern and its at-least-once consequence?</li>
+        <li>Do you handle multiple workers claiming rows?</li>
+        <li>Do you make it structural rather than a convention?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "publish inside the transaction."</li>
+        <li><span class="redflag">Red flag:</span> claiming the outbox gives exactly-once delivery.</li>
+        <li><span class="redflag">Red flag:</span> reaching for a distributed transaction / MSDTC.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do consumers deduplicate?</li>
+          <li>How do you guarantee ordering?</li>
+          <li>What if the outbox table grows to 200 million rows?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>You enabled <code>EnableRetryOnFailure</code> and now <code>BeginTransaction</code> throws. Why? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"EF refuses the combination on purpose. The message is that the retrying execution strategy 'does
+          not support user-initiated transactions'."</p>
+        <p>"The reasoning: retry operates <strong>per operation</strong>. If I have a transaction spanning three
+          <code>SaveChanges</code> calls and the second one fails transiently, retrying just that call is
+          meaningless — the transaction has already been aborted. EF would be retrying into a dead transaction
+          and producing something incoherent, so it throws instead of guessing."</p>
+        <p>"The fix is to make the <strong>whole transaction</strong> the retryable unit, using an execution
+          strategy: <code>db.Database.CreateExecutionStrategy()</code>, then put the
+          <code>BeginTransaction</code>, all the saves and the commit inside
+          <code>strategy.ExecuteAsync(...)</code>. Now if anything inside fails transiently, the entire block
+          re-runs from the beginning — which is the only correct granularity."</p>
+        <p>"The requirement that comes with that, and it's the part people miss: <strong>the block can run more
+          than once</strong>, so it has to be idempotent."</p>
+        <p>"Two concrete hazards there. First, entities added to the context in a failed attempt are
+          <em>still tracked</em> — so if I build the entity graph outside the block and only add it inside, a
+          retry can insert duplicates. The graph should be constructed inside the block. Second, anything
+          non-database in there — publishing a message, sending an email, calling an API — happens once per
+          attempt. Those belong outside, or behind an outbox."</p>
+        <p>"I'd also sanity-check whether the explicit transaction is needed at all. Often it's there because
+          someone added a second <code>SaveChanges</code>, and the two saves could be merged into one — which
+          is atomic automatically and sidesteps the whole issue. The usual legitimate reason is needing a
+          generated key from the first save, and for that the execution strategy is the right answer."</p>
+        <p>"Worth noting this is the same idempotency requirement as retry-safety in HTTP APIs. Any time
+          something can be retried, the work has to tolerate being done twice — the layer changes, the
+          constraint doesn't."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand why EF refuses rather than treating it as a bug?</li>
+        <li>Do you know the execution-strategy fix?</li>
+        <li>Do you know the block must be idempotent, and why tracked entities are a hazard?</li>
+        <li>Do you question whether the transaction is needed?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which errors does EF consider transient?</li>
+          <li>What happens if all retries are exhausted?</li>
+          <li>How does this interact with the outbox?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

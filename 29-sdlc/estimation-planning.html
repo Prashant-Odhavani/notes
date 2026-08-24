@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Estimation &amp; Planning — SDLC</title>
+<meta name="description" content="Why estimates are wrong, how to make them better, story points vs hours, Little's Law, and how to talk about dates honestly.">
+<meta name="keywords" content="estimation story points velocity capacity planning cone of uncertainty three point PERT spike vertical slice littles law cycle time forecast deadline commitment padding">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="29-sdlc/estimation-planning.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Estimation &amp; Planning</h1>
+    <p class="subtitle">Why estimates are systematically wrong, what to do about it, and how to talk about
+      dates without either lying or refusing to answer.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>An estimate is a <strong>range</strong>, not a number. Giving a single number throws away the only
+        information that mattered.</li>
+      <li>Estimates are wrong mostly because of <strong>unknown work</strong>, not slow typing.</li>
+      <li><strong>Commitment ≠ forecast.</strong> A team commits to a sprint it controls; it forecasts a
+        quarterly date it doesn't.</li>
+      <li>Story points measure relative size and uncertainty. Convert them to hours and they become a worse
+        unit of time.</li>
+      <li>Little's Law: <em>cycle time = WIP ÷ throughput</em>. Cutting work-in-progress is usually the
+        fastest way to deliver sooner.</li>
+      <li>Hidden padding gets consumed anyway. Explicit, attributed buffers survive scrutiny and actually
+        work.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-wrong">Why estimates are wrong <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>Knowing the mechanisms is what lets you improve estimates instead of just apologising for them.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>What's actually happening</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Cone of uncertainty</td>
+          <td>You're asked to be most precise at the point you know least. Early estimates are routinely off
+              by 2–4× either way. That's a property of the information available, not of skill.</td>
+        </tr>
+        <tr>
+          <td>Planning fallacy</td>
+          <td>People estimate the path where nothing goes wrong, because that's the path they can picture.
+              Integration surprises, flaky environments and the third round of feedback are invisible.</td>
+        </tr>
+        <tr>
+          <td>Unknown unknowns</td>
+          <td>The dominant factor. You can't estimate work you don't know exists — you can only bound how
+              long you'll spend discovering it.</td>
+        </tr>
+        <tr>
+          <td>Ignoring non-dev time</td>
+          <td>Review, CI, QA cycles, deployment windows, meetings, support duty. A "3-day" task takes 8
+              elapsed days for entirely predictable reasons.</td>
+        </tr>
+        <tr>
+          <td>Anchoring</td>
+          <td>Once someone says "feels like a week", every later estimate clusters around it. That's why
+              planning poker reveals estimates simultaneously.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="techniques">Techniques, and when each is worth it <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>How</th><th>Use when</th><th>Weakness</th></tr></thead>
+      <tbody>
+        <tr><td>Relative sizing (points)</td><td>Compare to a reference story; Fibonacci-ish scale</td><td>Ongoing sprint planning</td><td>Meaningless across teams; corrupted if management treats points as productivity</td></tr>
+        <tr><td>T-shirt sizing</td><td>S/M/L/XL</td><td>Roadmap triage before detail exists</td><td>Too coarse to schedule</td></tr>
+        <tr><td>Three-point / PERT</td><td>(optimistic + 4×likely + pessimistic) ÷ 6</td><td>One significant deliverable with a date</td><td>Only as good as the pessimistic case, which people under-imagine</td></tr>
+        <tr><td>Reference-class</td><td>"How long did the last three similar things take?"</td><td>Recurring work types — integrations, migrations</td><td>Needs history most teams don't keep</td></tr>
+        <tr><td>Throughput forecasting</td><td>Count stories done per week, project the remainder</td><td>Steady story sizes and a backlog</td><td>Breaks when story size varies wildly</td></tr>
+        <tr><td>Spike / timebox</td><td>Fixed time to answer a specific question</td><td>Unknown work you can't size at all</td><td>Becomes open-ended research if the question isn't written down</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>"I can't estimate this yet" is a <strong>finding</strong>, not a failure.</p>
+    <p>Say: "The unknown is whether the vendor API supports partial refunds. Give me a day to find out and
+      I'll come back with a range." A one-day spike that collapses a two-week uncertainty is the
+      highest-return activity in planning.</p>
+  </div>
+
+  <h3 id="points-vs-time">Story points vs hours <span class="pill pill-must">🔥 Must know</span></h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Story points</th><th>Time estimates</th></tr></thead>
+      <tbody>
+        <tr><td>Measures</td><td>Relative size + complexity + uncertainty</td><td>Duration</td></tr>
+        <tr><td>Stable across people?</td><td>Yes — a 5 is a 5 whoever does it</td><td>No — varies by experience</td></tr>
+        <tr><td>Good for</td><td>Sprint capacity; spotting stories that are too big</td><td>Fixed-scope external commitments</td></tr>
+        <tr><td>Fails when</td><td>Used to compare teams or as a productivity metric</td><td>Uncertainty is high — single numbers imply false precision</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>The honest position:</strong> points work because they dodge the false precision of hours, and
+    because humans are genuinely better at relative comparison than absolute duration.</p>
+
+  <p>They stop working the moment anyone outside the team consumes them as a performance number. Then they
+    inflate and become useless. If your organisation does that, forecasting by story <em>count</em> and
+    throughput is more robust — counts are harder to inflate.</p>
+
+  <h2 id="breaking-down">Breaking work down <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>Accuracy improves far more from decomposition than from thinking harder. Splitting a 10-point story
+    into five doesn't just distribute the estimate — it forces you to articulate the steps, and that's where
+    forgotten work surfaces.</p>
+
+  <p><strong>Ways to split, roughly in order of how often they apply:</strong></p>
+
+  <ul>
+    <li><strong>By workflow step</strong> — create, then edit, then delete.</li>
+    <li><strong>By rule variation</strong> — happy path now, the three exception rules as follow-ups.</li>
+    <li><strong>By data variation</strong> — one file format now, the other two later.</li>
+    <li><strong>By interface</strong> — API first, UI second, so integration risk shows up early.</li>
+    <li><strong>Walking skeleton</strong> — the thinnest end-to-end path, deployed to production, before any
+      depth. This is the single most effective risk-reduction technique available: it converts integration
+      and deployment unknowns into known work in the first days rather than the last.</li>
+    <li><strong>Spike then build</strong> — separate the learning from the delivery, and estimate only the
+      delivery.</li>
+  </ul>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Splitting <em>horizontally</em> — a "database layer" story, a "service layer" story,
+      a "UI" story. Looks tidy. Gives you three stories, none of which can be demonstrated, tested end to
+      end or released — and defers every integration risk to the moment they're joined.
+      <br><br>
+      <strong>If a split doesn't produce something that could in principle ship, it's a task list, not
+      stories.</strong></p>
+  </div>
+
+  <h2 id="flow">Velocity, capacity and flow <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Velocity is average completed points per sprint. Its only legitimate use is the team's own forecasting
+    — and as a <em>range</em> (last five sprints' min and max), not an average, because the average hides
+    the variability that is the actual planning risk.</p>
+
+  <p>Flow metrics are usually better for diagnosing <em>why</em> delivery is slow:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Metric</th><th>Definition</th><th>What it tells you</th></tr></thead>
+      <tbody>
+        <tr><td>Cycle time</td><td>Started → done</td><td>How long work takes once begun. The number to quote to stakeholders</td></tr>
+        <tr><td>Lead time</td><td>Requested → done</td><td>What the customer experiences, including queueing</td></tr>
+        <tr><td>Throughput</td><td>Items completed per week</td><td>Basis for count-based forecasting</td></tr>
+        <tr><td>WIP</td><td>Items in progress</td><td>The lever you can actually pull</td></tr>
+        <tr><td>Flow efficiency</td><td>Active time ÷ elapsed time</td><td>Usually shockingly low (10–25%) — proof that waiting dominates</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this — Little's Law</span>
+    <p><code>cycle time = WIP ÷ throughput</code></p>
+    <p>Six people each with two things in progress, team finishes six items a week → average cycle time is
+      two weeks. <strong>Halving WIP halves cycle time without anyone working faster.</strong> "Stop
+      starting, start finishing" isn't a slogan — it's arithmetic.</p>
+  </div>
+
+  <h2 id="communicating">Communicating estimates honestly <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>How you present an estimate matters more than its accuracy, because the presentation determines what
+    decisions get made on top of it.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Instead of</th><th>Say</th><th>Why it's better</th></tr></thead>
+      <tbody>
+        <tr><td>"About three weeks."</td><td>"Two to five weeks. The variance is the vendor's sandbox — if it behaves like the docs say, we're at the low end."</td><td>Names the uncertainty and what would remove it</td></tr>
+        <tr><td>"I can't estimate that."</td><td>"Not yet. One day to prototype the integration, then I can give you a range."</td><td>Offers a path instead of a refusal</td></tr>
+        <tr><td>"We'll try."</td><td>"With current scope we'll miss by about a week. If we drop bulk import, we make it."</td><td>Gives the decision-maker a lever</td></tr>
+        <tr><td>Padding silently by 40%</td><td>"Estimate is 8 days; I'd plan for 12 given the integration risk."</td><td>The buffer survives scrutiny because it's attributed</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — why hidden padding fails twice</div>
+    <p style="margin:0"><strong>First:</strong> everyone pads, so the total becomes absurd and management
+      applies a blanket cut — which punishes the honest estimators.
+      <br><br>
+      <strong>Second:</strong> work expands to fill the padded time, so you get the schedule risk anyway with
+      none of the safety.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Separate known work from unknown work. Estimate the first, spike the second.</li>
+      <li>Decomposition improves accuracy more than any technique.</li>
+      <li>Include review, QA cycles, deployment and cross-team waits — often 40% of elapsed time.</li>
+      <li>Give ranges with the driver of the variance named.</li>
+      <li>Cut WIP to cut cycle time. It costs nothing.</li>
+      <li>Re-forecast as information arrives. An estimate at 10% done shouldn't survive to 50% done.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Estimating alone</strong> and defending it later, instead of estimating with the people doing
+      the work.</li>
+    <li><strong>Treating a forecast as a commitment</strong> the moment it appears on a slide.</li>
+    <li><strong>Estimating only development.</strong></li>
+    <li><strong>Re-estimating in-flight work</strong> to make the burndown look right. Burndown is a signal,
+      not a target.</li>
+    <li><strong>Assuming six people deliver six times one person.</strong> Coordination cost grows roughly
+      with the square of team size — adding people to a late project usually makes it later.</li>
+    <li><strong>Never comparing estimates to actuals.</strong> Without that loop, estimation can't improve.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>How do you estimate a piece of work?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I start by separating what I know from what I don't, because they need different treatment."</p>
+        <p>"For the known part I decompose until each piece is small enough that I can picture the change.
+          If I can't describe the files I'd touch, it's still too big to estimate."</p>
+        <p>"For the unknown part I don't estimate at all — I propose a timeboxed spike with a specific
+          question. A number attached to unknown work is fiction, and everyone downstream treats it as fact."</p>
+        <p>"Then I deliberately include the non-coding work: review turnaround, test writing, the QA cycle
+          with at least one round of fixes, migration scripts, deployment, and any coordination with another
+          team. Cross-team dependencies are the biggest source of elapsed-time blowout, because they
+          introduce queueing I don't control."</p>
+        <p>"I present it as a range with the driver of the variance named, and I say what would narrow it.
+          And I re-forecast as information arrives — an estimate given at 10% done shouldn't survive
+          unchanged to 50%. Honestly, the biggest accuracy improvement isn't a technique, it's decomposition
+          plus actually looking back at what similar work took last time."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you distinguish uncertainty from effort?</li>
+        <li>Do you account for the non-coding two-thirds?</li>
+        <li>Is estimation a feedback loop for you, or a one-off ritual?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a confident single number for anything non-trivial.</li>
+        <li><span class="redflag">Red flag:</span> "I add 20% buffer" as the entire method.</li>
+        <li><span class="redflag">Red flag:</span> "estimates are pointless" — real teams still need "roughly when?"</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Your estimate was 2 weeks and it took 6. What did you learn?</li>
+          <li>How do you estimate work in a system you've never seen?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>The deadline is fixed and the scope won't fit. What do you do?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The classic framing is scope, time, quality and people — pick three. Practically, adding people
+          mid-project makes it later, and cutting quality is borrowing at a brutal rate because the defects
+          come back inside the same release window. So the real lever is scope."</p>
+        <p>"My job is to make that conversation as easy as possible for whoever owns the deadline. So I'd
+          arrive with a proposal, not a problem: split the scope into what must ship for the deadline to mean
+          anything, what could ship two weeks later without harm, and what got included because it seemed
+          convenient. Usually 60–70% of the value sits in a subset that fits."</p>
+        <p>"If the deadline is a genuine external commitment — a regulatory date, a conference — I'd also look
+          for ways to meet the letter of it with a reduced but complete experience: fewer supported formats,
+          a manual admin process instead of a UI, one region instead of three."</p>
+        <p>"What I wouldn't do is quietly compromise on the things that are invisible in a demo and expensive
+          later — error handling, data migration correctness, and the ability to roll back. Those aren't
+          polish. If I'm pushed to cut them, I'd name the specific risk being accepted and who's accepting
+          it."</p>
+        <p>"And I'd raise all of this as early as the evidence supports. The value of this conversation
+          decays to nothing the closer you get to the date."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know which corners are safe to cut and which aren't?</li>
+        <li>Do you bring options rather than escalate a problem?</li>
+        <li>Do you raise risk early?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "we'd work overtime".</li>
+        <li><span class="redflag">Red flag:</span> "add more developers".</li>
+        <li><span class="redflag">Red flag:</span> "cut testing" without naming the risk that accepts.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which specific things would you never cut, and why?</li>
+          <li>How do you say this to a stakeholder who doesn't want to hear it?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Velocity dropped 30% this sprint and the manager wants an explanation. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My first move is to push back gently on the premise. Velocity is a noisy planning aid for the
+          team, not a productivity measure, and one sprint's movement is well inside normal variance.
+          Comparing one sprint to one sprint is reading noise. I'd look at five or six before treating it as
+          a signal."</p>
+        <p>"If there is a real trend, the causes are usually mundane: people on support or leave, a large
+          story carried over so its points landed in a different sprint, unplanned production work, or
+          estimates drifting because the reference story changed. Those are accounting artefacts, not
+          performance changes, and I'd say so plainly."</p>
+        <p>"The things actually worth worrying about look different — cycle time rising while throughput
+          falls, review latency growing, or an increasing share of time on defect fixes. Those point at real
+          problems: an area of the codebase becoming hostile, a bottleneck reviewer, or quality debt turning
+          into rework."</p>
+        <p>"So I'd answer with flow metrics rather than points, because they're harder to game and they point
+          at a fixable cause. And I'd be direct that if velocity starts being used as a performance target,
+          the number will go up and mean nothing — estimates are the easiest thing in the world to inflate."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand measurement noise and Goodhart's law?</li>
+        <li>Can you redirect a manager to a better question without being obstructive?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What would you measure instead?</li>
+          <li>How would you explain DORA metrics to that manager?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Application Architectures — Architecture</title>
+<meta name="description" content="Layered, Clean, Hexagonal, Onion, Vertical Slice and Modular Monolith explained simply, with what each actually buys you and when it is overkill.">
+<meta name="keywords" content="layered architecture clean architecture hexagonal ports and adapters onion vertical slice modular monolith dependency rule n-tier csharp project structure">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="19-architecture/application-architecture.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Application Architectures</h1>
+    <p class="subtitle">Layered, Clean, Hexagonal, Onion, Vertical Slice and Modular Monolith — what each
+      one actually changes, and when it's overkill.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>Clean, Hexagonal and Onion are the <strong>same idea with different diagrams</strong>: business
+        rules in the middle, dependencies pointing inward.</li>
+      <li>Classic layered architecture points the other way — the domain depends on data access, so it can't
+        be tested or reused without the database.</li>
+      <li>The whole trick is <strong>the interface lives with the caller</strong>, and infrastructure
+        implements it.</li>
+      <li><strong>Vertical Slice</strong> organises by feature instead of by layer. Great for CRUD-heavy
+        apps; less good when many features share complex rules.</li>
+      <li><strong>Modular monolith</strong> = one deployable, hard internal boundaries. The right default for
+        most systems.</li>
+      <li>All of these cost indirection. For a small CRUD service, two layers is honest and enough.</li>
+    </ul>
+  </div>
+
+  <h2 id="layered">Classic layered (N-tier) <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="oneline"><b>One line:</b> stack the code in layers — UI, business, data — with each layer
+    calling the one below.</div>
+
+  <pre data-label="the dependency direction is the problem" class="code-bad"><code class="language-text" data-nohl>┌──────────────────┐
+│   Presentation   │   Controllers, views
+└────────┬─────────┘
+         │ depends on
+┌────────▼─────────┐
+│  Business Logic  │   Services, rules
+└────────┬─────────┘
+         │ depends on          ← this arrow is the problem
+┌────────▼─────────┐
+│   Data Access    │   EF Core, SQL
+└──────────────────┘</code></pre>
+
+  <p><strong>What goes wrong:</strong> your business logic depends on your data access layer. So:</p>
+
+  <ul>
+    <li>You can't unit test business rules without a database.</li>
+    <li>EF entities leak upward and become your domain model, so persistence concerns shape your rules.</li>
+    <li>Changing storage means touching business code.</li>
+    <li>The "business layer" gradually becomes a thin pass-through, and the real logic ends up in
+      controllers and stored procedures.</li>
+  </ul>
+
+  <p>It's not useless — for a genuinely simple CRUD app it's honest and everyone understands it. But it
+    doesn't survive complexity well.</p>
+
+  <h2 id="clean">Clean / Hexagonal / Onion — one idea <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Turn the dependency arrow around: <strong>infrastructure depends on the domain, never the
+      reverse.</strong></p>
+    <p>You do it by putting the interface in the inner layer and the implementation in the outer one.</p>
+  </div>
+
+  <pre data-label="dependencies all point inward" class="code-good"><code class="language-text" data-nohl>        ┌──────────────────────────────────┐
+        │  Infrastructure                  │  EF Core, HTTP clients, queues
+        │   ┌──────────────────────────┐   │
+        │   │  Application             │   │  Use cases, orchestration
+        │   │    ┌────────────────┐    │   │
+        │   │    │    Domain      │    │   │  Entities, rules, invariants
+        │   │    │  (no deps)     │    │   │
+        │   │    └────────────────┘    │   │
+        │   └──────────────────────────┘   │
+        └──────────────────────────────────┘
+              all arrows point INWARD
+
+  IOrderRepository       -> declared in Application
+  SqlOrderRepository     -> implemented in Infrastructure</code></pre>
+
+  <p>The three names differ mostly in vocabulary:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Name</th><th>Its particular emphasis</th><th>Vocabulary</th></tr></thead>
+      <tbody>
+        <tr><td>Hexagonal (Ports &amp; Adapters)</td><td>The app has "ports" (interfaces); adapters plug in — the UI is just another adapter</td><td>Ports, adapters, driving/driven side</td></tr>
+        <tr><td>Onion</td><td>Concentric layers, domain model at the centre</td><td>Domain model, domain services, application services</td></tr>
+        <tr><td>Clean</td><td>Same, with a stated "dependency rule" and use-case-centric application layer</td><td>Entities, use cases, interface adapters, frameworks</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>If an interviewer asks the difference, the strong answer is: <em>"They're the same idea. Hexagonal
+    emphasises that every external thing is an adapter, Onion emphasises the layering, Clean adds the
+    explicit dependency rule. In practice they produce the same project structure."</em></p>
+
+  <h3 id="clean-structure">What it looks like in a .NET solution</h3>
+
+  <pre data-label="project references — this is what enforces the rule"><code class="language-text" data-nohl>Domain            (no project references at all)
+   Order.cs, OrderLine.cs, Money.cs, OrderStatus.cs
+
+Application       -> references Domain
+   IOrderRepository.cs        <- interface lives HERE
+   IUnitOfWork.cs
+   PlaceOrderHandler.cs
+
+Infrastructure    -> references Application, Domain
+   SqlOrderRepository.cs      <- implementation lives HERE
+   AppDbContext.cs
+   StripePaymentGateway.cs
+
+Api               -> references Application, Infrastructure (for DI wiring only)
+   OrderController.cs
+   Program.cs</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The check that actually matters</div>
+    <p style="margin:0">Can the <strong>Domain</strong> project compile with zero package references — no EF
+      Core, no ASP.NET, no JSON library? If yes, the dependency rule is real. If it references EF Core "just
+      for the attributes", the rule is decorative.</p>
+  </div>
+
+  <h3 id="clean-cost">What it costs</h3>
+
+  <div class="note compare">
+    <div class="note-title">Trade-off</div>
+    <p style="margin:0">You get testable business rules, swappable infrastructure and clear boundaries.
+      <br><br>
+      You pay in <strong>indirection and mapping</strong>. A simple "get customer by ID" now passes through a
+      controller, a handler, a repository interface, an implementation, and possibly two mapping steps.
+      Newcomers navigate more files to follow one request.
+      <br><br>
+      For a service with real business rules, that's worth it. For CRUD over five tables, it's ceremony —
+      and honest two-layer code would be better.</p>
+  </div>
+
+  <h2 id="vertical-slice">Vertical Slice architecture <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="oneline"><b>One line:</b> organise code by <em>feature</em> instead of by technical layer.</div>
+
+  <div class="vs-grid">
+    <div class="bad">
+      <span class="vs-label">By layer — one feature is spread across four folders</span>
+      <p><code>Controllers/OrdersController.cs</code><br>
+         <code>Services/OrderService.cs</code><br>
+         <code>Repositories/OrderRepository.cs</code><br>
+         <code>DTOs/OrderDto.cs</code></p>
+    </div>
+    <div class="good">
+      <span class="vs-label">By feature — everything for one use case together</span>
+      <p><code>Features/Orders/PlaceOrder/</code><br>
+         &nbsp;&nbsp;<code>Command.cs, Handler.cs, Validator.cs, Endpoint.cs</code><br>
+         <code>Features/Orders/CancelOrder/</code><br>
+         &nbsp;&nbsp;<code>Command.cs, Handler.cs, Endpoint.cs</code></p>
+    </div>
+  </div>
+
+  <p><strong>Why it appeals:</strong> when you change a feature, everything you need is in one folder. You're
+    not opening four projects to add a field. And each slice can be as simple or as complex as it needs to
+    be — a trivial lookup doesn't need the full ceremony just because another feature does.</p>
+
+  <p><strong>Where it struggles:</strong> when many slices share complex domain rules, you either duplicate
+    them or extract a shared domain — at which point you're back to a layered core with vertical slices on
+    top. That's a perfectly good outcome; it's just worth knowing it's where you'll land.</p>
+
+  <h2 id="modular-monolith">Modular monolith <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="oneline"><b>One line:</b> one deployable unit, but with internal boundaries as strict as if it
+    were several services.</div>
+
+  <p>This is the most under-used architecture and, for most teams, the right default.</p>
+
+  <pre data-label="modules own their data and expose a narrow public surface"><code class="language-text" data-nohl>src/
+  Modules/
+    Orders/
+      Orders.Domain/          internal
+      Orders.Application/     internal
+      Orders.Infrastructure/  internal   own DbContext, own tables/schema
+      Orders.Contracts/       PUBLIC     the only thing other modules may reference
+    Billing/
+      ...same shape...
+  Host/                       references every module, wires DI, one deployable</code></pre>
+
+  <p><strong>The rules that make it work</strong> — and they have to be enforced, not just intended:</p>
+
+  <ol class="steps">
+    <li><strong>A module may only reference another module's <code>Contracts</code> project.</strong>
+      Everything else is internal.</li>
+    <li><strong>Each module owns its own tables.</strong> No cross-module joins, and no foreign keys across
+      module boundaries — otherwise you can't ever separate them.</li>
+    <li><strong>Cross-module communication is explicit</strong> — an in-process interface call or an
+      in-process event. Never reaching into another module's repository.</li>
+    <li><strong>Enforce it mechanically.</strong> Project references plus an architecture test
+      (NetArchTest or ArchUnitNET) that fails the build on a violation. Without that, the boundaries erode
+      within months.</li>
+  </ol>
+
+  <div class="remember">
+    <span class="r-label">Why this is the right default</span>
+    <p>You get most of the design benefits of services — clear ownership, independent evolution, a real
+      boundary — with <strong>none</strong> of the distributed cost.</p>
+    <p>One transaction. One deploy. One stack trace. And if a module later genuinely needs to be its own
+      service, the seam already exists.</p>
+  </div>
+
+  <h2 id="comparison">Choosing between them</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Style</th><th>Best when</th><th>Main cost</th></tr></thead>
+      <tbody>
+        <tr><td>Layered (N-tier)</td><td>Simple CRUD; small team; short-lived app</td><td>Domain coupled to data access; hard to test rules</td></tr>
+        <tr><td>Clean / Hexagonal / Onion</td><td>Real business rules that must be testable and durable</td><td>Indirection, mapping, more files per request</td></tr>
+        <tr><td>Vertical Slice</td><td>Many independent use cases; CRUD-heavy with occasional complexity</td><td>Shared rules can get duplicated across slices</td></tr>
+        <tr><td>Modular monolith</td><td>Most systems, most of the time</td><td>Boundaries erode unless mechanically enforced</td></tr>
+        <tr><td>Microservices</td><td>Several teams needing independent deploy cadences</td><td>Everything in <a href="../20-microservices/index.html">section 17</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>In plain terms:</strong> start with a modular monolith. Use Clean-style dependency inversion
+    <em>inside</em> the modules that have real business rules, and let the simple CRUD modules be simple.
+    Extract a service only when a specific module has a specific reason to deploy separately.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Clean/Hexagonal/Onion are one idea: dependencies point inward, interfaces live with the caller.</li>
+      <li>The real test is whether your Domain project has zero infrastructure references.</li>
+      <li>Layered architecture's flaw is the direction of the arrow, not the layering itself.</li>
+      <li>Vertical slices optimise for changing one feature; layers optimise for changing one technical concern.</li>
+      <li>Modular monolith = service-style boundaries without distributed cost. Enforce it with architecture tests.</li>
+      <li>Match the ceremony to the complexity. Two layers is a legitimate answer for simple CRUD.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Clean architecture with EF attributes on domain entities.</strong> The dependency rule is now
+      decorative — you've paid the ceremony and kept the coupling.</li>
+    <li><strong>Mapping between four near-identical models</strong> (entity → domain → DTO → view model) with
+      no behavioural difference between them.</li>
+    <li><strong>An "application service" that just forwards to a repository.</strong> If it adds nothing,
+      it's a layer of indirection with no purpose.</li>
+    <li><strong>Modules that share a DbContext</strong> "for convenience" — the boundary is now fictional.</li>
+    <li><strong>Foreign keys across module boundaries</strong>, which permanently prevents separation.</li>
+    <li><strong>Applying full Clean Architecture to a 5-table CRUD app</strong>, then wondering why simple
+      changes take a day.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What's the difference between Clean, Hexagonal and Onion architecture?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Honestly — they're the same idea with different diagrams and vocabulary. All three say: put the
+          business rules at the centre, and make every dependency point inward."</p>
+        <p>"Hexagonal calls the interfaces 'ports' and the implementations 'adapters', and its useful emphasis
+          is that the UI is <em>also</em> just an adapter — not the top of a stack. Onion draws concentric
+          circles with the domain model at the centre. Clean adds an explicit 'dependency rule' and organises
+          the application layer around use cases."</p>
+        <p>"In a .NET solution all three produce roughly the same project structure: a Domain project with no
+          references, an Application project that declares the interfaces, an Infrastructure project that
+          implements them, and a host that wires it up."</p>
+        <p>"The mechanism that makes any of them work is the same one thing: <strong>the interface lives with
+          the caller, not the implementer</strong>. <code>IOrderRepository</code> is defined in Application;
+          <code>SqlOrderRepository</code> is in Infrastructure and depends on Application. That's what turns
+          the arrow around."</p>
+        <p>"And the test I'd actually apply is whether the Domain project compiles with zero package
+          references. If it has EF Core in it 'just for the attributes', the rule is decorative and you're
+          paying the ceremony without getting the benefit."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand the underlying principle, or just the diagrams?</li>
+        <li>Are you comfortable saying three named things are basically the same?</li>
+        <li>Do you know the concrete mechanism — interface ownership?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> inventing distinctions between them to sound thorough.</li>
+        <li><span class="redflag">Red flag:</span> describing layers without mentioning dependency direction.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where does validation live?</li>
+          <li>Do you map EF entities to separate domain entities, or use the same class? What's the trade-off?</li>
+          <li>Where does the DbContext go, and why?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What's a modular monolith, and why would you choose it over microservices? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A modular monolith is one deployable unit with internal boundaries as strict as if the modules
+          were separate services. Each module owns its own data, exposes a narrow public contract, and
+          everything else is internal."</p>
+        <p>"I'd choose it because it separates two things people usually conflate: <em>modularity</em> and
+          <em>distribution</em>. Microservices give you both. But almost all the design benefits people want
+          — clear ownership, independent evolution, a real boundary — come from modularity, and none of the
+          costs do."</p>
+        <p>"With a monolith I still get one transaction across modules when I need it, one deploy, one stack
+          trace, and no distributed tracing or saga infrastructure. Those aren't small savings — they're
+          most of the operational burden of microservices."</p>
+        <p>"The thing that makes it work is enforcement. Boundaries that are only conventions erode within
+          months, and then you have a big ball of mud with folders. So I'd enforce it mechanically: project
+          references so a module physically <em>cannot</em> reference another module's internals, no foreign
+          keys across module boundaries, separate schemas per module, and an architecture test that fails the
+          build on a violation."</p>
+        <p>"And the payoff beyond simplicity is optionality. If one module later genuinely needs independent
+          deployment — different scaling, a different team, a compliance boundary — the seam is already
+          there. Extracting a well-isolated module is a real project but a tractable one. Extracting a module
+          from a tangled monolith is not."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you separate modularity from distribution?</li>
+        <li>Do you know boundaries need mechanical enforcement?</li>
+        <li>Can you argue against the fashionable option with reasons?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do two modules communicate without coupling?</li>
+          <li>Should modules share a database? What about a schema?</li>
+          <li>How do you decide when to extract one into a service?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Isn't Clean Architecture over-engineering for most projects?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Often, yes — and I'd rather say that than defend it reflexively."</p>
+        <p>"The cost is concrete. A simple 'get customer by ID' passes through a controller, a handler, a
+          repository interface, an implementation, and maybe two mapping steps. Every one of those is a file
+          a newcomer has to open to follow one request. If the business logic is 'validate three fields and
+          save', that structure is pure overhead."</p>
+        <p>"So the question I ask is: <strong>are there business rules that must not be bypassed?</strong> If
+          the domain has real invariants and state machines — pricing, entitlements, policy lifecycles — then
+          isolating them so they can be tested without infrastructure genuinely pays. If it's CRUD, honest
+          two-layer code is better, and I'd rather have that than ceremony."</p>
+        <p>"What I like doing in practice is applying it selectively. In a modular monolith, the two modules
+          with real complexity get the full inward-dependency structure; the simple CRUD modules get a
+          controller and a DbContext. Consistency across an entire codebase is less valuable than each part
+          being appropriately simple."</p>
+        <p>"The one piece I'd keep almost everywhere is dependency inversion at I/O boundaries — time, HTTP
+          calls, queues, external services. That's cheap and it's what makes tests fast and deterministic.
+          It's the rest of the ceremony that's optional."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you criticise a popular practice with specific costs?</li>
+        <li>Do you scale architecture to the actual complexity?</li>
+        <li>Do you know which single piece is worth keeping regardless?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you avoid inconsistency when different modules use different structures?</li>
+          <li>At what point would you retrofit it into a CRUD app?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

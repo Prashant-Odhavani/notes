@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Persistence, Clustering &amp; Failure — Redis</title>
+<meta name="description" content="RDB and AOF, eviction policies, replication and failover, cluster mode and hash tags, hot keys, and what your application does when Redis is gone.">
+<meta name="keywords" content="Redis RDB AOF persistence appendfsync eviction policy allkeys-lru volatile-lru maxmemory replication sentinel cluster mode hash tags CROSSSLOT hot key failover circuit breaker Azure Cache for Redis tiers monitoring">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="16-redis/operations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Persistence, Clustering &amp; Failure</h1>
+    <p class="subtitle">What happens when memory fills, when a node dies, and when Redis is simply gone. The
+      last one is the question most teams haven't answered.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>RDB</strong> = periodic snapshot, compact, loses recent writes. <strong>AOF</strong> = command
+        log, more durable, larger.</li>
+      <li><strong>Redis replication is asynchronous</strong> — a failover can lose acknowledged writes.</li>
+      <li><strong>Set <code>maxmemory</code> and an eviction policy.</strong> The default may reject writes
+        rather than evict.</li>
+      <li><strong><code>allkeys-lru</code> for a cache</strong>, <code>volatile-lru</code> when some keys must
+        persist.</li>
+      <li><strong>Cluster mode shards by key hash</strong>, and multi-key commands need the same slot.</li>
+      <li><strong>Hash tags</strong> — <code>{user:1}:profile</code> — force keys onto the same slot.</li>
+      <li><strong>A single hot key can't be sharded.</strong> Cluster mode doesn't help it.</li>
+    </ul>
+  </div>
+
+  <h2 id="persistence">RDB and AOF <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>RDB (snapshot)</th><th>AOF (append-only file)</th></tr></thead>
+      <tbody>
+        <tr><td>What it stores</td><td>A point-in-time binary dump</td><td>Every write command, replayed on start</td></tr>
+        <tr><td>Data loss on crash</td><td><strong>Everything since the last snapshot</strong></td><td>Up to one second, with the usual setting</td></tr>
+        <tr><td>File size</td><td>Compact</td><td>Larger; needs periodic rewriting</td></tr>
+        <tr><td>Restart speed</td><td><strong>Fast</strong> — loads a binary image</td><td>Slower — replays commands</td></tr>
+        <tr><td>Runtime cost</td><td>A fork per snapshot, which can spike memory</td><td>Continuous small writes</td></tr>
+        <tr><td>Best for</td><td>Backups, disaster recovery</td><td>Minimising data loss</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th><code>appendfsync</code></th><th>Behaviour</th><th>Loss window</th></tr></thead>
+      <tbody>
+        <tr><td><code>always</code></td><td>Flush on every write</td><td>Effectively none — and much slower</td></tr>
+        <tr><td><strong><code>everysec</code></strong></td><td>Flush once a second</td><td><strong>~1 second. The sensible default</strong></td></tr>
+        <tr><td><code>no</code></td><td>Let the OS decide</td><td>Up to 30 seconds</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — decide whether Redis is a cache or a database</div>
+    <p style="margin:0">This is the question persistence configuration actually answers, and it's worth stating
+      before discussing settings.
+      <br><br>
+      <strong>If Redis is a cache</strong>, persistence barely matters. Losing everything means a cold cache and
+      a temporary latency increase, and you can rebuild from the source of truth. RDB snapshots for convenience
+      are enough, and some teams disable persistence entirely to avoid the fork cost.
+      <br><br>
+      <strong>If Redis holds data you can't rebuild</strong> — sessions, a leaderboard, a rate-limit state you
+      care about — then you need AOF with <code>everysec</code>, and you should be honest that you've made Redis
+      a database with weaker durability than a real one.
+      <br><br>
+      Most production setups use <strong>both</strong>: AOF for recovery granularity, RDB for fast restarts and
+      backups. Azure Cache for Redis offers RDB or AOF on Premium tiers and no persistence on lower ones —
+      which is a detail worth knowing, because "we're on Standard" means you have no persistence at all.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The fork memory spike</div>
+    <p style="margin:0">An RDB snapshot forks the process. Copy-on-write means the child shares memory initially,
+      but pages modified during the snapshot get copied — so a write-heavy instance can approach
+      <strong>double its memory usage</strong> while snapshotting.
+      <br><br>
+      If <code>maxmemory</code> is set close to the machine's physical memory, that spike can trigger swapping or
+      an out-of-memory kill. It's a genuine cause of Redis instances dying mysteriously during backups.
+      <br><br>
+      Rule of thumb: don't let Redis use more than about half the available memory if you're taking RDB snapshots
+      on a write-heavy instance.</p>
+  </div>
+
+  <h2 id="eviction">Eviction <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What happens when memory fills</span>
+    <p>When Redis reaches <code>maxmemory</code>, the <strong>eviction policy</strong> decides what to do. One of
+      the options is to stop accepting writes.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Policy</th><th>Evicts</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><code>noeviction</code></td><td><strong>Nothing — writes fail with an error</strong></td><td>Redis holds data you can't lose</td></tr>
+        <tr><td><strong><code>allkeys-lru</code></strong></td><td>Least recently used, any key</td><td><strong>Pure cache. The usual choice</strong></td></tr>
+        <tr><td><code>allkeys-lfu</code></td><td>Least <em>frequently</em> used</td><td>Cache with a stable hot set</td></tr>
+        <tr><td><code>volatile-lru</code></td><td>LRU, <strong>only keys with a TTL</strong></td><td>Mixed use — some keys must survive</td></tr>
+        <tr><td><code>volatile-ttl</code></td><td>Whichever expires soonest</td><td>Rarely the best choice</td></tr>
+        <tr><td><code>allkeys-random</code></td><td>Any key at random</td><td>When access is genuinely uniform</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The <code>volatile-lru</code> trap</div>
+    <p style="margin:0"><code>volatile-lru</code> only evicts keys that <strong>have a TTL</strong>. That sounds
+      like a safe choice — it protects your persistent keys.
+      <br><br>
+      But if memory fills and there aren't enough TTL'd keys to evict, Redis <strong>starts rejecting
+      writes</strong> exactly as if it were <code>noeviction</code>. You get write errors on a cache, which is
+      surprising and hard to diagnose.
+      <br><br>
+      So <code>volatile-lru</code> is only safe if you're confident TTL'd keys always dominate memory usage. If
+      Redis is purely a cache, <code>allkeys-lru</code> is more robust — it will always find something to evict.
+      <br><br>
+      And a separate point: <strong>mixing cache and non-cache data in one Redis instance is the real
+      problem.</strong> Two instances, or two databases with different policies, avoids the whole dilemma.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">LRU here is approximate</div>
+    <p style="margin:0">Redis doesn't maintain a true LRU list — that would cost memory and time on every access.
+      It samples a few random keys and evicts the least recently used <em>of those</em>.
+      <br><br>
+      <code>maxmemory-samples</code> controls the sample size (default 5). Higher is more accurate and slightly
+      more CPU.
+      <br><br>
+      In practice the approximation is close enough that it doesn't matter, but it's worth knowing if someone
+      asks why an obviously-cold key survived while a warmer one was evicted.</p>
+  </div>
+
+  <h2 id="replication">Replication and failover <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Topology</th><th>Gives you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Single instance</strong></td><td>Nothing on failure. Fine for a pure cache in dev</td></tr>
+        <tr><td><strong>Primary + replica</strong></td><td>Read scaling and a warm standby. Manual promotion</td></tr>
+        <tr><td><strong>Sentinel</strong></td><td>Automatic failover and client discovery</td></tr>
+        <tr><td><strong>Cluster</strong></td><td>Sharding <em>plus</em> automatic failover</td></tr>
+        <tr><td><strong>Managed</strong> (Azure Cache, ElastiCache)</td><td>All of the above, configured for you</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Replication is asynchronous — a failover can lose writes</div>
+    <p style="margin:0">The primary acknowledges a write <strong>before</strong> replicating it. So if the primary
+      fails after acknowledging and before replicating, the promoted replica has never seen that write.
+      <br><br>
+      <code>WAIT</code> can block until N replicas acknowledge, which narrows the window and doesn't close it —
+      and it costs latency on every write.
+      <br><br>
+      The practical consequence: <strong>don't rely on Redis for data whose loss you can't tolerate.</strong> A
+      lost cache entry is a cache miss. A lost session logs someone out. A lost ledger entry is a serious
+      problem — and that's not what Redis is for.
+      <br><br>
+      This is worth stating plainly in an interview, because "we use Redis for X and it's replicated so it's
+      safe" is a common and incorrect assumption.</p>
+  </div>
+
+  <h2 id="cluster">Cluster mode <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">How sharding works</span>
+    <p>Cluster mode divides the keyspace into <strong>16,384 hash slots</strong>. Each key hashes to a slot, and
+      each node owns a range of slots.</p>
+    <p>The client library learns the slot map and routes each command to the right node directly.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Multi-key commands need the same slot</div>
+    <pre data-label="text" class="code-bad"><code class="language-text">MGET user:1:profile user:2:profile
+  -> CROSSSLOT error: keys must hash to the same slot</code></pre>
+    <pre data-label="text — hash tags force co-location" class="code-good"><code class="language-text">Only the part inside {braces} is hashed:
+
+  {user:1}:profile
+  {user:1}:settings
+  {user:1}:orders
+  -> all hash to the same slot, so MGET and Lua work across them</code></pre>
+    <p style="margin:0">Any command touching several keys — <code>MGET</code>, <code>SUNION</code>, a
+      transaction, a Lua script with multiple <code>KEYS</code> — requires them all in one slot.
+      <br><br>
+      <strong>Hash tags are the mechanism</strong>, and they're a design decision made at key-naming time.
+      Retrofitting them means changing every key, which invalidates the whole cache. So if there's any chance of
+      cluster mode later, adopt hash tags for related keys from the start — the cost is nil and the retrofit is
+      painful.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — hash tags trade the CROSSSLOT problem for a hot-slot problem</div>
+    <p style="margin:0">Over-using hash tags defeats the point of sharding. If every key is tagged
+      <code>{tenant:acme}</code>, all of that tenant's data lands on <strong>one node</strong> — so a large
+      tenant creates a hot node, and cluster mode gives you nothing.
+      <br><br>
+      The balance: tag <strong>only the keys you genuinely need to access together</strong> atomically or in one
+      command. Everything else should distribute freely.
+      <br><br>
+      That's the same tension as <a href="../14-cosmos-db/fundamentals.html#partition-key">choosing a partition
+      key</a> — co-location buys atomicity and multi-key operations, and costs distribution. Recognising it as
+      the same trade-off across three different databases is the useful insight.</p>
+  </div>
+
+  <h2 id="hot-keys">Hot keys <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The limit sharding can't fix</span>
+    <p>A single key lives on a single node. If one key receives enormous traffic — a global config document, a
+      leaderboard, a popular product — <strong>that node is the bottleneck</strong>.</p>
+    <p>Adding nodes doesn't help. You cannot split one key.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mitigation</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Local L1 cache</strong></td><td>Cache it in-process with a short TTL. Most reads never reach Redis. <strong>Usually the best answer</strong></td></tr>
+        <tr><td><strong>Read replicas</strong></td><td>Spread reads across replicas, accepting slight staleness</td></tr>
+        <tr><td><strong>Key replication</strong></td><td>Write to <code>config:0</code>–<code>config:9</code>, read a random one</td></tr>
+        <tr><td><strong>Split the value</strong></td><td>If it's a large hash, split into several keys that shard separately</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">A local cache is the right answer more often than people expect</div>
+    <p style="margin:0">If a config document is read on every request and changes twice a day, caching it
+      in-process for 30 seconds removes essentially all Redis traffic for it — and the staleness is
+      irrelevant.
+      <br><br>
+      People reach for Redis scaling because the problem appears to be a Redis problem. It's usually a
+      <em>round trip</em> problem, and the fix is not making the round trip.
+      <br><br>
+      Combine with <a href="distributed-primitives.html#pubsub">pub/sub invalidation</a> if you need the local
+      copies dropped promptly on change.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Finding a hot key</div>
+    <p style="margin:0"><code>redis-cli --hotkeys</code> samples key access (needs an LFU policy).
+      <code>MONITOR</code> shows every command in real time — useful for a few seconds of diagnosis and
+      <strong>never</strong> to leave running, since it has real overhead.
+      <br><br>
+      <code>redis-cli --bigkeys</code> finds the large keys, which are a related problem: a large key makes any
+      O(N) command on it a <a href="fundamentals.html#single-threaded">blocking event</a>. Hot and big are
+      different problems with different fixes, and worth distinguishing.</p>
+  </div>
+
+  <h2 id="failure">When Redis is down <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The question to have answered in advance</span>
+    <p><strong>Is Redis optional or load-bearing?</strong></p>
+    <p>If it's a cache, a Redis outage should mean slower responses. If your application returns errors when
+      Redis is unavailable, you've converted a performance optimisation into a
+      <strong>reduction in availability</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>What to do</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Cache reads</strong></td><td>Catch, log, fall through to the database</td></tr>
+        <tr><td><strong>Cache writes</strong></td><td>Catch and ignore — a failed populate is harmless</td></tr>
+        <tr><td><strong>Rate limiting</strong></td><td><strong>Decide deliberately:</strong> fail open (allow) or closed (reject)</td></tr>
+        <tr><td><strong>Distributed locks</strong></td><td>Can't acquire — usually means skip the work rather than proceed unlocked</td></tr>
+        <tr><td><strong>Sessions</strong></td><td>Users are logged out. This is why session state in Redis needs persistence</td></tr>
+        <tr><td><strong>Repeated failures</strong></td><td>A circuit breaker, so you stop paying the timeout on every request</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The cascade: falling through can take out the database</div>
+    <p style="margin:0">Falling through to the database is correct — and if the database can't serve 100% of
+      traffic uncached, a Redis outage becomes a database outage. Which is worse.
+      <br><br>
+      So "degrade gracefully" needs a second question: <strong>can the source of truth handle full
+      load?</strong> If not, you need load shedding — serve stale data if you have any, reject a proportion of
+      requests, or queue them — rather than letting every request pile onto the database.
+      <br><br>
+      A <a href="../07-aspnet-core/performance-resilience.html">circuit breaker</a> matters here too. Without
+      one, every request waits for the Redis timeout before falling through, so response times increase by that
+      timeout across the board and thread-pool exhaustion follows. The breaker makes failures fast rather than
+      slow, which is what keeps the application responsive.
+      <br><br>
+      Naming this cascade is a strong senior signal, because "fall back to the database" is the standard answer
+      and it's incomplete.</p>
+  </div>
+
+  <h2 id="monitoring">What to monitor <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Metric</th><th>Watch for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Memory used vs <code>maxmemory</code></strong></td><td>Approaching the limit means eviction is imminent</td></tr>
+        <tr><td><strong>Evicted keys</strong></td><td><strong>Non-zero means entries die before their TTL</strong> — the cache is undersized</td></tr>
+        <tr><td><strong>Hit rate</strong></td><td>A drop suggests eviction pressure or a TTL change</td></tr>
+        <tr><td><strong>Connected clients</strong></td><td>Climbing steadily means connections aren't being reused</td></tr>
+        <tr><td><strong>Blocked clients</strong></td><td>Waiting on blocking commands</td></tr>
+        <tr><td><strong>Slowlog</strong></td><td>Commands over a threshold — this is how you find the O(N) offenders</td></tr>
+        <tr><td><strong>Replication lag</strong></td><td>How much a failover would lose</td></tr>
+        <tr><td><strong>CPU</strong></td><td>Sustained high on the command thread means you need to shard</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Evictions and the slowlog are the two that matter most</div>
+    <p style="margin:0"><strong>A non-zero eviction rate</strong> means Redis is discarding keys because it's out
+      of memory, not because they expired. So your carefully-chosen TTLs aren't being honoured, hit rate drops,
+      and the database takes more load — with no error anywhere. It's the most commonly missed Redis metric.
+      <br><br>
+      <strong>The slowlog</strong> records commands exceeding a threshold, which is exactly how you catch the
+      <code>KEYS</code> or <code>HGETALL</code> that blocked the server. Since one slow command stalls
+      <em>everything</em>, a single slowlog entry can explain a fleet-wide latency spike.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Managed Redis: know what your tier gives you</div>
+    <p style="margin:0">On <strong>Azure Cache for Redis</strong>: Basic is a single node with no SLA and no
+      failover — dev only. Standard is a replicated pair with automatic failover. Premium adds persistence,
+      clustering, zone redundancy and VNet injection. Enterprise adds active geo-replication and Redis modules.
+      <br><br>
+      The one people get caught by: <strong>persistence and clustering require Premium.</strong> A team on
+      Standard that assumes their Redis data survives a restart is mistaken, and that's a bad thing to discover
+      during an incident.
+      <br><br>
+      Also worth knowing that scaling tiers involves a failover, so it isn't a zero-impact operation.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Decide whether Redis is a cache or a database — that answers the persistence question.</li>
+      <li>RDB for backups and fast restarts, AOF <code>everysec</code> to bound data loss. Often both.</li>
+      <li>RDB forks, which can nearly double memory on a write-heavy instance.</li>
+      <li>Always set <code>maxmemory</code> and a policy. <code>allkeys-lru</code> for a pure cache.</li>
+      <li><code>volatile-lru</code> can start rejecting writes if TTL'd keys run out.</li>
+      <li>Replication is asynchronous, so failover can lose acknowledged writes.</li>
+      <li>Cluster shards into 16,384 slots; multi-key commands need one slot, so hash tags are a
+        key-naming decision.</li>
+      <li>Over-tagging recreates a hot node and defeats sharding.</li>
+      <li>A single hot key can't be sharded — use a local L1 cache.</li>
+      <li>A cache failure must degrade, not fail — and check the database can take full load.</li>
+      <li>Monitor evictions and the slowlog above everything else.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No <code>maxmemory</code> set</strong>, so Redis grows until the OS kills it.</li>
+    <li><strong><code>noeviction</code> on a cache</strong>, so writes fail when it fills.</li>
+    <li><strong><code>volatile-lru</code> with too few TTL'd keys</strong>, producing write errors.</li>
+    <li><strong>Assuming replication prevents data loss.</strong></li>
+    <li><strong>Assuming a managed tier has persistence</strong> when it doesn't.</li>
+    <li><strong>No hash tags</strong>, then discovering <code>CROSSSLOT</code> errors when enabling cluster
+      mode.</li>
+    <li><strong>Tagging everything with the tenant</strong>, so one node holds it all.</li>
+    <li><strong>Scaling the cluster to fix a hot key.</strong></li>
+    <li><strong>Redis failures failing requests.</strong></li>
+    <li><strong>No circuit breaker</strong>, so every request pays the timeout during an outage.</li>
+    <li><strong>Not monitoring evictions.</strong></li>
+    <li><strong>Leaving <code>MONITOR</code> running.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What happens when Redis runs out of memory? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It depends entirely on the <strong>eviction policy</strong>, and the important point is that one of
+          the options is to stop accepting writes."</p>
+        <p>"With <code>noeviction</code>, Redis <strong>rejects writes with an error</strong> once
+          <code>maxmemory</code> is reached. Reads keep working. That's correct if Redis holds data you can't
+          lose, and it's a poor choice for a cache — you'd rather lose a cold entry than fail a write."</p>
+        <p>"With <code>allkeys-lru</code> it evicts the least recently used key regardless of TTL. That's the
+          usual choice for a pure cache, because it will always find something to evict, so writes never
+          fail."</p>
+        <p>"<code>allkeys-lfu</code> evicts least <em>frequently</em> used, which is better when there's a stable
+          hot set — LRU can evict a frequently-used key that just happens not to have been touched
+          recently."</p>
+        <p>"The one I'd flag as a trap is <strong><code>volatile-lru</code></strong>. It only evicts keys that
+          have a TTL, which sounds safe because it protects your persistent keys. But if memory fills and there
+          aren't enough TTL'd keys to reclaim, it behaves exactly like <code>noeviction</code> and starts
+          <strong>rejecting writes</strong>. Getting write errors on something you configured as a cache is
+          surprising and hard to diagnose."</p>
+        <p>"And the underlying issue there is <strong>mixing cache and non-cache data in one instance</strong>.
+          If some keys must survive and others are disposable, separate instances — or at least separate
+          databases with different policies — avoids the dilemma entirely."</p>
+        <p>"Two things I'd add."</p>
+        <p>"<strong>LRU is approximate.</strong> Redis samples a handful of random keys and evicts the least
+          recently used of those, rather than maintaining a true LRU list — which would cost memory and time on
+          every access. <code>maxmemory-samples</code> tunes it. It's close enough in practice, and it explains
+          why an obviously-cold key sometimes survives."</p>
+        <p>"<strong>Monitor the eviction rate.</strong> A non-zero eviction count means keys are dying before
+          their TTL because you're out of memory — so your TTL strategy isn't being honoured, the hit rate
+          drops, and the database silently takes more load. There's no error anywhere. It's the most commonly
+          missed Redis metric and it's the one that tells you the cache is undersized."</p>
+        <p>"I'd also make sure <code>maxmemory</code> is actually set. If it isn't, Redis grows until the OS
+          kills the process — which is a much worse failure than eviction."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know writes can fail rather than data being evicted?</li>
+        <li>Do you know the <code>volatile-lru</code> trap?</li>
+        <li>Do you monitor evictions?</li>
+        <li>Do you know LRU is sampled?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>LRU or LFU for your workload?</li>
+          <li>How do you size a Redis instance?</li>
+          <li>What if some keys must never be evicted?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Redis goes down in production. What happens to your application? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The honest answer is that it depends on decisions made long before the outage, and the question I'd
+          want answered in design is: <strong>is Redis optional or load-bearing?</strong>"</p>
+        <p>"<strong>If it's a cache, the application should keep working, more slowly.</strong> Every cache read
+          needs to catch the exception, log it, and fall through to the database. Cache writes can be caught and
+          ignored — a failed populate is harmless. If instead a Redis exception propagates and fails the request,
+          then a performance optimisation has become a <em>reduction</em> in availability, which is the opposite
+          of the intent."</p>
+        <p>"But 'fall through to the database' is the incomplete answer, and this is the part I'd emphasise:
+          <strong>can the database handle 100% of traffic uncached?</strong> If the cache was absorbing 95% of
+          reads, falling through means twenty times the database load arriving instantly. So a Redis outage
+          becomes a database outage, which is worse — you've turned a degradation into a full failure."</p>
+        <p>"So for a load-bearing cache I'd want <strong>load shedding</strong>: serve stale data if any is
+          available, reject a proportion of requests with a 503 and <code>Retry-After</code>, or queue them.
+          Deliberately serving some users a degraded experience beats everyone getting nothing."</p>
+        <p>"<strong>A circuit breaker is essential</strong> regardless. Without one, every request waits for the
+          Redis connection timeout before falling through — so if that's two seconds, every response is two
+          seconds slower and you exhaust the thread pool under load. The breaker makes the failure fast instead
+          of slow, which is what keeps the application responsive. It also stops hammering a recovering Redis
+          instance."</p>
+        <p>"Then the non-cache uses, each of which needs its own decision:"</p>
+        <p>"<strong>Rate limiting</strong> — fail open or closed? Failing closed rejects all traffic because the
+          limiter is unavailable, which is usually worse than not limiting. I'd fail open, log loudly, and
+          possibly fall back to a per-instance in-memory limiter as a rough backstop."</p>
+        <p>"<strong>Distributed locks</strong> — can't acquire, so the protected work shouldn't run. Skipping a
+          scheduled job is normally better than running it unlocked on every instance."</p>
+        <p>"<strong>Sessions</strong> — everyone is logged out, which is a visible incident. If sessions are in
+          Redis, that's an argument for persistence and replication, and for asking whether they belong there at
+          all."</p>
+        <p>"On the client side, the StackExchange.Redis setting that matters is
+          <strong><code>AbortOnConnectFail = false</code></strong>. With the historical default of
+          <code>true</code>, if Redis is briefly unavailable the multiplexer throws and <em>never
+          reconnects</em> — so a transient blip during a deployment permanently breaks caching until the
+          application is restarted."</p>
+        <p>"And after an outage there's a <strong>cold cache problem</strong>: Redis comes back empty, so every
+          request misses and the database gets the full uncached load again — plus a stampede on the hot keys.
+          Stampede protection and possibly a warm-up matter here, because recovery can be as damaging as the
+          outage."</p>
+        <p>"The thing I'd want to have done in advance is <strong>test this</strong> — block Redis in a staging
+          environment and watch what actually happens. Nobody's assumptions about degradation survive first
+          contact, and it's much better to find out deliberately."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you distinguish optional from load-bearing?</li>
+        <li>Do you catch the cascade to the database?</li>
+        <li>Do you know a circuit breaker is needed, and why?</li>
+        <li>Do you decide per-use-case rather than globally?</li>
+        <li>Do you consider the cold-cache recovery?</li>
+        <li>Do you test it?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "fall back to the database" with no capacity consideration.</li>
+        <li><span class="redflag">Red flag:</span> letting Redis exceptions fail requests.</li>
+        <li><span class="redflag">Red flag:</span> no mention of the recovery being a second spike.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you warm the cache after recovery?</li>
+          <li>Fail open or closed for rate limiting, and why?</li>
+          <li>How do you test a Redis outage safely?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

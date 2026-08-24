@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distributed Background Jobs — System Design Exercises</title>
+<meta name="description" content="A worked design: scheduling without duplicate runs, exactly-once effect, long-running work, fairness across tenants, and visibility into what ran.">
+<meta name="keywords" content="background jobs design distributed scheduler leader election singleton timer trigger cron exactly once execution idempotent jobs long running work checkpointing fairness priority queue visibility job history poison job">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/background-jobs.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Distributed Background Jobs</h1>
+    <p class="subtitle">Two hard problems: making a scheduled job run exactly once across many instances, and knowing
+      what happened when it didn't.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Assumed answer</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>Kinds of work?</td><td><strong>Scheduled, queued, and long-running</strong></td><td>Three different mechanisms</td></tr>
+        <tr><td>Must a scheduled job run exactly once?</td><td><strong>Yes</strong> — invoicing, statements</td><td>Needs a singleton guarantee</td></tr>
+        <tr><td>Longest job?</td><td><strong>Hours</strong> — a monthly billing run</td><td>Needs checkpointing and resumability</td></tr>
+        <tr><td>Multi-tenant?</td><td>Yes, with very uneven tenant sizes</td><td><strong>Fairness is a requirement</strong></td></tr>
+        <tr><td>Failure tolerance?</td><td>Retry, then park for a human. Never silently drop</td><td>Job history and alerting</td></tr>
+        <tr><td>Volume?</td><td>Thousands of queued items/hour; a few dozen schedules</td><td>Modest — correctness is the issue</td></tr>
+        <tr><td>Out of scope</td><td>The business logic of each job; reporting UI</td><td>Focus on the execution platform</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Three kinds of work, three mechanisms — don't build one thing</div>
+    <p style="margin:0">The first useful observation is that "background jobs" covers three quite different problems,
+      and a single mechanism serves none of them well.
+      <br><br>
+      <strong>Scheduled work</strong> — "run at 2am" — needs a trigger and a singleton guarantee. The hard part is
+      making it run once when several instances exist.
+      <br><br>
+      <strong>Queued work</strong> — "process this item" — needs throughput, retries and dead-lettering. The hard part
+      is fairness and poison messages.
+      <br><br>
+      <strong>Long-running work</strong> — "the monthly billing run" — needs progress, checkpointing and resumability.
+      The hard part is that it will be interrupted, so it must resume rather than restart.
+      <br><br>
+      Saying that up front frames the design and prevents the common answer of "a table of jobs and a polling worker",
+      which handles the easy case and fails at all three hard parts.
+      <br><br>
+      The pattern that ties them together: <strong>a schedule should enqueue work, not do it.</strong> The 2am trigger
+      fires once and publishes messages; the queue consumers do the work with all the retry and scaling behaviour that
+      brings.</p>
+  </div>
+
+  <h2 id="singleton">Making a scheduled job run exactly once <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Guarantee</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>A timer inside the web app</strong></td>
+          <td><strong>None</strong> — runs on every instance</td>
+          <td><strong>The bug.</strong> A nightly job fires <em>n</em> times</td>
+        </tr>
+        <tr>
+          <td><strong>Functions timer trigger</strong></td>
+          <td><strong>Singleton, via a platform lease</strong></td>
+          <td><strong>Preferred — the platform handles it</strong></td>
+        </tr>
+        <tr>
+          <td>Distributed lock (blob lease, Redis)</td>
+          <td>Whoever acquires it runs</td>
+          <td>Works; you own the expiry edge cases</td>
+        </tr>
+        <tr>
+          <td>A row-level claim in the database</td>
+          <td><strong>Atomic conditional update</strong></td>
+          <td>Robust, and gives you history for free</td>
+        </tr>
+        <tr>
+          <td>Kubernetes CronJob</td>
+          <td>One pod per schedule</td>
+          <td>Good, though it can double-fire in edge cases</td>
+        </tr>
+        <tr>
+          <td>Designating "instance 0"</td>
+          <td>None — instance identity isn't stable</td>
+          <td><strong>Doesn't work</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="sql — an atomic claim that also records history" class="code-good"><code class="language-sql">-- One statement. Exactly one caller gets a row; the rest get zero and skip.
+UPDATE JobSchedules
+SET    LastRunStartedAt = SYSUTCDATETIME(),
+       RunningOn        = @instanceId,
+       RunToken         = @runToken
+WHERE  JobName          = @jobName
+  AND  NextDueAt       &lt;= SYSUTCDATETIME()
+  AND (RunningOn IS NULL
+       -- reclaim a run whose instance died and never released the claim
+       OR LastRunStartedAt &lt; DATEADD(minute, -@staleAfterMinutes, SYSUTCDATETIME()));
+
+-- @@ROWCOUNT = 1 -> this instance owns the run
+-- @@ROWCOUNT = 0 -> someone else has it, or it is not due. Do nothing.</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">A timer in the web app is the single most common background-job bug</div>
+    <p style="margin:0">A <code>BackgroundService</code> or hosted timer inside the web application runs on
+      <strong>every instance</strong>. It works perfectly in development and on one instance, then silently multiplies
+      the moment you scale out.
+      <br><br>
+      The damage is that <strong>nothing errors</strong>. A nightly invoicing job on three instances sends every
+      invoice three times. Customers notice before your monitoring does, because there's no failure to alert on — the
+      job succeeded, repeatedly.
+      <br><br>
+      There's a second failure in the same place: on App Service <strong>without Always On, the app unloads when
+      idle</strong>, so on a low-traffic site the timer silently stops running altogether. Same code, opposite
+      failure, equally invisible.
+      <br><br>
+      So scheduled work belongs <strong>outside the web app</strong> — a Function with a timer trigger, or a dedicated
+      worker. And the reason isn't only correctness: a web app's instance count is scaled for request handling, which
+      is the wrong control for background work.
+      <br><br>
+      If it must stay in-process, it needs a <strong>distributed lock or an atomic claim</strong> — and note that
+      "let instance 0 do it" doesn't work, because instance identity isn't stable across restarts and scaling
+      events.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — exactly-once <em>triggering</em> still isn't exactly-once <em>effect</em></div>
+    <p style="margin:0">Even with a perfect singleton trigger, the job can start, do half its work, and crash. When it
+      next runs — or when another instance reclaims a stale lease — it starts again.
+      <br><br>
+      So a singleton guarantee gets you "one instance starts the run". It does not get you "the work happens once".
+      <strong>The job body itself must be idempotent</strong>, and that's the part people skip.
+      <br><br>
+      Concretely, for an invoicing run: rather than "generate invoices for all accounts", the job should
+      <strong>iterate accounts and claim each one atomically</strong> — <code>UPDATE Accounts SET InvoicedFor =
+      @period WHERE Id = @id AND InvoicedFor &lt;&gt; @period</code>. Then a crash halfway means the restart skips
+      what's already done, and a duplicate trigger is harmless.
+      <br><br>
+      That also gives you resumability for free, which is what the long-running case needs anyway.
+      <br><br>
+      The framing worth stating: <strong>a distributed lock reduces the probability of concurrent execution;
+      idempotency makes concurrent execution harmless.</strong> The second is strictly more valuable, because any lock
+      has an expiry and therefore a window. If you can only have one, have idempotency.</p>
+  </div>
+
+  <h2 id="long-running">Long-running work <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — a job that expects to be interrupted"><code class="language-text">  BAD: one long transaction over 200,000 accounts
+    holds locks for hours, blocks everything, and a failure at 90%
+    rolls back all of it. Nothing is recoverable and nothing is visible.
+
+  GOOD: a driver that enqueues, and workers that claim
+    1  trigger (singleton)  ->  create a RunId, enumerate the work
+    2  enqueue one message per unit of work (per account, per batch)
+    3  workers consume, each unit:
+         - claimed atomically, so a duplicate is a no-op
+         - committed in its own transaction
+         - progress recorded against the RunId
+    4  completion detected when outstanding units reach zero
+    5  failures recorded per unit -> retried -> parked, run marked partial
+
+  Properties: resumable, parallelisable, observable, and one bad account
+  cannot stop the other 199,999.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — convert a long job into many short ones</div>
+    <p style="margin:0">The instinct for "process 200,000 accounts" is a loop in one long-running process. That fails
+      in four ways, and it's worth naming all of them because each is a different objection.
+      <br><br>
+      <strong>It isn't resumable.</strong> A crash at 90% means starting over, and on a job that takes four hours
+      that's most of a day lost.
+      <br><br>
+      <strong>It isn't parallelisable.</strong> One process means one thread of progress, however much capacity you
+      have available.
+      <br><br>
+      <strong>It's opaque.</strong> "Is it working or hung?" has no answer without progress records.
+      <br><br>
+      <strong>One bad record stops everything.</strong> Account 47,000 has malformed data, the job throws, and the
+      remaining 153,000 are never processed.
+      <br><br>
+      Splitting into <strong>one queued unit of work per account or batch</strong> fixes all four at once. Each unit
+      commits independently, retries independently, and a poison record dead-letters without affecting the rest.
+      Progress is just a count of completed units. And scaling is adding consumers.
+      <br><br>
+      The trade-off to state: <strong>you lose the ability to treat the whole run as one transaction</strong>. If the
+      business genuinely needs "all invoices or none", that's a different design — usually a two-phase approach where
+      units are prepared and then committed together. Worth asking, because it's rarely a real requirement and
+      assuming it costs you all four benefits above.</p>
+  </div>
+
+  <h2 id="fairness">Fairness across tenants <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Problem</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><strong>One tenant enqueues 100,000 items</strong></td><td><strong>Everyone else waits behind them</strong> in a single FIFO queue</td></tr>
+        <tr><td>Fix: queue per tenant</td><td>Round-robin across queues. Practical to a few hundred tenants</td></tr>
+        <tr><td>Fix: a scheduler with per-tenant claims</td><td>Take the next item per tenant in rotation, from one table</td></tr>
+        <tr><td>Fix: per-tenant concurrency cap</td><td>A tenant may hold at most N workers</td></tr>
+        <tr><td>Priority work</td><td>A separate high-priority queue, drained first</td></tr>
+        <tr><td>Very large tenant</td><td>Its own worker pool, so it can't starve the shared one</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">A single FIFO queue is unfair by construction</div>
+    <p style="margin:0">This is the failure people don't anticipate because nothing breaks. A tenant triggers a bulk
+      operation producing 100,000 work items. They all go into the queue. Every other tenant's export, notification
+      and report now sits behind them — <strong>delayed by hours, with no error anywhere</strong>.
+      <br><br>
+      Queue depth looks high but healthy. Consumers are working. The job platform is functioning exactly as designed,
+      and 200 customers are having a bad day.
+      <br><br>
+      So fairness has to be designed. The two workable shapes:
+      <br><br>
+      <strong>A queue per tenant</strong> with consumers round-robining across them. Simple and fair; practical up to
+      a few hundred queues, beyond which the management overhead grows.
+      <br><br>
+      <strong>A work table with per-tenant claiming</strong> — one store, and the scheduler takes the next item for
+      each tenant in rotation rather than the globally oldest item. Scales to any number of tenants and needs a
+      slightly cleverer query.
+      <br><br>
+      Either way, add a <strong>per-tenant concurrency cap</strong>, so even in rotation one tenant can't occupy every
+      worker. And for a genuinely enormous tenant, a dedicated pool is often simpler than making the shared
+      scheduler handle a 250× outlier.
+      <br><br>
+      The principle, which recurs throughout this handbook: <strong>shared infrastructure defaults to
+      first-come-first-served, which under load means whoever submits the most wins.</strong></p>
+  </div>
+
+  <h2 id="visibility">Visibility <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>What answers it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>"Did last night's job run?"</strong></td><td>A run history row per execution, with outcome</td></tr>
+        <tr><td><strong>"Is it still running or stuck?"</strong></td><td>Heartbeat or last-progress timestamp</td></tr>
+        <tr><td><strong>"Why did it fail?"</strong></td><td>Error recorded per unit, not just per run</td></tr>
+        <tr><td><strong>"Did it silently stop running?"</strong></td><td><strong>Alert on an expected run not happening</strong></td></tr>
+        <tr><td>"How long does it usually take?"</td><td>Duration history, so a regression is visible</td></tr>
+        <tr><td>"What's stuck in the dead-letter queue?"</td><td>DLQ depth alert, plus a way to inspect and replay</td></tr>
+        <tr><td>"Can I run it again for one tenant?"</td><td>A manual trigger with parameters, audited</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The alert that matters is the job that <em>didn't</em> run</div>
+    <p style="margin:0">Every other failure mode announces itself. An exception is logged, a message dead-letters, a
+      duration spikes. <strong>A job that stops being triggered produces nothing at all</strong> — no error, no log
+      line, no metric change. Just silence.
+      <br><br>
+      And the causes are mundane: the timer was disabled during an incident and never re-enabled, a deployment removed
+      the function, the app idled out because Always On was off, a schedule expression was edited wrongly, the
+      subscription hit a quota.
+      <br><br>
+      In every case the first indication is a business consequence, usually weeks later. Invoices weren't sent.
+      Statements weren't generated. Data wasn't archived and now the table is enormous.
+      <br><br>
+      So the necessary alert is <strong>"expected run has not happened"</strong> — a watchdog comparing each schedule's
+      last successful run against its expected frequency, alerting when the gap is too large. That's a
+      <em>dead-man's switch</em>, and it's the only monitoring that detects absence.
+      <br><br>
+      It's the same principle as the business-metric alert: <strong>monitoring for things that happened cannot detect
+      things that stopped happening.</strong> Every scheduled job needs one, and it's the check most platforms are
+      missing.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Run history is cheap and repeatedly valuable</div>
+    <p style="margin:0">A row per execution — job name, run id, started, finished, outcome, units processed, units
+      failed — answers most operational questions immediately and costs almost nothing.
+      <br><br>
+      It gives you: whether it ran, how long it took compared to usual, whether failures are trending, and which
+      specific units failed so they can be replayed. Without it, every one of those requires trawling logs, and log
+      retention is usually shorter than the questions you'll be asked.
+      <br><br>
+      Two additions worth having. A <strong>heartbeat</strong> — a last-progress timestamp updated during a long
+      run — so "stuck" is distinguishable from "still working", which is otherwise impossible to tell from
+      outside.
+      <br><br>
+      And a <strong>manual trigger with parameters</strong>, audited: re-run last night's job for one tenant, or for a
+      specific date range. That request will come, and without it the answer is a deployment or a hand-written
+      script — both of which are worse than a button with an audit trail.</p>
+  </div>
+
+  <h2 id="platform">Choosing the platform <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>Good for</th><th>Watch for</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Azure Functions</strong> (timer + queue triggers)</td>
+          <td><strong>Most cases.</strong> Singleton timers, scaling consumers, no infrastructure</td>
+          <td><strong>Scale-out overwhelming the database</strong>; execution time limits</td>
+        </tr>
+        <tr>
+          <td>Container Apps jobs</td>
+          <td>Long-running work, scheduled or event-driven</td>
+          <td>Newer; check feature fit</td>
+        </tr>
+        <tr>
+          <td>A dedicated worker service</td>
+          <td>Full control, long-running, complex state</td>
+          <td>You own scaling, singleton behaviour and deployment</td>
+        </tr>
+        <tr>
+          <td>Hangfire / Quartz.NET</td>
+          <td>In-process scheduling with a dashboard and history</td>
+          <td>Its store becomes a dependency; scaling is yours</td>
+        </tr>
+        <tr>
+          <td>Durable Functions</td>
+          <td><strong>Multi-step workflows with state</strong></td>
+          <td>Orchestrator determinism constraints</td>
+        </tr>
+        <tr>
+          <td>Kubernetes CronJob</td>
+          <td>Already on AKS</td>
+          <td>Can double-fire; needs idempotency anyway</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Functions scaling out is what breaks the database</div>
+    <p style="margin:0">Queue-triggered Functions scale on backlog, which is the feature — and the platform will
+      happily add dozens or hundreds of instances. <strong>Each has its own connection pool.</strong>
+      <br><br>
+      So a backlog of 100,000 items can produce two hundred instances and thousands of connections against a database
+      with a hard limit. It then rejects connections for <em>everyone</em>, including the web application that was
+      perfectly healthy — a batch workload has taken down the interactive one.
+      <br><br>
+      Fixes: <strong>cap the scale-out</strong> with <code>functionAppScaleLimit</code> or a maximum instance count,
+      <strong>increase batch size rather than instance count</strong> so the same throughput uses fewer connections,
+      and <strong>lower the per-instance pool size</strong> since an instance handling a few messages doesn't need
+      100.
+      <br><br>
+      The general principle: <strong>elastic compute in front of a fixed-capacity dependency moves the failure rather
+      than removing it.</strong> Autoscaling is only safe when everything downstream can absorb the concurrency it
+      produces.
+      <br><br>
+      Worth also knowing that for Event Hubs and Cosmos change-feed triggers the opposite applies — scaling is
+      <em>capped at the partition count</em>, so lag can grow while the function refuses to scale, which looks like a
+      platform fault and is a design constraint.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Three kinds of work — scheduled, queued, long-running — need three mechanisms.</li>
+      <li>A schedule should enqueue work, not do it.</li>
+      <li>A timer in the web app runs on every instance and silently multiplies.</li>
+      <li>Without Always On, an in-app timer silently stops instead.</li>
+      <li>"Instance 0 does it" doesn't work — instance identity isn't stable.</li>
+      <li>Singleton triggering is not exactly-once effect; the job body must be idempotent.</li>
+      <li>A lock reduces the probability of concurrency; idempotency makes it harmless.</li>
+      <li>Convert a long job into many claimed units — resumable, parallel, observable, poison-tolerant.</li>
+      <li>Ask whether "all or nothing" is a real requirement before giving that up.</li>
+      <li>A single FIFO queue is unfair by construction — round-robin per tenant.</li>
+      <li>Per-tenant concurrency caps, and a dedicated pool for an outlier.</li>
+      <li>Run history per execution answers most operational questions cheaply.</li>
+      <li>A heartbeat distinguishes stuck from still-working.</li>
+      <li>Alert on the run that <em>didn't</em> happen — a dead-man's switch.</li>
+      <li>Cap Function scale-out, or the backlog takes down the database.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How do you make a scheduled job run exactly once across many instances? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd separate two things that get conflated: <strong>exactly-once <em>triggering</em></strong> and
+          <strong>exactly-once <em>effect</em></strong>. You need both, and the second matters more."</p>
+        <p>"<strong>First, what not to do.</strong> A <code>BackgroundService</code> or hosted timer inside the web app
+          runs on <em>every</em> instance. It works perfectly on one instance and silently multiplies when you scale
+          out — so a nightly invoicing job on three instances sends every invoice three times."</p>
+        <p>"The damage is that <strong>nothing errors</strong>. The job succeeded, repeatedly. Customers notice before
+          monitoring does, because there's no failure to alert on."</p>
+        <p>"There's a second failure in the same place: on App Service without Always On, the app unloads when idle,
+          so on a low-traffic site the timer silently stops running altogether. Same code, opposite failure, equally
+          invisible."</p>
+        <p>"And 'let instance 0 do it' doesn't work — instance identity isn't stable across restarts and scaling."</p>
+        <p>"<strong>For triggering, my preference is a Functions timer trigger</strong>, because the platform provides
+          the singleton guarantee via a lease. It's one attribute and there's no lock code to get wrong."</p>
+        <p>"If it has to live in my own process, then an <strong>atomic claim in the database</strong>: a single
+          conditional UPDATE on a schedule row, where exactly one caller gets a row count of 1 and the rest skip. I'd
+          include a staleness clause so a run whose instance died gets reclaimed rather than blocking forever — which
+          is the same self-correcting trick as reclaiming an expired hold in a booking system."</p>
+        <p>"I'd use that over a Redis lock, because it needs no extra dependency and it gives me run history for free
+          in the same table."</p>
+        <p>"<strong>Now the more important half.</strong> Even with a perfect singleton, the job can start, do half its
+          work, and crash. The next run starts again. So <strong>singleton triggering doesn't give you exactly-once
+          effect</strong> — the job body has to be idempotent."</p>
+        <p>"Concretely, instead of 'generate invoices for all accounts', the job iterates accounts and
+          <strong>claims each one atomically</strong>: <code>UPDATE Accounts SET InvoicedFor = @period WHERE Id = @id
+          AND InvoicedFor &lt;&gt; @period</code>. A crash halfway means the restart skips what's done, and a duplicate
+          trigger is harmless."</p>
+        <p>"That also gives resumability for free, which I need anyway for the long-running case."</p>
+        <p>"The framing I'd offer: <strong>a distributed lock reduces the probability of concurrent execution;
+          idempotency makes concurrent execution harmless.</strong> Every lock has an expiry and therefore a window,
+          so if I could only have one, I'd take idempotency."</p>
+        <p>"<strong>For a long job I'd restructure it entirely</strong> — the trigger enqueues one work item per
+          account rather than looping. That makes it resumable, parallelisable, observable as a count of completed
+          units, and immune to one bad record stopping the other 199,999. Four problems solved by one structural
+          change."</p>
+        <p>"The trade to name: I give up treating the whole run as one transaction. So I'd ask whether 'all invoices or
+          none' is a genuine requirement, because it usually isn't and assuming it costs all four benefits."</p>
+        <p>"<strong>Finally, the monitoring nobody has:</strong> an alert on the job that <em>didn't</em> run. Every
+          other failure announces itself — an exception, a dead-lettered message, a duration spike. A job that stops
+          being triggered produces nothing at all. The timer was disabled during an incident and never re-enabled, or
+          a deployment removed it, or the app idled out."</p>
+        <p>"So a <strong>dead-man's switch</strong>: a watchdog comparing each schedule's last successful run against
+          its expected frequency. Because <strong>monitoring for things that happened cannot detect things that
+          stopped happening</strong>, and the first indication otherwise is a business consequence weeks later."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know an in-app timer runs per instance?</li>
+        <li>Do you separate triggering from effect?</li>
+        <li>Do you make the job body idempotent, with per-unit claims?</li>
+        <li>Do you handle a stale claim from a dead instance?</li>
+        <li>Do you restructure long jobs into queued units?</li>
+        <li>Do you alert on the run that didn't happen?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a timer in the web app with no locking.</li>
+        <li><span class="redflag">Red flag:</span> a distributed lock presented as sufficient.</li>
+        <li><span class="redflag">Red flag:</span> no monitoring for a job that stops firing.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>The instance holding the claim dies. What happens?</li>
+          <li>How do you stop one tenant's bulk job starving everyone else?</li>
+          <li>How do you know a four-hour job is progressing rather than hung?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

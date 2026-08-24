@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>.NET Developer Interview Handbook</title>
+<meta name="description" content="A structured learning path for .NET developers preparing for mid-to-senior interviews: C# fundamentals through ASP.NET Core, databases, architecture, Azure and system design.">
+<meta name="keywords" content="dotnet developer interview handbook csharp aspnet core ef core azure architecture databases system design learning path senior">
+<link rel="stylesheet" href="assets/handbook.css">
+</head>
+<body data-page="index.html" data-root=".">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hero">
+    <h1>.NET Developer Interview Handbook</h1>
+    <p class="lead">
+      A structured learning path for a .NET developer preparing for mid-to-senior interviews. It starts
+      at the C# language and ends at full system design — and nothing in it depends on a concept that
+      appears later.
+    </p>
+    <div class="stat-row">
+      <div class="stat"><b id="stat-parts">9</b><span>parts</span></div>
+      <div class="stat"><b id="stat-sections">37</b><span>topics</span></div>
+      <div class="stat"><b id="stat-pages">-</b><span>pages written</span></div>
+      <div class="stat"><b>Press <code>/</code></b><span>to search anywhere</span></div>
+    </div>
+  </header>
+
+  <div class="remember">
+    <span class="r-label">How this handbook is ordered</span>
+    <p>Read it front to back and every topic builds on the one before it.</p>
+    <p>C# → OOP → SOLID → LINQ → advanced C# → the .NET platform → ASP.NET Core → databases → EF Core →
+      testing → architecture → cloud and DevOps → interview practice.</p>
+  </div>
+
+  <h2 id="how-to-use">Three ways to use it</h2>
+  <div class="card-grid">
+    <div class="card">
+      <div class="card-num">MODE 1</div>
+      <div class="card-title">Learn the path</div>
+      <p class="card-desc">Start at Part 1 and work forward. Each concept goes
+        <em>in simple terms &rarr; why it exists &rarr; small example &rarr; how it works &rarr; what goes
+        wrong in production</em>.</p>
+    </div>
+    <div class="card">
+      <div class="card-num">MODE 2</div>
+      <div class="card-title">Revise fast</div>
+      <p class="card-desc">Every page opens with <strong>Quick revision</strong>. Core ideas get
+        <strong>In simple terms</strong>, <strong>Remember this</strong> and <strong>Key takeaways</strong>
+        boxes. <a href="37-final-prep/rapid-revision.html">Rapid revision</a> collects them all.</p>
+    </div>
+    <div class="card">
+      <div class="card-num">MODE 3</div>
+      <div class="card-title">Practise out loud</div>
+      <p class="card-desc">Questions are collapsed. Read one, answer it aloud, then expand. Answers are
+        written as <strong>speech</strong> — what you'd actually say — plus what the interviewer is
+        checking and the likely follow-ups.</p>
+    </div>
+  </div>
+
+  <h2 id="conventions">How to read the labels</h2>
+  <p>Two independent things are marked: <strong>how hard</strong> a concept is, and <strong>how much it
+     matters</strong> for an interview.</p>
+  <div class="legend">
+    <div><span class="lvl lvl-b">🟢 Beginner</span> foundations — still asked, to probe depth</div>
+    <div><span class="lvl lvl-i">🟡 Intermediate</span> day-to-day working knowledge</div>
+    <div><span class="lvl lvl-a">🔴 Advanced</span> internals, edge cases, distributed behaviour</div>
+  </div>
+  <div class="legend" style="margin-bottom:18px">
+    <div><span class="pill pill-must">🔥 Must know</span> you will be asked this</div>
+    <div><span class="pill pill-senior">⭐ Senior-level</span> separates 7 years from 1 year &times; 7</div>
+    <div><span class="pill pill-good">💡 Good to know</span> recognise it, don't memorise it</div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>You'll also see</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td><strong>In simple terms</strong></td><td>The plain-English version, before any jargon.</td></tr>
+        <tr><td><strong>Think of it this way</strong></td><td>An analogy to make the idea stick.</td></tr>
+        <tr><td><strong>Remember this</strong></td><td>The one sentence to carry into the room.</td></tr>
+        <tr><td><strong>How I'd explain this in an interview</strong></td><td>A spoken answer — not a definition to memorise.</td></tr>
+        <tr><td>Red / green code blocks</td><td>A realistic wrong version, then the fix, and exactly why the first one bites.</td></tr>
+        <tr><td>Scenario questions</td><td>Production incidents: how you'd spot it, measure it, mitigate it, then fix it properly.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Version context</div>
+    <p style="margin:0">Examples target <strong>.NET 8/9</strong> and <strong>C# 12/13</strong>. Where
+    behaviour changed meaningfully across versions (EF Core, ASP.NET Core hosting, Angular, React) the
+    version is stated inline. Cloud limits and pricing move constantly — treat specific numbers as
+    &ldquo;order of magnitude, verify before quoting&rdquo;, and explain the <em>mechanism</em> in an interview.</p>
+  </div>
+
+  <h2 id="topics">The learning path</h2>
+  <p>Nine parts, thirty-seven topics. Prerequisites always come first: you will not meet
+     <code>async/await</code> before the type system, or EF Core before SQL, or microservices before
+     architecture.</p>
+  <div id="topic-parts"></div>
+
+  <h2 id="study-plans">Suggested study routes</h2>
+
+  <h3 id="route-two-weeks">Two weeks (interview scheduled)</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Days</th><th>Focus</th><th>Sections</th></tr></thead>
+      <tbody>
+        <tr><td>1–2</td><td>Language depth — the most common technical screen</td><td>01 C#, 02 OOP, 03 SOLID, 04 LINQ</td></tr>
+        <tr><td>3–4</td><td>The runtime topics that separate mid from senior</td><td>05 Memory/Async/Concurrency</td></tr>
+        <tr><td>5–6</td><td>Platform and web — where most of the job happens</td><td>06 .NET Platform, 07 ASP.NET Core, 08 HTTP/APIs</td></tr>
+        <tr><td>7–8</td><td>Data access — depth in your primary store</td><td>10 SQL, 11 EF Core (+12/13/14 as relevant)</td></tr>
+        <tr><td>9–10</td><td>Architecture and distributed patterns</td><td>18 Patterns, 19 Architecture, 20 Microservices, 16 Redis</td></tr>
+        <tr><td>11–12</td><td>Cloud and delivery</td><td>24 Azure, 25 Docker/K8s, 28 Actions, 29 SDLC</td></tr>
+        <tr><td>13–14</td><td>Practice under pressure — say the answers out loud</td><td>35 Scaling, 36 System design, 37 Final prep</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="route-weekend">One weekend (already strong, need recall)</h3>
+  <ul>
+    <li><a href="37-final-prep/rapid-revision.html">Rapid revision</a> end to end — flag anything you can't explain in 60 seconds.</li>
+    <li><a href="37-final-prep/senior-questions.html">Senior-level questions</a> and <a href="37-final-prep/red-flags.html">red flags</a>.</li>
+    <li>Two designs from <a href="36-system-design/index.html">system design</a>, spoken aloud, timed at 40 minutes.</li>
+    <li>Three scenarios from <a href="35-scaling-scenarios/index.html">scaling scenarios</a> — one API, one database, one messaging.</li>
+  </ul>
+
+  <h3 id="route-depth">Long term (no interview booked)</h3>
+  <p>One section a week, in order. The value is in the &ldquo;when <em>not</em> to use this&rdquo; and
+     &ldquo;what breaks in production&rdquo; parts — that's the material that turns into real engineering
+     judgement rather than interview trivia, and it's exactly what a senior interviewer probes for.</p>
+
+  <h2 id="project-files">Project files</h2>
+  <p>The handbook tracks its own state so work can continue across sessions without relying on chat history:</p>
+  <ul>
+    <li><code>PROJECT_STATUS.md</code> — what's complete, what's next, known gaps.</li>
+    <li><code>CONTENT_MAP.md</code> — every page, its scope, and the concepts it owns (prevents duplication).</li>
+    <li><code>STYLE_GUIDE.md</code> — page template, HTML conventions, tone and depth rules.</li>
+    <li><code>DECISIONS.md</code> — architectural and editorial decisions with rationale.</li>
+    <li><code>assets/nav-data.js</code> — the structural source of truth. <code>node tools/build-index.mjs</code>
+        rebuilds search and validates links; <code>node tools/check-highlight.mjs</code> validates every code block.</li>
+  </ul>
+
+</article>
+</main>
+</div>
+
+<script src="assets/nav-data.js"></script>
+<script src="assets/search-index.js"></script>
+<script src="assets/handbook.js"></script>
+<script>
+(function () {
+  var nav = window.HB_NAV, idx = window.HB_PAGES || null;
+  var host = document.getElementById("topic-parts");
+  var byId = {};
+  nav.sections.forEach(function (s) { byId[s.id] = s; });
+
+  var written = 0, total = 0, html = "";
+
+  (nav.parts || []).forEach(function (part) {
+    html += '<div class="part-head">' + part.title + "</div>";
+    if (part.desc) html += '<p class="part-desc">' + part.desc + "</p>";
+    html += '<div class="card-grid">';
+
+    part.sections.forEach(function (id) {
+      var s = byId[id];
+      if (!s) return;
+      var live = 0;
+      s.pages.forEach(function (p) {
+        total++;
+        if (!idx || Object.prototype.hasOwnProperty.call(idx, s.id + "/" + p.file)) { live++; written++; }
+      });
+      var badge = live === s.pages.length
+        ? '<span class="pill pill-neutral">' + s.pages.length + (s.pages.length === 1 ? " page" : " pages") + "</span>"
+        : '<span class="pill pill-neutral">' + live + " / " + s.pages.length + " pages</span>";
+      html += '<a class="card" href="' + s.id + '/index.html">' +
+        '<div class="card-num">' + s.num + "</div>" +
+        '<div class="card-title">' + s.title + "</div>" +
+        '<p class="card-desc">' + s.desc + "</p>" +
+        '<div class="card-tags">' + badge + "</div></a>";
+    });
+    html += "</div>";
+  });
+
+  host.innerHTML = html;
+  document.getElementById("stat-parts").textContent = (nav.parts || []).length;
+  document.getElementById("stat-sections").textContent = nav.sections.length;
+  document.getElementById("stat-pages").textContent = idx ? written + " / " + total : total;
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auth &amp; API Security — HTTP &amp; Web APIs</title>
+<meta name="description" content="OAuth 2.0 flows, OpenID Connect, JWT structure, token storage, and the API vulnerabilities that actually get exploited.">
+<meta name="keywords" content="OAuth 2.0 authorization code flow PKCE client credentials OpenID Connect id token access token refresh token JWT structure claims token storage OWASP API security injection">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="08-http-web-apis/auth-security.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Auth &amp; API Security</h1>
+    <p class="subtitle">OAuth 2.0 and OIDC — what they're each for, which flow to use, and the API
+      vulnerabilities that actually get exploited.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="note info">
+    <div class="note-title">Scope of this page</div>
+    <p style="margin:0">This is the <strong>standards</strong> side: OAuth flows, OIDC, JWT structure, token
+      handling. The ASP.NET Core mechanics — configuring bearer auth, policies, resource-based authorization,
+      CORS and antiforgery — are in
+      <a href="../07-aspnet-core/security.html">section 07</a>.</p>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>OAuth 2.0 is authorization</strong>, not authentication. It answers "may this app act on
+        my behalf?"</li>
+      <li><strong>OIDC sits on top of OAuth</strong> and adds authentication — the <code>id_token</code>
+        tells you <em>who</em> the user is.</li>
+      <li><strong>Authorization Code + PKCE</strong> for anything with a user. <strong>Client
+        credentials</strong> for machine-to-machine.</li>
+      <li><strong>Implicit and password flows are deprecated.</strong> Knowing that is a real signal.</li>
+      <li>A JWT is <strong>signed, not encrypted</strong>. Anyone holding it can read the payload.</li>
+      <li><strong>Access token</strong> = short-lived, sent to APIs. <strong>Refresh token</strong> =
+        long-lived, sent only to the auth server.</li>
+    </ul>
+  </div>
+
+  <h2 id="oauth-vs-oidc">OAuth 2.0 vs OpenID Connect <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>OAuth 2.0</strong> is about <em>delegated access</em>. "Let this app read my calendar" — it
+      never tells the app who you are.</p>
+    <p><strong>OIDC</strong> adds identity on top. "Here's who this user is, verifiably."</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>OAuth</strong> is a hotel key card. It opens room 402 and the gym. It doesn't say your name,
+      and the door doesn't care — it only checks whether the card grants access.</p>
+    <p><strong>OIDC</strong> is the photo ID you showed at reception to get the card. That's what proves
+      <em>who</em> you are.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>OAuth 2.0</th><th>OpenID Connect</th></tr></thead>
+      <tbody>
+        <tr><td>Answers</td><td>May this app do X on my behalf?</td><td>Who is this user?</td></tr>
+        <tr><td>Purpose</td><td>Authorization / delegation</td><td>Authentication</td></tr>
+        <tr><td>Token you use</td><td><code>access_token</code></td><td><code>id_token</code> (plus an access token)</td></tr>
+        <tr><td>Token format</td><td>Unspecified — opaque or JWT</td><td><strong>Always</strong> a JWT</td></tr>
+        <tr><td>Audience</td><td>The API</td><td>The client application</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The classic mistake — using an access token to identify the user</div>
+    <p style="margin:0">An access token is meant for the <strong>API</strong>, and its format isn't
+      guaranteed. Some providers issue opaque strings; some rotate the format. It may not contain a user
+      identifier at all.
+      <br><br>
+      An <code>id_token</code> is meant for the <strong>client</strong>, is always a JWT, and is where
+      identity claims belong.
+      <br><br>
+      "We use OAuth for login" was a very common design and it's why OIDC was created — OAuth alone doesn't
+      define how to prove identity, so everyone invented their own incompatible way.</p>
+  </div>
+
+  <h2 id="flows">Which flow to use <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Flow</th><th>Use for</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Authorization Code + PKCE</strong></td><td>Any flow involving a user — web apps, SPAs, mobile</td><td>✅ <strong>The default</strong></td></tr>
+        <tr><td><strong>Client Credentials</strong></td><td>Machine-to-machine, no user involved</td><td>✅ Correct for its purpose</td></tr>
+        <tr><td><strong>Device Code</strong></td><td>TVs, CLIs, devices with no browser</td><td>✅ Correct for its purpose</td></tr>
+        <tr><td><strong>Implicit</strong></td><td>—</td><td>❌ <strong>Deprecated</strong></td></tr>
+        <tr><td><strong>Resource Owner Password</strong></td><td>—</td><td>❌ <strong>Deprecated</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The short version</span>
+    <p><strong>User involved?</strong> Authorization Code with PKCE.</p>
+    <p><strong>No user, just two services?</strong> Client Credentials.</p>
+    <p>That covers almost everything you'll build.</p>
+  </div>
+
+  <h3 id="auth-code">Authorization Code + PKCE, step by step</h3>
+
+  <pre data-label="the flow, and what each step protects against" class="code-good"><code class="language-text" data-nohl>1. App generates a random 'code_verifier', hashes it -> 'code_challenge'
+
+2. Browser -> auth server:
+   /authorize?response_type=code
+             &client_id=...&redirect_uri=...
+             &code_challenge=XYZ&code_challenge_method=S256
+             &scope=openid profile orders.read&state=abc123
+
+3. User authenticates with the AUTH SERVER (your app never sees the password)
+
+4. Auth server -> browser redirect:
+   https://yourapp/callback?code=SHORT_LIVED_CODE&state=abc123
+                                    ↑ useless on its own
+
+5. App -> auth server (back channel, server to server):
+   POST /token   grant_type=authorization_code
+                 &code=SHORT_LIVED_CODE
+                 &code_verifier=ORIGINAL_RANDOM   ← proves same requester
+
+6. Auth server returns: access_token, id_token, refresh_token</code></pre>
+
+  <p>Two protections in that flow are worth being able to explain, because they're what interviews probe:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mechanism</th><th>Protects against</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>PKCE</strong> (<code>code_verifier</code> / <code>code_challenge</code>)</td>
+          <td><strong>Authorization code interception.</strong> The code travels through the browser, where a
+              malicious app or a logged URL could capture it. Without PKCE, whoever holds the code can
+              exchange it. With PKCE, they'd also need the original random verifier, which never left the
+              legitimate app.</td>
+        </tr>
+        <tr>
+          <td><strong><code>state</code> parameter</strong></td>
+          <td><strong>CSRF on the callback.</strong> The app checks the returned <code>state</code> matches
+              what it sent, so an attacker can't trick a user's browser into completing <em>their</em> login
+              and binding the attacker's account.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Why the code is exchanged server-side</div>
+    <p style="margin:0">Step 5 happens on the <strong>back channel</strong> — server to server, never through
+      the browser. So the tokens themselves never appear in a URL, browser history, referrer header or proxy
+      log.
+      <br><br>
+      That's exactly what the deprecated <strong>implicit flow</strong> got wrong: it returned the access token
+      directly in the redirect fragment, so the token ended up in the browser's address bar. PKCE made
+      authorization code viable for SPAs, which is why implicit was retired rather than fixed.</p>
+  </div>
+
+  <h3 id="why-deprecated">Why the two deprecated flows were deprecated</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Flow</th><th>Problem</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Implicit</strong></td>
+          <td>Returned the access token in the URL fragment — so it landed in browser history, referrer
+              headers and logs. No refresh tokens either, so it needed long-lived access tokens, making the
+              exposure worse.</td>
+        </tr>
+        <tr>
+          <td><strong>Resource Owner Password</strong></td>
+          <td>The <em>application</em> collects the user's password and sends it to the auth server. That
+              defeats the whole point: the app now handles credentials, can't support MFA or federated login,
+              and trains users to type their password into third-party UIs.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Knowing that implicit and password grants are deprecated — and <em>why</em> — is one of
+      the cleanest ways to show your auth knowledge is current rather than from a 2016 tutorial.
+      <br><br>
+      If you see a codebase using the password grant, that's a finding worth raising: it usually means MFA
+      can't be added without rework.</p>
+  </div>
+
+  <h2 id="tokens">Access, ID and refresh tokens <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Access token</th><th>ID token</th><th>Refresh token</th></tr></thead>
+      <tbody>
+        <tr><td>Sent to</td><td>The API</td><td>Nowhere — the client reads it</td><td>The auth server only</td></tr>
+        <tr><td>Purpose</td><td>Prove permission</td><td>Prove identity</td><td>Get a new access token</td></tr>
+        <tr><td>Lifetime</td><td>Minutes</td><td>Minutes</td><td>Days to months</td></tr>
+        <tr><td>Format</td><td>JWT or opaque</td><td>Always JWT</td><td>Usually opaque</td></tr>
+        <tr><td>Audience claim</td><td>The API</td><td>The client</td><td>n/a</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Never send an ID token to an API</strong>, and never use an access token to identify a user.</p>
+    <p>They have different audiences. An API validating an <code>id_token</code> is accepting a token that
+      wasn't issued for it.</p>
+  </div>
+
+  <h3 id="revocation">The revocation problem</h3>
+
+  <p>A JWT is validated by checking its signature. That means the API doesn't call the auth server — which is
+    the whole performance benefit, and also the whole problem:</p>
+
+  <div class="simple">
+    <span class="sm-label">The consequence</span>
+    <p>You <strong>cannot revoke a JWT</strong>. If a user is disabled or a token is stolen, it keeps working
+      until it expires.</p>
+  </div>
+
+  <p><strong>The standard mitigation</strong> is short-lived access tokens plus a revocable refresh token:</p>
+
+  <ul>
+    <li><strong>Access token: 5–15 minutes.</strong> Worst case, a stolen token is useful for that long.</li>
+    <li><strong>Refresh token: long-lived but stored server-side</strong>, so it <em>can</em> be revoked. The
+      client exchanges it for a new access token when the old one expires.</li>
+    <li><strong>Refresh token rotation:</strong> each refresh issues a new refresh token and invalidates the
+      old one. If an old one is ever reused, that's evidence of theft — and the whole family gets revoked.</li>
+  </ul>
+
+  <div class="note warn">
+    <div class="note-title">If you genuinely need instant revocation</div>
+    <p style="margin:0">Then stateless validation isn't enough and you have to reintroduce a check —
+      a denylist of revoked token IDs (the <code>jti</code> claim) in a fast store like Redis, checked on
+      each request.
+      <br><br>
+      That's a real trade-off: you've given up the statelessness you chose JWTs for. Worth doing for
+      high-value operations, not for every request. Be able to say that rather than claiming JWTs are
+      revocable.</p>
+  </div>
+
+  <h2 id="jwt-structure">What's actually in a JWT <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="text — three base64url parts separated by dots" class="code-good"><code class="language-text" data-nohl>eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYyJ9 . eyJzdWIiOiIxMjMiLCJleHAiOjE3MDB9 . SIGNATURE
+└──────── header ────────────────────┘  └──────── payload ──────────────┘  └───────┘
+
+header  : { "alg": "RS256", "kid": "abc" }        which key signed it
+payload : { "sub": "123", "aud": "orders-api",
+            "iss": "https://login.example.com",
+            "exp": 1700000000, "scope": "orders.read" }
+signature: signs header + payload with the issuer's private key</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Claim</th><th>Meaning</th><th>Must you validate it?</th></tr></thead>
+      <tbody>
+        <tr><td><code>iss</code></td><td>Issuer</td><td><strong>Yes</strong> — is this from a server I trust?</td></tr>
+        <tr><td><code>aud</code></td><td>Audience</td><td><strong>Yes</strong> — was it issued for <em>me</em>?</td></tr>
+        <tr><td><code>exp</code></td><td>Expiry</td><td><strong>Yes</strong></td></tr>
+        <tr><td><code>sub</code></td><td>Subject — the user's stable ID</td><td>Use it as the user key</td></tr>
+        <tr><td><code>jti</code></td><td>Unique token ID</td><td>Needed for a denylist</td></tr>
+        <tr><td><code>scope</code></td><td>Granted permissions</td><td>Check it for authorization</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Two things people get wrong about JWTs</div>
+    <p style="margin:0"><strong>1. Signed is not encrypted.</strong> The payload is base64, not
+      encryption — anyone holding the token can read every claim. So no PII you wouldn't want exposed, and
+      certainly no secrets. Signing guarantees <em>integrity</em>, not confidentiality.
+      <br><br>
+      <strong>2. Never trust the <code>alg</code> header.</strong> The historic attack is changing
+      <code>alg</code> to <code>none</code>, or from <code>RS256</code> to <code>HS256</code> so the library
+      verifies using the public key as an HMAC secret. Libraries pin the expected algorithm now, but only if
+      you configure it — validate against your expected algorithm rather than accepting what the token
+      claims.</p>
+  </div>
+
+  <h2 id="token-storage">Where a browser should store a token <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>localStorage</code></th><th><code>HttpOnly</code> cookie</th></tr></thead>
+      <tbody>
+        <tr><td>Readable by JavaScript</td><td><strong>Yes</strong> — so XSS can steal it</td><td>No</td></tr>
+        <tr><td>Sent automatically</td><td>No — so CSRF isn't a risk</td><td><strong>Yes</strong> — needs CSRF protection</td></tr>
+        <tr><td>Works cross-domain</td><td>Yes</td><td>Awkward</td></tr>
+        <tr><td>Main risk</td><td>XSS token theft</td><td>CSRF</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">There is no free option</span>
+    <p>Both have a real attack. The question is which you'd rather defend against.</p>
+    <p>Most guidance prefers the <strong>cookie</strong>, because XSS token theft is silent and gives an
+      attacker a reusable credential, whereas CSRF has a well-understood standard defence.</p>
+  </div>
+
+  <p><strong>The pattern that avoids the choice</strong> is a
+    <a href="../19-architecture/integration-patterns.html#bff">backend-for-frontend</a>: the BFF holds the
+    tokens server-side and issues the browser a plain <code>HttpOnly</code> session cookie. The browser never
+    holds a token at all, so XSS can't steal one — and the BFF handles refresh transparently.</p>
+
+  <h2 id="api-vulnerabilities">The vulnerabilities that actually get exploited <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Vulnerability</th><th>What it looks like</th><th>Defence</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Broken object-level authorization</strong> (IDOR)</td>
+          <td>Change the ID in the URL, see someone else's data</td>
+          <td>Filter by owner/tenant <em>in the query</em> — see <a href="../07-aspnet-core/security.html#resource-authorization">resource authorization</a></td>
+        </tr>
+        <tr>
+          <td><strong>Excessive data exposure</strong></td>
+          <td>Returning the whole entity and letting the UI hide fields</td>
+          <td>Response DTOs with only what the client needs</td>
+        </tr>
+        <tr>
+          <td><strong>Mass assignment</strong></td>
+          <td>Client sets <code>isAdmin</code> because the endpoint binds to the entity</td>
+          <td>Request DTOs — see <a href="../07-aspnet-core/apis.html#over-posting">over-posting</a></td>
+        </tr>
+        <tr>
+          <td><strong>Injection</strong></td>
+          <td>String-concatenated SQL or NoSQL queries</td>
+          <td>Parameterised queries always; an ORM by default</td>
+        </tr>
+        <tr>
+          <td><strong>Broken function-level authorization</strong></td>
+          <td>An admin endpoint that only the UI hides</td>
+          <td>Authorize on the server for every endpoint, without exception</td>
+        </tr>
+        <tr>
+          <td><strong>Lack of rate limiting</strong></td>
+          <td>Credential stuffing, scraping, resource exhaustion</td>
+          <td>Per-client limits — see <a href="reliability.html#rate-limiting">reliability</a></td>
+        </tr>
+        <tr>
+          <td><strong>Security misconfiguration</strong></td>
+          <td>Verbose errors, public Swagger, permissive CORS, default credentials</td>
+          <td>Environment-specific config, reviewed</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The pattern behind most of them</span>
+    <p>Nearly every item on that list is <strong>trusting the client</strong> — trusting it to send only
+      expected fields, to only request its own data, to only call the endpoints the UI shows.</p>
+    <p>The server has to assume the client is an attacker with your API documentation.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — "the UI doesn't show that button"</div>
+    <p style="margin:0">Hiding an action in the front end is not authorization. Anyone can read your
+      JavaScript, watch the network tab, or just try the obvious URL.
+      <br><br>
+      Every endpoint needs a server-side check, and every query needs an ownership filter — regardless of what
+      the UI offers. This is the single most common real-world API vulnerability, and it's always the same
+      root cause.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>OAuth 2.0 = authorization. OIDC = authentication on top of it.</li>
+      <li>Access token for the API; ID token for the client. Don't mix them.</li>
+      <li>Authorization Code + PKCE for users; Client Credentials for services.</li>
+      <li>Implicit and password grants are deprecated — know why.</li>
+      <li>PKCE stops code interception; <code>state</code> stops callback CSRF.</li>
+      <li>JWTs are signed, not encrypted, and effectively unrevocable. Keep them short-lived.</li>
+      <li>Always validate issuer, audience, expiry and the expected algorithm.</li>
+      <li>Cookie vs localStorage is XSS vs CSRF. A BFF avoids the choice.</li>
+      <li>Most API breaches are the server trusting the client.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Using an access token to identify the user</strong> instead of an ID token.</li>
+    <li><strong>Long-lived access tokens</strong> with no refresh flow, making revocation impossible.</li>
+    <li><strong>Not validating the audience</strong>, so a token for another service is accepted.</li>
+    <li><strong>Putting PII or secrets in the JWT payload.</strong></li>
+    <li><strong>The password grant</strong> in new code, which blocks MFA.</li>
+    <li><strong>Skipping PKCE</strong> for a SPA or mobile app.</li>
+    <li><strong>Not checking <code>state</code></strong> on the OAuth callback.</li>
+    <li><strong>Relying on the UI to hide privileged actions.</strong></li>
+    <li><strong>Returning full entities</strong> and letting the client filter.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What's the difference between OAuth 2.0 and OpenID Connect? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"OAuth 2.0 is an <strong>authorization</strong> framework. It's about delegated access — letting an
+          application act on a user's behalf without the user handing over their password. The token it gives
+          you says what the app may do, not who the user is."</p>
+        <p>"OpenID Connect is a thin layer <strong>on top of</strong> OAuth that adds authentication. It
+          defines an <code>id_token</code>, always a JWT, containing verifiable identity claims — subject,
+          email, name."</p>
+        <p>"The analogy I use is a hotel: the OAuth access token is the key card, which opens specific doors
+          and says nothing about your name. OIDC is the photo ID you showed at reception."</p>
+        <p>"The reason this distinction matters practically is a very common mistake — using an OAuth access
+          token to identify the user. Access tokens are meant for the API and their format isn't guaranteed;
+          some providers issue opaque strings, and they may contain no user identifier at all. So code that
+          parses an access token to find out who's logged in is relying on something the spec doesn't
+          promise."</p>
+        <p>"That's actually <em>why</em> OIDC exists. Everyone was using OAuth for login and inventing their
+          own incompatible way of getting identity out of it, so OIDC standardised it."</p>
+        <p>"So in practice: the ID token goes to my client and tells me who the user is. The access token goes
+          to the API and proves permission. Different audiences, different jobs."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know OAuth alone isn't authentication?</li>
+        <li>Do you know the access/ID token split and their audiences?</li>
+        <li>Bonus: knowing <em>why</em> OIDC was created.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "they're the same thing" or "OIDC is just OAuth for login".</li>
+        <li><span class="redflag">Red flag:</span> using an access token for identity with no caveat.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which flow would you use for a SPA?</li>
+          <li>What's in an ID token?</li>
+          <li>Can an API validate an ID token?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Which OAuth flow would you use for a single-page app, and why?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Authorization Code with PKCE. Not implicit — that used to be the recommendation for SPAs and it's
+          been deprecated."</p>
+        <p>"Implicit returned the access token directly in the URL fragment of the redirect. So the token
+          ended up in the browser address bar, in history, potentially in referrer headers and proxy logs.
+          And because implicit didn't support refresh tokens, you needed long-lived access tokens, which made
+          the exposure worse."</p>
+        <p>"Authorization Code avoids that by returning a short-lived <em>code</em> through the browser and
+          exchanging it for tokens on a separate back-channel request. So the tokens never travel through the
+          browser at all."</p>
+        <p>"The problem historically was that the exchange requires a client secret, and a SPA can't keep a
+          secret — it's all downloadable. That's what <strong>PKCE</strong> solves. The app generates a random
+          verifier, sends a hash of it with the authorize request, and sends the original when exchanging the
+          code. Whoever intercepts the code can't use it without the verifier, which never left the app. So
+          you get proof-of-possession without a stored secret."</p>
+        <p>"I'd also check the <code>state</code> parameter on the callback, which is a separate protection —
+          it stops CSRF on the redirect, where an attacker tricks a user's browser into completing the
+          attacker's login."</p>
+        <p>"And for token storage I'd think carefully. <code>localStorage</code> is readable by any XSS; an
+          <code>HttpOnly</code> cookie isn't but needs CSRF protection. If the architecture allows it I'd
+          prefer a backend-for-frontend that holds the tokens server-side and gives the browser a session
+          cookie — then the browser never holds a token at all."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know implicit is deprecated, and why?</li>
+        <li>Can you explain what PKCE actually protects against?</li>
+        <li>Bonus: <code>state</code>, and the token storage trade-off.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "implicit flow, because SPAs can't keep a secret" — the
+          2016 answer.</li>
+        <li><span class="redflag">Red flag:</span> naming PKCE without being able to say what it prevents.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where would you store the refresh token?</li>
+          <li>What does <code>state</code> protect against?</li>
+          <li>How do you handle silent token renewal?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A user is disabled but their JWT still works. Is that a bug? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It's expected behaviour, not a bug — but it may well be an unacceptable design, and that
+          distinction is the actual answer."</p>
+        <p>"A JWT is validated by checking its signature. The API doesn't call the auth server, which is
+          exactly why it scales — but it also means the API has no idea the user was disabled. The token
+          remains cryptographically valid until it expires."</p>
+        <p>"So the question becomes: how long is that window, and is it acceptable? If access tokens live 15
+          minutes, the worst case is 15 minutes of access after disabling. For most systems that's fine. If
+          they live 24 hours, that's a genuine security problem and the fix is shortening the lifetime."</p>
+        <p>"The standard design is short access tokens plus a longer refresh token that <em>is</em> checked
+          server-side. When the access token expires, the client refreshes — and at that point the auth
+          server sees the account is disabled and refuses. So revocation takes effect within one access-token
+          lifetime rather than immediately."</p>
+        <p>"I'd also mention <strong>refresh token rotation</strong>: each refresh issues a new refresh token
+          and invalidates the old one. If an old one gets reused, that's evidence it was stolen, and you
+          revoke the whole family."</p>
+        <p>"If the business genuinely needs <em>instant</em> revocation — say, a compromised account with
+          access to payments — then stateless validation isn't sufficient and you have to reintroduce a
+          check: a denylist of revoked token IDs, the <code>jti</code> claim, in Redis, checked per request."</p>
+        <p>"I'd be explicit that this gives up the statelessness you chose JWTs for. So I'd apply it
+          selectively — on high-value operations rather than every request — or accept a short window
+          everywhere else. That's the honest trade-off, and pretending JWTs are revocable is where people go
+          wrong."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know this is inherent to stateless validation, not a defect?</li>
+        <li>Can you reason about the window rather than just naming it?</li>
+        <li>Do you know refresh rotation and the denylist option — and its cost?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "just delete the token" — the client holds it, you can't.</li>
+        <li><span class="redflag">Red flag:</span> claiming JWTs can be revoked with no mechanism.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you implement logout with JWTs?</li>
+          <li>What lifetime would you choose, and how would you decide?</li>
+          <li>What does a denylist cost you at scale?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

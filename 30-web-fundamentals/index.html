@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTML, CSS &amp; JavaScript — Overview</title>
+<meta name="description" content="What a .NET developer actually gets asked about the browser, why the event loop is the highest-value topic, and how this section is organised.">
+<meta name="keywords" content="front end for backend developers browser fundamentals event loop full stack .NET interview HTML CSS JavaScript what to know">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="30-web-fundamentals/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>HTML, CSS &amp; JavaScript</h1>
+    <p class="subtitle">You're not being interviewed as a front-end specialist. You're being checked for the
+      gaps that make a full-stack developer dangerous.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="what-gets-asked">What actually gets asked <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>For a .NET role with a front-end component, interviewers rarely test CSS trivia. They test whether you
+      understand the <strong>execution model</strong> — because that's where backend developers make expensive
+      mistakes in browser code.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Topic</th><th>Why they ask</th><th>Priority</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>The event loop</strong></td>
+          <td>Single-threaded concurrency is genuinely different from .NET's thread pool. Getting it wrong
+              freezes the UI</td>
+          <td><strong>Highest</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Closures and <code>this</code></strong></td>
+          <td>The two things that behave unlike C#, and the source of most confusing bugs</td>
+          <td><strong>High</strong></td>
+        </tr>
+        <tr>
+          <td><strong><code>==</code> vs <code>===</code>, coercion</strong></td>
+          <td>Cheap to check, and a wrong answer suggests you've never debugged JS seriously</td>
+          <td>High</td>
+        </tr>
+        <tr>
+          <td><strong>Semantic HTML and accessibility</strong></td>
+          <td>Increasingly a legal requirement, and a <code>div</code>-only answer is a red flag</td>
+          <td>Medium — rising</td>
+        </tr>
+        <tr>
+          <td><strong>Flexbox and grid</strong></td>
+          <td>Basic competence. Nobody expects you to recall every property</td>
+          <td>Medium</td>
+        </tr>
+        <tr>
+          <td><strong>XSS and token storage</strong></td>
+          <td>A backend developer who mishandles tokens in the browser is a security risk</td>
+          <td><strong>High</strong></td>
+        </tr>
+        <tr>
+          <td><strong>CSS specificity minutiae</strong></td>
+          <td>Rarely. Look it up when you need it</td>
+          <td>Low</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>If you have limited preparation time, spend it on <strong>the event loop</strong> and
+      <strong>closures</strong>.</p>
+    <p>Those two explain async behaviour, framework quirks, memory leaks and most "why does this run in the
+      wrong order?" bugs. Everything else on this page is easier to look up on the job.</p>
+  </div>
+
+  <h2 id="coming-from-dotnet">The mental shifts from C# <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>In C#</th><th>In JavaScript</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Multiple threads; <code>await</code> can resume on another</td>
+          <td><strong>One thread.</strong> Ever</td>
+          <td>A long synchronous loop <strong>freezes the entire page</strong> — no other code, no rendering,
+              no clicks</td>
+        </tr>
+        <tr>
+          <td><code>Task</code> starts when you create it</td>
+          <td>A <code>Promise</code> executor runs <strong>immediately</strong>, but <code>.then</code> is
+              always deferred</td>
+          <td>Ordering surprises even when nothing is truly asynchronous</td>
+        </tr>
+        <tr>
+          <td><code>this</code> is the instance, always</td>
+          <td><code>this</code> depends on <strong>how the function is called</strong></td>
+          <td>Passing a method as a callback loses <code>this</code> unless it's an arrow function</td>
+        </tr>
+        <tr>
+          <td>Static typing at compile time</td>
+          <td>Dynamic, with implicit coercion</td>
+          <td><code>"1" + 1</code> is <code>"11"</code>. Use TypeScript</td>
+        </tr>
+        <tr>
+          <td>Class-based inheritance</td>
+          <td>Prototype chains (<code>class</code> is sugar over them)</td>
+          <td>Mostly invisible until you debug a library</td>
+        </tr>
+        <tr>
+          <td>GC handles almost everything</td>
+          <td>GC exists, but <strong>event listeners and closures hold references</strong></td>
+          <td>Leaks in long-lived single-page applications</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The one that catches .NET developers hardest</div>
+    <p style="margin:0"><strong>There is no second thread to offload work to.</strong>
+      <br><br>
+      In .NET, a CPU-bound operation on a background thread leaves the UI responsive. In a browser, a
+      synchronous loop over 100,000 items blocks <em>everything</em> — rendering, input, timers, network
+      callbacks — until it finishes. The tab appears frozen.
+      <br><br>
+      Work either has to be broken into chunks that yield to the event loop, or moved to a
+      <strong>Web Worker</strong>, which is a genuinely separate thread with no DOM access and message-passing
+      only.
+      <br><br>
+      Reaching for <code>async</code> does <em>not</em> fix this. <code>async</code> only helps with waiting;
+      it doesn't create parallelism. That distinction is the single most valuable thing on this page.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="javascript.html">JavaScript</a></td>
+          <td><strong>Start here.</strong> Types and coercion, scope and closures, <code>this</code>,
+              prototypes, promises, and the event loop in detail</td>
+        </tr>
+        <tr>
+          <td><a href="html.html">HTML &amp; Accessibility</a></td>
+          <td>Semantic elements and why they matter, forms, ARIA, the rendering path, and what actually
+              affects SEO</td>
+        </tr>
+        <tr>
+          <td><a href="css.html">CSS</a></td>
+          <td>Box model, the layout systems, specificity, responsive design, and what causes reflow</td>
+        </tr>
+        <tr>
+          <td><a href="jquery.html">jQuery &amp; Legacy Front Ends</a></td>
+          <td>The API you'll meet in older codebases, why it faded, and how to modernise incrementally</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="typescript">A note on TypeScript <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why it matters for you specifically</span>
+    <p>TypeScript is JavaScript with static types checked at build time. It compiles to JavaScript and
+      <strong>disappears at runtime</strong> — there are no type checks in the shipped code.</p>
+    <p>For someone coming from C#, it's the difference between front-end work feeling foreign and feeling
+      familiar. Both Angular and React are overwhelmingly written in it.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The distinction interviewers listen for</div>
+    <p style="margin:0"><strong>TypeScript types are erased at compile time.</strong> They are not runtime
+      validation.
+      <br><br>
+      So declaring an API response as <code>User</code> does not guarantee the server sent a
+      <code>User</code>. If the API returns something different, TypeScript is perfectly happy and your code
+      fails at the point of use with a confusing error.
+      <br><br>
+      Anything crossing a trust boundary — an API response, form input, <code>localStorage</code> — needs
+      <strong>runtime validation</strong>, with something like Zod. That's the same reasoning as
+      <a href="../07-aspnet-core/apis.html">validating incoming models server-side</a> rather than trusting a
+      declared type.
+      <br><br>
+      "Types are compile-time only, so I'd validate at the boundary" is a strong answer, because a lot of
+      developers treat a TypeScript interface as a guarantee.</p>
+  </div>
+
+  <h2 id="scope">Being honest about your level <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — don't oversell front-end depth</div>
+    <p style="margin:0">If you're a backend-leaning developer, saying so plainly is better than bluffing. What
+      interviewers want to know is whether you can <strong>work effectively across the stack</strong>, not
+      whether you can recite CSS grid syntax.
+      <br><br>
+      A strong version: <em>"I'm strongest on the .NET side. I'm comfortable building and maintaining Angular
+      features, I understand the event loop and change detection well enough to debug performance problems, and
+      I'd defer to a specialist on complex layout or design-system work."</em>
+      <br><br>
+      That's credible and it tells them exactly where you fit. Claiming senior front-end skill and then failing
+      a closure question is much worse than a calibrated answer — and the calibration itself reads as
+      seniority.</p>
+  </div>
+
+  <details class="qa">
+    <summary>You have a CPU-heavy calculation that freezes the page. How do you fix it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd be clear that <strong><code>async</code> won't fix this</strong>, because that's the
+          instinct coming from .NET and it's wrong here. JavaScript runs on one thread. <code>async</code> and
+          <code>await</code> only help when you're <em>waiting</em> on something — a network call, a timer.
+          They don't create parallelism, so wrapping a CPU-bound loop in an <code>async</code> function blocks
+          the thread exactly as before."</p>
+        <p>"So there are two real options."</p>
+        <p>"<strong>A Web Worker</strong>, if the work is genuinely heavy. That's a separate OS thread with its
+          own JavaScript context. You post the input to it, it computes, it posts the result back, and the main
+          thread stays responsive throughout. The constraints are that it has <strong>no DOM access</strong>
+          and communication is by message-passing with structured cloning — so you can't share objects, and
+          transferring very large payloads has its own cost. For something like parsing a large file, image
+          processing, or a heavy calculation, this is the correct answer."</p>
+        <p>"<strong>Chunking with yields</strong>, if the work is moderate or a worker is overkill. Process a
+          few hundred items, then yield to the event loop so rendering and input can happen, then continue.
+          <code>setTimeout</code> with zero delay works; <code>requestIdleCallback</code> is better because it
+          runs only when the browser is idle; and <code>scheduler.yield()</code> is the modern purpose-built
+          option where available."</p>
+        <p>"The trade-off: chunking keeps the page responsive but makes the total work slower, and the code
+          more complex. A worker keeps full speed and adds the message-passing boundary."</p>
+        <p>"Before either, though, I'd ask <strong>whether this belongs in the browser at all</strong>. If it's
+          a heavy computation over a large dataset, that's often work for the server — where I have real
+          threads, more memory, and can cache the result. Moving it to an API endpoint can be simpler than
+          either browser-side option, and it means every user isn't recomputing the same thing."</p>
+        <p>"And I'd check the obvious first: is it genuinely CPU-bound, or is it accidentally quadratic? A
+          nested loop over an array where a <code>Map</code> lookup would do is a very common cause, and then
+          the fix is algorithmic rather than architectural. I'd profile it in DevTools before deciding."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>async</code> doesn't create parallelism?</li>
+        <li>Do you know Web Workers exist and their constraints?</li>
+        <li>Do you consider moving the work server-side?</li>
+        <li>Do you profile before optimising?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "make it <code>async</code>" — the classic .NET
+          transplant.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that the UI thread is the only thread.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you get data into and out of a Worker?</li>
+          <li>What's the difference between a microtask and a macrotask?</li>
+          <li>How would you measure the blocking time?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Where this leads</div>
+    <p style="margin:0"><a href="../31-angular/index.html">Angular</a> and
+      <a href="../32-react/index.html">React</a> both assume the JavaScript page here. In particular, the event
+      loop explains Angular's <a href="../31-angular/reactivity.html">change detection</a> and React's
+      <a href="../32-react/rendering-performance.html">rendering behaviour</a> — so it's worth being solid on it
+      before either.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

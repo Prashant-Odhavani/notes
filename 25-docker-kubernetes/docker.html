@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker &amp; Containerization</title>
+<meta name="description" content="Images and layers, multi-stage builds for .NET, base image choice, volumes and networks, Compose, and container security.">
+<meta name="keywords" content="Dockerfile multi-stage build layer caching .NET container images aspnet runtime-deps chiseled alpine distroless non-root user dotnet publish container ReadyToRun trimming AOT dockerignore volumes bind mounts Compose Testcontainers image scanning">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="25-docker-kubernetes/docker.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Docker &amp; Containerization</h1>
+    <p class="subtitle">The Dockerfile is where most of the mistakes live. Layer caching and base image choice are
+      the two things worth understanding properly.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Each instruction is a layer</strong>, cached by content, and invalidating one invalidates
+        everything after it.</li>
+      <li><strong>Copy the project files and restore before copying the source</strong> — that's the whole caching
+        trick.</li>
+      <li><strong>Multi-stage build:</strong> the SDK builds, the runtime image ships. No compiler in
+        production.</li>
+      <li><strong>A deleted file in a later layer still occupies space.</strong> Layers are additive.</li>
+      <li><strong>Run as a non-root user.</strong> The .NET images have one built in.</li>
+      <li><strong>Never bake secrets into an image</strong> — they're extractable from any layer.</li>
+      <li><strong>Tag with a version or digest, never <code>:latest</code>.</strong></li>
+      <li><strong><code>.dockerignore</code> matters</strong> for both build speed and security.</li>
+    </ul>
+  </div>
+
+  <h2 id="layers">Images and layers <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The model</span>
+    <p>An image is <strong>a stack of read-only layers</strong>. Each Dockerfile instruction that changes the
+      filesystem adds one.</p>
+    <p>A running container adds <strong>one writable layer</strong> on top. When it's removed, that layer goes with
+      it — which is why containers are ephemeral and anything you need to keep goes in a volume or an external
+      store.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Layers are cached by content</strong></td><td>An unchanged instruction is reused, not re-run</td></tr>
+        <tr><td><strong>Changing a layer invalidates every layer after it</strong></td><td><strong>Order your Dockerfile from least to most volatile</strong></td></tr>
+        <tr><td><strong>Layers are shared between images</strong></td><td>Ten images on one base cost one base</td></tr>
+        <tr><td><strong>Layers are additive</strong></td><td><strong>Deleting a file later doesn't shrink the image</strong></td></tr>
+        <tr><td>Layers are pulled in parallel</td><td>Smaller layers can mean faster startup on a cold node</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A secret added in one layer and deleted in another is still in the image</div>
+    <p style="margin:0">This is the consequence of layers being additive, and it's the one that actually causes
+      incidents.
+      <br><br>
+      If a Dockerfile copies a credentials file, uses it, then runs <code>rm</code> in a later instruction, the file
+      <strong>is still present in the earlier layer</strong>. Anyone who can pull the image can extract it —
+      <code>docker save</code> and unpack, no special tooling.
+      <br><br>
+      The same applies to a <code>nuget.config</code> containing a private feed PAT, an SSH key used to clone a
+      dependency, or an <code>appsettings.Production.json</code> copied by an over-broad <code>COPY . .</code>.
+      <br><br>
+      The fixes: <strong>BuildKit secret mounts</strong> (<code>--mount=type=secret</code>), which make a secret
+      available during one instruction without persisting it; <strong>multi-stage builds</strong>, where the secret
+      stays in a stage you don't copy from; and a <code>.dockerignore</code> so sensitive files never enter the
+      build context at all.
+      <br><br>
+      And the rule underneath: <strong>configuration is injected at runtime, never baked in.</strong> An image
+      should be identical across environments — that's what makes it the artefact you tested.</p>
+  </div>
+
+  <h2 id="dockerfile">A .NET Dockerfile worth copying <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="dockerfile — multi-stage, cache-friendly, non-root" class="code-good"><code class="language-dockerfile"># ---------- build ----------
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+ARG BUILD_CONFIGURATION=Release
+WORKDIR /src
+
+# 1. Copy ONLY the project files first.
+#    These change rarely, so the restore layer below stays cached
+#    across every source-code-only change.
+COPY Directory.Packages.props Directory.Build.props nuget.config ./
+COPY src/Orders.Api/Orders.Api.csproj              src/Orders.Api/
+COPY src/Orders.Application/Orders.Application.csproj src/Orders.Application/
+COPY src/Orders.Domain/Orders.Domain.csproj        src/Orders.Domain/
+
+# 2. Restore. Cached unless a .csproj or lock file changed.
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet restore src/Orders.Api/Orders.Api.csproj
+
+# 3. NOW copy the source. This layer changes on every commit,
+#    and everything above it is still cached.
+COPY src/ src/
+
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet publish src/Orders.Api/Orders.Api.csproj \
+      -c $BUILD_CONFIGURATION -o /app/publish \
+      --no-restore /p:UseAppHost=false
+
+# ---------- runtime ----------
+FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
+WORKDIR /app
+
+# The Microsoft images ship a non-root user (uid 64198). Use it.
+USER $APP_UID
+
+# Kestrel binds 8080 by default in .NET 8+ images - no root needed for that
+EXPOSE 8080
+ENV ASPNETCORE_HTTP_PORTS=8080
+
+COPY --from=build /app/publish .
+ENTRYPOINT ["dotnet", "Orders.Api.dll"]</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the restore-before-source split is the point of the whole file</div>
+    <p style="margin:0">The two-step copy looks like fussiness. It's the difference between a 20-second build and a
+      three-minute one, on every single commit.
+      <br><br>
+      Because layers invalidate downward: if you <code>COPY . .</code> and then restore, <strong>any</strong> source
+      change invalidates the copy layer, so the restore re-runs and every package is fetched again.
+      <br><br>
+      Copying only the <code>.csproj</code> files first means the restore layer is keyed on
+      <em>project dependencies</em>, which change rarely. Source changes invalidate only the layers below it.
+      <br><br>
+      That's the same reasoning that puts <code>apt-get install</code> before <code>COPY</code> in any Dockerfile:
+      <strong>least volatile first</strong>. The general principle is worth stating rather than just the .NET
+      recipe.
+      <br><br>
+      The BuildKit <code>--mount=type=cache</code> on the NuGet folder is the modern addition — it persists the
+      package cache across builds even when the layer <em>is</em> invalidated, which helps CI where the layer cache
+      is often cold.
+      <br><br>
+      Worth mentioning as an alternative: <strong><code>dotnet publish /t:PublishContainer</code></strong> builds an
+      image with no Dockerfile at all, handling layering, non-root and base image selection for you. For a
+      straightforward service it's genuinely simpler, and it doesn't need a Docker daemon in CI.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Multi-stage isn't only about size — it's about what ships</div>
+    <p style="margin:0">A single-stage build on the SDK image gives you a ~800 MB image containing
+      <strong>the compiler, the SDK, NuGet caches and your source code</strong>. The runtime image is well under half
+      that.
+      <br><br>
+      Size matters for pull time and registry cost, but the security argument is stronger: <strong>the production
+      container has no compiler and no source</strong>. Anyone who gets a shell in it can't build or inspect
+      anything, and the attack surface is only what the app needs to run.
+      <br><br>
+      It also gives you a clean place to run tests — a stage between build and final that executes
+      <code>dotnet test</code>, so a failing test fails the image build and a broken image can't be produced at
+      all.
+      <br><br>
+      That's <em>structural</em> rather than procedural: it isn't a pipeline step someone can skip.</p>
+  </div>
+
+  <h2 id="base-images">Choosing a base image <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Image</th><th>Contains</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><code>dotnet/sdk</code></td><td>Compiler, SDK, everything</td><td><strong>Build stages only</strong></td></tr>
+        <tr><td><code>dotnet/aspnet</code></td><td>ASP.NET Core runtime</td><td><strong>The normal choice</strong> for web apps</td></tr>
+        <tr><td><code>dotnet/runtime</code></td><td>.NET runtime without ASP.NET</td><td>Console apps and workers</td></tr>
+        <tr><td><code>dotnet/runtime-deps</code></td><td>Native dependencies only</td><td><strong>Self-contained</strong> or AOT-published apps</td></tr>
+        <tr><td><strong>Chiseled</strong> variants</td><td>Ubuntu, <strong>no shell, no package manager</strong>, non-root by default</td><td><strong>Production — the best default now</strong></td></tr>
+        <tr><td>Alpine variants</td><td>musl libc, very small</td><td>Size-critical; watch for musl differences</td></tr>
+        <tr><td>Windows / Nano Server</td><td>Windows runtime</td><td>Only when you genuinely need Windows</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Chiseled images are the modern answer</div>
+    <p style="margin:0">Microsoft's <strong>chiseled</strong> images are Ubuntu-based and stripped to what .NET
+      actually needs: <strong>no shell, no package manager, no root user</strong>.
+      <br><br>
+      Two benefits. The <strong>vulnerability surface collapses</strong> — most CVEs reported against a container
+      image are in OS packages the app never uses, and removing them removes the findings, which is a real saving in
+      remediation effort. And <strong>no shell means no shell to exploit</strong>; a great deal of post-compromise
+      tooling assumes one exists.
+      <br><br>
+      The cost is that <strong>you can't <code>docker exec</code> into it to poke around</strong>, which changes how
+      you debug. Diagnostics must come from telemetry, or from
+      <a href="production.html#debugging">ephemeral debug containers</a> that attach a shell alongside the
+      pod — which is where Kubernetes' <code>kubectl debug</code> earns its place.
+      <br><br>
+      On <strong>Alpine</strong>: it's smaller, and it uses <strong>musl</strong> rather than glibc. That's mostly
+      fine for .NET now, but native dependencies compiled against glibc can fail in ways that are unpleasant to
+      diagnose. Chiseled gives you comparable size on a familiar libc, so it's usually the better trade.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Trimming and AOT: real gains, real constraints</div>
+    <p style="margin:0"><strong>ReadyToRun</strong> pre-compiles IL to native code, improving startup at the cost of
+      a larger image. Low risk, and a sensible default for anything where cold start matters.
+      <br><br>
+      <strong>Trimming</strong> removes unused IL. It can break <strong>reflection-based code</strong> — some
+      serialisers, DI conventions, EF Core patterns — and the failure appears at <em>runtime</em>, not build time.
+      So it needs real testing of the trimmed artefact, not just a successful build.
+      <br><br>
+      <strong>Native AOT</strong> gives dramatic startup and memory improvements and the tightest constraints: no
+      runtime code generation, no unbounded reflection, and several frameworks don't support it. It works well for
+      minimal APIs and console tools; it's often impractical for a large MVC app with EF Core.
+      <br><br>
+      The honest position: <strong>ReadyToRun by default, AOT where startup genuinely dominates</strong> — a Function
+      or a scale-to-zero service — and treat trimming as something to verify rather than enable and hope. For a
+      long-running web service, startup time is amortised and the constraints usually aren't worth it.</p>
+  </div>
+
+  <h2 id="dockerignore">.dockerignore <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <pre data-label="text — .dockerignore"><code class="language-text">**/bin/
+**/obj/
+**/.vs/
+**/node_modules/
+**/.git/
+**/.env
+**/appsettings.*.json      # keep environment config out of the image
+**/*.user
+**/TestResults/
+Dockerfile*
+docker-compose*
+README.md</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">It affects correctness, not just speed</div>
+    <p style="margin:0">The build context is everything sent to the daemon. Without a
+      <code>.dockerignore</code> that includes <strong><code>bin</code> and <code>obj</code></strong>, you ship
+      local build output into the image — which can be a different configuration or target framework than the one
+      you just built, producing genuinely confusing behaviour.
+      <br><br>
+      It's also a <strong>security control</strong>. Excluding <code>.git</code> keeps your full history out of the
+      image. Excluding <code>.env</code> and <code>appsettings.*.json</code> keeps local secrets and connection
+      strings out.
+      <br><br>
+      And it's a speed control: sending a <code>node_modules</code> folder or a large <code>.git</code> directory to
+      the daemon on every build is wasted time before anything starts.
+      <br><br>
+      Worth pairing with a <strong>narrow <code>COPY</code></strong> — copying specific paths rather than
+      <code>COPY . .</code> — so the image contains what you intended even if the ignore file is incomplete. Belt
+      and braces, and cheap.</p>
+  </div>
+
+  <h2 id="volumes-networks">Volumes and networks <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Storage</th><th>Is</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Named volume</strong></td><td>Docker-managed storage</td><td><strong>Persistent data</strong> — a local database's files</td></tr>
+        <tr><td><strong>Bind mount</strong></td><td>A host directory mapped in</td><td>Development — source, certificates, config</td></tr>
+        <tr><td><code>tmpfs</code></td><td>Memory-backed</td><td>Sensitive scratch data that must not touch disk</td></tr>
+        <tr><td>Nothing</td><td>The container's writable layer</td><td><strong>Lost when the container is removed</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Service discovery inside a Compose network</div>
+    <p style="margin:0">Containers on a user-defined network reach each other <strong>by service name</strong>, with
+      Docker's embedded DNS resolving it. So the API connects to <code>Server=sqlserver</code>, not to an IP.
+      <br><br>
+      That's the same idea as a Kubernetes Service, and it's why moving from Compose to Kubernetes is less of a jump
+      than it looks — both give a stable name in front of a moving target.
+      <br><br>
+      Two things to know. <strong>Port mapping is only for host access</strong>: within the network, containers use
+      the container port regardless of what's published. Publishing <code>8080:8080</code> is for <em>your</em>
+      browser, not for the other containers.
+      <br><br>
+      And <strong><code>localhost</code> inside a container is that container.</strong> Trying to reach the host
+      database on <code>localhost</code> from inside a container is the classic first-day mistake — the host is
+      <code>host.docker.internal</code> on Docker Desktop.</p>
+  </div>
+
+  <pre data-label="yaml — a dev stack with health-gated startup" class="code-good"><code class="language-yaml">services:
+  api:
+    build:
+      context: .
+      dockerfile: src/Orders.Api/Dockerfile
+    ports: ["8080:8080"]
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Default: "Server=sqlserver;Database=orders;User Id=sa;Password=${SA_PASSWORD};TrustServerCertificate=True"
+      ConnectionStrings__Redis: "redis:6379"
+    depends_on:
+      sqlserver: { condition: service_healthy }   # WAIT for healthy, not just started
+      redis:     { condition: service_started }
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${SA_PASSWORD}
+    ports: ["1433:1433"]
+    volumes: ["sqldata:/var/opt/mssql"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1'"]
+      interval: 10s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+volumes:
+  sqldata:</code></pre>
+
+  <div class="note warn">
+    <div class="note-title"><code>depends_on</code> alone doesn't mean "ready"</div>
+    <p style="margin:0">Plain <code>depends_on</code> waits for the container to <em>start</em>, not for the service
+      inside it to be usable. SQL Server takes 20–30 seconds to accept connections after the container is running.
+      <br><br>
+      So the API starts, tries to connect, fails, and — depending on your startup code — either crashes or logs a
+      confusing error. It's the standard "works the second time you run it" symptom.
+      <br><br>
+      <strong><code>condition: service_healthy</code> with a real health check</strong> fixes it properly, which is
+      why the check above runs an actual query rather than checking a port.
+      <br><br>
+      Worth also making the <strong>application resilient to it</strong>, with connection retry on startup, since
+      the same race exists in production during a rolling deployment or a database failover. The Compose fix makes
+      development pleasant; retry logic makes production correct — and you want both.</p>
+  </div>
+
+  <h2 id="security">Security <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Practice</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Non-root user</strong></td><td>A container escape starts from an unprivileged account</td></tr>
+        <tr><td><strong>Minimal base image</strong></td><td>Fewer packages, fewer CVEs, no shell to exploit</td></tr>
+        <tr><td><strong>Pin the base image by digest</strong></td><td><code>:9.0</code> moves; a digest is reproducible</td></tr>
+        <tr><td><strong>Scan images in CI</strong></td><td>Trivy, Defender for Containers, registry scanning</td></tr>
+        <tr><td><strong>Read-only root filesystem</strong></td><td>An attacker can't write a payload to disk</td></tr>
+        <tr><td><strong>Drop capabilities</strong></td><td>Almost no app needs <code>NET_ADMIN</code> or <code>SYS_PTRACE</code></td></tr>
+        <tr><td><strong>No secrets in the image</strong></td><td>Extractable from any layer, forever</td></tr>
+        <tr><td><strong>No Docker socket mount</strong></td><td>Mounting <code>/var/run/docker.sock</code> is root on the host</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — patching containers means rebuilding, not updating</div>
+    <p style="margin:0">There's no <code>apt upgrade</code> in a running container's lifecycle. A CVE in a base image
+      layer is fixed by <strong>rebuilding on the patched base and redeploying</strong>.
+      <br><br>
+      Which has a real organisational consequence: <strong>your patching cadence is your deployment
+      cadence</strong>. A service last deployed eight months ago is running eight-month-old OS packages, whatever
+      your vulnerability policy says.
+      <br><br>
+      So container security depends on being able to rebuild and redeploy routinely — meaning a reliable pipeline
+      and a test suite you trust. Teams that deploy rarely accumulate vulnerabilities they can't practically fix,
+      because the redeploy itself is risky.
+      <br><br>
+      That's why "we scan images" is only half an answer. The scan produces findings; <strong>the ability to ship
+      resolves them.</strong> A useful framing: <em>a scheduled rebuild of unchanged services</em>, so patches land
+      even when the code doesn't change.
+      <br><br>
+      The other half is <strong>tagging discipline</strong>. Immutable version tags — or digests — so you know
+      exactly what's running and can roll back precisely. <code>:latest</code> defeats both: you can't tell what's
+      deployed, and you can't reliably go back.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Each instruction is a cached layer; changing one invalidates everything below.</li>
+      <li>Order least-volatile to most-volatile — project files and restore before source.</li>
+      <li>Layers are additive: a deleted secret is still in the image.</li>
+      <li>Use BuildKit secret mounts and a real <code>.dockerignore</code>.</li>
+      <li>Multi-stage so no compiler or source ships to production.</li>
+      <li>A test stage makes a broken image impossible to build.</li>
+      <li>Chiseled images are the best production default — no shell, no root.</li>
+      <li>ReadyToRun by default; AOT where startup dominates; verify trimming.</li>
+      <li><code>depends_on</code> needs <code>service_healthy</code>, and the app still needs retry.</li>
+      <li><code>localhost</code> in a container is that container.</li>
+      <li>Non-root, read-only root filesystem, dropped capabilities, no Docker socket.</li>
+      <li>Patching means rebuilding — your patch cadence is your deploy cadence.</li>
+      <li>Immutable tags or digests, never <code>:latest</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>COPY . .</code> before <code>dotnet restore</code></strong>, destroying the cache on every
+      commit.</li>
+    <li><strong>Shipping the SDK image</strong> to production.</li>
+    <li><strong>Secrets copied then deleted</strong>, still extractable from the layer.</li>
+    <li><strong>No <code>.dockerignore</code></strong>, so <code>bin</code>, <code>obj</code>, <code>.git</code>
+      and local config go in.</li>
+    <li><strong>Running as root</strong> when the image ships a non-root user.</li>
+    <li><strong><code>:latest</code> tags</strong>, so you can't tell what's deployed or roll back.</li>
+    <li><strong>Connection strings baked into the image</strong> instead of injected.</li>
+    <li><strong>Writing application data to the container filesystem</strong> with no volume.</li>
+    <li><strong>Using <code>localhost</code></strong> to reach another container.</li>
+    <li><strong>Relying on <code>depends_on</code></strong> without a health condition.</li>
+    <li><strong>Enabling trimming</strong> without testing the trimmed output.</li>
+    <li><strong>Mounting the Docker socket</strong> into a container.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Walk me through a production Dockerfile for a .NET API. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd use a <strong>multi-stage build</strong>, and I'd organise it around two things: layer caching and
+          what ends up in the final image."</p>
+        <p>"<strong>The build stage</strong> starts from the SDK image. The key detail is the copy order: I copy
+          <strong>only the <code>.csproj</code> and props files first</strong>, run <code>dotnet restore</code>, and
+          <em>then</em> copy the source."</p>
+        <p>"That's the single most impactful thing in the file. Layers invalidate downward, so if I did
+          <code>COPY . .</code> followed by restore, <strong>any</strong> source change would invalidate the copy
+          layer and re-run the full restore — fetching every package again on every commit. Splitting it means the
+          restore layer is keyed on project dependencies, which change rarely."</p>
+        <p>"It's the general principle of <strong>least volatile first</strong>, which applies to any Dockerfile —
+          the same reason system package installs go before application code."</p>
+        <p>"I'd add a <strong>BuildKit cache mount on the NuGet folder</strong>, which persists packages across
+          builds even when the layer is invalidated. That matters in CI, where the layer cache is often cold."</p>
+        <p>"<strong>The final stage</strong> starts from the ASP.NET runtime image — or better,
+          <strong>chiseled</strong> — and copies only the publish output. So the production image has
+          <strong>no compiler, no SDK, no NuGet cache and no source code</strong>. Smaller, yes, but the security
+          argument matters more: if someone gets a shell in that container, there's nothing there to use."</p>
+        <p>"On the base image, I'd pick <strong>chiseled</strong> for production. No shell, no package manager,
+          non-root by default. Most CVEs reported against container images are in OS packages the app never touches,
+          and removing them removes the findings — which is real remediation effort saved. The trade is that I can't
+          <code>docker exec</code> in to look around, so diagnostics have to come from telemetry or an ephemeral
+          debug container."</p>
+        <p>"<strong>Non-root user</strong> — the Microsoft images provide <code>$APP_UID</code>, so it's one
+          line. Combined with .NET 8+ binding to port 8080 by default rather than 80, there's no need for privileged
+          ports."</p>
+        <p>"I'd also add a <strong>test stage</strong> between build and final that runs <code>dotnet test</code>.
+          A failing test then fails the image build, so a broken image can't be produced at all. That's structural
+          rather than a pipeline step someone can skip."</p>
+        <p>"Things I'd deliberately <em>not</em> put in it: <strong>no secrets, no environment-specific
+          configuration.</strong> The image must be identical across environments — that's what makes it the artefact
+          I tested. Connection strings come from environment variables or Key Vault at runtime."</p>
+        <p>"And I'd note that <strong>a secret copied and later deleted is still in the image</strong>, because
+          layers are additive. If the build needs a private NuGet feed token, that goes through a BuildKit secret
+          mount, not a <code>COPY</code>."</p>
+        <p>"Supporting pieces: a <strong><code>.dockerignore</code></strong> excluding <code>bin</code>,
+          <code>obj</code>, <code>.git</code> and <code>appsettings.*.json</code> — it's a correctness and security
+          control, not just speed, because shipping local build output produces genuinely confusing behaviour. And
+          <strong>immutable version tags</strong>, never <code>:latest</code>, so I can tell what's running and roll
+          back precisely."</p>
+        <p>"One alternative worth mentioning: <strong><code>dotnet publish /t:PublishContainer</code></strong> builds
+          an image with no Dockerfile at all, handling layering, non-root and base image selection. For a
+          straightforward service it's simpler and doesn't need a Docker daemon in CI. I'd reach for a Dockerfile
+          when the build needs something it can't express."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know why restore comes before copying source?</li>
+        <li>Do you use multi-stage, and can you say why beyond size?</li>
+        <li>Do you run as non-root and pick a minimal base?</li>
+        <li>Do you keep secrets and config out of the image?</li>
+        <li>Do you know layers are additive?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a single-stage build on the SDK image.</li>
+        <li><span class="redflag">Red flag:</span> <code>COPY . .</code> then restore.</li>
+        <li><span class="redflag">Red flag:</span> configuration baked into the image.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you use a private NuGet feed in the build?</li>
+          <li>How would you debug a chiseled image with no shell?</li>
+          <li>Would you enable trimming or AOT?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Your image is 1.2 GB and builds take six minutes. Fix both. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Two different problems with overlapping fixes. I'd measure first — <code>docker history</code> shows
+          which layers are large, and BuildKit output shows which steps are slow and which were cached — because
+          guessing here wastes time."</p>
+        <p>"<strong>On size</strong>, the usual causes in order."</p>
+        <p>"<strong>Shipping the SDK image.</strong> If the final stage is <code>dotnet/sdk</code>, that alone is
+          most of the 1.2 GB — compiler, SDK, NuGet caches. Moving to a multi-stage build with
+          <code>dotnet/aspnet</code> as the final stage typically takes it to around 220 MB. Chiseled takes it lower
+          again, and removes the shell and package manager while it's at it."</p>
+        <p>"<strong>The build context being copied in.</strong> Without a <code>.dockerignore</code>,
+          <code>bin</code>, <code>obj</code>, <code>node_modules</code> and <code>.git</code> all go into the image.
+          A large <code>.git</code> directory alone can be hundreds of megabytes — and it's a security issue too,
+          since it contains your full history."</p>
+        <p>"<strong>Files deleted in a later layer.</strong> Layers are additive, so <code>rm</code> in a later
+          instruction doesn't reclaim anything — it just adds a deletion marker. Anything downloaded and cleaned up
+          must be in the same <code>RUN</code>, or better, in a stage you don't copy from."</p>
+        <p>"<strong>Frontend build artefacts.</strong> If there's a Node build, the whole
+          <code>node_modules</code> tree often ends up in the image when only the compiled output is needed. That's
+          a separate build stage copying just <code>dist</code>."</p>
+        <p>"<strong>On build time</strong>, this is almost always <strong>cache invalidation</strong> rather than
+          slow compilation."</p>
+        <p>"The dominant cause is <strong><code>COPY . .</code> before <code>dotnet restore</code></strong>. Every
+          source change invalidates the copy layer, so restore re-runs and every package is fetched again. Splitting
+          it — copy the <code>.csproj</code> files, restore, then copy source — means a typical code-only change
+          skips restore entirely. That's usually minutes down to tens of seconds."</p>
+        <p>"Then a <strong>BuildKit cache mount on the NuGet packages folder</strong>, which persists across builds
+          even when the layer is invalidated. That's specifically valuable in CI, where the layer cache is frequently
+          cold and the fix above doesn't help."</p>
+        <p>"In CI I'd also check whether the layer cache exists at all. A fresh runner has none, so
+          <strong><code>--cache-from</code> pointing at the registry</strong>, or a registry-backed BuildKit cache,
+          is what makes previous layers reusable. Optimising Dockerfile order and then throwing the cache away every
+          build is a common wasted effort."</p>
+        <p>"Other build-time items: <strong>parallel stages</strong>, since BuildKit runs independent stages
+          concurrently — a Node build and a .NET build don't need to be sequential. And <code>--no-restore</code> on
+          publish so it doesn't restore a second time."</p>
+        <p>"On whether to reach for <strong>trimming or AOT</strong> for size — I'd be cautious. Trimming can break
+          reflection-based code at <em>runtime</em>, not build time, so it needs the trimmed artefact properly
+          tested. AOT is more constrained again. For a long-running web service the startup benefit is amortised and
+          the image savings are usually not worth the risk. I'd take the easy 80% from multi-stage and chiseled
+          first."</p>
+        <p>"The order I'd actually do it: <strong>multi-stage and a <code>.dockerignore</code></strong> — biggest
+          size win, near-zero risk. <strong>Reorder for caching</strong> — biggest time win, no risk. Then chiseled,
+          then CI cache configuration. Measure after each, because the first two usually resolve most of it and the
+          rest can be judged against effort."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you measure before optimising?</li>
+        <li>Do you know the SDK image is usually the size problem?</li>
+        <li>Do you know cache invalidation is usually the time problem?</li>
+        <li>Do you know layers are additive so deletion doesn't shrink?</li>
+        <li>Do you think about CI cache availability?</li>
+        <li>Are you appropriately cautious about trimming?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> jumping to Alpine or AOT as the first move.</li>
+        <li><span class="redflag">Red flag:</span> adding <code>rm</code> commands to shrink layers.</li>
+        <li><span class="redflag">Red flag:</span> no mention of cache ordering.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you make the layer cache work in CI?</li>
+          <li>What breaks with trimming, and how would you find out?</li>
+          <li>What's actually in a 220 MB aspnet image?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IaC in Production — Infrastructure as Code</title>
+<meta name="description" content="Pipelines and approvals, OIDC instead of secrets, drift detection, environment strategy, policy as code and the tool comparison.">
+<meta name="keywords" content="IaC pipeline plan approval OIDC federated credentials workload identity federation drift detection Checkov tfsec Azure Policy landing zones environment strategy blast radius Terraform vs Bicep vs ARM Pulumi testing infrastructure">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="26-iac/practices.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>IaC in Production</h1>
+    <p class="subtitle">The tool matters less than the pipeline around it. This page is about the parts that keep it
+      trustworthy.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Plan on the pull request, apply after approval</strong> — applying the saved plan.</li>
+      <li><strong>OIDC federation, not a service principal secret.</strong> No credential to rotate.</li>
+      <li><strong>Humans get read-only in the portal.</strong> The pipeline holds write.</li>
+      <li><strong>Scheduled drift detection</strong>, alerting on any difference.</li>
+      <li><strong>A documented break-glass path</strong> — emergencies happen anyway.</li>
+      <li><strong>Policy as code</strong> so insecure configuration fails the build.</li>
+      <li><strong>Split state by blast radius</strong>, not by tidiness.</li>
+      <li><strong>Same definition, different parameters</strong> across environments.</li>
+    </ul>
+  </div>
+
+  <h2 id="pipeline">The pipeline <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="yaml — OIDC login and a reviewed plan artefact" class="code-good"><code class="language-yaml">name: infrastructure
+
+on:
+  pull_request:
+    paths: ['infra/**']
+  push:
+    branches: [main]
+    paths: ['infra/**']
+
+permissions:
+  id-token: write          # required for OIDC - this is what replaces a secret
+  contents: read
+  pull-requests: write     # to post the plan as a comment
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    environment: production-plan          # read-only credentials
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:                             # NO client secret anywhere
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8        # pinned, like the providers
+
+      - run: terraform init
+        working-directory: infra/envs/prod
+
+      - run: terraform validate
+        working-directory: infra/envs/prod
+
+      # Security and policy scanning BEFORE anything is applied
+      - uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infra
+          soft_fail: false                # findings fail the build
+
+      - name: Plan
+        run: terraform plan -out=tf.plan -input=false
+        working-directory: infra/envs/prod
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tf-plan
+          path: infra/envs/prod/tf.plan   # THIS artefact is what gets applied
+
+  apply:
+    needs: plan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production               # requires a human approval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - uses: actions/download-artifact@v4
+        with: { name: tf-plan, path: infra/envs/prod }
+      - run: terraform init
+        working-directory: infra/envs/prod
+      # Apply the REVIEWED plan, not a freshly computed one
+      - run: terraform apply -input=false -auto-approve tf.plan
+        working-directory: infra/envs/prod</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the plan artefact is what makes the approval mean something</div>
+    <p style="margin:0">The important structural detail is that <strong>the plan job saves a plan file and the
+      apply job applies that exact file</strong>.
+      <br><br>
+      If apply recomputes its own plan, the approval was for a <em>different</em> set of operations than the one
+      that runs. State may have changed, someone may have made a portal change, another apply may have run. So the
+      approval degrades into "I approve of the general idea."
+      <br><br>
+      Applying the saved plan means the reviewed operations are the executed operations — and if reality has moved,
+      the apply <strong>fails</strong> rather than doing something different. Failing is the correct outcome there.
+      <br><br>
+      Two supporting details worth naming. The plan job uses a <strong>read-only identity</strong>, so a pull
+      request from anywhere can safely produce a plan without any ability to change infrastructure — which matters
+      because plan runs on untrusted input. And apply is gated by a <strong>GitHub environment</strong> (or an Azure
+      DevOps approval), so the human gate is enforced by the platform rather than by convention.
+      <br><br>
+      One caution on plan output: <strong>a plan can contain sensitive values</strong>. Posting it verbatim as a
+      pull request comment on a public repository leaks them, so redact or restrict where plans are published.</p>
+  </div>
+
+  <h2 id="oidc">OIDC instead of secrets <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Service principal secret</th><th>OIDC federated credential</th></tr></thead>
+      <tbody>
+        <tr><td>Stored</td><td><strong>In the CI system, as a secret</strong></td><td><strong>Nothing is stored</strong></td></tr>
+        <tr><td>Expiry</td><td>Expires; deployment breaks when it does</td><td>Tokens are per-run and short-lived</td></tr>
+        <tr><td>Rotation</td><td>A recurring manual task</td><td><strong>Nothing to rotate</strong></td></tr>
+        <tr><td>If leaked</td><td>Usable by anyone, from anywhere</td><td><strong>Useless — bound to repo, branch and environment</strong></td></tr>
+        <tr><td>Scope</td><td>Whatever it was granted</td><td>Constrained by the federation subject</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the binding is what makes it strong, not the absence of a secret</div>
+    <p style="margin:0">The obvious benefit is that there's no credential to store or rotate. The stronger property
+      is <strong>what the trust is bound to</strong>.
+      <br><br>
+      A federated credential names a <em>subject</em>: this repository, this branch or this environment, from this
+      issuer. So a token minted for <code>repo:org/infra:environment:production</code> is only issued to a workflow
+      run that genuinely meets those conditions — checked by Entra against GitHub's signed token, not asserted by the
+      workflow.
+      <br><br>
+      Which means even a fully compromised CI configuration in another repository cannot obtain it. A leaked client
+      secret, by contrast, works from anywhere until someone notices.
+      <br><br>
+      Two things to get right. <strong>Federate on the environment, not just the repository</strong>, or any branch
+      in that repo can request production credentials — which defeats the approval gate you just built. And keep the
+      <strong>plan identity separate from the apply identity</strong>: Reader for plan, Contributor for apply. Plan
+      runs on pull requests, including from forks in some configurations, so it should never hold write access.
+      <br><br>
+      Same reasoning as <a href="../24-azure/config-secrets.html#managed-identity">managed identity</a> for
+      applications: the best credential is one that doesn't exist.</p>
+  </div>
+
+  <h2 id="permissions">Who can change infrastructure <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Principal</th><th>Production access</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Developers</strong></td><td><strong>Reader.</strong> Enough to diagnose, not to change</td></tr>
+        <tr><td><strong>Plan identity</strong></td><td>Reader, plus state read/write</td></tr>
+        <tr><td><strong>Apply identity</strong></td><td><strong>Contributor</strong>, scoped to its own resource groups</td></tr>
+        <tr><td><strong>Break-glass group</strong></td><td>Elevated, <strong>time-bound via PIM</strong>, alerting on activation</td></tr>
+        <tr><td>Platform team</td><td>Owner at management group, for policy and landing zones</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — without read-only humans, IaC is advisory</div>
+    <p style="margin:0">This is the point that separates a team that <em>uses</em> IaC from one that
+      <em>relies</em> on it.
+      <br><br>
+      If engineers have Contributor in production, then IaC is a convention people follow when convenient. Under
+      pressure someone will click, because clicking is faster — and that's a completely rational choice for the
+      individual in that moment. Drift then accumulates, the repository stops matching reality, and people stop
+      trusting it.
+      <br><br>
+      <strong>Reader for humans, write for the pipeline</strong> makes the code the only path. Not because people
+      are untrustworthy, but because it removes the temptation entirely and keeps the repository authoritative.
+      <br><br>
+      The necessary companion is a <strong>break-glass path</strong>, and this is where a lot of well-intentioned
+      policies fail. During a genuine incident someone may need to change something now. If there's no sanctioned
+      way, they'll find an unsanctioned one — a shared account, a standing exemption — and you've lost both the
+      control and the audit trail.
+      <br><br>
+      So: an elevation group activated through <strong>PIM</strong>, time-bound to a few hours, requiring a
+      justification, <strong>alerting the team on activation</strong>, and with a mandatory follow-up to reconcile
+      the code. That's the mature position — <strong>plan for the emergency instead of forbidding it</strong>.</p>
+  </div>
+
+  <h2 id="drift">Drift detection <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="yaml — a nightly job that finds drift while it's cheap" class="code-good"><code class="language-yaml">name: drift-detection
+
+on:
+  schedule:
+    - cron: '0 6 * * *'      # every morning, before anyone deploys
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  detect:
+    strategy:
+      fail-fast: false        # check every environment even if one drifts
+      matrix:
+        env: [dev, test, prod]
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.env }}-plan     # READ-ONLY identity
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: hashicorp/setup-terraform@v3
+
+      - run: terraform init
+        working-directory: infra/envs/${{ matrix.env }}
+
+      # -detailed-exitcode: 0 = no changes, 2 = changes present, 1 = error
+      - name: Detect drift
+        id: drift
+        continue-on-error: true
+        run: terraform plan -detailed-exitcode -input=false -no-color
+        working-directory: infra/envs/${{ matrix.env }}
+
+      - name: Raise an issue if drift found
+        if: steps.drift.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Infrastructure drift detected in ${{ matrix.env }}`,
+              labels: ['drift', 'infrastructure'],
+              body: 'A scheduled plan found differences. Review the run log.'
+            })</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The value is timing, not detection</div>
+    <p style="margin:0">Drift gets discovered eventually — the next time someone runs a plan. The problem is
+      <em>when</em>: usually mid-deployment, when someone is trying to ship something unrelated and now has to
+      decide, under time pressure, whether an unexpected change in the plan is safe to apply.
+      <br><br>
+      A nightly check moves that discovery to a quiet morning, with context still fresh about whatever happened
+      yesterday.
+      <br><br>
+      It also catches the more dangerous case: <strong>drift that IaC would silently revert</strong>. An emergency
+      firewall rule added during an incident will be removed by the next apply, at some unrelated moment, with no
+      obvious connection to anything. That's how an outage returns weeks later, and it's genuinely hard to diagnose.
+      <br><br>
+      Two implementation details. Use <code>-detailed-exitcode</code>, which returns 2 specifically for "changes
+      present", so you can distinguish drift from an error. And <strong>route the alert somewhere with an
+      owner</strong> — an issue or a channel message. A nightly job that fails quietly is worse than none, because it
+      creates the impression of coverage.
+      <br><br>
+      For Bicep the equivalent is a scheduled <code>what-if</code>, with the caveat that it's noisier on
+      modifications, so tune what you alert on or you'll train people to ignore it.</p>
+  </div>
+
+  <h2 id="policy">Policy as code <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Layer</th><th>Catches</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Linting</strong> (tflint, bicep lint)</td><td>Syntax, deprecated usage, naming</td><td>Editor and CI</td></tr>
+        <tr><td><strong>Static analysis</strong> (Checkov, tfsec, trivy)</td><td><strong>Insecure configuration</strong> — public access, no encryption, weak TLS</td><td>Pull request</td></tr>
+        <tr><td><strong>Plan inspection</strong></td><td><strong>Destructive operations</strong> on protected resources</td><td>Pull request</td></tr>
+        <tr><td><strong>Azure Policy</strong></td><td>Non-compliant resources, <strong>however they were created</strong></td><td>At deployment, and continuously</td></tr>
+        <tr><td>OPA / Conftest / Sentinel</td><td>Organisation-specific rules on the plan</td><td>Pull request</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — Azure Policy is the layer that can't be bypassed</div>
+    <p style="margin:0">CI checks are excellent and they share one weakness: <strong>they only see changes that go
+      through CI</strong>. A portal change, a CLI command, another team's pipeline — none of it is scanned.
+      <br><br>
+      <strong>Azure Policy evaluates at the resource-manager level</strong>, so it applies to every creation path.
+      A <code>deny</code> effect makes a non-compliant resource impossible to create, whoever is creating it and
+      however. <code>deployIfNotExists</code> can add diagnostics settings automatically so nothing is deployed
+      without telemetry.
+      <br><br>
+      That's the difference between a rule that's <em>checked</em> and a rule that's <em>enforced</em> — and it's the
+      same structural-not-procedural principle that runs through this whole part of the handbook.
+      <br><br>
+      So the layers complement each other. <strong>CI scanning gives fast, specific feedback</strong> in the pull
+      request where the fix is cheap and the author has context. <strong>Azure Policy is the backstop</strong> that
+      holds regardless of path. Neither replaces the other: policy alone gives you a deployment failure with a
+      cryptic message; CI alone gives you a rule people can route around.
+      <br><br>
+      One practical note: <strong>start policies in <code>audit</code> mode.</strong> Turning on <code>deny</code>
+      across an existing estate will block legitimate deployments in ways nobody predicted. Audit first, look at
+      what's non-compliant, fix or exempt deliberately, then enforce.</p>
+  </div>
+
+  <h2 id="environments">Environment strategy <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="text — a layout that scales"><code class="language-text">infra/
+  modules/                     reusable, versioned building blocks
+    web-app/
+    sql-database/
+    networking/
+
+  envs/
+    dev/
+      main.tf                  thin - mostly module calls
+      terraform.tfvars         small SKUs, relaxed settings
+      backend.tf               its OWN state
+    test/
+    prod/
+      main.tf                  same modules, same structure
+      terraform.tfvars         production SKUs, zone redundancy, strict settings
+      backend.tf               its own state, separate storage account
+
+  policy/                      Azure Policy definitions and assignments
+
+  Same modules everywhere. Differences live in tfvars, visibly.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Principle</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Same definition, different parameters</strong></td><td>If dev and prod are different code, dev tests nothing</td></tr>
+        <tr><td><strong>Separate state per environment</strong></td><td>A dev mistake cannot reach production</td></tr>
+        <tr><td><strong>Separate subscriptions</strong></td><td>Quota isolation, clean cost attribution, a real boundary</td></tr>
+        <tr><td><strong>Promote through environments</strong></td><td>The same commit reaches prod having passed test</td></tr>
+        <tr><td><strong>Split state by blast radius</strong></td><td>Networking changes rarely; apps change daily</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Parity has limits, and pretending otherwise wastes money</div>
+    <p style="margin:0">"Dev should be identical to production" is the ideal and it's rarely affordable. Zone-redundant
+      Premium plans, geo-replicated databases and a full AKS cluster per environment is a serious bill.
+      <br><br>
+      The useful distinction is between <strong>structural parity</strong> and <strong>capacity parity</strong>.
+      <br><br>
+      <strong>Structure must match:</strong> the same resource types, the same networking topology, the same identity
+      and authentication model, the same TLS and firewall configuration. These are where behavioural differences
+      hide — if dev uses a connection string and prod uses managed identity, dev never tests the thing most likely to
+      break.
+      <br><br>
+      <strong>Capacity can differ:</strong> SKU sizes, instance counts, redundancy tier, retention periods. A B1
+      plan in dev and P1v3 in prod is fine; both are App Service and behave the same way.
+      <br><br>
+      The differences worth being nervous about are the ones that change <em>semantics</em>: single-instance dev
+      versus multi-instance prod hides every
+      <a href="../24-azure/app-service.html#scaling">local-state bug</a>, and a serverless database tier can behave
+      differently under load. Running <strong>at least two instances even in dev</strong> is a cheap way to close the
+      most damaging gap.
+      <br><br>
+      And keep the differences in a <strong>parameter file rather than in conditionals</strong>. A tfvars file is
+      readable; <code>count = var.environment == "prod" ? 3 : 1</code> scattered through the code means production's
+      actual shape can only be discovered by mentally evaluating expressions.</p>
+  </div>
+
+  <h2 id="testing">Testing infrastructure code <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>What it verifies</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>validate</code> and lint</strong></td><td>It parses and is internally consistent</td><td>Seconds</td></tr>
+        <tr><td><strong>Static analysis</strong></td><td>Security and convention rules</td><td>Seconds</td></tr>
+        <tr><td><strong>Plan assertions</strong></td><td><strong>The plan contains what you expect</strong> — via JSON output</td><td>Under a minute</td></tr>
+        <tr><td><code>terraform test</code></td><td>Native module tests, with or without applying</td><td>Varies</td></tr>
+        <tr><td><strong>Ephemeral environment</strong></td><td><strong>It actually deploys and works</strong></td><td>Minutes, and real money</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Plan assertions are the best value</div>
+    <p style="margin:0">Deploying to a real environment is the only way to know something truly works, and it's slow
+      and costs money — so it isn't a per-pull-request check.
+      <br><br>
+      <strong>Asserting against the JSON plan</strong> gets you most of the way in seconds. <code>terraform show
+      -json</code> gives a machine-readable description of every intended change, so you can assert mechanically:
+      no resource is being deleted, every storage account has HTTPS-only enabled, no SQL server permits public
+      network access, everything carries the required tags.
+      <br><br>
+      That catches the mistakes that actually happen, in the pull request, where the fix is cheap.
+      <br><br>
+      For <strong>modules</strong>, which are consumed repeatedly and where a bug multiplies,
+      <code>terraform test</code> is worth the investment — including a real apply against a throwaway resource
+      group for the important ones.
+      <br><br>
+      What I'd be sceptical about is elaborate testing of <em>root</em> configurations. They change constantly, and
+      the honest test is deploying to a real environment and promoting the same commit through it — which the
+      pipeline already does. Effort is better spent on plan assertions plus fast, safe rollback.</p>
+  </div>
+
+  <h2 id="comparison">Choosing a tool <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Terraform</th><th>Bicep</th><th>ARM JSON</th><th>Pulumi</th></tr></thead>
+      <tbody>
+        <tr><td>Scope</td><td><strong>Multi-cloud + SaaS</strong></td><td>Azure only</td><td>Azure only</td><td>Multi-cloud</td></tr>
+        <tr><td>Language</td><td>HCL</td><td>Bicep DSL</td><td>JSON</td><td><strong>C#, TypeScript, Python</strong></td></tr>
+        <tr><td>State</td><td><strong>You manage it</strong></td><td><strong>None</strong></td><td>None</td><td>Managed service or self-hosted</td></tr>
+        <tr><td>New Azure features</td><td>Waits for the provider</td><td><strong>Day one</strong></td><td>Day one</td><td>Waits for the provider</td></tr>
+        <tr><td>Preview / plan quality</td><td><strong>Precise</strong></td><td>Noisier <code>what-if</code></td><td>Same as Bicep</td><td>Good</td></tr>
+        <tr><td>Removal handling</td><td><strong>Deletes what you remove</strong></td><td>Incremental never deletes; stacks do</td><td>Same</td><td>Deletes</td></tr>
+        <tr><td>Ecosystem</td><td><strong>Largest</strong></td><td>Azure Verified Modules</td><td>Minimal</td><td>Growing</td></tr>
+        <tr><td>Write by hand?</td><td>Yes</td><td>Yes</td><td><strong>No — generated only</strong></td><td>Yes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">A word on Pulumi</div>
+    <p style="margin:0">Pulumi lets you define infrastructure in <strong>C#</strong>, which is genuinely appealing to
+      a .NET team: real types, real tests, real refactoring tools, and the language you already know.
+      <br><br>
+      The counterargument is the one that decides it for most teams: <strong>a general-purpose language invites
+      general-purpose complexity.</strong> HCL and Bicep are constrained, and that constraint keeps infrastructure
+      definitions readable by people who didn't write them — including operations staff and auditors.
+      <br><br>
+      With C# available, someone will eventually add a class hierarchy, a factory and some LINQ, and the
+      infrastructure becomes a program you must execute mentally to understand what it deploys.
+      <br><br>
+      Worth knowing it exists and being able to articulate that trade. In practice the ecosystem and hiring pool for
+      Terraform and Bicep are much larger, which matters more than language preference.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Save the plan as an artefact and apply that file, so the approval means something.</li>
+      <li>Plan identity read-only, apply identity write, both separate.</li>
+      <li>OIDC federation on the environment — no secret, and bound to repo and environment.</li>
+      <li>Reader for humans in production; otherwise IaC is advisory.</li>
+      <li>A PIM break-glass path with alerting and mandatory reconciliation.</li>
+      <li>Nightly drift detection with <code>-detailed-exitcode</code>, alerting an owner.</li>
+      <li>CI scanning for fast feedback; Azure Policy as the unbypassable backstop.</li>
+      <li>Start policies in audit mode before denying.</li>
+      <li>Structural parity across environments; capacity can differ.</li>
+      <li>Two instances even in dev, to surface local-state bugs.</li>
+      <li>Differences in parameter files, not conditionals.</li>
+      <li>Plan assertions are the best-value test; module tests for reused code.</li>
+      <li>Terraform for multi-cloud and ecosystem; Bicep for Azure-only and no state.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Apply recomputing its own plan</strong>, so the approval covered something else.</li>
+    <li><strong>One identity for plan and apply</strong>, giving write access to pull request runs.</li>
+    <li><strong>A service principal secret in CI</strong> instead of OIDC.</li>
+    <li><strong>OIDC federated on the repository only</strong>, so any branch can reach production.</li>
+    <li><strong>Developers with Contributor in production</strong>, so drift is inevitable.</li>
+    <li><strong>No break-glass path</strong>, so emergencies happen unsanctioned.</li>
+    <li><strong>No drift detection</strong>, so drift is found mid-deployment.</li>
+    <li><strong>A drift job that fails quietly</strong>, creating false confidence.</li>
+    <li><strong>Policy set to <code>deny</code> immediately</strong>, blocking legitimate work.</li>
+    <li><strong>Different code per environment</strong>, so dev tests nothing.</li>
+    <li><strong>Single-instance dev</strong>, hiding every scale-out bug.</li>
+    <li><strong>Environment conditionals scattered through the code.</strong></li>
+    <li><strong>Plan output with secrets posted publicly.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Design the pipeline that deploys your infrastructure. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd design it around one question: <strong>can someone change production without a reviewed plan?</strong>
+          If the answer is yes anywhere, the rest is decoration."</p>
+        <p>"<strong>On a pull request</strong>, the pipeline runs validate, lint, security scanning and a
+          <code>plan</code>. The plan is posted as a comment and <strong>saved as an artefact</strong>."</p>
+        <p>"That artefact is the important part. <strong>Apply must apply the saved plan, not compute a fresh
+          one.</strong> Otherwise the approval was for a different set of operations than the one that runs — state
+          may have moved, someone may have made a portal change. Applying the saved file means the reviewed
+          operations are the executed operations, and if reality has shifted the apply <em>fails</em>, which is the
+          correct outcome."</p>
+        <p>"The plan job uses a <strong>read-only identity</strong>. Plan runs on pull requests, which is
+          semi-untrusted input, so it must have no ability to change anything. Apply uses a separate identity with
+          Contributor scoped to its own resource groups."</p>
+        <p>"<strong>Authentication is OIDC federation</strong>, not a service principal secret. No credential stored,
+          nothing to rotate, and nothing to leak. The stronger property is what the trust is bound to — a federated
+          credential names a subject like <code>repo:org/infra:environment:production</code>, so Entra only issues a
+          token to a run that genuinely meets those conditions."</p>
+        <p>"I'd federate on the <strong>environment</strong>, not just the repository, because repository-level
+          federation lets any branch request production credentials — which defeats the approval gate."</p>
+        <p>"<strong>On merge to main</strong>, apply runs behind a <strong>GitHub environment with required
+          reviewers</strong>, so the human gate is enforced by the platform rather than by convention."</p>
+        <p>"<strong>Automated checks I'd add before the human sees it:</strong> Checkov or tfsec for insecure
+          configuration, and — the one I'd insist on — a check on the <strong>JSON plan</strong> that fails the build
+          if any protected resource type would be deleted. <code>terraform show -json</code> makes that mechanical
+          rather than depending on a reviewer spotting a destroy in a 200-line plan at five o'clock."</p>
+        <p>"<strong>Promotion</strong>: the same commit applied to dev, then test, then production, with the same
+          modules and only tfvars differing. If environments are different code, dev tests nothing."</p>
+        <p>"<strong>Nightly drift detection</strong> per environment, using the read-only identity and
+          <code>-detailed-exitcode</code> so I can distinguish drift from error, raising an issue when it finds
+          anything. The value is timing — drift gets found eventually, and I want it found on a quiet morning rather
+          than mid-deployment when someone is trying to ship something unrelated."</p>
+        <p>"Then the parts around the pipeline that matter as much as the pipeline."</p>
+        <p>"<strong>Humans get Reader in production.</strong> Otherwise this is all advisory — under pressure someone
+          will click, because clicking is faster, and that's a rational choice in the moment. Read-only makes the
+          code the only path."</p>
+        <p>"<strong>A break-glass path</strong>, because emergencies happen. A PIM-activated group, time-bound,
+          requiring justification, alerting the team on activation, with a mandatory follow-up to reconcile the code.
+          If there's no sanctioned emergency route, people invent an unsanctioned one and you lose the audit
+          trail."</p>
+        <p>"<strong>Azure Policy</strong> as a backstop, in <code>deny</code> mode for the rules that matter. CI
+          checks only see changes that go through CI; policy evaluates at the resource-manager level, so it applies
+          however a resource is created. That's the difference between a rule that's checked and one that's enforced.
+          I'd start it in audit mode though — switching straight to deny on an existing estate blocks legitimate
+          deployments in ways nobody predicted."</p>
+        <p>"<strong>State</strong>: remote, locked, versioned, encrypted, split per environment, with access limited
+          to the pipeline identities. And split further by blast radius — networking separately from applications,
+          since networking changes rarely and one enormous state means every plan touches everything and unrelated
+          changes contend for the same lock."</p>
+        <p>"Two things I'd watch. <strong>Plan output can contain sensitive values</strong>, so posting it publicly
+          leaks them. And <strong>a nightly job that fails quietly is worse than none</strong>, because it creates
+          the appearance of coverage — the alert needs an owner."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you apply the saved plan rather than a fresh one?</li>
+        <li>Do you separate plan and apply identities?</li>
+        <li>Do you use OIDC, federated on the environment?</li>
+        <li>Do you make humans read-only, with a break-glass path?</li>
+        <li>Do you automate destructive-change detection?</li>
+        <li>Do you add Azure Policy as an unbypassable layer?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> apply straight from a merge with no approval.</li>
+        <li><span class="redflag">Red flag:</span> a service principal secret in CI.</li>
+        <li><span class="redflag">Red flag:</span> no answer for emergency changes.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you stop a pull request from a fork obtaining credentials?</li>
+          <li>How do you handle a change that must go out in ten minutes?</li>
+          <li>How would you split one large state file?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Someone changed a production setting in the portal. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd separate two things: <strong>dealing with this instance</strong>, and <strong>the fact that it was
+          possible</strong>. The second one matters more."</p>
+        <p>"<strong>On the instance.</strong> First, find out what changed and why. The activity log gives me the
+          resource, the change, the identity and the timestamp. Then I'd talk to whoever made it — not to blame them,
+          but because the reason determines the response."</p>
+        <p>"<strong>If it was a correct emergency fix</strong> — say a firewall rule opened during an incident — then
+          the change is right and the code is wrong. So I bring it into the definition and confirm the plan goes
+          quiet. The urgent part here is that <strong>the next apply would silently revert it</strong>, possibly
+          during an unrelated deployment weeks later, and the outage comes back with no obvious connection to
+          anything. That's genuinely hard to diagnose, so reconciling promptly isn't tidiness — it's preventing a
+          future incident."</p>
+        <p>"<strong>If it was wrong or accidental</strong>, then running apply reverts it, which is the tool working
+          as intended. I'd still check the plan carefully first, because Azure sometimes implements a property change
+          by <em>replacing</em> the resource, and the code diff won't show that — only the plan will."</p>
+        <p>"<strong>If it's ambiguous</strong> — someone changed a setting because they believed it was needed and
+          nobody is sure — I'd treat the code as the source of truth and make the change properly through a pull
+          request, so the reasoning is recorded. That's the whole point of the repository."</p>
+        <p>"<strong>Now the more important half.</strong>"</p>
+        <p>"<strong>Why did they have write access?</strong> If engineers hold Contributor in production, then IaC is
+          a convention people follow when convenient. Under pressure someone will click, and that's rational for the
+          individual. I'd move humans to <strong>Reader</strong> — enough to diagnose, not to change — with write held
+          by the pipeline identity."</p>
+        <p>"<strong>Was there a sanctioned way to do it urgently?</strong> If not, that's my finding. A pipeline that
+          takes twenty minutes with a required approval is unusable at three in the morning during an outage, so
+          people will route around it. Forbidding the manual change without providing an alternative just makes it
+          undocumented."</p>
+        <p>"So I'd want a <strong>break-glass path</strong>: a PIM-activated elevation, time-bound to a few hours,
+          requiring a justification, <strong>alerting the team on activation</strong>, and with a mandatory
+          reconciliation task afterwards. Then an emergency change is visible, attributable and followed up, rather
+          than discovered by accident."</p>
+        <p>"<strong>How long did it take to notice?</strong> If the answer is 'we found out when a deployment
+          behaved oddly', I'd add <strong>scheduled drift detection</strong> — a nightly plan that raises an issue on
+          any difference. That moves discovery to a quiet morning with the context still fresh."</p>
+        <p>"<strong>For rules that must never be violated</strong>, regardless of route — public network access, TLS
+          version, missing encryption — I'd use <strong>Azure Policy in deny mode</strong>. CI checks only see changes
+          that go through CI; policy applies at the resource-manager level, so it stops a portal change too. That's
+          the only layer that genuinely can't be bypassed."</p>
+        <p>"The framing I'd bring: <strong>drift's real cost is loss of trust in the repository.</strong> One
+          manual change is usually harmless. The damage is that the definition no longer describes reality, so people
+          stop believing it — and once they stop believing it, they stop using it, and you're back to portal changes
+          with extra ceremony. Protecting that trust is what all of the above is actually for."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you investigate before reverting?</li>
+        <li>Do you know an apply will silently revert it later?</li>
+        <li>Do you check the plan for replacement before applying?</li>
+        <li>Do you treat the access as the real problem?</li>
+        <li>Do you provide a break-glass path rather than just forbidding?</li>
+        <li>Do you reach for Azure Policy for unbypassable rules?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> immediately running apply to revert it.</li>
+        <li><span class="redflag">Red flag:</span> treating it as a discipline problem only.</li>
+        <li><span class="redflag">Red flag:</span> no mechanism to detect it next time.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you make an urgent change safely at 3am?</li>
+          <li>What if the drifted resource can't be changed back without downtime?</li>
+          <li>Which rules would you put in deny mode first?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

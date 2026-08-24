@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Structural Patterns — Design Patterns</title>
+<meta name="description" content="Adapter, Decorator, Facade, Proxy, Composite and Bridge in C#: what each solves, real .NET usage, and how decorator differs from proxy.">
+<meta name="keywords" content="adapter decorator facade proxy composite bridge csharp delegating handler cross cutting concerns anti corruption layer scrutor decorator vs proxy retry caching">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="18-design-patterns/structural.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Structural Patterns</h1>
+    <p class="subtitle">How objects get composed — wrapping, bridging and simplifying — without changing
+      what they already do.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Adapter</strong> — makes an incompatible interface fit. Changes the shape, not the behaviour.</li>
+      <li><strong>Decorator</strong> — same interface, adds behaviour around the inner object. Stackable.</li>
+      <li><strong>Proxy</strong> — same interface, controls <em>access</em>: laziness, caching, permissions,
+        remoting.</li>
+      <li>Decorator vs Proxy: same structure, different intent. Decorator <em>adds</em>, Proxy
+        <em>governs</em> (and often skips the call entirely).</li>
+      <li><strong>Facade</strong> — one simple entry point over a complicated subsystem.</li>
+      <li><strong>Composite</strong> — treat a tree and its leaves the same way. <strong>Bridge</strong> —
+        two things vary independently.</li>
+    </ul>
+  </div>
+
+  <h2 id="adapter">Adapter <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="oneline"><b>One line:</b> translate someone else's interface into yours.</div>
+
+  <p><strong>The problem:</strong> a vendor SDK does what you need but in the wrong shape — wrong names,
+    wrong types, its own exception hierarchy. Use it directly and vendor types spread through your
+    codebase, so replacing it becomes a rewrite.</p>
+
+  <pre data-label="csharp — your contract, in your language"><code class="language-csharp">public interface ISmsSender
+{
+    Task&lt;SmsResult&gt; SendAsync(PhoneNumber to, string message, CancellationToken ct);
+}</code></pre>
+
+  <pre data-label="csharp — the adapter does the translating"><code class="language-csharp">public sealed class TwilioSmsAdapter(ITwilioRestClient client) : ISmsSender
+{
+    public async Task&lt;SmsResult&gt; SendAsync(PhoneNumber to, string message, CancellationToken ct)
+    {
+        try
+        {
+            var response = await MessageResource.CreateAsync(
+                to: new Twilio.Types.PhoneNumber(to.E164),
+                body: message,
+                client: client);
+
+            // 2. translate their vocabulary into ours
+            return response.Status switch
+            {
+                MessageResource.StatusEnum.Queued or MessageResource.StatusEnum.Sent
+                    =&gt; SmsResult.Accepted(response.Sid),
+                _   =&gt; SmsResult.Rejected(response.ErrorMessage ?? "unknown")
+            };
+        }
+        catch (ApiException ex) when (ex.Status == 429)
+        {
+            // 3. translate their failures into ours
+            throw new TransientMessagingException("SMS provider throttled us.", ex);
+        }
+    }
+}</code></pre>
+
+  <p>An adapter does three jobs. Notice the third one especially:</p>
+
+  <ol class="steps">
+    <li><strong>Convert types</strong> — our <code>PhoneNumber</code> into theirs.</li>
+    <li><strong>Convert vocabulary</strong> — their status enum into our result.</li>
+    <li><strong>Convert failures</strong> — their exceptions into ours.</li>
+  </ol>
+
+  <p>People skip the third one, and it's the one that leaks hardest. Once callers start catching
+    <code>ApiException</code>, swapping vendors breaks code everywhere.</p>
+
+  <div class="note tip">
+    <div class="note-title">Best practice</div>
+    <p style="margin:0">This is the tactical version of an <strong>anti-corruption layer</strong> in DDD —
+      see <a href="../19-architecture/ddd.html">domain-driven design</a>. Every external integration
+      deserves one: it keeps foreign concepts out of your domain, and gives you one place to put retry,
+      timeout and logging.</p>
+  </div>
+
+  <h2 id="decorator">Decorator <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="oneline"><b>One line:</b> same interface, wraps an inner instance, adds behaviour around it.</div>
+
+  <p><strong>The problem:</strong> you want caching, retry, logging or metrics on an existing component
+    without modifying it — and you want to combine them freely.</p>
+
+  <pre data-label="csharp — a retry decorator that doesn't know what it wraps"><code class="language-csharp">public sealed class RetryingPriceFeed(IPriceFeed inner, ILogger&lt;RetryingPriceFeed&gt; log)
+    : IPriceFeed
+{
+    public async Task&lt;Price&gt; GetAsync(string symbol, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await inner.GetAsync(symbol, ct);
+            }
+            catch (TransientFeedException ex) when (attempt &lt; 3)
+            {
+                // Jitter matters: without it every caller retries in lockstep
+                // and recreates the exact spike you're recovering from.
+                var delay = TimeSpan.FromMilliseconds(
+                    Math.Pow(2, attempt) * 100 + Random.Shared.Next(0, 100));
+
+                log.LogWarning(ex, "Attempt {Attempt} failed for {Symbol}", attempt, symbol);
+                await Task.Delay(delay, ct);
+            }
+        }
+    }
+}</code></pre>
+
+  <p>Then you compose them at registration:</p>
+
+  <pre data-label="csharp — two ways to wire a decorator chain"><code class="language-csharp">// Explicit factory - no extra package, completely clear.
+services.AddSingleton&lt;HttpPriceFeed&gt;();
+services.AddSingleton&lt;IPriceFeed&gt;(sp =&gt;
+    new CachingPriceFeed(
+        new RetryingPriceFeed(sp.GetRequiredService&lt;HttpPriceFeed&gt;(),
+                              sp.GetRequiredService&lt;ILogger&lt;RetryingPriceFeed&gt;&gt;()),
+        sp.GetRequiredService&lt;IMemoryCache&gt;()));
+
+// Or with Scrutor:
+services.AddSingleton&lt;IPriceFeed, HttpPriceFeed&gt;();
+services.Decorate&lt;IPriceFeed, RetryingPriceFeed&gt;();
+services.Decorate&lt;IPriceFeed, CachingPriceFeed&gt;();   // outermost registered last</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake — order</div>
+    <p style="margin:0"><strong>Caching outside retry</strong> means a cache hit skips the retry logic
+      entirely. That's usually what you want.
+      <br><br>
+      <strong>Retry outside caching</strong> means every retry re-checks the cache, which is pointless —
+      and worse, a failure gets retried before the cache can serve a value.
+      <br><br>
+      Logging outermost if you want to measure total time including retries. Decide deliberately and leave
+      a comment saying why.</p>
+  </div>
+
+  <p>For HTTP, .NET already gives you this: <code>DelegatingHandler</code> instances registered through
+    <code>IHttpClientFactory</code> form a decorator chain around the transport. That's where Polly
+    policies live — see <a href="../07-aspnet-core/performance-resilience.html">performance &amp;
+    resilience</a>.</p>
+
+  <h2 id="proxy">Proxy <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="oneline"><b>One line:</b> stands in for something else and controls access to it.</div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Kind</th><th>Purpose</th><th>.NET example</th></tr></thead>
+      <tbody>
+        <tr><td>Virtual</td><td>Defer expensive creation</td><td>EF Core lazy loading; <code>Lazy&lt;T&gt;</code></td></tr>
+        <tr><td>Remote</td><td>Make a network call look local</td><td>gRPC clients, Refit interfaces</td></tr>
+        <tr><td>Protection</td><td>Check permission before delegating</td><td>An authorisation wrapper</td></tr>
+        <tr><td>Caching</td><td>Serve a previous result</td><td>Output caching</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="decorator-vs-proxy">Decorator vs Proxy — the classic question</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Decorator</th><th>Proxy</th></tr></thead>
+      <tbody>
+        <tr><td>Structure</td><td>Implements the interface, holds an inner instance</td><td>Identical</td></tr>
+        <tr><td>Intent</td><td>Add behaviour</td><td>Control access</td></tr>
+        <tr><td>Stacked?</td><td>Usually several</td><td>Usually one</td></tr>
+        <tr><td>Who supplies the inner object?</td><td>Injected from outside</td><td>Often created or found by the proxy itself</td></tr>
+        <tr><td>Might skip the call?</td><td>Rarely — it delegates</td><td>Often — cache hit or denied permission short-circuits</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>The honest summary:</strong> structurally identical, distinguished by intent. Say that plainly
+    and then give the last two rows — that's a better answer than inventing a structural difference.</p>
+
+  <h2 id="facade">Facade <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="oneline"><b>One line:</b> one simple method over a subsystem that needs several calls in a
+    specific order.</div>
+
+  <pre data-label="csharp — callers get one operation instead of four services"><code class="language-csharp">public sealed class OnboardingFacade(
+    ITenantProvisioner provisioner,
+    IIdentityService identity,
+    IBillingClient billing,
+    ISeedDataLoader seeder)
+{
+    public async Task&lt;Tenant&gt; OnboardAsync(OnboardingRequest request, CancellationToken ct)
+    {
+        var tenant = await provisioner.CreateAsync(request.Name, request.Region, ct);
+        await identity.CreateAdminAsync(tenant.Id, request.AdminEmail, ct);
+        await billing.CreateSubscriptionAsync(tenant.Id, request.Plan, ct);
+        await seeder.SeedDefaultsAsync(tenant.Id, ct);
+        return tenant;
+    }
+}</code></pre>
+
+  <p><strong>What a facade does <em>not</em> solve — worth noticing:</strong> those are four steps across
+    four systems with no transaction. If step three fails, you have a half-provisioned tenant. That's a
+    <a href="../19-architecture/distributed-data.html">saga / compensation</a> problem, not a facade problem.</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Letting the facade grow. Callers keep asking for "just one more method" until it's
+      the whole application. Past a handful of coherent operations, split it by use case.</p>
+  </div>
+
+  <h2 id="composite">Composite <span class="lvl lvl-i">🟡 Intermediate</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="oneline"><b>One line:</b> treat a single item and a group of items through the same interface.</div>
+
+  <pre data-label="csharp — a bundle can contain products or other bundles"><code class="language-csharp">public interface IPricedItem { Money Price(); }
+
+public sealed record Product(string Sku, Money UnitPrice, int Quantity) : IPricedItem
+{
+    public Money Price() =&gt; UnitPrice * Quantity;
+}
+
+public sealed class Bundle(decimal discountRate) : IPricedItem
+{
+    private readonly List&lt;IPricedItem&gt; _items = [];
+    public Bundle Add(IPricedItem item) { _items.Add(item); return this; }
+
+    public Money Price()
+    {
+        var gross = _items.Aggregate(Money.Zero("GBP"), (sum, i) =&gt; sum.Add(i.Price()));
+        return gross * (1 - discountRate);
+    }
+}</code></pre>
+
+  <p>The client calls <code>Price()</code> and never knows whether it's holding one product or a nested
+    tree.</p>
+
+  <div class="note danger">
+    <div class="note-title">Production trap</div>
+    <p style="margin:0">Composite is a great <em>in-memory</em> pattern and a performance trap when the tree
+      is in a database. If each node lazily loads its children, you get an N+1 query storm. Load the whole
+      tree in one query — recursive CTE, closure table, or materialised path — rather than walking it node
+      by node. Also watch for unbounded recursion on deep or cyclic data.</p>
+  </div>
+
+  <h2 id="bridge">Bridge <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="oneline"><b>One line:</b> two things vary independently, so don't model them with one
+    inheritance tree.</div>
+
+  <p>Classic case: notification <em>types</em> (alert, reminder, digest) × delivery <em>channels</em>
+    (email, SMS, push). Inheritance gives you 9 classes. Bridge gives you 3 + 3.</p>
+
+  <pre data-label="csharp — the abstraction HOLDS a channel instead of inheriting one"><code class="language-csharp">public interface IMessageChannel
+{
+    Task DeliverAsync(string to, string subject, string body, CancellationToken ct);
+}
+
+public abstract class Notification(IMessageChannel channel)
+{
+    protected IMessageChannel Channel { get; } = channel;
+    public abstract Task SendAsync(User user, CancellationToken ct);
+}</code></pre>
+
+  <p>In practice Bridge is rare in application code, because dependency injection produces the same
+    structure naturally. The moment you inject an interface instead of inheriting an implementation, you
+    have a bridge. Saying that is more useful than memorising the diagram.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Adapter must also translate <em>exceptions</em>, not just types and names.</li>
+      <li>Decorator order changes behaviour — cache outside retry, logging outermost.</li>
+      <li>Decorator and Proxy have the same shape; intent is what differs.</li>
+      <li>A facade simplifies calls but doesn't give you transactions across systems.</li>
+      <li>Composite over a database tree = N+1 unless you load it in one query.</li>
+      <li>DI already gives you Bridge without calling it that.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Vendor types leaking through an adapter</strong> — especially exceptions and enums.</li>
+    <li><strong>Decorator chains ordered by accident</strong>, so caching sits inside retry or metrics
+      exclude retries.</li>
+    <li><strong>A facade that grows</strong> until it's the application.</li>
+    <li><strong>Composite over a database-backed tree</strong>, producing an N+1 storm.</li>
+    <li><strong>Calling a decorator a proxy</strong> (or vice versa) — harmless in code, but it reads as
+      imprecision in an interview.</li>
+    <li><strong>Wrapping everything "for flexibility"</strong> until a request passes through five wrappers
+      that each do nothing.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What's the difference between Decorator and Proxy?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Structurally they're the same — both implement the interface of the thing they wrap and hold a
+          reference to it. The difference is intent, and it shows up in a few concrete behaviours."</p>
+        <p>"A decorator adds behaviour around the call — logging, retry, caching, metrics — and it's designed
+          to be stacked. It almost always delegates, because augmenting is its job. And the inner instance
+          is injected from outside, so the decorator doesn't choose what it wraps."</p>
+        <p>"A proxy controls access. It frequently <em>doesn't</em> call through: a protection proxy denies
+          the call, a caching proxy returns a stored result, a virtual proxy defers creating the real object
+          until it's needed. Proxies also often create or locate their target rather than receiving it —
+          that's what makes lazy loading and remote proxies possible."</p>
+        <p>"In practice the line blurs. A caching wrapper can be described either way. What I'd take from the
+          distinction is the design question: am I augmenting behaviour, in which case I should expect to
+          stack these and think about ordering? Or am I governing access, in which case there's probably one
+          and it needs to be impossible to bypass?"</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you discuss intent, not just structure?</li>
+        <li>Are you comfortable saying two patterns overlap, rather than inventing a difference?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does EF Core's lazy loading proxy work, and what problems does it cause?</li>
+          <li>Where does <code>DelegatingHandler</code> fit?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Add caching and retry to an existing service without changing it. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Decorators. Two classes implementing the same interface, each wrapping an inner instance,
+          composed at registration. The original class stays untouched, each concern lives in one place, and
+          I can vary the composition per environment — caching in production, none in integration tests."</p>
+        <p>"Ordering is the part I'd think about explicitly. Caching on the outside, so a cache hit skips
+          the retry logic entirely and costs nothing. Retry inside it, so a transient failure gets retried
+          before anything is cached. And I'd make sure failures aren't cached, or are cached with a very
+          short TTL — caching an error for ten minutes turns a blip into an outage."</p>
+        <p>"For the retry itself I'd use Polly rather than hand-rolling it. The details are easy to get
+          wrong: exponential backoff with jitter so callers don't retry in lockstep, a cap on attempts, and
+          only retrying genuinely transient failures — retrying a 400 is pointless load. I'd pair it with a
+          circuit breaker so we stop hammering a dependency that's properly down, and a timeout so a hung
+          call can't hold a request thread forever."</p>
+        <p>"If it's an HTTP dependency, all of that belongs in a <code>DelegatingHandler</code> through
+          <code>IHttpClientFactory</code> — same pattern, at the transport level."</p>
+        <p>"One caution I'd raise unprompted: retry must be safe. If the operation isn't idempotent — a
+          payment authorisation, an order submission — retrying can duplicate the effect. The fix is an
+          idempotency key, not removing the retry."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the pattern and the ordering consequences?</li>
+        <li>Does idempotency occur to you when discussing retry?</li>
+        <li>Do you use the platform rather than reimplementing it?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> modifying the original class to add try/catch and a cache lookup.</li>
+        <li><span class="redflag">Red flag:</span> retry with no backoff, no cap, or on non-idempotent operations.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you register that chain in the built-in DI container?</li>
+          <li>What if the cache and retry both have a 30s timeout and the caller has 10s?</li>
+          <li>How would you invalidate the cache when the underlying data changes?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

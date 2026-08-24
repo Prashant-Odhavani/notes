@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Configuration, Options &amp; Logging — .NET Platform</title>
+<meta name="description" content="The configuration provider chain, the options pattern and its three interfaces, structured logging, log levels and secrets handling.">
+<meta name="keywords" content="IConfiguration providers appsettings environment variables user secrets options pattern IOptions IOptionsSnapshot IOptionsMonitor structured logging log levels scopes serilog key vault">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="06-dotnet-platform/configuration-logging.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Configuration, Options &amp; Logging</h1>
+    <p class="subtitle">Where settings come from, how to consume them without <code>string</code> keys
+      everywhere, and how to log so the logs are actually useful at 3am.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>Configuration is <strong>layered</strong>. Providers are added in order and later ones override
+        earlier ones.</li>
+      <li>Environment variables beat <code>appsettings.json</code> — that's how containers and CI inject
+        settings.</li>
+      <li>The <strong>options pattern</strong> turns config into a strongly-typed class you inject, instead
+        of magic string lookups.</li>
+      <li><code>IOptions</code> = read once. <code>IOptionsSnapshot</code> = per request.
+        <code>IOptionsMonitor</code> = live reload, safe in singletons.</li>
+      <li><strong>Structured logging:</strong> log with named placeholders, never string interpolation. You
+        can then query on the values.</li>
+      <li><strong>Never put secrets in <code>appsettings.json</code>.</strong> Use user secrets locally, a
+        secret store in production.</li>
+    </ul>
+  </div>
+
+  <h2 id="config-chain">The configuration chain <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Configuration isn't one file. It's a <strong>stack of sources</strong> merged into a single key/value
+      lookup.</p>
+    <p>If two sources define the same key, <strong>the one added later wins.</strong></p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Sheets of tracing paper stacked on a lightbox. Each one can overwrite what's underneath.</p>
+    <p><code>appsettings.json</code> is the bottom sheet. Environment variables go on top. Whatever's on the
+      topmost sheet is what you read.</p>
+  </div>
+
+  <p>The default order in <code>CreateBuilder</code>, from lowest priority to highest:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Source</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>appsettings.json</code></td><td>Defaults, committed to source control</td></tr>
+        <tr><td>2</td><td><code>appsettings.{Environment}.json</code></td><td>Per-environment overrides</td></tr>
+        <tr><td>3</td><td>User secrets <em>(Development only)</em></td><td>Local secrets, stored outside the repo</td></tr>
+        <tr><td>4</td><td>Environment variables</td><td><strong>How containers and CI inject settings</strong></td></tr>
+        <tr><td>5</td><td>Command-line arguments</td><td>Highest priority — one-off overrides</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — nested keys flatten with colons"><code class="language-csharp">// appsettings.json
+// { "Database": { "ConnectionString": "Server=dev;..." , "CommandTimeout": 30 } }
+
+var cs = builder.Configuration["Database:ConnectionString"];
+var timeout = builder.Configuration.GetValue&lt;int&gt;("Database:CommandTimeout");</code></pre>
+
+  <div class="note info">
+    <div class="note-title">The double-underscore convention</div>
+    <p style="margin:0">Many platforms don't allow <code>:</code> in environment variable names, so .NET also
+      accepts <strong>double underscore</strong> as the separator:
+      <br><br>
+      <code>Database__ConnectionString=Server=prod;...</code>
+      <br><br>
+      That's the mechanism behind almost all container configuration — and it's worth knowing, because it's
+      how you override a nested setting from a Kubernetes manifest or a Docker <code>-e</code> flag without
+      touching a file.</p>
+  </div>
+
+  <h2 id="options-pattern">The options pattern <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Instead of reading <code>Configuration["Database:CommandTimeout"]</code> wherever you need it, bind
+      that section to a <strong>class</strong> once, and inject the class.</p>
+  </div>
+
+  <p><strong>Why bother?</strong> Three concrete reasons:</p>
+
+  <ul>
+    <li><strong>Typos become compile errors</strong>, not silent nulls at runtime.</li>
+    <li><strong>Types are checked</strong> — you get an <code>int</code>, not a <code>string</code> you have
+      to parse.</li>
+    <li><strong>You can validate at startup</strong>, so a misconfigured deployment fails immediately rather
+      than on the first request that needs the setting.</li>
+  </ul>
+
+  <pre data-label="csharp — define, register, validate" class="code-good"><code class="language-csharp">public sealed class DatabaseOptions
+{
+    public const string Section = "Database";
+
+    [Required]
+    public string ConnectionString { get; init; } = "";
+
+    [Range(1, 300)]
+    public int CommandTimeoutSeconds { get; init; } = 30;
+}
+
+// Program.cs
+builder.Services
+    .AddOptions&lt;DatabaseOptions&gt;()
+    .Bind(builder.Configuration.GetSection(DatabaseOptions.Section))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();          // fail at startup, not on first use</code></pre>
+
+  <pre data-label="csharp — consume it"><code class="language-csharp">public sealed class OrderRepository(IOptions&lt;DatabaseOptions&gt; options)
+{
+    private readonly DatabaseOptions _config = options.Value;
+    // strongly typed, validated, no magic strings
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why <code>ValidateOnStart()</code> matters</div>
+    <p style="margin:0">Without it, validation runs the first time something resolves the options — which
+      might be an endpoint nobody hits for an hour. With it, a bad deployment fails at startup, the container
+      never becomes healthy, and your rollout stops automatically.
+      <br><br>
+      That turns a mysterious runtime error into a clean deployment failure, which is exactly what you want
+      in a pipeline.</p>
+  </div>
+
+  <h3 id="options-interfaces">The three options interfaces <span class="lvl lvl-i">🟡 Intermediate</span></h3>
+
+  <p>A common interview question, because choosing wrong causes subtle bugs.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Reads config</th><th>Reload on change?</th><th>Injectable into</th></tr></thead>
+      <tbody>
+        <tr><td><code>IOptions&lt;T&gt;</code></td><td>Once, at first resolve</td><td>No</td><td>Anything, including singletons</td></tr>
+        <tr><td><code>IOptionsSnapshot&lt;T&gt;</code></td><td>Once per scope/request</td><td>Yes, per request</td><td><strong>Scoped only</strong></td></tr>
+        <tr><td><code>IOptionsMonitor&lt;T&gt;</code></td><td>Live, with change notifications</td><td>Yes, immediately</td><td>Anything, including singletons</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to choose</span>
+    <p>Default to <strong><code>IOptions</code></strong>. Most settings don't change while the app runs.</p>
+    <p>Need to pick up changes without a restart? Use <strong><code>IOptionsMonitor</code></strong> — and note
+      it's the <em>only</em> one safe in a singleton.</p>
+    <p><code>IOptionsSnapshot</code> is scoped, so injecting it into a singleton is a captive dependency.</p>
+  </div>
+
+  <pre data-label="csharp — IOptionsMonitor in a singleton, reacting to change"><code class="language-csharp">public sealed class FeatureGate
+{
+    private FeatureOptions _current;
+
+    public FeatureGate(IOptionsMonitor&lt;FeatureOptions&gt; monitor)
+    {
+        _current = monitor.CurrentValue;
+        monitor.OnChange(updated =&gt; _current = updated);   // hot reload
+    }
+
+    public bool IsEnabled(string name) =&gt; _current.Enabled.Contains(name);
+}</code></pre>
+
+  <h2 id="secrets">Secrets <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="note danger">
+    <div class="note-title">Never commit a secret to <code>appsettings.json</code></div>
+    <p style="margin:0">It ends up in source control, in every clone, in every branch, and in the git history
+      <strong>forever</strong> — deleting it in a later commit doesn't remove it.
+      <br><br>
+      If it happens, the only real remediation is to <strong>rotate the credential</strong>. Rewriting
+      history helps but you must assume it was already read.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Where</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td>Local development</td><td><code>dotnet user-secrets set "Db:ConnectionString" "..."</code> — stored in your user profile, outside the repo</td></tr>
+        <tr><td>CI/CD</td><td>Pipeline secrets injected as environment variables</td></tr>
+        <tr><td>Azure</td><td>Key Vault with <strong>managed identity</strong> — no credential to store at all</td></tr>
+        <tr><td>Kubernetes</td><td>Secrets as env vars, or a CSI driver mounting from a vault</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Managed identity is the one worth understanding: the app authenticates to Key Vault using an identity
+    the platform assigns it, so there's no secret needed <em>to fetch the secrets</em>. That removes the
+    bootstrapping problem entirely. Covered in
+    <a href="../24-azure/config-secrets.html">App Configuration &amp; Key Vault</a>.</p>
+
+  <h2 id="logging">Structured logging <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Log with <strong>named placeholders</strong>, not string interpolation.</p>
+    <p>The logging system then stores the values as separate fields — so you can search and filter on them
+      rather than grepping text.</p>
+  </div>
+
+  <pre data-label="csharp — bad: one opaque string" class="code-bad"><code class="language-csharp">_logger.LogInformation($"Order {orderId} shipped to {country}");</code></pre>
+
+  <pre data-label="csharp — good: queryable fields" class="code-good"><code class="language-csharp">_logger.LogInformation("Order {OrderId} shipped to {Country}", orderId, country);</code></pre>
+
+  <p>They look almost identical. The difference at 3am is enormous:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>With interpolation</th><th>With structured logging</th></tr></thead>
+      <tbody>
+        <tr><td>Stored as one flat string</td><td>Stored as a template plus <code>OrderId</code> and <code>Country</code> fields</td></tr>
+        <tr><td>Find one order by substring search</td><td><code>where OrderId == "abc-123"</code></td></tr>
+        <tr><td>Can't group or aggregate</td><td>"Count shipments by country" is a query</td></tr>
+        <tr><td>Formatting cost paid even if the level is off</td><td>No formatting if the level is disabled</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>That last row is a real performance point: with interpolation the string is built <em>before</em> the
+    call, so you pay for it even when <code>Information</code> logging is switched off.</p>
+
+  <h3 id="log-levels">Log levels — and what they should mean</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>Use for</th><th>Production?</th></tr></thead>
+      <tbody>
+        <tr><td><code>Trace</code></td><td>Extremely detailed diagnostics</td><td>Never — may contain sensitive data</td></tr>
+        <tr><td><code>Debug</code></td><td>Developer diagnostics</td><td>Off, enabled temporarily to investigate</td></tr>
+        <tr><td><code>Information</code></td><td>Notable business events: order placed, user registered</td><td>Yes, but be selective</td></tr>
+        <tr><td><code>Warning</code></td><td>Something unexpected that was handled — a retry, a fallback</td><td>Yes</td></tr>
+        <tr><td><code>Error</code></td><td>An operation failed and a user is affected</td><td>Yes — should be alertable</td></tr>
+        <tr><td><code>Critical</code></td><td>The application or a subsystem is down</td><td>Yes — should page someone</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake — everything at Information</div>
+    <p style="margin:0">Two costs. The signal gets buried: real errors scroll past in a flood of routine
+      chatter. And the bill — log ingestion is usually charged by volume, and verbose Information logging is
+      one of the most common sources of surprise observability spend.
+      <br><br>
+      The test for <code>Information</code>: <em>would I want to see this for every single request in
+      production?</em> Usually the answer is no, and it belongs at <code>Debug</code>.</p>
+  </div>
+
+  <h3 id="log-scopes">Scopes and correlation <span class="lvl lvl-i">🟡 Intermediate</span></h3>
+
+  <pre data-label="csharp — attach context to every log inside the scope"><code class="language-csharp">using (_logger.BeginScope("Processing order {OrderId} for {TenantId}", order.Id, tenantId))
+{
+    _logger.LogInformation("Validating");     // both fields attached automatically
+    await _validator.ValidateAsync(order, ct);
+
+    _logger.LogInformation("Charging card");  // and here
+    await _payments.ChargeAsync(order, ct);
+}</code></pre>
+
+  <p>Without a scope you'd repeat <code>orderId</code> in every call and inevitably forget somewhere. With
+    one, every log inside carries the context — so filtering by order ID gives you the whole story of that
+    operation.</p>
+
+  <div class="note tip">
+    <div class="note-title">The single most valuable thing to add</div>
+    <p style="margin:0">A <strong>correlation ID</strong> that flows through every log line and across
+      service boundaries. ASP.NET Core gives you <code>Activity.Current.TraceId</code> automatically with
+      OpenTelemetry-style tracing.
+      <br><br>
+      Without it, debugging a request that touched four services means guessing from timestamps. With it, one
+      query returns the whole path. It's cheap to add and transformative during an incident — see
+      <a href="../29-sdlc/operations.html#observability">observability</a>.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — logging sensitive data</div>
+    <p style="margin:0">Logging a whole request object is convenient and dangerous. Passwords, tokens, card
+      numbers and personal data end up in your log store, which usually has broader access and longer
+      retention than your database.
+      <br><br>
+      That's a data-protection incident created by the observability system. Log identifiers, not payloads —
+      and never log an entire exception's request context without checking what's in it.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Configuration is layered; later providers win. Environment variables override files.</li>
+      <li><code>Database__ConnectionString</code> — double underscore for nested keys in env vars.</li>
+      <li>Bind config to a class, validate it, and <code>ValidateOnStart()</code> so bad deploys fail fast.</li>
+      <li><code>IOptions</code> by default; <code>IOptionsMonitor</code> for reload and for singletons;
+        <code>IOptionsSnapshot</code> is scoped only.</li>
+      <li>Never commit secrets. User secrets locally, managed identity in Azure.</li>
+      <li>Structured logging with named placeholders — queryable, and cheaper when the level is off.</li>
+      <li>Don't log everything at Information. It buries the signal and costs money.</li>
+      <li>A correlation ID is the highest-value logging investment you can make.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Secrets in <code>appsettings.json</code></strong> — permanent, once committed.</li>
+    <li><strong>Magic string config lookups</strong> scattered through the codebase instead of bound options.</li>
+    <li><strong>No validation</strong>, so a missing setting fails on the first request that needs it.</li>
+    <li><strong><code>IOptionsSnapshot</code> in a singleton</strong> — captive dependency.</li>
+    <li><strong>String interpolation in log calls</strong>, losing structure and paying formatting cost when
+      disabled.</li>
+    <li><strong>Everything at Information</strong>, drowning real errors and inflating the bill.</li>
+    <li><strong>Logging whole request or entity objects</strong>, leaking personal data into the log store.</li>
+    <li><strong>No correlation ID</strong>, making cross-service debugging guesswork.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>Where does configuration come from in ASP.NET Core, and what takes precedence?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It's a layered system rather than a single file. Providers are added in order and later ones
+          override earlier ones for the same key."</p>
+        <p>"The default order is <code>appsettings.json</code>, then
+          <code>appsettings.{Environment}.json</code>, then user secrets in Development, then environment
+          variables, then command-line arguments — so command line wins over everything."</p>
+        <p>"The practically important one is environment variables, because that's how containers and CI
+          inject settings. And there's a detail worth knowing: many platforms won't allow a colon in an
+          environment variable name, so .NET also accepts double underscore as the separator.
+          <code>Database__ConnectionString</code> overrides <code>Database:ConnectionString</code>. That's how
+          you override a nested setting from a Kubernetes manifest without touching a file."</p>
+        <p>"Rather than reading keys as strings everywhere, I'd bind sections to typed options classes with
+          data annotation validation and <code>ValidateOnStart</code>. That means a misconfigured deployment
+          fails at startup — the container never goes healthy and the rollout stops — instead of throwing on
+          the first request that happens to need that setting."</p>
+        <p>"And secrets never go in the files. Locally I use <code>dotnet user-secrets</code>, which stores
+          them in the user profile outside the repo. In Azure, Key Vault with managed identity, so there's no
+          credential needed to fetch the credentials."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's layered, and the order?</li>
+        <li>Do you know the double-underscore convention? That's a practical container detail.</li>
+        <li>Do you validate configuration at startup?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Difference between <code>IOptions</code>, <code>IOptionsSnapshot</code> and
+            <code>IOptionsMonitor</code>?</li>
+          <li>How do you reload configuration without a restart?</li>
+          <li>Someone committed a connection string. What do you do?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is structured logging and why does it matter? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It means logging with named placeholders and passing the values as arguments, rather than building
+          a string. So <code>LogInformation("Order {OrderId} shipped", orderId)</code> rather than
+          interpolating the ID into the message."</p>
+        <p>"They look nearly identical in code, and the difference only shows up when you need the logs. With
+          interpolation you get one flat string, so finding a specific order means a substring search, and
+          you can't aggregate at all. With structured logging the provider stores the template plus
+          <code>OrderId</code> as a separate field, so it's a query — and I can group, count and alert on
+          field values."</p>
+        <p>"There's also a performance angle. With interpolation the string is built before the call, so you
+          pay the formatting cost even when Information logging is switched off. With the template form,
+          nothing is formatted if the level is disabled."</p>
+        <p>"Two things I'd add on top. <strong>Scopes</strong>, so context like the order ID and tenant ID
+          attaches to every log inside a block rather than being repeated and forgotten. And a
+          <strong>correlation ID</strong> flowing across service boundaries — that's the difference between
+          one query returning a request's whole journey and guessing from timestamps across four services."</p>
+        <p>"The discipline part is levels. If everything is Information, real errors get buried and the
+          ingestion bill balloons. My test is: would I want this for every request in production? If not,
+          it's Debug. And I'd be careful never to log whole request objects, because that's how tokens and
+          personal data end up in a log store with broader access than the database."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the mechanism, and why the two forms differ?</li>
+        <li>Do you mention correlation IDs unprompted?</li>
+        <li>Do you think about cost and about leaking sensitive data?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> not knowing the difference from interpolation.</li>
+        <li><span class="redflag">Red flag:</span> "log everything so you have it if you need it."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you trace one request across four services?</li>
+          <li>How do you keep logging cost under control at high volume?</li>
+          <li>What's <code>[LoggerMessage]</code> and why would you use it?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

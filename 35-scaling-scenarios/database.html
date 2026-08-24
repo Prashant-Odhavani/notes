@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Database Scaling — Scaling Scenarios</title>
+<meta name="description" content="A query that was fast and isn't, hot partitions, write-heavy load, blocking, batch jobs and reporting — with the diagnosis order for each.">
+<meta name="keywords" content="database scaling slow query at scale missing index parameter sniffing plan regression hot partition write heavy load blocking deadlock batch job reporting read replica table growth archival N+1 tempdb">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="35-scaling-scenarios/database.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Database Scaling</h1>
+    <p class="subtitle">The database is the usual real ceiling. Most of these problems are about a query plan, a key
+      choice, or work that shouldn't be running there at all.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>"It was fast last week"</strong> → data growth crossed a threshold, or the plan changed.</li>
+      <li><strong>Scans are fine until they aren't.</strong> Cost grows with rows; the query didn't change.</li>
+      <li><strong>Hot partition: adding capacity never helps.</strong> Increase key cardinality.</li>
+      <li><strong>Every index makes writes slower.</strong> Read wins are paid for on write.</li>
+      <li><strong>Reporting on the transactional database</strong> is the most common self-inflicted wound.</li>
+      <li><strong>Read replicas are eventually consistent</strong> — read-after-write will surprise you.</li>
+      <li><strong>Batch jobs need batching</strong>, not one big transaction.</li>
+      <li><strong>Unbounded tables have a cliff</strong>, not a slope.</li>
+    </ul>
+  </div>
+
+  <h2 id="was-fast">Scenario: a query that was fast is now slow <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Clue</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Data growth crossed a threshold</strong></td>
+          <td>Gradual degradation; row count grew a lot</td>
+          <td><strong>An index</strong> — the scan was always there</td>
+        </tr>
+        <tr>
+          <td><strong>Plan regression / parameter sniffing</strong></td>
+          <td><strong>Sudden</strong>, no deployment, fast for some parameters</td>
+          <td><code>OPTIMIZE FOR</code>, recompile, or fix the statistics</td>
+        </tr>
+        <tr>
+          <td><strong>Stale statistics</strong></td>
+          <td>After a large load or a migration</td>
+          <td>Update statistics; check auto-update thresholds</td>
+        </tr>
+        <tr>
+          <td><strong>Blocking</strong></td>
+          <td>Intermittent, correlates with other activity</td>
+          <td>Shorten transactions; check isolation level</td>
+        </tr>
+        <tr>
+          <td><strong>A new N+1</strong></td>
+          <td>Started at a deployment; hundreds of fast calls</td>
+          <td><code>Include</code> or a projection</td>
+        </tr>
+        <tr>
+          <td><strong>Index fragmentation or a dropped index</strong></td>
+          <td>After maintenance or a schema change</td>
+          <td>Rebuild, or restore the index</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — gradual versus sudden splits the causes in half</div>
+    <p style="margin:0">Before looking at any plan, establish the <em>shape</em> of the degradation, because it
+      eliminates half the possibilities immediately.
+      <br><br>
+      <strong>Gradual</strong> — slower each month — is almost always <strong>a scan whose cost grows with the
+      table</strong>. The query didn't change; the data did. A missing index that costs 20ms on 50,000 rows costs two
+      seconds on five million, and nothing in the code looks different. This is the single most common "it used to be
+      fast".
+      <br><br>
+      <strong>Sudden</strong>, with no deployment, points at <strong>a plan change</strong>. The optimiser chose
+      differently — new statistics, a recompile, or <a href="../10-sql/performance.html#parameter-sniffing">parameter
+      sniffing</a> where the plan was compiled for an atypical parameter and cached.
+      <br><br>
+      Parameter sniffing is worth being able to describe, because it produces a genuinely confusing symptom:
+      <strong>the same query is fast for some inputs and slow for others</strong>, and which is which can flip after a
+      restart or a statistics update. That's because the cached plan suits the parameter it was compiled for, and a
+      plan good for one customer with ten orders is terrible for one with a million.
+      <br><br>
+      <strong>Sudden, at a deployment</strong> is a code change — a new N+1, a changed query, a lost
+      <code>AsNoTracking</code>, an <code>Include</code> that now pulls far more data.
+      <br><br>
+      So "when did it change, and was it gradual or sudden?" is the first question, and it's worth asking out loud in
+      an interview.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Read the plan, and know what you're looking for</div>
+    <p style="margin:0">The plan answers most of this, and there are four things worth checking specifically.
+      <br><br>
+      <strong>Scans where a seek was expected.</strong> A clustered index scan on a large table with a selective
+      predicate means no usable index.
+      <br><br>
+      <strong>Estimated versus actual rows.</strong> A large discrepancy means the optimiser was working from bad
+      information — stale statistics, or a parameter it couldn't sniff usefully — and every downstream choice follows
+      from that estimate. This is usually the most informative single number in a plan.
+      <br><br>
+      <strong>Key lookups.</strong> The index was used to find rows, then the engine went back to the table for
+      columns the index didn't cover. Adding those as <code>INCLUDE</code> columns often removes most of the
+      cost.
+      <br><br>
+      <strong>Spills to disk.</strong> A sort or hash that exceeded its memory grant, which is slow and usually
+      follows from the bad estimate above.
+      <br><br>
+      For Azure SQL, <strong>Query Store</strong> is the tool that answers "what changed": it keeps plan history per
+      query, so you can see the exact point a plan regressed and force the previous one as an immediate mitigation.
+      That's a much stronger answer than "I'd look at the plan".</p>
+  </div>
+
+  <h2 id="hot-partition">Scenario: one partition is saturated <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — the signature, in any partitioned store"><code class="language-text">  Provisioned: 10,000 RU/s across 10 physical partitions = 1,000 RU/s each
+
+  partition 0   [##########]  1000 RU/s   THROTTLED - 429s
+  partition 1   [#         ]   100 RU/s
+  partition 2   [          ]     0 RU/s
+  ...
+
+  Total consumption: 1,100 of 10,000 RU/s.
+  The metric says 11% utilised. Users are getting errors.
+
+  Doubling to 20,000 RU/s -> 20 partitions -> 1,000 RU/s each.
+  The hot key STILL hashes to one partition. Nothing improves.</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">This is the same problem in every store, and capacity never fixes it</div>
+    <p style="margin:0">Cosmos DB partition keys, DynamoDB partition keys, Kafka and Event Hubs partition keys, Redis
+      hot keys, sequential blob name prefixes, and a SQL table partitioned on a skewed column.
+      <strong>One problem, six APIs.</strong>
+      <br><br>
+      The reason capacity doesn't help is worth stating precisely: <strong>throughput is divided across partitions,
+      and a single key always maps to exactly one partition.</strong> Adding partitions gives each one a smaller
+      share — so in some configurations, scaling up makes the hot partition <em>worse</em>.
+      <br><br>
+      And the aggregate metric is actively misleading. Total consumption at 11% while users see 429s is exactly what
+      this looks like, which is why <strong>you must split the metric by partition</strong> to see it at all.
+      <br><br>
+      What actually works:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Increase key cardinality.</strong> A synthetic key — <code>tenantId_bucket</code> where bucket is a
+        hash suffix — spreads one logical key across N partitions. Cost: reads for that key must fan out across the
+        buckets.</li>
+      <li><strong>Choose a different key.</strong> The real fix and usually a migration, because the key is
+        immutable in Cosmos and DynamoDB.</li>
+      <li><strong>Hierarchical partition keys</strong> in Cosmos, which subdivide within a tenant so a large tenant
+        isn't confined to one physical partition.</li>
+      <li><strong>Cache the hot key</strong>, which removes read pressure without changing the model — the pragmatic
+        immediate mitigation.</li>
+      <li><strong>Separate the outlier.</strong> One enormous tenant in its own container or database, which is
+        often simpler than making the shared model handle both.</li>
+    </ul>
+    <p style="margin:8px 0 0">The mitigation-versus-fix framing matters here: caching or throttling the hot caller
+      restores service today; the key change is a migration you plan properly.</p>
+  </div>
+
+  <h2 id="write-heavy">Scenario: writes can't keep up <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Fix</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Too many indexes</strong></td><td>Drop unused ones — <strong>every index is written on every insert</strong></td><td>Some reads get slower</td></tr>
+        <tr><td><strong>One row per event</strong></td><td>Batch inserts, or <code>SqlBulkCopy</code></td><td>Latency before durability</td></tr>
+        <tr><td><strong>Log write throughput</strong></td><td>Higher tier, or fewer/larger transactions</td><td>Cost, or larger blast radius</td></tr>
+        <tr><td><strong>Page latch contention on a sequential key</strong></td><td>A different key, or table partitioning</td><td>Loses index locality</td></tr>
+        <tr><td><strong>Triggers or computed indexes</strong></td><td>Move the work out of the write path</td><td>Consistency becomes eventual</td></tr>
+        <tr><td><strong>Synchronous writes in the request path</strong></td><td><strong>Queue and write asynchronously</strong></td><td>The client no longer knows it persisted</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The two highest-value checks on a write-heavy table</div>
+    <p style="margin:0"><strong>Count the indexes.</strong> Every non-clustered index must be maintained on every
+      insert, update and delete that touches its columns. A table with twelve indexes does thirteen writes per
+      insert. Teams add indexes to fix read performance and rarely remove any, so this accumulates
+      invisibly — and the DMVs will tell you which indexes have never been used since the last restart.
+      <br><br>
+      That's the clearest example of the general rule: <strong>a read optimisation is paid for on write</strong>, and
+      on a write-heavy table the bill can exceed the benefit.
+      <br><br>
+      <strong>Check the write pattern.</strong> One row per statement is enormously more expensive than batching —
+      each is a round trip, a transaction and a log flush. Batching a thousand inserts into one operation is
+      routinely an order of magnitude faster, and <code>SqlBulkCopy</code> more again for bulk loads.
+      <br><br>
+      Beyond that, the structural change is <strong>queue-based writes</strong>: accept the request, publish to a
+      queue, write in batches from a consumer. That converts a throughput ceiling into a latency trade-off, which is
+      usually the better problem to have. The honest cost is that the caller gets a 202 rather than a confirmation,
+      so the API contract changes and the client needs a way to check status.</p>
+  </div>
+
+  <h2 id="blocking">Scenario: intermittent timeouts and blocking <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Signature</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Long transactions</strong></td><td>Locks held far longer than the work requires</td></tr>
+        <tr><td><strong>An HTTP call inside a transaction</strong></td><td>Lock duration depends on a third party</td></tr>
+        <tr><td><strong>Lock escalation</strong></td><td>Bulk update takes a table lock at ~5,000 row locks</td></tr>
+        <tr><td><strong>Serializable isolation</strong></td><td>Range locks blocking more than expected</td></tr>
+        <tr><td><strong>Deadlocks</strong></td><td>Error 1205; two paths taking locks in different orders</td></tr>
+        <tr><td><strong>A report against live tables</strong></td><td>Long shared locks blocking writers</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A transaction's cost is its duration, not its size</div>
+    <p style="margin:0">The mental model that fixes most blocking: <strong>a transaction holds locks until it
+      commits</strong>, so what matters is how long it's open — not how much data it touches.
+      <br><br>
+      Which makes the worst pattern clear: <strong>an external call inside a transaction.</strong> Begin, update a
+      row, call a payment provider, commit. Now the lock is held for however long that provider takes — normally
+      200ms, occasionally 30 seconds — and every writer touching that row waits behind a third party you don't
+      control. Under load that cascades into timeouts that look like a database problem.
+      <br><br>
+      Same for a transaction spanning user interaction, or one that starts before some expensive computation.
+      <br><br>
+      The fix is to <strong>do the slow work outside the transaction</strong>, and if the external call must be
+      atomic with the write, that's what the
+      <a href="../19-architecture/integration-patterns.html">outbox pattern</a> is for: write the intent locally in
+      the transaction, commit, then perform the call from a separate process with retries.
+      <br><br>
+      Two more that come up: <strong>lock escalation</strong>, where a bulk update crossing about 5,000 row locks
+      takes a table lock instead and blocks everything — batch the update to stay below it. And
+      <strong>deadlocks</strong>, which are usually two code paths taking the same locks in different orders; the fix
+      is consistent ordering, plus a retry, since a deadlock victim is a transient failure by design.</p>
+  </div>
+
+  <h2 id="reporting">Scenario: reporting is killing the database <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>Gives you</th><th>Costs</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Read replica</strong> / read-scale-out</td><td>Reports off the primary, minimal work</td><td><strong>Eventual consistency</strong></td></tr>
+        <tr><td><strong>A separate reporting database</strong></td><td>Its own schema and indexes</td><td>ETL to build and operate</td></tr>
+        <tr><td><strong>Materialised summaries</strong></td><td>Fast, cheap queries</td><td>Staleness; maintenance on write</td></tr>
+        <tr><td><strong>Analytical store</strong> (Fabric, Synapse, Cosmos analytical store)</td><td>Columnar, built for this</td><td>Another system; latency</td></tr>
+        <tr><td><code>READ UNCOMMITTED</code> / snapshot</td><td>Stops report locks blocking writers</td><td><strong>Dirty reads</strong>, or version-store pressure</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — these are different workloads sharing one machine</div>
+    <p style="margin:0">The framing that makes this decision easy: <strong>transactional and analytical workloads
+      want opposite things.</strong>
+      <br><br>
+      OLTP wants many small, selective, indexed operations with low latency and short locks. Analytics wants to scan
+      millions of rows and aggregate. Running both on one server means the report's scans evict the working set from
+      the buffer pool, its shared locks block writers, and its memory grants starve everything else.
+      <br><br>
+      So the first question isn't "how do I make this report faster?" — it's <strong>"why is this running here at
+      all?"</strong>
+      <br><br>
+      <strong>A read replica is the cheapest real separation</strong>: on Azure SQL it's a connection-string change
+      (<code>ApplicationIntent=ReadOnly</code>) with a Business Critical or Hyperscale tier. Almost no work, and it
+      removes the interference completely.
+      <br><br>
+      The trade to state honestly: <strong>replicas are asynchronous</strong>, so a report may not see the last few
+      seconds of writes — fine for reporting, and it breaks <em>read-after-write</em>. Routing ordinary application
+      reads to a replica means a user can save a record and not see it, which is a much more visible problem than a
+      slightly stale report.
+      <br><br>
+      So: reports and exports to the replica, user-facing reads that follow a write to the primary. That distinction
+      is what separates a considered answer from "use a read replica".</p>
+  </div>
+
+  <h2 id="growth">Scenario: a table that grew without bound <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="note warn">
+    <div class="note-title">Unbounded growth is a cliff, not a slope</div>
+    <p style="margin:0">An events, audit or notifications table with no retention policy behaves fine for a long
+      time and then degrades quickly — because performance holds while the working set fits in memory and falls off
+      when it doesn't.
+      <br><br>
+      So the symptom is "it was fine last month", and the cause is months old.
+      <br><br>
+      The options, and they compose:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Archive and delete</strong> on a retention policy. The real fix, and the deletion itself must be
+        batched — a single <code>DELETE</code> of ten million rows takes a table lock, fills the log and blocks
+        everything.</li>
+      <li><strong>Table partitioning</strong> by date, so old data can be switched out almost instantly rather than
+        deleted row by row.</li>
+      <li><strong>Move cold data to cheaper storage</strong> — blob, or an analytical store — if it must be
+        retained.</li>
+      <li><strong>Cosmos DB or DynamoDB TTL</strong>, where the platform expires rows for you. Much better than a
+        cleanup job, because there's nothing to schedule or monitor.</li>
+    </ul>
+    <p style="margin:8px 0 0">The prevention is the point though: <strong>every table that grows per-event needs a
+      retention decision when it's created.</strong> That's a five-minute conversation at design time and a migration
+      afterwards — and "how big will this be in three years?" is a genuinely useful review question.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Gradual degradation is a scan meeting more rows; sudden is a plan change.</li>
+      <li>Parameter sniffing makes the same query fast for some inputs and slow for others.</li>
+      <li>Query Store shows when a plan regressed and can force the old one.</li>
+      <li>Estimated versus actual rows is the most informative number in a plan.</li>
+      <li>A hot partition can't be fixed with capacity — increase key cardinality.</li>
+      <li>Aggregate utilisation hides a hot partition entirely; split by partition.</li>
+      <li>Every index is a write cost; check for unused ones on write-heavy tables.</li>
+      <li>Batch writes; queue-based writes trade a throughput ceiling for a latency one.</li>
+      <li>A transaction's cost is its duration — never an HTTP call inside one.</li>
+      <li>Batch bulk updates to stay under lock escalation.</li>
+      <li>OLTP and analytics want opposite things — separate them.</li>
+      <li>Read replicas are asynchronous, so they break read-after-write.</li>
+      <li>Unbounded tables degrade suddenly; decide retention at design time.</li>
+      <li>Batch large deletes, or partition and switch out.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Scaling the tier</strong> for what is a missing index.</li>
+    <li><strong>Adding capacity for a hot partition.</strong></li>
+    <li><strong>Reading aggregate RU or DTU</strong> and concluding there's headroom.</li>
+    <li><strong>Adding indexes without removing any</strong>, on a write-heavy table.</li>
+    <li><strong>One insert per row</strong> in a bulk load.</li>
+    <li><strong>An HTTP call inside a transaction.</strong></li>
+    <li><strong>A single <code>DELETE</code> for millions of rows.</strong></li>
+    <li><strong>Reporting queries against live transactional tables.</strong></li>
+    <li><strong>Routing user reads to a replica</strong>, breaking read-after-write.</li>
+    <li><strong><code>READ UNCOMMITTED</code> everywhere</strong> to avoid blocking.</li>
+    <li><strong>No retention policy</strong> on an events or audit table.</li>
+    <li><strong>Retrying a deadlock victim's whole request</strong> without idempotency.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A query that took 50ms now takes 8 seconds. Nothing was deployed. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"'Nothing was deployed' is the useful constraint — it rules out a code change, so either
+          <strong>the data changed</strong> or <strong>the plan changed</strong>. The first thing I'd establish is
+          whether this was <em>gradual or sudden</em>, because that separates those two cleanly."</p>
+        <p>"<strong>If gradual</strong> — slower over weeks — it's almost certainly <strong>a scan meeting more
+          rows</strong>. The query was always doing a scan; it just didn't matter at 50,000 rows and does at five
+          million. Nothing changed except the data, which is why it feels mysterious. The fix is an index, and I'd
+          confirm from the plan that there's a scan where a seek should be."</p>
+        <p>"<strong>If sudden</strong>, with no deployment, it's a <strong>plan change</strong>. And the specific one I'd
+          suspect is <strong>parameter sniffing</strong>."</p>
+        <p>"The mechanism: SQL Server compiles a plan for the first parameter values it sees and caches it. If that
+          first execution was for a customer with ten orders, the plan uses a nested loop with index seeks — perfect
+          for ten rows, catastrophic for a customer with a million. So the <em>same query text</em> is fast for some
+          parameters and slow for others."</p>
+        <p>"And it flips without warning: a restart, a failover, a statistics update or a memory-pressure eviction
+          causes a recompile, and whichever parameter arrives first sets the plan for everyone. That's exactly 'it
+          was fine yesterday'."</p>
+        <p>"<strong>Query Store is how I'd confirm it</strong>, and this is the concrete answer I'd give. It keeps
+          plan history per query, so I can see the point the plan changed, compare the two plans, and see the
+          duration distribution. On Azure SQL it's on by default."</p>
+        <p>"It also gives me the fastest mitigation: <strong>force the previous plan</strong>. That's a
+          minutes-not-hours fix, and I'd label it as a mitigation — it's a hint pinned to a query, and it can become
+          wrong as the data changes, so it needs revisiting rather than leaving forever."</p>
+        <p>"<strong>Other candidates</strong> I'd check. <strong>Stale statistics</strong> — if a large data load
+          happened, the optimiser may be working from bad row estimates, and a large gap between estimated and actual
+          rows in the plan is the tell. That's usually the most informative single number in a plan, because every
+          downstream choice follows from the estimate."</p>
+        <p>"<strong>Blocking</strong>, if it's intermittent rather than consistent — the query itself may be fine and
+          waiting behind something else. Wait statistics distinguish that immediately: <code>LCK_</code> waits mean
+          blocking, not a slow plan."</p>
+        <p>"<strong>A dropped or disabled index</strong>, if there was any maintenance. Worth a quick check because
+          it's cheap to rule out and embarrassing to miss."</p>
+        <p>"<strong>Longer-term fixes</strong>, depending on the cause. For parameter sniffing:
+          <code>OPTIMIZE FOR UNKNOWN</code> to get an average-case plan, or <code>RECOMPILE</code> if the compile
+          cost is acceptable relative to the work, or splitting the query so the skewed and typical cases get
+          different plans. Each has a real cost, and I'd choose based on how skewed the data actually is."</p>
+        <p>"And on prevention: <strong>an alert on p95 duration per query</strong> from Query Store, so a regression
+          is caught in hours rather than when someone complains. Automatic plan correction is worth considering too —
+          Azure SQL can detect a regression and revert the plan itself, which handles the common case without
+          anyone being paged."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you separate gradual from sudden first?</li>
+        <li>Can you explain parameter sniffing mechanically?</li>
+        <li>Do you know Query Store and forcing a plan?</li>
+        <li>Do you check estimated versus actual rows?</li>
+        <li>Do you rule out blocking with wait statistics?</li>
+        <li>Do you treat forcing a plan as a mitigation?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add an index" with no diagnosis.</li>
+        <li><span class="redflag">Red flag:</span> scaling the database tier.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that plans change on their own.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why would forcing a plan be a bad long-term fix?</li>
+          <li>How would you handle genuinely skewed data?</li>
+          <li>What would you alert on?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Cosmos DB is returning 429s but you're using 15% of provisioned RUs. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That combination is diagnostic on its own: <strong>throughput is provisioned per container and divided
+          across physical partitions</strong>, so 15% aggregate with throttling means one partition is at its share
+          while the others are idle. A <strong>hot partition</strong>."</p>
+        <p>"The arithmetic makes it concrete. 10,000 RU/s across ten physical partitions is 1,000 RU/s each. If one
+          partition is taking 1,000 and the rest take almost nothing, total consumption is around 11% and that one
+          partition is throttling every request."</p>
+        <p>"<strong>I'd confirm it</strong> by looking at normalised RU consumption <em>per partition key range</em>,
+          which Azure Monitor exposes. The aggregate metric is the thing that misled us; the per-partition view shows
+          it immediately. Same principle as never trusting an average across instances."</p>
+        <p>"<strong>Then find which key.</strong> Usually one of three things: a tenant far larger than the others, a
+          poorly-chosen key with low cardinality — status, country, type — or a synthetic hotspot like using today's
+          date so all of today's writes land in one place."</p>
+        <p>"<strong>The critical point is that adding RUs does not fix this.</strong> Doubling to 20,000 gives twenty
+          partitions at 1,000 each — the hot key still hashes to exactly one. In some cases scaling up makes it
+          <em>worse</em>, because each partition's share shrinks. So the instinctive fix is not only ineffective, it's
+          expensive."</p>
+        <p>"That's worth saying explicitly, because it's the same physics as a hot key in Redis, a skewed Kafka
+          partition key, and a sequential blob name prefix. One problem, different APIs — and in all of them capacity
+          is not the lever."</p>
+        <p>"<strong>Immediate mitigation</strong>, since the real fix is a migration: <strong>cache the hot
+          key</strong> if reads dominate — that removes pressure without touching the data model.
+          <strong>Throttle or queue the hot writer</strong> if it's writes. And make sure the SDK's retry-on-429 with
+          backoff is configured, so throttling degrades latency rather than surfacing as errors."</p>
+        <p>"<strong>The real fixes</strong>, and the choice depends on the cause."</p>
+        <p>"<strong>A synthetic key</strong> — <code>tenantId_bucket</code> where bucket is a hash of the item id
+          modulo N. That spreads one logical key across N partitions. The cost is real: reads for that tenant must now
+          fan out across all N buckets, so a point read becomes a cross-partition query. Worth it for a write hotspot,
+          often not worth it for reads."</p>
+        <p>"<strong>Hierarchical partition keys</strong>, which is usually the better answer for the large-tenant
+          case: partition on tenant <em>and then</em> a subkey, so Cosmos can split a single tenant across physical
+          partitions while keeping queries for that tenant efficient. That's specifically designed for this
+          problem."</p>
+        <p>"<strong>Separate the outlier.</strong> If one tenant is a hundred times the others, putting them in their
+          own container or account is often simpler than making a shared model serve both extremes — and it gives them
+          isolated throughput, which is a benefit rather than a workaround."</p>
+        <p>"<strong>A different partition key entirely</strong>, if it was just wrong. That's the honest answer and
+          it's a migration: the key is immutable, so it means a new container and a copy, usually via change feed
+          with dual-write during the transition."</p>
+        <p>"On prevention, two things. <strong>Per-partition monitoring and alerting</strong>, because the aggregate
+          will never show this. And treating <strong>partition key choice as an architectural decision reviewed up
+          front</strong> — it's irreversible, and the cardinality question 'how many distinct values, and how evenly
+          distributed?' takes two minutes to ask at design time versus a migration later."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you recognise a hot partition from the aggregate/throttle mismatch?</li>
+        <li>Do you know throughput is divided per partition?</li>
+        <li>Do you know adding RUs doesn't help, and can explain why?</li>
+        <li>Do you know synthetic and hierarchical keys, with their costs?</li>
+        <li>Do you separate mitigation from the migration?</li>
+        <li>Do you connect it to hot keys elsewhere?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "increase the RUs."</li>
+        <li><span class="redflag">Red flag:</span> unaware throughput is divided across partitions.</li>
+        <li><span class="redflag">Red flag:</span> proposing a key change with no mention of migration.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you migrate to a new partition key with no downtime?</li>
+          <li>What does a synthetic key cost you on reads?</li>
+          <li>What would you have asked at design time?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

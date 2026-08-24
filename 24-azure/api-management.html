@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Management — Azure</title>
+<meta name="description" content="The gateway, the policy pipeline, products and subscriptions, versioning, tier trade-offs and the self-hosted gateway.">
+<meta name="keywords" content="Azure API Management APIM gateway policies inbound outbound backend on-error rate-limit-by-key validate-jwt products subscriptions versions revisions tiers consumption developer standard premium self-hosted gateway named values developer portal">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/api-management.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>API Management</h1>
+    <p class="subtitle">A programmable gateway in front of your APIs. The policy pipeline is the whole product —
+      almost every question about APIM is really a question about policies.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>It's a reverse proxy you can program</strong> with declarative policies.</li>
+      <li><strong>Four policy scopes:</strong> global, product, API, operation — and they nest.</li>
+      <li><strong>Four sections:</strong> inbound, backend, outbound, on-error.</li>
+      <li><strong><code>&lt;base /&gt;</code> controls where the parent scope's policy runs.</strong></li>
+      <li><strong>Validate JWTs at the gateway</strong>, so bad tokens never reach your service.</li>
+      <li><strong>Rate limit by key</strong>, not by the whole gateway.</li>
+      <li><strong>Products + subscriptions</strong> is how you package and meter access.</li>
+      <li><strong>Tier choice is mostly about VNet and multi-region</strong>, not throughput.</li>
+    </ul>
+  </div>
+
+  <h2 id="why">What it's actually for <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Without a gateway</th><th>With APIM</th></tr></thead>
+      <tbody>
+        <tr><td>Authentication</td><td>Every service validates tokens itself</td><td><strong>Validated once, at the edge</strong></td></tr>
+        <tr><td>Rate limiting</td><td>Per-instance, so it multiplies on scale-out</td><td><strong>Enforced centrally per key</strong></td></tr>
+        <tr><td>Multiple backends</td><td>Clients know every service URL</td><td><strong>One stable surface</strong></td></tr>
+        <tr><td>Versioning</td><td>Ad hoc per service</td><td>Versions and revisions as first-class</td></tr>
+        <tr><td>Consumer onboarding</td><td>Emails and shared secrets</td><td><strong>Developer portal and subscription keys</strong></td></tr>
+        <tr><td>Legacy API shape</td><td>Rewrite the service</td><td><strong>Transform requests and responses at the gateway</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The honest scope: APIM is for APIs you publish to others</div>
+    <p style="margin:0">If you have one web API consumed by your own SPA, APIM adds cost, latency and a deployment
+      dependency for very little. <a href="app-service.html">App Service</a> plus a WAF via Front Door or
+      Application Gateway covers that case.
+      <br><br>
+      APIM earns its place when there's <strong>a consumer relationship to manage</strong>: third parties, partners,
+      internal teams you don't control, or paid API tiers. Then subscription keys, per-consumer quotas, a
+      self-service portal and the ability to change the exposed contract without touching the backend are all
+      genuinely valuable.
+      <br><br>
+      It's also the pragmatic answer for <strong>fronting something you can't change</strong> — a legacy SOAP
+      service, a vendor API with an awkward shape, a mainframe endpoint. Policies can rewrite the request and
+      response so consumers see a clean modern API while the backend stays untouched.
+      <br><br>
+      Being able to say when <em>not</em> to use it is part of a good answer, because "we put APIM in front of
+      everything" is a common and expensive default.</p>
+  </div>
+
+  <h2 id="policies">The policy pipeline <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — how a request flows"><code class="language-text">  client
+    |
+    v
+  INBOUND     auth, rate limit, validate, rewrite, cache lookup
+    |
+    v
+  BACKEND     forward-request  (retry, timeout, circuit breaker live here)
+    |
+    v
+  your API
+    |
+    v
+  OUTBOUND    transform response, strip headers, cache store
+    |
+    v
+  client
+
+  ON-ERROR    runs instead of the remaining sections when anything throws
+
+  Scopes nest:  global  ->  product  ->  API  ->  operation
+                <base /> decides WHERE the outer scope's policy runs.</code></pre>
+
+  <pre data-label="xml — a realistic API-scope policy" class="code-good"><code class="language-xml">&lt;policies&gt;
+  &lt;inbound&gt;
+    &lt;base /&gt;                          &lt;!-- run global + product policy first --&gt;
+
+    &lt;!-- Reject bad tokens at the edge. The backend never sees them. --&gt;
+    &lt;validate-jwt header-name="Authorization"
+                  failed-validation-httpcode="401"
+                  failed-validation-error-message="Unauthorized"&gt;
+      &lt;openid-config url="https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration" /&gt;
+      &lt;audiences&gt;&lt;audience&gt;api://orders&lt;/audience&gt;&lt;/audiences&gt;
+      &lt;required-claims&gt;
+        &lt;claim name="scp" match="any"&gt;&lt;value&gt;orders.read&lt;/value&gt;&lt;/claim&gt;
+      &lt;/required-claims&gt;
+    &lt;/validate-jwt&gt;
+
+    &lt;!-- Per-caller limit. NOT a global one - see the note below. --&gt;
+    &lt;rate-limit-by-key calls="100" renewal-period="60"
+                       counter-key="@(context.Subscription?.Id ?? context.Request.IpAddress)"
+                       remaining-calls-header-name="X-RateLimit-Remaining" /&gt;
+
+    &lt;!-- Contract enforcement from the OpenAPI spec --&gt;
+    &lt;validate-content unspecified-content-type-action="prevent"
+                      max-size="102400" size-exceeded-action="prevent"
+                      errors-variable-name="validationErrors"&gt;
+      &lt;content type="application/json" validate-as="json" action="prevent" /&gt;
+    &lt;/validate-content&gt;
+
+    &lt;!-- Backend auth by managed identity: no key travels anywhere --&gt;
+    &lt;authentication-managed-identity resource="api://orders-backend" /&gt;
+  &lt;/inbound&gt;
+
+  &lt;backend&gt;
+    &lt;forward-request timeout="30" buffer-request-body="false" /&gt;
+  &lt;/backend&gt;
+
+  &lt;outbound&gt;
+    &lt;base /&gt;
+    &lt;!-- Never leak backend internals --&gt;
+    &lt;set-header name="X-Powered-By" exists-action="delete" /&gt;
+    &lt;set-header name="Server" exists-action="delete" /&gt;
+  &lt;/outbound&gt;
+
+  &lt;on-error&gt;
+    &lt;base /&gt;
+    &lt;!-- Log the real reason, return something safe --&gt;
+    &lt;set-body&gt;@{
+      return new JObject(
+        new JProperty("type", "https://httpstatuses.io/500"),
+        new JProperty("title", "Request could not be processed"),
+        new JProperty("traceId", context.RequestId)).ToString();
+    }&lt;/set-body&gt;
+  &lt;/on-error&gt;
+&lt;/policies&gt;</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — <code>&lt;base /&gt;</code> is the detail that separates familiarity from experience</div>
+    <p style="margin:0">Policies at each scope don't simply concatenate. <strong><code>&lt;base /&gt;</code> is a
+      placeholder for the parent scope's policy at that section</strong>, and where you put it decides the
+      order.
+      <br><br>
+      So in an inbound section, <code>&lt;base /&gt;</code> first means global and product policies run
+      <em>before</em> yours. Putting it last means yours runs first — which is how you'd skip a global rate limit for
+      a health endpoint, or add a header the parent policy reads.
+      <br><br>
+      <strong>Omitting <code>&lt;base /&gt;</code> entirely silently discards the parent policy</strong> for that
+      section. That's the bug: someone writes an API-scope policy without it, and the global authentication or CORS
+      policy stops applying — with no error, and the API works fine in testing because the token happened to be
+      valid anyway.
+      <br><br>
+      Also worth knowing: <strong>outbound sections evaluate outward</strong> — operation, then API, then product,
+      then global — so the nesting is inverted on the way back out. Which is what you want for response
+      transformation, and confusing the first time you debug it.
+      <br><br>
+      The related discipline: put security policies at the <strong>global or product scope</strong>, so a new API
+      inherits them by default rather than depending on whoever creates it remembering.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Policy</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>validate-jwt</code></td><td><strong>Full token validation</strong> — signature, issuer, audience, claims</td></tr>
+        <tr><td><code>rate-limit-by-key</code></td><td>Short-window throttling per caller. Returns 429</td></tr>
+        <tr><td><code>quota-by-key</code></td><td><strong>Long-window volume cap</strong> — monthly call or bandwidth limits</td></tr>
+        <tr><td><code>cache-lookup</code> / <code>cache-store</code></td><td>Response caching at the gateway, optionally varying by header or claim</td></tr>
+        <tr><td><code>set-backend-service</code></td><td><strong>Route dynamically</strong> — canary, tenant routing, A/B</td></tr>
+        <tr><td><code>authentication-managed-identity</code></td><td>Gateway obtains a token for the backend. <strong>No shared key</strong></td></tr>
+        <tr><td><code>validate-content</code> / <code>validate-headers</code></td><td>Enforce the OpenAPI contract before forwarding</td></tr>
+        <tr><td><code>retry</code></td><td>Retry the backend on defined conditions</td></tr>
+        <tr><td><code>circuit-breaker</code> (backend config)</td><td>Trip on a failure threshold and stop hammering a sick backend</td></tr>
+        <tr><td><code>send-request</code></td><td>Call another service mid-pipeline — enrichment, external authorisation</td></tr>
+        <tr><td><code>llm-*</code> policies</td><td>Token-based rate limiting, semantic caching and emitting metrics for AI backends</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title"><code>rate-limit</code> versus <code>rate-limit-by-key</code></div>
+    <p style="margin:0">Plain <code>rate-limit</code> applies per <strong>subscription</strong>. That sounds right
+      until you consider what happens when many callers share one subscription, or when you want to limit by
+      something else entirely.
+      <br><br>
+      <code>rate-limit-by-key</code> lets you choose the counter: subscription id, IP, a JWT claim, a tenant header.
+      <strong>That choice is the security decision.</strong>
+      <br><br>
+      Two traps. Keying on <strong>IP alone</strong> is wrong behind NAT or a corporate proxy, where thousands of
+      users share an address and throttle each other. Keying on a <strong>client-supplied header</strong> with no
+      validation is worse — the caller just changes the value to reset their limit, so the limit does nothing.
+      <br><br>
+      Key on something the caller cannot forge: a subscription id, or a claim from a token you validated in the same
+      pipeline. And note the <em>ordering</em> matters — validate the JWT <strong>before</strong> rate limiting by a
+      claim from it, or you're trusting an unverified value.
+      <br><br>
+      Also: on multi-region or scaled deployments, rate-limit counters are not perfectly synchronised across
+      gateway units, so treat the limit as approximate rather than exact. Fine for protection, not for billing.</p>
+  </div>
+
+  <h2 id="products">Products, subscriptions and versions <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concept</th><th>Is</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Product</strong></td><td>A bundle of APIs with its own policy — "Free tier", "Partner tier"</td></tr>
+        <tr><td><strong>Subscription</strong></td><td>A consumer's access to a product, with keys. <strong>The unit of metering</strong></td></tr>
+        <tr><td><strong>Version</strong></td><td>A <em>breaking</em> change, exposed by path, header or query. Consumers choose</td></tr>
+        <tr><td><strong>Revision</strong></td><td>A <em>non-breaking</em> change, staged and tested, then made current</td></tr>
+        <tr><td><strong>Named value</strong></td><td>Configuration for policies, optionally <strong>backed by Key Vault</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Versions and revisions solve different problems</div>
+    <p style="margin:0">The distinction is worth being precise about, because it's the natural interview
+      follow-up.
+      <br><br>
+      A <strong>version</strong> is for a <em>breaking</em> change. <code>v1</code> and <code>v2</code> exist
+      simultaneously, consumers move when they're ready, and you retire <code>v1</code> on a published timeline.
+      That's a consumer-visible decision.
+      <br><br>
+      A <strong>revision</strong> is for a <em>non-breaking</em> change to an existing version. You create it, test
+      it against a separate revision URL, then make it current — and consumers see nothing. It also gives you a
+      change log and a one-click way back to the previous revision.
+      <br><br>
+      So: <strong>revisions for safe iteration, versions for contract breaks.</strong> Teams that create a new
+      version for every change end up maintaining five versions that differ trivially, which is a maintenance
+      burden with no benefit — and each one has to be tested and supported.
+      <br><br>
+      The related discipline is <strong>knowing who uses what</strong>. Subscription-level metrics tell you which
+      consumers are still on <code>v1</code>, which turns "we'd like to retire it" into a specific list of people to
+      contact. Without that you can never safely remove anything.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Subscription keys are not authentication</div>
+    <p style="margin:0">A subscription key identifies <em>which consumer application</em> is calling. It's an API
+      key: useful for metering, quotas and revoking a specific consumer.
+      <br><br>
+      It says nothing about <strong>which user</strong> is acting, or what they're allowed to do. It travels in a
+      header, appears in logs and configuration, and is shared across everyone using that application.
+      <br><br>
+      So user authentication and authorisation is still <a href="../08-http-web-apis/auth-security.html#tokens">OAuth 2.0 and
+      JWTs</a>, validated with <code>validate-jwt</code>. The two are complementary — the key says who the
+      integration is, the token says who the user is and what scopes they hold.
+      <br><br>
+      Treating a subscription key as authentication is a genuine security mistake, and it's common in internal APIs
+      where "you need the key to call it" gets mistaken for access control. Any leak of the key becomes full access,
+      with no user identity in the audit trail.</p>
+  </div>
+
+  <h2 id="tiers">Tiers <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tier</th><th>Key property</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Consumption</strong></td><td>Serverless, per-call billing, <strong>no VNet, no developer portal</strong></td><td>Low or spiky volume</td></tr>
+        <tr><td><strong>Developer</strong></td><td>Full features, <strong>no SLA</strong></td><td>Non-production only</td></tr>
+        <tr><td><strong>Basic / Standard</strong></td><td>Production SLA, <strong>no VNet injection</strong></td><td>Public APIs</td></tr>
+        <tr><td><strong>Premium</strong></td><td><strong>VNet injection, multi-region, availability zones, self-hosted gateway</strong></td><td>Internal APIs, HA, global</td></tr>
+        <tr><td><strong>v2 tiers</strong></td><td>Faster to provision and scale, VNet integration on Standard v2 / Premium v2</td><td>The modern default for new work</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The classic tiers take a long time to do anything</div>
+    <p style="margin:0">Provisioning a classic APIM instance takes <strong>30 to 45 minutes</strong>, and so does
+      scaling it or changing its network configuration. That's not a typo and it shapes how you work with it: you
+      can't spin one up per pull request, and an emergency scale-out is not a quick fix.
+      <br><br>
+      The <strong>v2 tiers</strong> exist largely to fix this — provisioning and scaling in minutes — and they're the
+      sensible default for new deployments. Feature parity has been improving, so it's worth checking the current
+      state against what you need rather than relying on an older comparison.
+      <br><br>
+      Two other tier facts that decide architectures. <strong>VNet injection is Premium on the classic tiers</strong>
+      — so "the gateway must sit inside our network and reach private backends" historically forced Premium, which is
+      a large jump in cost. And <strong>multi-region deployment is Premium only</strong>, which is the answer to
+      global latency and regional failover.
+      <br><br>
+      Developer tier has <strong>no SLA</strong>. It's fully featured, which makes it tempting for production, and
+      it is explicitly not supported for it.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The self-hosted gateway</div>
+    <p style="margin:0">Premium lets you run the <strong>gateway itself as a container</strong> — in your own
+      Kubernetes cluster, another cloud, or on-premises — while management, policy authoring and analytics stay in
+      Azure.
+      <br><br>
+      Two problems it solves. <strong>Data residency</strong>: traffic never leaves the jurisdiction, because the
+      gateway is local even though the control plane is in Azure. And <strong>latency to local backends</strong>: a
+      request from an on-premises client to an on-premises service doesn't make a round trip to Azure and back.
+      <br><br>
+      The trade: you're now operating the gateway — upgrades, scaling, monitoring — so it's only worth it when
+      residency or locality genuinely demands it. It also needs connectivity to Azure for configuration, though it
+      keeps serving on cached configuration if that connection drops, which is the property that makes it viable.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>APIM is a programmable reverse proxy; policies are the product.</li>
+      <li>Use it when there's a consumer relationship to manage, not for a single internal API.</li>
+      <li>Scopes nest global → product → API → operation; <code>&lt;base /&gt;</code> decides ordering.</li>
+      <li>Omitting <code>&lt;base /&gt;</code> silently drops the parent policy.</li>
+      <li>Outbound evaluates outward — the nesting inverts on the way back.</li>
+      <li>Put security policies at global or product scope so new APIs inherit them.</li>
+      <li>Validate JWTs at the gateway; the backend still shouldn't trust blindly.</li>
+      <li>Rate limit by a key the caller can't forge, and validate the token first.</li>
+      <li>Rate-limit counters are approximate across scale units.</li>
+      <li>Revisions for non-breaking change, versions for contract breaks.</li>
+      <li>Subscription keys identify the application, not the user.</li>
+      <li>Classic tiers take 30–45 minutes to provision or scale; v2 tiers are minutes.</li>
+      <li>VNet injection and multi-region are Premium on classic tiers.</li>
+      <li>Self-hosted gateway for data residency and local latency.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Omitting <code>&lt;base /&gt;</code></strong>, silently disabling inherited policy.</li>
+    <li><strong>Security policies at operation scope</strong>, so a new API is unprotected by default.</li>
+    <li><strong>Rate limiting on a client-supplied header</strong> the caller can change.</li>
+    <li><strong>Rate limiting by IP</strong> behind NAT, so users throttle each other.</li>
+    <li><strong>Rate limiting on a claim before validating the token.</strong></li>
+    <li><strong>Treating the subscription key as authentication.</strong></li>
+    <li><strong>Backends reachable directly</strong>, so the gateway can be bypassed entirely.</li>
+    <li><strong>Secrets as plain named values</strong> instead of Key Vault references.</li>
+    <li><strong>A new version for every non-breaking change.</strong></li>
+    <li><strong>Developer tier in production</strong> — no SLA.</li>
+    <li><strong>Assuming you can scale APIM quickly</strong> on a classic tier during an incident.</li>
+    <li><strong>Policy edited in the portal</strong> and never captured in source control.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What would you put in an APIM policy, and what should stay in the service? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My dividing line is: <strong>cross-cutting concerns that are the same for every API go in the gateway;
+          anything involving business meaning stays in the service.</strong>"</p>
+        <p>"So <strong>in the gateway</strong>: JWT validation, rate limiting and quotas, request size and schema
+          validation against the OpenAPI spec, CORS, response caching, stripping headers that leak backend detail,
+          and obtaining a token for the backend via managed identity."</p>
+        <p>"The reason those belong there is that they're <em>identical</em> across services and they're cheaper to
+          do early. A request with an invalid token is rejected at the edge and never consumes a backend instance —
+          which matters under attack, because otherwise every bad request costs you compute."</p>
+        <p>"And putting them at the <strong>global or product scope</strong> means a newly-added API inherits them
+          automatically, rather than depending on whoever created it remembering. That's a structural guarantee
+          instead of a procedural one, which is the part I care about."</p>
+        <p>"<strong>In the service</strong>: authorisation decisions that depend on data — 'can this user see this
+          specific order?' — business validation, and anything needing domain knowledge. The gateway shouldn't know
+          what an order is or query the database to decide."</p>
+        <p>"The important qualifier: <strong>gateway validation doesn't mean the service can stop
+          validating.</strong> The service should still validate its own tokens and inputs, because if anything ever
+          reaches it another way — a misconfigured network rule, an internal caller, a private endpoint someone
+          added — it's the last line of defence."</p>
+        <p>"That's related to something I'd check explicitly: <strong>can the backend be reached directly, bypassing
+          the gateway?</strong> If yes, every gateway policy is advisory. The backend should only accept traffic from
+          APIM — via VNet, private endpoint, or at minimum a client certificate — otherwise all this is theatre."</p>
+        <p>"On policy mechanics, the thing I'd be careful about is <strong><code>&lt;base /&gt;</code></strong>. It's
+          a placeholder for the parent scope's policy, so where it sits controls ordering — and
+          <strong>omitting it silently drops the inherited policy</strong> for that section. No error, and the API
+          works fine in testing. That's the APIM bug people hit."</p>
+        <p>"Two things I'd avoid putting in policies. <strong>Complex logic in C# expressions</strong> — it's
+          possible, and it becomes untestable, hard to debug and invisible to anyone reading the service code.
+          Once a policy needs real logic, that logic belongs in code."</p>
+        <p>"And <strong>secrets as plain named values</strong>. Named values should be Key Vault references so
+          they're not sitting readable in the APIM configuration."</p>
+        <p>"Last thing: <strong>policies belong in source control</strong>. They're deployable artefacts. Editing
+          XML in the portal means the running configuration is untracked, unreviewed, and lost on any redeploy from
+          a template — and 'someone changed a policy in the portal' is a genuinely hard incident to diagnose."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have a principled dividing line rather than a list?</li>
+        <li>Do you know policies at global scope make protection the default?</li>
+        <li>Do you keep validation in the service too?</li>
+        <li>Do you check that the gateway can't be bypassed?</li>
+        <li>Do you keep policy in source control?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> putting business logic in policies.</li>
+        <li><span class="redflag">Red flag:</span> removing service-side validation because the gateway does
+          it.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that the backend may be directly reachable.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you stop traffic reaching the backend directly?</li>
+          <li>Where would you cache, and how do you avoid serving one user another's data?</li>
+          <li>How do you test a policy change?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>You're exposing an API to external partners. Design the gateway configuration. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd design this around <strong>per-partner isolation</strong> — the ability to see, limit and revoke each
+          partner independently — because that's the requirement that distinguishes a partner API from an internal
+          one."</p>
+        <p>"<strong>Products and subscriptions</strong> give me that. A product per commercial tier — say Standard
+          and Premium partner — with different rate limits and quotas, and a subscription per partner. Then each
+          partner has their own key, their own usage metrics, and I can revoke exactly one without touching anyone
+          else."</p>
+        <p>"<strong>Authentication is OAuth with client credentials</strong>, validated by
+          <code>validate-jwt</code> at the gateway — checking signature against the published JWKS, issuer,
+          audience, and the specific scopes required for each operation."</p>
+        <p>"I'd be explicit that the <strong>subscription key is not authentication</strong>. It identifies which
+          partner integration is calling, which is what I need for metering and revocation. The token is what
+          establishes authorisation. Both, doing different jobs."</p>
+        <p>"<strong>Rate limiting and quotas</strong> keyed on the subscription id — something the partner cannot
+          forge. I'd use <code>rate-limit-by-key</code> for a short window to protect the backend from bursts, and
+          <code>quota-by-key</code> for the monthly volume in the commercial agreement. And I'd return
+          <code>Retry-After</code> and remaining-call headers, because a partner that can see their limit will
+          handle it properly instead of retrying blindly."</p>
+        <p>"Important ordering detail: <strong>validate the JWT before rate limiting on anything from it.</strong>
+          Otherwise the counter key comes from an unverified token."</p>
+        <p>"<strong>Contract enforcement</strong> with <code>validate-content</code> and
+          <code>validate-headers</code> against the OpenAPI spec, plus a maximum body size. Partner integrations
+          send malformed requests — that's normal — and I'd rather reject them at the edge with a clear message than
+          have them produce obscure backend errors. It also stops a malformed-payload attack reaching my
+          service."</p>
+        <p>"<strong>Backend protection</strong> is the part I'd insist on. The backend accepts traffic
+          <em>only</em> from APIM — via VNet integration and private endpoints, or a client certificate if the
+          network can't do it. If partners can reach the backend directly, every policy above is decoration. I'd
+          also use <code>authentication-managed-identity</code> so the gateway gets its own token for the backend and
+          no shared secret exists."</p>
+        <p>"<strong>Versioning:</strong> path-based versions, since partners integrate once and change slowly, so
+          the version must be obvious and stable. Revisions for non-breaking changes so I can improve things without
+          asking anyone to do work. And I'd track which subscriptions still call <code>v1</code>, because that turns
+          deprecation from a hope into a list of people to email."</p>
+        <p>"<strong>Onboarding</strong> through the developer portal — self-service documentation, a try-it console,
+          key management — with subscription approval required rather than automatic, since these are commercial
+          relationships."</p>
+        <p>"<strong>Resilience:</strong> a backend timeout well below the partner's likely client timeout, retry only
+          on genuinely idempotent operations, and a circuit breaker on the backend so a failing service returns fast
+          rather than holding connections. A slow gateway is worse than a failing one, because the partner's
+          connections pile up too."</p>
+        <p>"<strong>Observability per subscription</strong> — that's the operational point. When a partner says 'your
+          API is broken', I need to see <em>their</em> traffic, error rates and latency specifically, not an
+          aggregate. I'd also return a correlation id in every response so a support conversation starts with an
+          identifier instead of a timestamp."</p>
+        <p>"<strong>Tier:</strong> if the backend is private, that historically means Premium for VNet injection on
+          the classic tiers, or Standard v2 which supports VNet integration — worth checking current parity. Premium
+          also gives multi-region, which matters if partners are geographically spread. Not Developer tier: no
+          SLA."</p>
+        <p>"And a practical constraint I'd raise early: <strong>classic APIM takes 30 to 45 minutes to provision or
+          scale.</strong> So capacity planning has to be ahead of time — you cannot scale out during an incident —
+          and the v2 tiers are much better on that, which is a real argument for them."</p>
+        <p>"Finally, <strong>everything in source control</strong> — APIs, products, policies — deployed through the
+          pipeline. Portal edits mean untracked production configuration, and with external partners depending on
+          it, an unreviewed policy change is a genuine risk."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you use products and subscriptions for per-partner isolation?</li>
+        <li>Do you separate the key from authentication?</li>
+        <li>Do you order JWT validation before claim-based rate limiting?</li>
+        <li>Do you lock the backend to gateway-only traffic?</li>
+        <li>Do you plan deprecation using subscription-level usage?</li>
+        <li>Do you know the provisioning-time constraint?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> API keys as the only security.</li>
+        <li><span class="redflag">Red flag:</span> a single shared rate limit for all partners.</li>
+        <li><span class="redflag">Red flag:</span> leaving the backend publicly reachable.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>A partner exceeds their quota mid-month. What happens?</li>
+          <li>How do you deprecate v1 safely?</li>
+          <li>How do you test policy changes before production?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker &amp; Kubernetes — Overview</title>
+<meta name="description" content="What containers actually are, what problem orchestration solves, and how much of it a .NET developer needs to know.">
+<meta name="keywords" content="containers vs virtual machines Docker overview Kubernetes overview orchestration why containers .NET containerization image layers namespaces cgroups when you need Kubernetes">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="25-docker-kubernetes/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Docker &amp; Kubernetes</h1>
+    <p class="subtitle">A container is a process with a restricted view of the machine. Everything else follows from
+      that, including why orchestration exists.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="what-is-a-container">What a container actually is <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In one sentence</span>
+    <p>A container is <strong>an ordinary process on the host</strong>, started with a restricted view of the
+      filesystem, network and process list, and a cap on how much CPU and memory it can use.</p>
+    <p>There is no guest operating system. <code>ps</code> on the host shows your container's process directly.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A <strong>virtual machine</strong> is a separate flat in a building — its own walls, plumbing and heating. It
+      boots an entire operating system.</p>
+    <p>A <strong>container</strong> is a room in a shared flat with a lock on the door. It has its own space and
+      can't see what's in the other rooms, but the plumbing and heating are shared.</p>
+    <p>That's why a container starts in milliseconds and a VM takes a minute: <strong>there's nothing to
+      boot</strong>. And it's why containers on one host must share the same kernel.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Virtual machine</th><th>Container</th></tr></thead>
+      <tbody>
+        <tr><td>Contains</td><td><strong>A full guest OS</strong></td><td>Your process and its dependencies</td></tr>
+        <tr><td>Start time</td><td>Tens of seconds</td><td><strong>Milliseconds</strong></td></tr>
+        <tr><td>Size</td><td>Gigabytes</td><td>Tens to hundreds of megabytes</td></tr>
+        <tr><td>Kernel</td><td>Its own</td><td><strong>Shared with the host</strong></td></tr>
+        <tr><td>Isolation</td><td><strong>Strong — hardware-level</strong></td><td>Weaker — kernel features</td></tr>
+        <tr><td>Density per host</td><td>Tens</td><td><strong>Hundreds</strong></td></tr>
+        <tr><td>Run Linux and Windows together</td><td>Yes</td><td><strong>No — the kernel must match</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The mechanisms, in case you're asked</div>
+    <p style="margin:0">Containers are built from ordinary Linux kernel features rather than anything exotic.
+      <br><br>
+      <strong>Namespaces</strong> restrict what a process can <em>see</em> — its own process list, network
+      interfaces, mount points, hostname and users. That's the isolation.
+      <br><br>
+      <strong>cgroups</strong> restrict what it can <em>use</em> — CPU shares, memory limit, I/O bandwidth. That's
+      the resource control, and it's the mechanism behind Kubernetes requests and limits.
+      <br><br>
+      <strong>A union filesystem</strong> stacks read-only image layers with one writable layer on top. That's why
+      ten containers from one image cost roughly one image's worth of disk.
+      <br><br>
+      Being able to name those three is usually enough. The reason it's worth knowing rather than memorising is that
+      it explains the consequences: <strong>shared kernel means weaker isolation than a VM</strong>, which is why
+      you don't rely on container boundaries alone for hostile multi-tenancy, and why a kernel vulnerability affects
+      every container on the host.</p>
+  </div>
+
+  <h2 id="why">What containers actually solve <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Problem</th><th>How containers address it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>"Works on my machine"</strong></td><td>The runtime, dependencies and configuration ship <em>with</em> the app</td></tr>
+        <tr><td>Environment drift</td><td><strong>The same image</strong> runs in dev, test and production</td></tr>
+        <tr><td>Slow, fragile deployment</td><td>An image is one immutable artefact — deploy or roll back by tag</td></tr>
+        <tr><td>Conflicting runtime versions</td><td>Each container carries its own</td></tr>
+        <tr><td>Poor server utilisation</td><td>High density on shared hosts</td></tr>
+        <tr><td>Local development setup</td><td><strong>Compose brings up a whole dependency stack</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the real win is the immutable artefact</div>
+    <p style="margin:0">"Consistent environments" is the usual answer and it undersells it. .NET already had
+      reasonable environment consistency compared with, say, Python.
+      <br><br>
+      The more valuable property is that <strong>the image is a single immutable, content-addressed
+      artefact</strong>. The bytes tested in staging are the exact bytes running in production — not a rebuild from
+      the same commit, the identical image.
+      <br><br>
+      That collapses a whole class of question. "Was this built with the right configuration?" "Did the deploy pick
+      up the new dependency?" "Is production running what we tested?" All answerable by digest.
+      <br><br>
+      It's also what makes rollback trivial and reliable: deploy the previous tag. No rebuild, no restore, no
+      pipeline run — and no risk that rebuilding produces something subtly different because a transitive dependency
+      moved.
+      <br><br>
+      Two things it does <em>not</em> solve, worth saying so you don't oversell it: <strong>configuration and data
+      still live outside the image</strong> — that's the point — and containers do nothing about a bad architecture.
+      A monolith in a container is a containerised monolith.</p>
+  </div>
+
+  <h2 id="orchestration">Why orchestration exists <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The gap Docker leaves</span>
+    <p>Docker runs a container on <em>one machine</em>. That's the whole scope.</p>
+    <p>Production needs more: many machines, restart on crash, replace a failed host, roll out a new version without
+      downtime, route traffic to healthy instances, scale on load, and give services a stable way to find each
+      other.</p>
+    <p><strong>That list is what Kubernetes is.</strong> It's a control loop that continuously moves actual state
+      toward declared state.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Need</th><th>Kubernetes primitive</th></tr></thead>
+      <tbody>
+        <tr><td>Run N copies, replace failures</td><td><strong>Deployment</strong> (managing ReplicaSets)</td></tr>
+        <tr><td>A stable address for a set of pods</td><td><strong>Service</strong></td></tr>
+        <tr><td>HTTP routing from outside</td><td><strong>Ingress</strong> or Gateway API</td></tr>
+        <tr><td>Configuration and secrets</td><td>ConfigMap, Secret</td></tr>
+        <tr><td>Scale on metrics</td><td><strong>HPA</strong>, or KEDA for events</td></tr>
+        <tr><td>Run to completion</td><td>Job, CronJob</td></tr>
+        <tr><td>Stable identity and storage per replica</td><td>StatefulSet</td></tr>
+        <tr><td>One copy per node</td><td>DaemonSet</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Declarative, and why that's the whole idea</div>
+    <p style="margin:0">You don't tell Kubernetes to <em>start three pods</em>. You declare that
+      <strong>three should exist</strong>, and a controller works continuously to make that true.
+      <br><br>
+      Kill a pod and another appears. Lose a node and its pods are rescheduled elsewhere. Change the image tag and
+      the deployment rolls pods over gradually, checking readiness as it goes.
+      <br><br>
+      That reconciliation loop is the mental model to carry. It explains behaviour that otherwise looks strange —
+      like a pod you deleted coming straight back, or a rollout stalling because a new pod never became ready and
+      the controller correctly refuses to continue.
+      <br><br>
+      It also means <strong>debugging is usually about the gap between declared and actual</strong>:
+      <code>kubectl describe</code> tells you what the controller is trying to do and why it can't.</p>
+  </div>
+
+  <h2 id="how-much">How much of this you need <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>You're doing this</th><th>You need</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Local development with a database, Redis, a message broker</td>
+          <td><strong>Docker and Compose.</strong> Non-negotiable — this is everyday tooling</td>
+        </tr>
+        <tr>
+          <td>Deploying to App Service or Container Apps</td>
+          <td>Docker. <strong>Kubernetes concepts are useful background, not required</strong></td>
+        </tr>
+        <tr>
+          <td>Deploying to AKS as an application developer</td>
+          <td>Deployments, Services, ConfigMaps, probes, requests and limits</td>
+        </tr>
+        <tr>
+          <td>Owning the cluster</td>
+          <td>All of it — networking, RBAC, upgrades, admission policy, capacity</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — Docker is essential, Kubernetes is conditional</div>
+    <p style="margin:0">Worth separating these, because they're often bundled and they don't carry equal weight for
+      a .NET developer.
+      <br><br>
+      <strong>Docker is table stakes.</strong> Writing a sensible multi-stage Dockerfile, understanding layer
+      caching, and running dependencies locally with Compose are ordinary day-to-day skills. Not knowing them is a
+      real gap.
+      <br><br>
+      <strong>Kubernetes is a platform commitment</strong>, and plenty of well-run .NET systems never touch it —
+      because <a href="../24-azure/app-service.html">App Service</a> or Container Apps covers the requirement with a
+      fraction of the operational surface.
+      <br><br>
+      So in an interview, the answer that lands is knowing the concepts well enough to reason about them, plus being
+      able to say <strong>when Kubernetes is <em>not</em> the right choice</strong>. Reaching for a cluster for three
+      services is a judgement error, and recognising that reads as more senior than reciting primitives.
+      <br><br>
+      What you should be solid on regardless: <strong>images and layers, requests and limits, readiness versus
+      liveness, and graceful shutdown.</strong> Those four come up constantly and the mistakes are expensive —
+      see <a href="../24-azure/aks.html#identity">probes done wrong causing outages</a>.</p>
+  </div>
+
+  <h2 id="in-this-section">In this section</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="docker.html">Docker &amp; Containerization</a></td>
+          <td>Images, layers, multi-stage builds for .NET, base image choice, volumes, networks, security</td>
+        </tr>
+        <tr>
+          <td><a href="kubernetes.html">Kubernetes</a></td>
+          <td>Pods, Deployments, Services, Ingress, config, StatefulSets, Jobs, HPA</td>
+        </tr>
+        <tr>
+          <td><a href="production.html">Containers in Production</a></td>
+          <td>Requests and limits, probes, rollouts, graceful shutdown, .NET in containers, debugging</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>A container is a host process with a restricted view — no guest OS, so it starts in milliseconds.</li>
+      <li>Namespaces isolate what it sees; cgroups limit what it uses; layers make images cheap.</li>
+      <li>Shared kernel means weaker isolation than a VM.</li>
+      <li>The real win is one immutable artefact — the exact bytes you tested.</li>
+      <li>Rollback is deploying the previous tag, with no rebuild.</li>
+      <li>Containers don't fix architecture, and config stays outside the image.</li>
+      <li>Docker runs one container on one machine; orchestration covers everything else.</li>
+      <li>Kubernetes reconciles actual state toward declared state, continuously.</li>
+      <li>Docker is table stakes; Kubernetes is a platform commitment.</li>
+      <li>Be solid on images, requests and limits, probes, and graceful shutdown.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What's the difference between a container and a virtual machine? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The core difference is that <strong>a VM virtualises hardware and a container virtualises the operating
+          system</strong>."</p>
+        <p>"A VM runs a complete guest OS with its own kernel on top of a hypervisor. A container is
+          <strong>just a process on the host</strong>, started with a restricted view of the filesystem, network and
+          process list, and a cap on CPU and memory. If I run <code>ps</code> on the host I can see the container's
+          process directly — there's no boundary in the way you might expect."</p>
+        <p>"Everything practical follows from that. <strong>There's no OS to boot</strong>, so a container starts in
+          milliseconds rather than tens of seconds. It's tens of megabytes rather than gigabytes, because it holds
+          the app and its dependencies rather than a whole OS. And you can run hundreds on a host instead of
+          tens."</p>
+        <p>"The mechanisms, if it's useful: <strong>namespaces</strong> restrict what the process can see,
+          <strong>cgroups</strong> restrict what it can use, and a <strong>union filesystem</strong> stacks
+          read-only image layers with one writable layer. That last one is why ten containers from the same image
+          cost roughly one image's worth of disk."</p>
+        <p>"The trade-off worth being honest about: <strong>isolation is weaker</strong>. A VM boundary is enforced
+          by hardware; a container boundary is enforced by kernel features, and the kernel is shared. So a kernel
+          vulnerability potentially affects every container on the host, and a privileged container can often escape
+          entirely."</p>
+        <p>"Which is why <strong>containers alone aren't a security boundary for hostile workloads</strong>. If I
+          were running untrusted code — a customer's build script, say — I'd want VM-level isolation, or something
+          like gVisor. For my own services in a trusted estate, containers are fine."</p>
+        <p>"One more practical consequence: <strong>the kernel must match.</strong> Windows containers need a
+          Windows host and Linux containers need a Linux kernel. Docker Desktop makes this invisible on Windows by
+          running a Linux VM underneath, which is worth knowing because it explains why 'it works on my Windows
+          machine' can mean 'it works in a Linux VM on my Windows machine'."</p>
+        <p>"And they're not exclusive — in practice containers usually run <em>on</em> VMs. AKS nodes are VMs. So
+          it's layered rather than a choice, with the VM providing the hard boundary between tenants and containers
+          providing density and packaging within it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know a container is a host process, not a small VM?</li>
+        <li>Can you connect that to start time, size and density?</li>
+        <li>Are you honest about weaker isolation?</li>
+        <li>Do you know the kernel must match?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "a container is a lightweight VM."</li>
+        <li><span class="redflag">Red flag:</span> claiming equal isolation to a VM.</li>
+        <li><span class="redflag">Red flag:</span> thinking a Linux container runs on a Windows kernel.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Would you run untrusted code in a container?</li>
+          <li>How does Docker Desktop run Linux containers on Windows?</li>
+          <li>Why is an image with ten layers not ten times the size?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

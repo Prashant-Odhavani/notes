@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Components, Modules &amp; DI — Angular</title>
+<meta name="description" content="The component model, template bindings, standalone components, the injector hierarchy, lifecycle hooks and content projection.">
+<meta name="keywords" content="Angular component standalone NgModule template binding property event two-way ngModel dependency injection injector hierarchy providedIn inject lifecycle hooks ngOnInit ngOnChanges content projection ng-content directive pipe">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="31-angular/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Components, Modules &amp; DI</h1>
+    <p class="subtitle">The building blocks. Dependency injection will feel familiar; the injector hierarchy is
+      the part worth real attention.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Standalone components are the default now.</strong> <code>NgModule</code> is legacy but
+        interoperates.</li>
+      <li><strong>Binding syntax:</strong> <code>[prop]</code> in, <code>(event)</code> out,
+        <code>[(ngModel)]</code> both.</li>
+      <li><strong><code>providedIn: 'root'</code> is a singleton</strong> and tree-shakeable.</li>
+      <li><strong>A provider on a component</strong> gives one instance per component instance.</li>
+      <li><strong><code>ngOnInit</code> for initialisation</strong>, not the constructor.</li>
+      <li><strong><code>ngOnChanges</code> fires on reference change</strong>, not mutation.</li>
+      <li><strong><code>ng-content</code> projects children</strong> — the composition mechanism.</li>
+    </ul>
+  </div>
+
+  <h2 id="component">The component model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="typescript — a modern standalone component" class="code-good"><code class="language-typescript">@Component({
+  selector: 'app-order-summary',
+  standalone: true,                       // implicit in v19+
+  imports: [CurrencyPipe, OrderRowComponent],   // what the TEMPLATE needs
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    &lt;h2&gt;{{ title() }}&lt;/h2&gt;
+    @for (line of order().lines; track line.id) {
+      &lt;app-order-row [line]="line" (removed)="remove($event)" /&gt;
+    } @empty {
+      &lt;p&gt;No items.&lt;/p&gt;
+    }
+    &lt;strong&gt;{{ total() | currency }}&lt;/strong&gt;
+  `
+})
+export class OrderSummaryComponent {
+  // Signal inputs - Angular 17.1+
+  readonly order = input.required&lt;Order&gt;();
+  readonly title = input('Order summary');
+
+  readonly removed = output&lt;string&gt;();
+
+  readonly total = computed(() =&gt;
+    this.order().lines.reduce((s, l) =&gt; s + l.price, 0));
+
+  remove(id: string) { this.removed.emit(id); }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Part</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>selector</code></td><td>The element name used in templates</td></tr>
+        <tr><td><code>imports</code></td><td>Components, directives and pipes the <strong>template</strong> uses. Standalone components declare their own dependencies</td></tr>
+        <tr><td><code>template</code></td><td>Inline, or <code>templateUrl</code> for a separate file</td></tr>
+        <tr><td><code>input()</code></td><td>Data in. <code>input.required</code> makes it mandatory at compile time</td></tr>
+        <tr><td><code>output()</code></td><td>Events out, via <code>emit()</code></td></tr>
+        <tr><td><code>changeDetection</code></td><td><code>OnPush</code> should be the default choice — see <a href="reactivity.html#onpush">reactivity</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Signal inputs are a real improvement, not just new syntax</div>
+    <p style="margin:0">The old <code>@Input()</code> decorator gave you a plain property. To react to a change
+      you needed <code>ngOnChanges</code> and a string-keyed lookup, or a setter.
+      <br><br>
+      <code>input()</code> returns a <strong>signal</strong>, so it composes directly into
+      <code>computed()</code>. Derived values update automatically with no lifecycle hook at all — which removes
+      most legitimate uses of <code>ngOnChanges</code>.
+      <br><br>
+      <code>input.required&lt;T&gt;()</code> also gives compile-time enforcement that the input was supplied,
+      replacing the <code>!</code> non-null assertion that everyone used to write and occasionally got wrong.</p>
+  </div>
+
+  <h2 id="standalone">Standalone vs NgModule <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Standalone</th><th><code>NgModule</code></th></tr></thead>
+      <tbody>
+        <tr><td>Declares dependencies</td><td><strong>On the component</strong></td><td>In a module's <code>declarations</code>/<code>imports</code></td></tr>
+        <tr><td>Boilerplate</td><td>None</td><td>A module per feature</td></tr>
+        <tr><td>Lazy loading</td><td><strong>Per component or route</strong></td><td>Per module</td></tr>
+        <tr><td>What a component needs</td><td>Visible in the component file</td><td>Requires finding the module</td></tr>
+        <tr><td>Status</td><td><strong>The default from v17+</strong></td><td>Supported, not recommended for new code</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why standalone is genuinely better</div>
+    <p style="margin:0">The real problem with <code>NgModule</code> wasn't the boilerplate, it was
+      <strong>indirection</strong>. To know whether a component could use a particular directive, you had to
+      find its module, check the <code>imports</code>, and possibly follow a chain of re-exporting modules.
+      <br><br>
+      With standalone, a component's dependencies are declared in the component. What it needs is visible where
+      it's used, and unused imports are a compile error rather than dead weight in a shared module.
+      <br><br>
+      It also makes <strong>lazy loading finer-grained</strong> — you can lazy-load a single component rather
+      than needing a module boundary, so route-level code splitting stops being an architectural decision.
+      <br><br>
+      Migration is incremental by design: standalone components can be imported into modules and vice versa, so
+      a mixed codebase is entirely normal and not a problem to apologise for.</p>
+  </div>
+
+  <h2 id="bindings">Template bindings <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="html — the four forms"><code class="language-html">&lt;!-- Interpolation: value into text --&gt;
+&lt;p&gt;{{ order.reference }}&lt;/p&gt;
+
+&lt;!-- Property binding: value into a property. Note NOT an attribute --&gt;
+&lt;img [src]="imageUrl" [alt]="description"&gt;
+&lt;button [disabled]="!isValid"&gt;Save&lt;/button&gt;
+
+&lt;!-- Event binding: DOM or component event out --&gt;
+&lt;button (click)="save()"&gt;Save&lt;/button&gt;
+&lt;app-row (removed)="onRemoved($event)" /&gt;
+
+&lt;!-- Two-way: shorthand for [value] plus (valueChange) --&gt;
+&lt;input [(ngModel)]="searchTerm"&gt;</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Property versus attribute — the distinction that causes bugs</div>
+    <p style="margin:0"><code>[disabled]="false"</code> sets the DOM <em>property</em> to false, so the button is
+      enabled. <code>disabled="false"</code> sets the HTML <em>attribute</em> to the string
+      <code>"false"</code> — and the mere <em>presence</em> of the attribute disables the button, so the button
+      is disabled.
+      <br><br>
+      Angular binds to properties by default, which is almost always what you want. For genuine attributes
+      there's <code>[attr.aria-label]</code>, and that's required for ARIA attributes because they have no
+      corresponding DOM property.
+      <br><br>
+      So <code>[attr.aria-expanded]="isOpen"</code> is correct and <code>[aria-expanded]="isOpen"</code> silently
+      does nothing. That's a common accessibility bug in Angular templates.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Old syntax</th><th>New control flow (v17+)</th></tr></thead>
+      <tbody>
+        <tr><td><code>*ngIf="x"</code></td><td><code>@if (x) { }</code></td></tr>
+        <tr><td><code>*ngIf="x; else y"</code></td><td><code>@if (x) { } @else { }</code></td></tr>
+        <tr><td><code>*ngFor="let i of items; trackBy: fn"</code></td><td><code>@for (i of items; track i.id) { }</code></td></tr>
+        <tr><td><code>*ngSwitch</code></td><td><code>@switch</code> / <code>@case</code></td></tr>
+        <tr><td>An extra <code>*ngIf</code> for the empty case</td><td><strong><code>@empty { }</code></strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title"><code>track</code> is now mandatory, and that's deliberate</div>
+    <p style="margin:0">The old <code>trackBy</code> was optional, so it was usually omitted — and without it,
+      replacing an array causes Angular to destroy and recreate every DOM node instead of reusing them. On a
+      large list that's a very visible performance problem, and it also loses focus and scroll position.
+      <br><br>
+      <code>@for</code> <strong>requires</strong> a <code>track</code> expression. Making it mandatory removed
+      an entire category of accidental slowness.
+      <br><br>
+      Track by a stable unique identifier — usually <code>item.id</code>. Tracking by index defeats the purpose,
+      because the identity of position 3 changes when you insert at position 0.</p>
+  </div>
+
+  <h2 id="di">Dependency injection <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="typescript — the two injection styles"><code class="language-typescript">// Modern: the inject() function
+export class OrderComponent {
+  private readonly http   = inject(HttpClient);
+  private readonly logger = inject(LoggerService);
+}
+
+// Traditional: constructor injection - still fully supported
+export class OrderComponent {
+  constructor(
+    private readonly http: HttpClient,
+    private readonly logger: LoggerService
+  ) {}
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Registration</th><th>Lifetime</th><th>ASP.NET Core equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>@Injectable({ providedIn: 'root' })</code></td><td><strong>One per application</strong></td><td><code>AddSingleton</code></td></tr>
+        <tr><td><code>providers: []</code> on a component</td><td><strong>One per component instance</strong></td><td>Closest to <code>AddScoped</code></td></tr>
+        <tr><td><code>providers: []</code> on a route</td><td>One per activated route</td><td>Scoped to a request path</td></tr>
+        <tr><td><code>providedIn: 'root'</code> + a factory</td><td>Singleton with construction logic</td><td>Factory registration</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">The injector hierarchy</span>
+    <p>Angular resolves a dependency by looking at the component's own injector, then its parent's, then upward
+      to the root. The <strong>first match wins</strong>.</p>
+    <p>So providing a service on a component gives that component and its children their own instance,
+      shadowing any root-level one.</p>
+  </div>
+
+  <pre data-label="typescript — deliberate per-component state" class="code-good"><code class="language-typescript">@Component({
+  selector: 'app-wizard',
+  standalone: true,
+  providers: [WizardStateService],   // a fresh instance per wizard
+  template: `&lt;app-step-one /&gt;&lt;app-step-two /&gt;`
+})
+export class WizardComponent {}
+
+// Every child step injects the SAME WizardStateService instance -
+// the one belonging to this wizard. Two wizards on a page don't share state.</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this is how you scope shared state without a global store</div>
+    <p style="margin:0">A component-level provider is the cleanest way to share state between a component and its
+      descendants without making it application-global.
+      <br><br>
+      A multi-step wizard, a data grid with child cells, a form section with several sub-components — all need
+      shared state that is <em>per-instance</em>. Putting it in a root singleton means two wizards on the same
+      page interfere; passing it down through inputs means threading it through every intermediate layer.
+      <br><br>
+      A provider on the parent gives every descendant the same instance via injection, and it's destroyed with
+      the parent — so there's no cleanup and no leakage between instances.
+      <br><br>
+      That's a pattern worth knowing explicitly, because the instinct from backend DI is to register everything
+      at the root.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The captive dependency problem applies here too</div>
+    <p style="margin:0">Injecting a component-scoped service into a root singleton doesn't work — the root
+      injector can't see component providers, so you get a
+      <code>NullInjectorError</code>.
+      <br><br>
+      The reverse is fine and common: a component-scoped service injecting root singletons.
+      <br><br>
+      This is the same reasoning as
+      <a href="../06-dotnet-platform/hosting-di-config.html">not injecting a scoped service into a singleton in
+      ASP.NET Core</a> — a longer-lived thing cannot depend on a shorter-lived one. Angular fails loudly at
+      runtime rather than silently capturing, which is arguably better than .NET's behaviour before the
+      validation was added.</p>
+  </div>
+
+  <h2 id="lifecycle">Lifecycle hooks <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Hook</th><th>Fires</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><code>constructor</code></td><td>On instantiation, before inputs are set</td><td><strong>DI only</strong> — inputs aren't available yet</td></tr>
+        <tr><td><code>ngOnChanges</code></td><td>Before <code>ngOnInit</code>, and on every input change</td><td>Reacting to input changes (largely replaced by signal inputs)</td></tr>
+        <tr><td><strong><code>ngOnInit</code></strong></td><td>Once, after the first <code>ngOnChanges</code></td><td><strong>Initialisation, initial data load</strong></td></tr>
+        <tr><td><code>ngAfterViewInit</code></td><td>After the view and children render</td><td>DOM measurement, <code>ViewChild</code> access</td></tr>
+        <tr><td><code>ngOnDestroy</code></td><td>Before destruction</td><td>Cleanup — unsubscribe, clear timers</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Why initialisation goes in <code>ngOnInit</code>, not the constructor</div>
+    <p style="margin:0">The constructor runs <strong>before Angular sets the inputs</strong>. So reading
+      <code>this.orderId</code> there gives you <code>undefined</code>, and an HTTP call using it requests the
+      wrong thing — or throws.
+      <br><br>
+      <code>ngOnInit</code> runs after the first round of inputs is applied, so the values are there.
+      <br><br>
+      Keeping the constructor to dependency injection only also makes components far easier to test — you can
+      construct one without triggering side effects, then call <code>ngOnInit</code> when you actually want the
+      initialisation to happen. A constructor that fires HTTP requests makes every test do network work.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title"><code>ngOnChanges</code> only sees reference changes</div>
+    <p style="margin:0">It fires when an input is <em>reassigned</em>, not when the object it points at is
+      mutated. So a parent doing <code>this.order.total = 100</code> does not trigger the child's
+      <code>ngOnChanges</code>.
+      <br><br>
+      Same underlying rule as <a href="reactivity.html#onpush"><code>OnPush</code>'s reference
+      comparison</a> — and the same fix: replace rather than mutate.
+      <br><br>
+      With signal inputs this mostly stops mattering, because a <code>computed()</code> depending on the input
+      signal re-evaluates automatically and there's no hook to get wrong.</p>
+  </div>
+
+  <h2 id="projection">Content projection <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="typescript — a reusable card shell" class="code-good"><code class="language-typescript">@Component({
+  selector: 'app-card',
+  standalone: true,
+  template: `
+    &lt;div class="card"&gt;
+      &lt;header&gt;&lt;ng-content select="[card-title]" /&gt;&lt;/header&gt;
+      &lt;div class="body"&gt;&lt;ng-content /&gt;&lt;/div&gt;
+      &lt;footer&gt;&lt;ng-content select="[card-actions]" /&gt;&lt;/footer&gt;
+    &lt;/div&gt;`
+})
+export class CardComponent {}</code></pre>
+
+  <pre data-label="html — the consumer fills the slots"><code class="language-html">&lt;app-card&gt;
+  &lt;h3 card-title&gt;Order 1041&lt;/h3&gt;
+  &lt;p&gt;Placed 12 June. Three items.&lt;/p&gt;
+  &lt;button card-actions&gt;View&lt;/button&gt;
+&lt;/app-card&gt;</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Projection is what makes components composable</div>
+    <p style="margin:0">Without it, a card component would need an input for every possible piece of content —
+      <code>[title]</code>, <code>[body]</code>, <code>[buttonText]</code> — and would break the moment someone
+      needed two buttons or an icon.
+      <br><br>
+      With projection the card owns the <em>structure and styling</em>, and the consumer owns the
+      <em>content</em>. That's a much better separation, and it's how every component library is built.
+      <br><br>
+      Note that projected content belongs to the <strong>parent's</strong> change detection context, not the
+      card's — which is why projecting into an <code>OnPush</code> component still updates when the parent's data
+      changes.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Standalone components declare their own dependencies — less indirection, finer lazy loading.</li>
+      <li>Signal inputs compose into <code>computed()</code>, removing most uses of
+        <code>ngOnChanges</code>.</li>
+      <li><code>[prop]</code> binds a property; <code>[attr.x]</code> for real attributes, required for
+        ARIA.</li>
+      <li><code>@for</code> requires <code>track</code> — track a stable id, never the index.</li>
+      <li><code>providedIn: 'root'</code> is a singleton; a component provider is one per component
+        instance.</li>
+      <li>Component-level providers are how you scope shared state to a subtree.</li>
+      <li>A singleton can't inject a component-scoped service — the same rule as .NET DI lifetimes.</li>
+      <li>Constructor for DI only; <code>ngOnInit</code> for initialisation.</li>
+      <li><code>ngOnChanges</code> fires on reassignment, not mutation.</li>
+      <li><code>ng-content</code> gives structure/content separation; projected content stays in the parent's
+        change detection.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>HTTP calls in the constructor</strong>, before inputs are set.</li>
+    <li><strong>Mutating an input object</strong> and expecting <code>ngOnChanges</code> to fire.</li>
+    <li><strong><code>[aria-label]</code> instead of <code>[attr.aria-label]</code></strong>.</li>
+    <li><strong><code>disabled="false"</code></strong> as an attribute, which disables the control.</li>
+    <li><strong>Tracking by index</strong> in <code>@for</code>.</li>
+    <li><strong>Registering everything in <code>root</code></strong> when per-instance state was needed.</li>
+    <li><strong>Injecting a component-scoped service into a singleton.</strong></li>
+    <li><strong>Not using <code>OnPush</code></strong> as the default for new components.</li>
+    <li><strong>Inputs for content</strong> where projection is the right answer.</li>
+    <li><strong>Forgetting to add an import</strong> to a standalone component's <code>imports</code>.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Explain Angular's dependency injection and service lifetimes. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It's close enough to ASP.NET Core's DI that the reasoning transfers directly, which is one reason
+          Angular feels natural coming from .NET."</p>
+        <p>"Angular has a <strong>hierarchy of injectors</strong>. When a component asks for a dependency,
+          Angular checks that component's own injector, then its parent's, then upward to the root injector. The
+          first match wins."</p>
+        <p>"<strong><code>@Injectable({ providedIn: 'root' })</code></strong> registers on the root injector, so
+          you get one instance for the whole application — effectively a singleton. It's also tree-shakeable: if
+          nothing injects it, it's dropped from the bundle, which the old <code>NgModule</code> providers array
+          couldn't do."</p>
+        <p>"<strong>A <code>providers</code> array on a component</strong> creates a new instance per component
+          instance, shared with that component's descendants. That's the closest thing to a scoped lifetime."</p>
+        <p>"That second one is more useful than people realise. If I have a multi-step wizard where the steps
+          need shared state, providing the state service on the wizard component means every child step injects
+          <em>the same instance</em> — the one belonging to that wizard. Two wizards on a page don't interfere,
+          and it's destroyed with the parent so there's no cleanup and no leakage. A root singleton would make
+          them share state; passing it through inputs would mean threading it through every intermediate
+          component."</p>
+        <p>"The <strong>failure mode is the same as .NET's</strong>: a longer-lived service can't depend on a
+          shorter-lived one. Injecting a component-scoped service into a root singleton throws
+          <code>NullInjectorError</code>, because the root injector can't see component providers. The reverse —
+          a component service injecting root singletons — is fine and normal."</p>
+        <p>"Angular fails loudly there, which is arguably better than the captive-dependency problem in .NET
+          where a singleton holding a scoped service used to just silently misbehave."</p>
+        <p>"On syntax: <code>inject()</code> is the modern form and constructor injection still works
+          identically. <code>inject()</code> is more convenient for base classes and functional guards and
+          interceptors, where there's no constructor to inject into. It has to be called in an injection
+          context — a field initialiser or constructor — which is the one gotcha."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the injector hierarchy and first-match resolution?</li>
+        <li>Do you know component providers give per-instance scope?</li>
+        <li>Can you give a real reason to use one?</li>
+        <li>Do you know the lifetime constraint?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does tree-shakeable mean here?</li>
+          <li>How would you provide different implementations per environment?</li>
+          <li>What's an injection token for?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why put initialisation in <code>ngOnInit</code> rather than the constructor? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Because <strong>inputs aren't set when the constructor runs</strong>. Angular constructs the
+          component first, then applies the bound inputs, then calls <code>ngOnInit</code>."</p>
+        <p>"So if a component takes an <code>orderId</code> input and the constructor tries to load that order,
+          <code>this.orderId</code> is <code>undefined</code> — and you either throw or request
+          <code>/api/orders/undefined</code>. That's a genuinely common bug and it looks baffling, because the
+          input clearly is bound in the template."</p>
+        <p>"<code>ngOnInit</code> runs after the first <code>ngOnChanges</code>, so the inputs are populated."</p>
+        <p>"There's a second reason that matters as much: <strong>testability</strong>. If the constructor only
+          does dependency injection, I can construct the component in a test without triggering any side
+          effects, set up whatever state I need, then call <code>ngOnInit</code> deliberately. A constructor
+          that fires HTTP requests means every test — including ones that don't care about loading — does network
+          work and needs mocks."</p>
+        <p>"That's the same principle as keeping .NET constructors cheap and side-effect-free: construction
+          shouldn't do work."</p>
+        <p>"So the rule I'd state: <strong>constructor for DI, <code>ngOnInit</code> for
+          initialisation</strong>."</p>
+        <p>"Worth adding what modern Angular changes here. With <strong>signal inputs</strong>, a lot of what
+          used to go in <code>ngOnInit</code> or <code>ngOnChanges</code> becomes a <code>computed()</code> that
+          just depends on the input signal — so it re-evaluates when the input changes and there's no lifecycle
+          hook to get wrong. For loading data based on an input, the pattern is
+          <code>toObservable</code> on the input signal piped through <code>switchMap</code>, converted back with
+          <code>toSignal</code> — which also handles the case where the input changes <em>after</em>
+          initialisation, something an <code>ngOnInit</code>-only implementation misses entirely."</p>
+        <p>"That last point is worth making, because 'load in <code>ngOnInit</code>' quietly assumes the input
+          never changes — and when it does, the component shows stale data."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know inputs aren't available in the constructor?</li>
+        <li>Do you mention testability?</li>
+        <li>Do you know <code>ngOnInit</code> alone misses later input changes?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the input changes after init?</li>
+          <li>When would you use <code>ngAfterViewInit</code>?</li>
+          <li>How do signal inputs change this?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

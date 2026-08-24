@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Communication — Microservices</title>
+<meta name="description" content="Synchronous versus asynchronous, REST and gRPC, service discovery, API gateways, and versioning contracts without breaking consumers.">
+<meta name="keywords" content="microservices communication synchronous asynchronous REST gRPC messaging service discovery API gateway BFF contract versioning consumer driven contract tests temporal coupling chatty">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="20-microservices/communication.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Communication</h1>
+    <p class="subtitle">Every synchronous call between services is a coupling you have to pay for at runtime.
+      Choosing where to accept that is the design work.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Synchronous = temporal coupling.</strong> The callee must be up <em>now</em>.</li>
+      <li><strong>Asynchronous decouples availability</strong> at the cost of eventual consistency.</li>
+      <li><strong>Chained synchronous calls multiply failure.</strong> Five 99.9% services in series is
+        99.5%.</li>
+      <li><strong>gRPC for internal service-to-service</strong>, REST for public and browser-facing.</li>
+      <li><strong>An API gateway handles cross-cutting concerns</strong>; a BFF shapes responses per
+        client.</li>
+      <li><strong>Never break a contract.</strong> Add optional fields; version when you must.</li>
+      <li><strong>Contract tests catch breakage</strong> that unit tests cannot.</li>
+    </ul>
+  </div>
+
+  <h2 id="sync-vs-async">Synchronous or asynchronous <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The distinction that matters most</span>
+    <p><strong>Synchronous</strong> means the caller waits. So the callee must be available <em>at that
+      moment</em> — that's <strong>temporal coupling</strong>, and it's the coupling microservices are least good
+      at removing.</p>
+    <p><strong>Asynchronous</strong> means the caller publishes and moves on. The consumer processes when it
+      can, so it can be down without affecting the publisher.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Synchronous (HTTP / gRPC)</th><th>Asynchronous (messaging)</th></tr></thead>
+      <tbody>
+        <tr><td>Caller waits</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Callee must be up</td><td><strong>Yes</strong></td><td>No — the broker holds the message</td></tr>
+        <tr><td>Consistency</td><td>Immediate</td><td><strong>Eventual</strong></td></tr>
+        <tr><td>Failure handling</td><td>Retry, circuit break, fall back</td><td>Broker retries; dead-letter queue</td></tr>
+        <tr><td>Debugging</td><td>Straightforward — a request and a response</td><td><strong>Harder</strong> — needs tracing</td></tr>
+        <tr><td>Backpressure</td><td>The caller absorbs it</td><td>The queue absorbs it</td></tr>
+        <tr><td>Best for</td><td><strong>Queries, and anything the user waits for</strong></td><td><strong>Commands with side effects, notifications, fan-out</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The rule of thumb</span>
+    <p><strong>Synchronous when the caller needs the answer to continue. Asynchronous when it just needs the
+      work to happen.</strong></p>
+    <p>"Is this card valid?" — synchronous; the checkout can't proceed without knowing.</p>
+    <p>"Send the confirmation email", "update the search index", "recalculate loyalty points" — asynchronous.
+      Nobody is waiting, and doing them synchronously means the order fails if the email service is down.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Chained synchronous calls multiply failure — do the arithmetic</div>
+    <pre data-label="text" class="code-bad"><code class="language-text">  Gateway ──► Orders ──► Inventory ──► Pricing ──► Tax ──► Payments
+
+  Each service is individually 99.9% available.
+  Availability of the chain:  0.999^5 = 99.5%
+
+  99.9% = ~43 minutes of downtime a month
+  99.5% = ~3.6 hours a month
+
+  Latency is additive too: five services at 50ms each is 250ms
+  before any of them does real work.</code></pre>
+    <p style="margin:0">Each hop multiplies the failure probability and adds its latency. A chain of well-behaved
+      services is a badly-behaved system.
+      <br><br>
+      Worse, a <em>slow</em> dependency is more dangerous than a failed one: without a timeout, threads pile up
+      waiting, the caller's thread pool exhausts, and the caller fails too — then <em>its</em> caller fails.
+      That's a <strong>cascading failure</strong>, and it's how one slow service takes down a whole system.
+      <br><br>
+      Which is why <a href="operations.html#resilience">timeouts and circuit breakers</a> aren't optional
+      polish — and why replacing a hop with replicated data or an event is often the better fix than making the
+      hop more resilient.</p>
+  </div>
+
+  <h2 id="rest-vs-grpc">REST or gRPC <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>REST / JSON</th><th>gRPC</th></tr></thead>
+      <tbody>
+        <tr><td>Payload</td><td>JSON — human-readable, larger</td><td><strong>Protobuf — binary, compact</strong></td></tr>
+        <tr><td>Contract</td><td>OpenAPI, often written after the fact</td><td><strong><code>.proto</code> file — the contract <em>is</em> the source</strong></td></tr>
+        <tr><td>Code generation</td><td>Optional</td><td><strong>Built in, both ends</strong></td></tr>
+        <tr><td>Transport</td><td>HTTP/1.1 or 2</td><td>HTTP/2 — multiplexed</td></tr>
+        <tr><td>Streaming</td><td>Awkward</td><td><strong>Bidirectional, first-class</strong></td></tr>
+        <tr><td>Browser support</td><td><strong>Native</strong></td><td>Needs gRPC-Web and a proxy</td></tr>
+        <tr><td>Debuggability</td><td><strong>curl, browser, readable logs</strong></td><td>Needs tooling</td></tr>
+        <tr><td>Best for</td><td><strong>Public APIs, browsers, third parties</strong></td><td><strong>Internal service-to-service</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="proto — the contract is a real artefact"><code class="language-proto">syntax = "proto3";
+
+service Pricing {
+  rpc GetPrice (PriceRequest) returns (PriceResponse);
+  rpc StreamPriceUpdates (PriceStreamRequest) returns (stream PriceUpdate);
+}
+
+message PriceRequest {
+  string sku = 1;
+  string currency = 2;
+  int32 quantity = 3;
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the contract, not the performance</div>
+    <p style="margin:0">gRPC is usually justified on speed. The binary encoding and HTTP/2 multiplexing are real,
+      and for most internal calls the difference is <strong>not what matters</strong> — a few milliseconds against
+      a database query taking twenty.
+      <br><br>
+      <strong>The stronger argument is the contract.</strong> A <code>.proto</code> file is a real, versioned
+      artefact that generates both client and server. So a breaking change is a <em>compile</em> error in the
+      consumer, not a runtime surprise in production.
+      <br><br>
+      With REST, the contract is a document that drifts from the implementation — OpenAPI generated after the
+      fact, or hand-maintained and stale. Renaming a JSON field breaks consumers silently.
+      <br><br>
+      So: <strong>gRPC internally where both ends are yours and the contract discipline pays</strong>; REST at the
+      edge where reach, browser support and debuggability matter more. Mixing them by audience rather than picking
+      one globally is the calibrated answer.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Protobuf field numbers are permanent</div>
+    <p style="margin:0">The numbers — <code>sku = 1</code> — are what's on the wire, not the names. So you can
+      <strong>rename a field freely</strong>, and you must <strong>never reuse or renumber</strong> one.
+      <br><br>
+      Reusing a retired number means old clients interpret new data as the old field: silent data corruption
+      rather than an error. Protobuf provides <code>reserved</code> specifically to prevent this, and using it is
+      the mark of someone who's maintained a proto over time.
+      <br><br>
+      Safe evolution: add new fields with new numbers, make them optional, never change a type, never renumber.
+      Same discipline as <a href="../07-aspnet-core/api-lifecycle.html">additive API versioning</a>.</p>
+  </div>
+
+  <h2 id="discovery">Service discovery <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mechanism</th><th>How it works</th><th>Where</th></tr></thead>
+      <tbody>
+        <tr><td><strong>DNS</strong></td><td>Platform resolves a service name to healthy instances</td><td><strong>Kubernetes, Container Apps — the usual answer</strong></td></tr>
+        <tr><td><strong>Client-side</strong></td><td>Client queries a registry and load-balances itself</td><td>Consul, Eureka</td></tr>
+        <tr><td><strong>Server-side</strong></td><td>A load balancer in front of each service</td><td>Classic infrastructure</td></tr>
+        <tr><td><strong>Service mesh</strong></td><td>A sidecar handles discovery, retries, mTLS</td><td>Istio, Linkerd</td></tr>
+        <tr><td><strong>Configuration</strong></td><td>URLs in config</td><td>Small systems; fine until it isn't</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">On Kubernetes this is mostly a solved problem</div>
+    <p style="margin:0">A Kubernetes <code>Service</code> gives you a stable DNS name that resolves to healthy
+      pods, with load balancing included. So <code>http://pricing/api/prices</code> just works, and scaling or
+      replacing pods requires no client change.
+      <br><br>
+      That means a dedicated discovery component like Consul is often unnecessary — the platform does it. Bringing
+      in a service registry when you're already on Kubernetes usually adds a moving part for no gain.
+      <br><br>
+      <a href="index.html#dotnet-stack">.NET Aspire</a> also provides service discovery for local development, so
+      the same logical name works on a developer machine and in the cluster — which removes a common source of
+      environment-specific configuration.</p>
+  </div>
+
+  <h2 id="gateway">API gateway and BFF <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>API Gateway</th><th>Backend for Frontend</th></tr></thead>
+      <tbody>
+        <tr><td>Purpose</td><td>One entry point; cross-cutting concerns</td><td><strong>Shape responses for one client type</strong></td></tr>
+        <tr><td>How many</td><td>Usually one</td><td><strong>One per client</strong> — web, mobile, partner</td></tr>
+        <tr><td>Owned by</td><td>A platform team</td><td><strong>The client's team</strong></td></tr>
+        <tr><td>Does</td><td>Auth, rate limiting, routing, TLS</td><td>Aggregates and reshapes for that UI</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="text — where each sits"><code class="language-text">  Browser ──►  Web BFF     ──┐
+  Mobile  ──►  Mobile BFF  ──┼──►  Gateway  ──►  Orders / Pricing / Inventory
+  Partner ──►  Public API  ──┘
+
+  Gateway: authentication, rate limiting, TLS termination, routing
+  BFF:     "the basket screen needs these six fields from three services"</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the BFF exists to stop clients being chatty</div>
+    <p style="margin:0">Without one, a mobile app rendering a basket screen calls Orders, then Pricing, then
+      Inventory — three round trips over a mobile network, where latency is the dominant cost and each request
+      might be 200ms.
+      <br><br>
+      A BFF makes <strong>one</strong> call. It fans out server-side where the calls are fast and parallel, and
+      returns exactly the fields that screen needs.
+      <br><br>
+      The reason it's <em>per client</em> is that a mobile screen and a desktop screen genuinely need different
+      data — and a shared aggregation layer becomes a compromise nobody is happy with, then a coordination point
+      between the web and mobile teams. Separate BFFs let each client team change its own without asking
+      anyone.
+      <br><br>
+      The trade-off: some duplicated aggregation logic between BFFs. That's usually the right trade, because the
+      alternative is coupling the client teams together — and the duplication is shallow.
+      <br><br>
+      This is also the answer to <a href="../08-http-web-apis/rest-design.html">"how do you avoid over-fetching
+      and under-fetching?"</a> without adopting GraphQL.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Don't let the gateway become a monolith</div>
+    <p style="margin:0">Gateways accumulate. It starts as routing and auth, then someone adds a response
+      transformation, then a business rule, then request enrichment — and now it's a shared component every team
+      must change to ship a feature.
+      <br><br>
+      At that point the gateway is <strong>the coordination bottleneck</strong> the architecture was meant to
+      remove, and it's a single point of failure with business logic in it.
+      <br><br>
+      Keep gateways to genuinely cross-cutting infrastructure: authentication, rate limiting, TLS, routing,
+      request logging. Anything client-specific belongs in a BFF; anything domain-specific belongs in a
+      service.</p>
+  </div>
+
+  <h2 id="contracts">Versioning contracts <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The rule</span>
+    <p><strong>You cannot deploy a breaking change to a service and its consumers simultaneously.</strong></p>
+    <p>During any rolling deployment, old and new versions of both run at once. So every change must be
+      compatible in <em>both</em> directions for the duration.</p>
+    <p>Which means: <strong>add, don't change</strong>. New optional fields, new endpoints, new event types.
+      Removing or renaming anything is a multi-step process.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Safe</th><th>Breaking</th></tr></thead>
+      <tbody>
+        <tr><td>Adding an optional field</td><td>Removing or renaming a field</td></tr>
+        <tr><td>Adding an endpoint</td><td>Changing a field's type</td></tr>
+        <tr><td>Adding an enum value <em>if consumers tolerate unknowns</em></td><td>Making an optional field required</td></tr>
+        <tr><td>Relaxing validation</td><td>Tightening validation</td></tr>
+        <tr><td>Adding a new event type</td><td>Changing an existing event's meaning</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The enum trap</div>
+    <p style="margin:0">Adding an enum value looks additive and frequently isn't. If a consumer has
+      <code>switch (status)</code> with no default case, or deserialises strictly, a new value <strong>breaks
+      it</strong> — and it breaks at runtime, in production, on data it has never seen.
+      <br><br>
+      Two defences. <strong>Producers</strong> should treat new enum values as a versioned change unless consumers
+      are known to tolerate unknowns. <strong>Consumers</strong> should always handle the unknown case explicitly
+      — a default branch that logs and degrades rather than throwing.
+      <br><br>
+      This is worth raising because it's the most common "but it was only an addition" incident.</p>
+  </div>
+
+  <h3 id="removing-a-field">How to remove a field safely</h3>
+
+  <ol class="steps">
+    <li><strong>Add the replacement</strong> alongside the old one. Both are populated.</li>
+    <li><strong>Migrate consumers</strong> to the new field, one at a time, deploying independently.</li>
+    <li><strong>Verify nothing reads the old field</strong> — instrument it and check the telemetry, don't
+      assume.</li>
+    <li><strong>Stop populating it</strong>, and leave it present but empty for a release.</li>
+    <li><strong>Remove it.</strong></li>
+  </ol>
+
+  <div class="note tip">
+    <div class="note-title">Step 3 is the one people skip</div>
+    <p style="margin:0">"We told everyone to migrate" is not evidence. <strong>Instrument the old field</strong> —
+      log or count each read — and remove it only when the count has been zero for long enough to cover monthly
+      jobs and infrequent clients.
+      <br><br>
+      Without that, you discover the remaining consumer during an incident, and it's usually something nobody
+      remembered: a reporting job, a partner integration, a mobile app version still in the wild that you can't
+      force-update.
+      <br><br>
+      Mobile is the case that makes this non-negotiable — you cannot deprecate a field an old app version still
+      requires, however long ago you announced it.</p>
+  </div>
+
+  <h3 id="contract-tests">Contract tests</h3>
+
+  <div class="simple">
+    <span class="sm-label">The gap they fill</span>
+    <p>Unit tests verify a service against <em>its own</em> expectations. Integration tests need everything
+      running. Neither catches "we renamed a field and a consumer three teams away depends on it".</p>
+    <p>A <strong>consumer-driven contract test</strong> has each consumer declare what it needs, and the
+      producer's pipeline verifies it still provides it — <strong>without running the consumer</strong>.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this is what makes independent deployment safe</div>
+    <p style="margin:0">Independent deployability is the point of microservices, and it's only genuinely safe if
+      you can tell — <em>before</em> deploying — whether you've broken a consumer.
+      <br><br>
+      Contract tests give you that: the producer's build fails if it violates a published expectation. So the
+      feedback arrives in CI rather than in someone else's error logs.
+      <br><br>
+      Without them, teams compensate with a <strong>coordinated integration environment and a release train</strong>
+      — which is exactly the coordination microservices were adopted to remove. So contract testing isn't
+      optional infrastructure; it's what keeps the architecture's central promise true.
+      <br><br>
+      Pact is the usual tool. The honest cost is that it requires discipline from both sides and a broker to store
+      the contracts, and teams often abandon it — which is worth acknowledging rather than presenting it as
+      free.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Synchronous calls create temporal coupling — the callee must be up now.</li>
+      <li>Synchronous when the caller needs the answer; asynchronous when it just needs the work done.</li>
+      <li>Chained sync calls multiply failure and add latency — five 99.9% services is 99.5%.</li>
+      <li>A slow dependency is more dangerous than a failed one; timeouts are mandatory.</li>
+      <li>gRPC internally for the contract discipline; REST at the edge for reach and debuggability.</li>
+      <li>Protobuf field numbers are permanent — never reuse, use <code>reserved</code>.</li>
+      <li>On Kubernetes, DNS-based discovery is usually sufficient.</li>
+      <li>Gateway for cross-cutting infrastructure; BFF per client to stop chatty clients.</li>
+      <li>Keep business logic out of the gateway or it becomes the bottleneck.</li>
+      <li>Add, don't change. Removing a field is a five-step process, and step 3 is instrumentation.</li>
+      <li>New enum values are frequently breaking — handle unknowns on the consumer side.</li>
+      <li>Contract tests are what make independent deployment genuinely safe.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Synchronous calls for work nobody is waiting for.</strong></li>
+    <li><strong>Long synchronous chains</strong>, multiplying failure and latency.</li>
+    <li><strong>No timeouts</strong>, so a slow dependency exhausts the caller's threads.</li>
+    <li><strong>gRPC for browser-facing APIs</strong> without considering the proxy requirement.</li>
+    <li><strong>Reusing a protobuf field number.</strong></li>
+    <li><strong>Business logic in the API gateway.</strong></li>
+    <li><strong>One shared aggregation layer</strong> instead of a BFF per client.</li>
+    <li><strong>Breaking changes deployed in one step.</strong></li>
+    <li><strong>Removing a field without instrumenting reads first.</strong></li>
+    <li><strong>Adding an enum value</strong> assuming it's additive.</li>
+    <li><strong>No contract tests</strong>, so breakage is found in production.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Service A needs data from Service B. What are your options? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Three options, and I'd choose based on whether A can function when B is unavailable — because that's
+          the question that actually decides it."</p>
+        <p>"<strong>1. Synchronous call.</strong> A calls B's API when it needs the data. Simple, immediately
+          consistent, easy to debug. The cost is <strong>temporal coupling</strong>: A is now down whenever B is
+          down, and A's latency includes B's."</p>
+        <p>"That's fine for a genuine query where the user is waiting and the data must be current — a card
+          authorisation, a stock check at checkout. It's the wrong choice if A's core function shouldn't depend on
+          B being up."</p>
+        <p>"<strong>2. Replicate the data.</strong> B publishes events when its data changes; A keeps a local
+          read-only copy of the fields it needs and queries its own store."</p>
+        <p>"This is usually the right answer when A needs B's data <em>frequently</em> but doesn't need it
+          <em>current to the millisecond</em>. A stays available when B is down, and its reads are local — so no
+          network latency and no cascading failure."</p>
+        <p>"The costs I'd state rather than gloss over: it's <strong>eventually consistent</strong>, so A can act
+          on slightly stale data — which needs to be acceptable for that use case. It needs the
+          <strong>outbox pattern</strong> on B's side, or events get lost when the database commit succeeds and
+          the publish fails. And it needs a <strong>reconciliation job</strong>, because replicas drift — a
+          missed event, a bug, a manual data fix. Anyone proposing replication without reconciliation hasn't run
+          it in production."</p>
+        <p>"<strong>3. Move the operation.</strong> If A needs so much of B's data that replicating it means
+          copying half of B, that's a <strong>boundary problem</strong>, not a communication problem. Either the
+          logic belongs in B, or A and B should be one service."</p>
+        <p>"That third option is the one people don't consider, and it's often correct. <strong>Chattiness is a
+          boundary smell.</strong> If A calls B five times to complete one operation, the seam was cut in the
+          wrong place — and the fix is to move the seam, not to optimise the calls."</p>
+        <p>"So the decision procedure I'd use: does A need this to answer a request the user is waiting on, and
+          must it be current? Then synchronous, with a timeout, a circuit breaker and a defined fallback. Does A
+          need it often but tolerate staleness? Replicate via events. Does A need so much that replication is
+          absurd? Reconsider the boundary."</p>
+        <p>"One thing I'd add on the synchronous option, because it's frequently missed: <strong>a slow
+          dependency is more dangerous than a failed one.</strong> Without a timeout, A's threads accumulate
+          waiting for B, A's thread pool exhausts, and A fails too — then A's callers fail. That's a cascading
+          failure from one slow service. So if I do take a synchronous dependency, the timeout isn't optional
+          polish, and I'd want a circuit breaker so A fails fast rather than queueing."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you frame it around availability coupling?</li>
+        <li>Do you know replication via events is an option?</li>
+        <li>Do you state the outbox and reconciliation requirements?</li>
+        <li>Do you consider that it might be a boundary problem?</li>
+        <li>Do you know a slow dependency cascades?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> synchronous HTTP as the only option.</li>
+        <li><span class="redflag">Red flag:</span> A reading B's database.</li>
+        <li><span class="redflag">Red flag:</span> replication with no consistency discussion.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you detect and fix a drifted replica?</li>
+          <li>What do you do when the circuit breaker is open?</li>
+          <li>How would you version the events B publishes?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you change a service's API without breaking consumers? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The constraint that drives everything: <strong>you cannot deploy a breaking change to a service and
+          its consumers at the same moment.</strong> During any rolling deployment both old and new versions of
+          both are running, so every change has to be compatible in both directions for the duration."</p>
+        <p>"So the rule is <strong>add, don't change</strong>. New optional fields, new endpoints, new event
+          types — all safe. Removing a field, renaming one, changing a type, or making an optional field required
+          are all breaking."</p>
+        <p>"For a genuine removal it's a multi-step process:"</p>
+        <p>"Add the replacement alongside the old field and populate both. Migrate consumers one at a time,
+          deploying independently. <strong>Verify nothing reads the old field.</strong> Stop populating it but
+          leave it present. Then remove it."</p>
+        <p>"<strong>The verification step is the one people skip</strong>, and it's the one that matters.
+          'We announced the deprecation' isn't evidence. I'd instrument the old field — count or log every read —
+          and only remove it once that count has been zero for long enough to cover monthly jobs and infrequent
+          clients."</p>
+        <p>"Without that you find the last consumer during an incident, and it's always something nobody
+          remembered: a quarterly reporting job, a partner integration, or a mobile app version still in the
+          wild. Mobile is what makes this non-negotiable — you cannot deprecate a field an old app build still
+          requires, no matter how long ago you announced it."</p>
+        <p>"When a breaking change genuinely can't be avoided, I'd <strong>version and run both</strong> —
+          <code>/v1</code> and <code>/v2</code> side by side, with a stated deprecation window and telemetry per
+          version so I know when v1 is actually unused. Versioning by URL path is the most operationally obvious;
+          header-based versioning is cleaner in theory and harder to debug."</p>
+        <p>"The trap I'd flag specifically: <strong>adding an enum value is frequently breaking</strong> even
+          though it looks additive. A consumer with a <code>switch</code> and no default case, or strict
+          deserialisation, fails at runtime on a value it's never seen. So producers should treat it as versioned
+          unless consumers are known to tolerate unknowns, and consumers should always handle the unknown case
+          by degrading rather than throwing."</p>
+        <p>"And the mechanism that makes all of this safe rather than hopeful: <strong>consumer-driven contract
+          tests</strong>. Each consumer publishes what it needs; the producer's pipeline verifies it still
+          provides that, without running the consumer. So a breaking change fails <em>my</em> build rather than
+          appearing in someone else's error logs."</p>
+        <p>"That matters because the alternative is a shared integration environment and a release train — which
+          is precisely the coordination microservices were adopted to eliminate. So contract testing isn't
+          optional tooling; it's what keeps independent deployability true. I'd be honest that it takes
+          discipline from both sides and teams do abandon it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know both versions run simultaneously during deployment?</li>
+        <li>Do you have the full removal sequence?</li>
+        <li>Do you insist on instrumenting before removing?</li>
+        <li>Do you know the enum trap?</li>
+        <li>Do you connect contract tests to independent deployability?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "version everything" as the whole answer.</li>
+        <li><span class="redflag">Red flag:</span> announcing deprecation and removing on schedule.</li>
+        <li><span class="redflag">Red flag:</span> no mention of contract tests.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How long do you keep v1 running?</li>
+          <li>How do you version events, as opposed to APIs?</li>
+          <li>How does Pact actually work?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

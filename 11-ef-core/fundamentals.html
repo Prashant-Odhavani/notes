@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DbContext &amp; Change Tracking — EF Core</title>
+<meta name="description" content="Why DbContext is scoped, entity states, tracking vs AsNoTracking, identity resolution, and what SaveChanges actually does.">
+<meta name="keywords" content="DbContext lifetime scoped singleton AddDbContext change tracker entity state Added Modified Deleted Detached Unchanged AsNoTracking identity resolution SaveChanges Update Attach thread safety DbContextFactory">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="11-ef-core/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>DbContext &amp; Change Tracking</h1>
+    <p class="subtitle">Understand the change tracker and most confusing EF behaviour stops being confusing.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong><code>DbContext</code> is scoped</strong> — one per request. Not thread-safe, and it
+        accumulates state.</li>
+      <li><strong>It's a unit of work.</strong> Nothing hits the database until <code>SaveChanges</code>.</li>
+      <li><strong>Five entity states:</strong> Detached, Unchanged, Added, Modified, Deleted.</li>
+      <li><strong>Tracked entities are compared against a snapshot</strong> — that's how EF knows what
+        changed.</li>
+      <li><strong><code>AsNoTracking</code> for read-only queries.</strong> Less memory, less CPU, faster.</li>
+      <li><strong>Identity resolution:</strong> a tracked context returns the <em>same object instance</em> for
+        the same key — and ignores newer database values.</li>
+      <li><strong><code>SaveChanges</code> is a single transaction</strong> whether you asked for one or not.</li>
+    </ul>
+  </div>
+
+  <h2 id="unit-of-work">DbContext is a unit of work <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A shopping basket. You add things, remove things, change quantities — and none of it reaches the shop's
+      systems.</p>
+    <p><code>SaveChanges</code> is the checkout: one atomic operation that either completes entirely or not at
+      all.</p>
+  </div>
+
+  <pre data-label="csharp — nothing touches the database until the last line"><code class="language-csharp">var order = await db.Orders.FirstAsync(o =&gt; o.Id == id);  // 1 SELECT
+
+order.Status = OrderStatus.Shipped;      // in memory only
+order.ShippedUtc = DateTime.UtcNow;      // in memory only
+db.OrderLines.Add(newLine);              // in memory only
+db.Remove(oldLine);                      // in memory only
+
+await db.SaveChangesAsync();             // ONE transaction: UPDATE, INSERT, DELETE</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong><code>SaveChanges</code> always runs in a transaction</strong>, even if you never wrote
+      <code>BeginTransaction</code>.</p>
+    <p>So one <code>SaveChanges</code> is atomic. <strong>Two <code>SaveChanges</code> calls are two
+      transactions</strong> — and that's where people accidentally lose atomicity.</p>
+  </div>
+
+  <h2 id="lifetime">Why it's scoped <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the standard registration"><code class="language-csharp">builder.Services.AddDbContext&lt;AppDbContext&gt;(options =&gt;
+    options.UseSqlServer(connectionString));
+// Registers AppDbContext as SCOPED - one instance per HTTP request</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lifetime</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Scoped</strong> ✅</td><td>One per request. Changes within a request share a unit of work; disposed at the end</td></tr>
+        <tr><td><strong>Singleton</strong> ❌</td><td><strong>Broken.</strong> Not thread-safe, and the tracker grows forever — a memory leak plus concurrency exceptions</td></tr>
+        <tr><td><strong>Transient</strong> ⚠️</td><td>Works, but two services in one request get different contexts, so they can't participate in the same <code>SaveChanges</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The two reasons a singleton <code>DbContext</code> fails</div>
+    <p style="margin:0"><strong>1. It isn't thread-safe.</strong> Two concurrent requests using the same
+      context produce <em>"A second operation was started on this context instance before a previous operation
+      completed"</em> — the most common EF exception there is, and almost always caused by either a singleton
+      context or a missing <code>await</code>.
+      <br><br>
+      <strong>2. The change tracker never empties.</strong> Every entity ever loaded stays referenced, so
+      memory grows without bound and <code>SaveChanges</code> gets slower over time because it re-scans
+      everything. Eventually you also get key conflicts between unrelated requests.</p>
+  </div>
+
+  <h3 id="factory">When scoped doesn't fit</h3>
+
+  <pre data-label="csharp — background services and parallel work" class="code-good"><code class="language-csharp">builder.Services.AddDbContextFactory&lt;AppDbContext&gt;(o =&gt; o.UseSqlServer(cs));
+
+public class Worker(IDbContextFactory&lt;AppDbContext&gt; factory) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            // A fresh context per iteration - fresh tracker, no accumulation
+            await using var db = await factory.CreateDbContextAsync(ct);
+            // ... work ...
+            await Task.Delay(TimeSpan.FromMinutes(1), ct);
+        }
+    }
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why a factory rather than a scope</div>
+    <p style="margin:0">A <a href="../07-aspnet-core/background-services.html">background service is a
+      singleton</a>, so it can't inject a scoped <code>DbContext</code> — the container will refuse, and
+      rightly so.
+      <br><br>
+      You can create a scope manually with <code>IServiceScopeFactory</code>, and that's fine. But
+      <code>IDbContextFactory</code> is clearer when the context is all you need, and it's the only sane option
+      for <strong>parallel</strong> work: each parallel branch needs its own context, because a single one
+      can't be shared across concurrent operations.</p>
+  </div>
+
+  <h2 id="states">Entity states <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>State</th><th>Meaning</th><th>On <code>SaveChanges</code></th></tr></thead>
+      <tbody>
+        <tr><td><strong>Detached</strong></td><td>Not tracked at all</td><td>Nothing</td></tr>
+        <tr><td><strong>Unchanged</strong></td><td>Tracked, matches the snapshot</td><td>Nothing</td></tr>
+        <tr><td><strong>Added</strong></td><td>New, not yet in the database</td><td><code>INSERT</code></td></tr>
+        <tr><td><strong>Modified</strong></td><td>Tracked, differs from the snapshot</td><td><code>UPDATE</code> — only the changed columns</td></tr>
+        <tr><td><strong>Deleted</strong></td><td>Marked for removal</td><td><code>DELETE</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">How EF knows what changed</span>
+    <p>When a tracked entity is loaded, EF stores a <strong>snapshot</strong> of its original values.</p>
+    <p>At <code>SaveChanges</code>, it compares current values against that snapshot. Differences become the
+      <code>SET</code> clause.</p>
+    <p>That's why <strong>you never call an "update" method</strong> — mutating a tracked object is enough.</p>
+  </div>
+
+  <pre data-label="csharp — no Update() call needed" class="code-good"><code class="language-csharp">var order = await db.Orders.FindAsync(id);   // tracked, snapshot stored
+order.Status = OrderStatus.Shipped;          // now Modified
+await db.SaveChangesAsync();                 // UPDATE [Order] SET Status=@p WHERE Id=@id</code></pre>
+
+  <h3 id="update-trap">The <code>Update()</code> trap <span class="lvl lvl-i">🟡 Intermediate</span></h3>
+
+  <pre data-label="csharp — marks EVERY property modified" class="code-bad"><code class="language-csharp">var dto = await Request.ReadFromJsonAsync&lt;OrderDto&gt;();
+
+var order = new Order { Id = dto.Id, Status = dto.Status };
+db.Orders.Update(order);          // ALL columns marked Modified
+await db.SaveChangesAsync();
+// UPDATE sets every column - including ones the client never sent,
+// overwriting them with default values.</code></pre>
+
+  <pre data-label="csharp — load, then assign only what changed" class="code-good"><code class="language-csharp">var order = await db.Orders.FindAsync(dto.Id);
+if (order is null) return NotFound();
+
+order.Status = dto.Status;        // only this column ends up in the UPDATE
+await db.SaveChangesAsync();</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Why this causes real data loss</div>
+    <p style="margin:0"><code>Update()</code> on a detached entity marks <strong>every</strong> property as
+      modified, because EF has no snapshot to compare against — it has to assume everything changed.
+      <br><br>
+      So a partial DTO wipes out every field it didn't include. Values become <code>null</code> or
+      <code>0</code>, and the operation looks entirely successful.
+      <br><br>
+      This is the most common serious EF Core bug in API code, and it maps exactly to the
+      <a href="../08-http-web-apis/http-protocol.html#put-vs-patch">PUT vs PATCH</a> distinction — a partial
+      update needs partial semantics all the way down.
+      <br><br>
+      If you must update without loading, set individual properties as modified:
+      <code>db.Entry(order).Property(o =&gt; o.Status).IsModified = true;</code></p>
+  </div>
+
+  <h2 id="tracking">Tracking vs no-tracking <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp"><code class="language-csharp">// Tracked: snapshot per entity, entity kept in the tracker
+var orders = await db.Orders.ToListAsync();
+
+// Not tracked: no snapshot, no tracker entry
+var report = await db.Orders.AsNoTracking().ToListAsync();</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Tracked</th><th><code>AsNoTracking</code></th></tr></thead>
+      <tbody>
+        <tr><td>Memory</td><td>Entity + snapshot</td><td><strong>Entity only</strong></td></tr>
+        <tr><td><code>SaveChanges</code> cost</td><td>Scans all tracked entities</td><td>Not involved</td></tr>
+        <tr><td>Identity resolution</td><td>Yes — same key returns the same instance</td><td><strong>No</strong> — duplicate instances possible</td></tr>
+        <tr><td>Can save changes</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Use for</td><td>Anything you intend to modify</td><td><strong>Reads, reports, API responses</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>If you're not going to change it, don't track it.</strong></p>
+    <p>Typical gain is 10–30% on read-heavy queries — larger on big result sets, because you skip building a
+      snapshot per row.</p>
+    <p>Even better: <strong>project into a DTO</strong>. A projection is automatically untracked, selects fewer
+      columns, and can be served by a
+      <a href="../10-sql/indexing.html#covering">covering index</a>. That's usually the bigger win.</p>
+  </div>
+
+  <pre data-label="csharp — projection beats AsNoTracking" class="code-good"><code class="language-csharp">// Selects 3 columns, no tracking, no entity materialisation
+var summaries = await db.Orders
+    .Where(o =&gt; o.CustomerId == customerId)
+    .Select(o =&gt; new OrderSummary(o.Id, o.CreatedUtc, o.Total))
+    .ToListAsync();</code></pre>
+
+  <div class="note info">
+    <div class="note-title">Making no-tracking the default</div>
+    <pre data-label="csharp"><code class="language-csharp">options.UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking);</code></pre>
+    <p style="margin:0">Defensible for a read-heavy API, and you then opt in with <code>.AsTracking()</code>
+      where you intend to modify.
+      <br><br>
+      The risk is that someone loads an entity, changes it, calls <code>SaveChanges</code>, and
+      <strong>nothing happens</strong> — silently. No exception, no update. That's a nasty bug class, so it's a
+      decision to make deliberately and document, not a default to flip casually.</p>
+  </div>
+
+  <h2 id="identity-resolution">Identity resolution <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A tracking context keeps <strong>one object instance per primary key</strong>.</p>
+    <p>Query for the same row twice and you get <em>the same object</em> back — not two copies.</p>
+  </div>
+
+  <pre data-label="csharp — the surprising part"><code class="language-csharp">var a = await db.Orders.FirstAsync(o =&gt; o.Id == 1);
+a.Status = OrderStatus.Cancelled;             // local change, not saved
+
+var b = await db.Orders.FirstAsync(o =&gt; o.Id == 1);   // hits the database again
+
+Console.WriteLine(ReferenceEquals(a, b));     // True  - same instance
+Console.WriteLine(b.Status);                  // Cancelled - the LOCAL value</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The rule that catches people</div>
+    <p style="margin:0">EF <strong>does</strong> execute the second query. But when materialising the result it
+      finds the key is already tracked, so it <strong>keeps your in-memory values and discards the database
+      ones</strong>.
+      <br><br>
+      That's correct — losing your unsaved changes would be worse — but it means a long-lived context can serve
+      stale data indefinitely.
+      <br><br>
+      To force a refresh: <code>await db.Entry(a).ReloadAsync()</code>, or use
+      <code>AsNoTracking()</code>, or use a new context. And this is another argument for scoped lifetime: a
+      short-lived context can't go stale.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The flip side: <code>AsNoTracking</code> duplicates objects</div>
+    <p style="margin:0">Without tracking there's no identity map, so loading 100 orders that all belong to one
+      customer with <code>Include(o =&gt; o.Customer)</code> materialises <strong>100 separate Customer
+      objects</strong>.
+      <br><br>
+      Usually harmless. It matters if you're comparing references, mutating them, or the object is large enough
+      that 100 copies is real memory. <code>AsNoTrackingWithIdentityResolution()</code> gives you an identity
+      map without full change tracking — the middle option most people don't know exists.</p>
+  </div>
+
+  <h2 id="savechanges">What <code>SaveChanges</code> does <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <ol class="steps">
+    <li><strong>Detect changes</strong> — compare every tracked entity against its snapshot.</li>
+    <li><strong>Order the operations</strong> by foreign-key dependencies, so parents insert before
+      children.</li>
+    <li><strong>Open a transaction</strong> (unless one is already open).</li>
+    <li><strong>Execute</strong> the statements, batched where the provider supports it.</li>
+    <li><strong>Read back generated values</strong> — identity keys, computed columns,
+      <code>rowversion</code>.</li>
+    <li><strong>Commit</strong>, then mark everything <code>Unchanged</code> and refresh snapshots.</li>
+  </ol>
+
+  <div class="note tip">
+    <div class="note-title">Two consequences worth knowing</div>
+    <p style="margin:0"><strong>Batching is real.</strong> EF Core batches multiple statements into one round
+      trip — up to a provider limit. Adding 50 entities is a handful of round trips, not 50. That's why
+      <code>AddRange</code> then one <code>SaveChanges</code> beats a loop with <code>SaveChanges</code>
+      inside.
+      <br><br>
+      <strong>Dependency ordering is free.</strong> Add a parent and child in one go and EF works out that the
+      parent must be inserted first, then uses the generated key for the child. Doing that by hand is real
+      work, and it's one of the strongest arguments for an ORM on the write path.</p>
+  </div>
+
+  <pre data-label="csharp — the loop that generates 1000 transactions" class="code-bad"><code class="language-csharp">foreach (var item in items)          // 1000 items
+{
+    db.Orders.Add(item);
+    await db.SaveChangesAsync();     // 1000 round trips, 1000 transactions
+}</code></pre>
+
+  <pre data-label="csharp — one transaction, few round trips" class="code-good"><code class="language-csharp">db.Orders.AddRange(items);
+await db.SaveChangesAsync();</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">But don't take it too far</div>
+    <p style="margin:0">One <code>SaveChanges</code> with 500,000 entities is also wrong — the change tracker
+      holds all of them, change detection becomes O(n) over a huge set, and the transaction and log grow
+      enormous.
+      <br><br>
+      For genuinely large volumes, batch in chunks of a few thousand with a fresh context per chunk, or use
+      <a href="performance.html#bulk">bulk operations</a>. The sweet spot is "batched, but bounded".</p>
+  </div>
+
+  <h2 id="interceptors">Hooking into SaveChanges <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="csharp — audit fields, set in one place" class="code-good"><code class="language-csharp">public class AuditInterceptor(IUserContext user) : SaveChangesInterceptor
+{
+    public override ValueTask&lt;InterceptionResult&lt;int&gt;&gt; SavingChangesAsync(
+        DbContextEventData e, InterceptionResult&lt;int&gt; result, CancellationToken ct = default)
+    {
+        var ctx = e.Context;
+        if (ctx is null) return base.SavingChangesAsync(e, result, ct);
+
+        foreach (var entry in ctx.ChangeTracker.Entries&lt;IAuditable&gt;())
+        {
+            if (entry.State == EntityState.Added)
+            {
+                entry.Entity.CreatedUtc = DateTime.UtcNow;
+                entry.Entity.CreatedBy  = user.UserId;
+            }
+            else if (entry.State == EntityState.Modified)
+            {
+                entry.Entity.ModifiedUtc = DateTime.UtcNow;
+                entry.Entity.ModifiedBy  = user.UserId;
+            }
+        }
+        return base.SavingChangesAsync(e, result, ct);
+    }
+}</code></pre>
+
+  <p>Register with <code>options.AddInterceptors(...)</code>. This is the right home for audit stamps, soft
+    deletes and <a href="transactions-concurrency.html#outbox">outbox writes</a> — anything that must happen on
+    every save and would otherwise be duplicated in every handler.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li><code>DbContext</code> is a unit of work — a notepad, not a live connection.</li>
+      <li>Scoped lifetime. Singleton breaks on thread safety and unbounded tracker growth.</li>
+      <li><code>IDbContextFactory</code> for background services and parallel work.</li>
+      <li>Five states; EF derives them by comparing against a snapshot.</li>
+      <li>Mutating a tracked entity is enough — no <code>Update()</code> call.</li>
+      <li><code>Update()</code> on a detached entity marks every column modified and silently wipes fields.</li>
+      <li><code>AsNoTracking</code> for reads; projection into a DTO is usually better still.</li>
+      <li>Identity resolution keeps your local values and discards fresher database ones.</li>
+      <li>One <code>SaveChanges</code> = one transaction, with batching and FK ordering handled.</li>
+      <li>Interceptors are the place for cross-cutting save behaviour.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Singleton <code>DbContext</code></strong>, causing concurrency exceptions and memory growth.</li>
+    <li><strong>Injecting a scoped context into a singleton</strong> such as a background service.</li>
+    <li><strong><code>Update()</code> with a partial DTO</strong>, overwriting unsent fields.</li>
+    <li><strong><code>SaveChanges</code> inside a loop.</strong></li>
+    <li><strong>Tracking read-only queries</strong> that feed an API response.</li>
+    <li><strong>Two <code>SaveChanges</code> calls</strong> where atomicity was required.</li>
+    <li><strong>Expecting a re-query to return fresh data</strong> for an already-tracked entity.</li>
+    <li><strong>Missing <code>await</code></strong> — producing the "second operation started" error on a
+      correctly-scoped context.</li>
+    <li><strong>Loading tens of thousands of entities</strong> into one context.</li>
+    <li><strong><code>EnableSensitiveDataLogging</code> in production.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>Why is <code>DbContext</code> registered as scoped? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Two hard reasons and one design reason."</p>
+        <p>"<strong>It isn't thread-safe.</strong> One <code>DbContext</code> can't handle concurrent
+          operations. As a singleton, two simultaneous requests produce <em>'a second operation was started on
+          this context instance before a previous operation completed'</em> — which is probably the most
+          commonly seen EF exception."</p>
+        <p>"<strong>The change tracker accumulates.</strong> Every entity loaded stays referenced for the life
+          of the context. A singleton therefore leaks memory indefinitely, and <code>SaveChanges</code> gets
+          progressively slower because change detection has to scan everything it's ever seen."</p>
+        <p>"<strong>And scoped matches the unit-of-work model.</strong> A web request is naturally one unit of
+          work — several services can share the same context, make their changes, and one
+          <code>SaveChanges</code> commits them atomically. Transient would give each service its own context,
+          so they couldn't participate in the same transaction."</p>
+        <p>"Where scoped doesn't fit is background services, because those are singletons and the container
+          correctly refuses to inject a scoped dependency into one. There I'd use
+          <code>IDbContextFactory</code> and create a context per unit of work — which also means a fresh
+          tracker each iteration rather than one growing forever."</p>
+        <p>"Same applies to parallel work: if I'm processing items concurrently, each branch needs its own
+          context, because one can't be shared across concurrent operations."</p>
+        <p>"One thing worth adding: the 'second operation' error also happens on a correctly-scoped context if
+          someone forgets an <code>await</code>, so two operations overlap within the same request. Same
+          symptom, different cause — worth checking both."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know both reasons — thread safety <em>and</em> tracker growth?</li>
+        <li>Do you know what to do in a background service?</li>
+        <li>Do you connect it to the unit-of-work idea?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you use EF in a background service?</li>
+          <li>What if two services in one request both need to save?</li>
+          <li>What's context pooling?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What does <code>AsNoTracking</code> do, and when would you use it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"By default EF tracks every entity a query returns — it stores a <strong>snapshot</strong> of the
+          original values and keeps the entity in the change tracker, so that when I mutate a property it can
+          work out what changed at <code>SaveChanges</code>."</p>
+        <p>"That's essential if I'm going to modify the entity, and pure overhead if I'm not.
+          <code>AsNoTracking</code> skips the snapshot and the tracker entry."</p>
+        <p>"So I'd use it for anything read-only: API responses, reports, dropdown lists, exports. Typically
+          10–30% faster, and more on large result sets because you're not building a snapshot per row."</p>
+        <p>"But the better answer for most read paths is <strong>projection</strong> — <code>Select</code> into
+          a DTO. That's automatically untracked, and it also selects fewer columns, which means less network
+          traffic and the possibility of the query being served entirely by a covering index. So projection
+          usually beats <code>AsNoTracking</code> on a full entity, and I'd reach for it first."</p>
+        <p>"There's a behavioural difference worth knowing, not just a performance one. Tracking gives you
+          <strong>identity resolution</strong> — one object instance per primary key. Without tracking there's
+          no identity map, so if I load 100 orders that all belong to the same customer with
+          <code>Include</code>, I get 100 separate Customer objects rather than 100 references to one. Usually
+          harmless, but it matters if I'm comparing references or the object is large.
+          <code>AsNoTrackingWithIdentityResolution</code> gives you the identity map without full change
+          tracking, which is the middle option people tend not to know about."</p>
+        <p>"You can make no-tracking the default with <code>UseQueryTrackingBehavior</code>, and for a
+          read-heavy API that's defensible. The risk is that someone loads an entity, modifies it, calls
+          <code>SaveChanges</code>, and <strong>nothing happens</strong> — silently, no exception. That's a
+          nasty bug class, so I'd only do it as a deliberate, documented decision."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's the snapshot that's being skipped?</li>
+        <li>Do you know projection is usually better?</li>
+        <li>Do you know about identity resolution as a behavioural difference?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Does <code>AsNoTracking</code> change the SQL?</li>
+          <li>What breaks if you make it the global default?</li>
+          <li>How would you measure the difference?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A PUT endpoint uses <code>db.Update(entity)</code> and fields are being wiped. Why? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Because <code>Update()</code> on a <strong>detached</strong> entity marks every property as
+          modified."</p>
+        <p>"EF has no snapshot for a detached entity — it never loaded it, so it has nothing to compare
+          against. It has to assume everything changed, so the generated <code>UPDATE</code> sets every
+          column."</p>
+        <p>"So if the client sent a partial payload and the code constructed a new entity from it, every field
+          the client <em>didn't</em> send is at its CLR default — <code>null</code>, <code>0</code>,
+          <code>DateTime.MinValue</code> — and those defaults get written over the real data. And it looks
+          entirely successful: no exception, no warning."</p>
+        <p>"The fix I'd default to is <strong>load, then assign</strong>. Fetch the tracked entity, set only
+          the properties the request actually changes, and call <code>SaveChanges</code>. EF compares against
+          the snapshot and generates an <code>UPDATE</code> containing only the changed columns. Costs one
+          extra <code>SELECT</code>, and that's almost always worth it — it also gives you a natural
+          not-found check and a place to enforce authorisation on the existing row."</p>
+        <p>"If I genuinely need to avoid the read — a hot path, or a high-volume update — I'd attach and mark
+          specific properties: <code>db.Attach(e); db.Entry(e).Property(x =&gt; x.Status).IsModified =
+          true;</code>. Explicit about what's changing, single round trip."</p>
+        <p>"There's a broader point here: this is the <strong>PUT versus PATCH</strong> distinction showing up
+          in the data layer. <code>Update()</code> has PUT semantics — full replacement. If the API is really
+          doing a partial update, then the whole stack needs partial semantics, and using
+          <code>Update()</code> is a mismatch between what the endpoint promises and what the persistence
+          layer does."</p>
+        <p>"I'd also add optimistic concurrency here while I'm at it — a <code>rowversion</code> column — so
+          two concurrent edits don't silently overwrite each other. That's the same class of bug: a lost
+          update that nothing reports."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know why — no snapshot, so everything is assumed modified?</li>
+        <li>Do you know the load-then-assign fix and its cost?</li>
+        <li>Do you know the explicit <code>IsModified</code> alternative?</li>
+        <li>Bonus: do you connect it to PUT vs PATCH and to lost updates?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "always use <code>Update</code>" with no awareness.</li>
+        <li><span class="redflag">Red flag:</span> not knowing what a snapshot is.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you implement PATCH properly?</li>
+          <li>What SQL does each version generate?</li>
+          <li>How does <code>rowversion</code> fit in?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

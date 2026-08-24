@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Core Language Features — C# Fundamentals</title>
+<meta name="description" content="Generics, delegates, events, lambdas, closures, extension methods, iterators and pattern matching explained simply, with the C# details interviewers probe.">
+<meta name="keywords" content="csharp generics constraints covariance delegates Func Action events lambdas closures captured variables extension methods yield return iterators pattern matching switch expression interview">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="01-csharp-fundamentals/language-features.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Core Language Features</h1>
+    <p class="subtitle">Generics, delegates, lambdas, iterators and pattern matching. LINQ, dependency
+      injection and events are all built on these — so this page unlocks several later sections.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Generics</strong> — write the algorithm once, keep type safety, avoid boxing.
+        <code>where</code> constraints let you actually use the type.</li>
+      <li><strong>Delegate</strong> — a variable that holds a method. <code>Func</code> returns a value,
+        <code>Action</code> doesn't, <code>Predicate</code> returns <code>bool</code>.</li>
+      <li><strong>Event</strong> — a delegate with restricted access: outsiders can subscribe, only the
+        owner can raise it.</li>
+      <li><strong>Closure</strong> — a lambda that captures a variable. It captures the
+        <em>variable</em>, not the value — that's the classic loop bug.</li>
+      <li><strong>Extension method</strong> — a static method that <em>looks</em> like an instance method.
+        All of LINQ is built this way.</li>
+      <li><code>yield return</code> makes a method produce items lazily, one at a time, without building a
+        list.</li>
+    </ul>
+  </div>
+
+  <h2 id="generics">Generics <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Generics let you write code that works with <strong>any type</strong>, while the compiler still knows
+      exactly <em>which</em> type you're using.</p>
+    <p>You get one implementation, full type safety, and no boxing.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A generic type is a <strong>labelled shipping box</strong>. Same box design for anything, but the
+      label says exactly what's inside — so nobody can put a laptop in the box marked "books", and you don't
+      have to unwrap it to find out what it holds.</p>
+    <p>The non-generic alternative was one unlabelled box for everything: you had to open it and hope
+      (<code>(int)list[0]</code>).</p>
+  </div>
+
+  <h3 id="generics-why">Why they exist — the before and after</h3>
+
+  <pre data-label="csharp — life before generics" class="code-bad"><code class="language-csharp">var list = new ArrayList();
+list.Add(1);
+list.Add("oops");                 // compiles fine - no type safety
+
+int first = (int)list[0];         // cast needed, and it boxes/unboxes
+int second = (int)list[1];        // InvalidCastException at runtime</code></pre>
+
+  <pre data-label="csharp — with generics" class="code-good"><code class="language-csharp">var list = new List&lt;int&gt;();
+list.Add(1);
+list.Add("oops");                 // compile error - caught immediately
+
+int first = list[0];              // no cast, no boxing</code></pre>
+
+  <p>Three wins in one change: errors move from runtime to compile time, the casts disappear, and the boxing
+    disappears.</p>
+
+  <h3 id="constraints">Constraints — how you actually use <code>T</code></h3>
+
+  <p>By default <code>T</code> could be anything, so you can barely do anything with it.
+    <code>where</code> tells the compiler more:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Constraint</th><th>Means</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td><code>where T : class</code></td><td>Must be a reference type</td><td>You need to compare to <code>null</code></td></tr>
+        <tr><td><code>where T : struct</code></td><td>Must be a value type</td><td>Avoiding null entirely</td></tr>
+        <tr><td><code>where T : SomeBase</code></td><td>Must derive from it</td><td>You need its members</td></tr>
+        <tr><td><code>where T : ISomething</code></td><td>Must implement it</td><td>The common case</td></tr>
+        <tr><td><code>where T : new()</code></td><td>Has a public no-arg constructor</td><td>You need to create one</td></tr>
+        <tr><td><code>where T : notnull</code></td><td>Cannot be a nullable type</td><td>Dictionary keys</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — a constraint makes T usable"><code class="language-csharp">// Without a constraint, entity.Id doesn't compile - T might not have an Id.
+public sealed class Repository&lt;T&gt; where T : IEntity
+{
+    public T? Find(IEnumerable&lt;T&gt; items, Guid id) =&gt;
+        items.FirstOrDefault(e =&gt; e.Id == id);      // works: T is guaranteed to have Id
+}</code></pre>
+
+  <div class="note info">
+    <div class="note-title">Generics in .NET are real, not erased <span class="pill pill-senior">⭐ Senior-level</span></div>
+    <p style="margin:0">This is a good differentiator if you've used Java. Java erases generics at compile
+      time — at runtime, <code>List&lt;String&gt;</code> is just <code>List</code>.
+      <br><br>
+      .NET keeps them at runtime. The CLR generates a specialised version for each value type
+      (<code>List&lt;int&gt;</code> really stores ints, no boxing) and shares one version across reference
+      types. That's why <code>typeof(List&lt;int&gt;) != typeof(List&lt;string&gt;)</code> in C#, and why
+      you can reflect over generic arguments.</p>
+  </div>
+
+  <h2 id="delegates">Delegates <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A delegate is a <strong>variable that holds a method</strong>.</p>
+    <p>Just as an <code>int</code> variable holds a number, a delegate variable holds "some code I can call
+      later".</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A delegate is a phone number. You're not the plumber, but you can hold their number and call it when
+      needed — and you can swap the number without changing anything about how you make the call.</p>
+  </div>
+
+  <pre data-label="csharp — the three built-in ones cover almost everything"><code class="language-csharp">Func&lt;int, int&gt;        square  = x =&gt; x * x;          // takes int, RETURNS int
+Action&lt;string&gt;        log     = msg =&gt; Console.WriteLine(msg);   // returns NOTHING
+Predicate&lt;int&gt;        isEven  = x =&gt; x % 2 == 0;      // returns BOOL
+
+Console.WriteLine(square(5));    // 25
+log("hello");
+Console.WriteLine(isEven(4));    // True</code></pre>
+
+  <div class="remember">
+    <span class="r-label">How to remember them</span>
+    <p><strong><code>Func</code></strong> = <em>function</em>, so it returns something. The
+      <strong>last</strong> type parameter is the return type.</p>
+    <p><strong><code>Action</code></strong> = an <em>action</em> — it does something and returns nothing.</p>
+  </div>
+
+  <p>Why this matters: <strong>this is what LINQ is</strong>. <code>Where</code> takes a
+    <code>Func&lt;T, bool&gt;</code>; <code>Select</code> takes a <code>Func&lt;T, TResult&gt;</code>. Once
+    delegates click, LINQ stops looking like magic.</p>
+
+  <pre data-label="csharp — passing behaviour as a parameter"><code class="language-csharp">// Instead of writing a class per rule, pass the rule in.
+public static IEnumerable&lt;Order&gt; Filter(IEnumerable&lt;Order&gt; orders, Func&lt;Order, bool&gt; rule)
+{
+    foreach (var order in orders)
+        if (rule(order)) yield return order;
+}
+
+var big = Filter(orders, o =&gt; o.Total &gt; 1000);
+var recent = Filter(orders, o =&gt; o.CreatedUtc &gt; DateTime.UtcNow.AddDays(-7));</code></pre>
+
+  <p>That's the <a href="../18-design-patterns/behavioral.html#strategy">Strategy pattern</a> in one line —
+    which is why C# often doesn't need the full interface-based version.</p>
+
+  <h2 id="closures">Closures — and the classic bug <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>When a lambda uses a variable from outside itself, it <strong>captures</strong> that variable. The
+      lambda is now a <em>closure</em>.</p>
+    <p>The key detail: it captures the <strong>variable</strong>, not the value at that moment.</p>
+  </div>
+
+  <pre data-label="csharp — what does this print?" class="code-bad"><code class="language-csharp">var actions = new List&lt;Action&gt;();
+
+for (var i = 0; i &lt; 3; i++)
+    actions.Add(() =&gt; Console.WriteLine(i));
+
+foreach (var a in actions) a();</code></pre>
+
+  <p>Most people expect <code>0 1 2</code>. In a classic <code>for</code> loop it prints
+    <strong><code>3 3 3</code></strong>.</p>
+
+  <p>There is <em>one</em> <code>i</code> for the whole loop. All three lambdas captured that same variable,
+    and by the time they run the loop has finished and <code>i</code> is 3.</p>
+
+  <pre data-label="csharp — the fix: give each iteration its own variable" class="code-good"><code class="language-csharp">for (var i = 0; i &lt; 3; i++)
+{
+    var copy = i;                                  // new variable each iteration
+    actions.Add(() =&gt; Console.WriteLine(copy));    // prints 0 1 2
+}</code></pre>
+
+  <div class="note info">
+    <div class="note-title">The version difference that catches people out</div>
+    <p style="margin:0">In <code>foreach</code>, this was fixed in <strong>C# 5</strong> — the iteration
+      variable became per-iteration, so <code>foreach</code> closures behave as you'd expect.
+      <br><br>
+      In a <code>for</code> loop it was <strong>never</strong> changed, because <code>i</code> is genuinely
+      one variable that the loop mutates. So <code>for</code> still needs the explicit copy.
+      <br><br>
+      Knowing that distinction is a good senior-level detail.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — closures capture more than you think</div>
+    <p style="margin:0">A closure keeps its captured variables alive. If a lambda captures
+      <code>this</code> — which happens implicitly when you use any instance field — and that lambda is
+      stored in a long-lived place (an event handler, a static cache, a timer), the <strong>entire
+      object</strong> can't be garbage collected.
+      <br><br>
+      That's a common source of slow memory growth in long-running services. See
+      <a href="../05-csharp-advanced/memory-gc.html">memory &amp; GC</a>.</p>
+  </div>
+
+  <h2 id="events">Events <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An event is a delegate with a <strong>lock on it</strong>. Outside code can subscribe and
+      unsubscribe, but only the declaring class can raise it or clear it.</p>
+  </div>
+
+  <pre data-label="csharp — why the event keyword exists"><code class="language-csharp">public class OrderService
+{
+    // Without 'event', any caller could do  svc.OrderPlaced = null;
+    // and wipe out every other subscriber.
+    public event EventHandler&lt;OrderPlacedArgs&gt;? OrderPlaced;
+
+    public void Place(Order order)
+    {
+        // ... do the work ...
+        OrderPlaced?.Invoke(this, new OrderPlacedArgs(order.Id));
+    }
+}</code></pre>
+
+  <p>Note the <code>?.</code> — if nobody has subscribed, the delegate is <code>null</code>, and invoking it
+    would throw.</p>
+
+  <div class="note warn">
+    <div class="note-title">Two things to know about events</div>
+    <ul style="margin:8px 0 0">
+      <li><strong>They leak memory if you don't unsubscribe.</strong> The publisher holds a strong reference
+        to every subscriber. A long-lived publisher plus short-lived subscribers that never detach means
+        those subscribers can never be collected — the "lapsed listener" problem.</li>
+      <li><strong>One throwing handler stops the rest.</strong> Handlers run in subscription order; an
+        exception in the second one means the third never runs.</li>
+    </ul>
+    <p style="margin:8px 0 0">For in-process decoupling inside a domain model, prefer
+      <a href="../18-design-patterns/behavioral.html#observer">domain events with an explicit dispatcher</a>
+      — they support async handlers and give you control over failure.</p>
+  </div>
+
+  <h2 id="extension-methods">Extension methods <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A static method that you can call as if it were an instance method on the type — even a type you
+      don't own.</p>
+  </div>
+
+  <pre data-label="csharp — the whole feature in one snippet"><code class="language-csharp">public static class StringExtensions
+{
+    // 'this' on the first parameter is what makes it an extension
+    public static bool IsValidEmail(this string value) =&gt;
+        !string.IsNullOrWhiteSpace(value) &amp;&amp; value.Contains('@');
+}
+
+// Now it reads like a method on string:
+if (email.IsValidEmail()) { /* ... */ }</code></pre>
+
+  <p><strong>This is how LINQ works.</strong> <code>Where</code>, <code>Select</code> and
+    <code>OrderBy</code> aren't members of <code>IEnumerable&lt;T&gt;</code> — they're extension methods in
+    <code>System.Linq.Enumerable</code>. That's why you need
+    <code>using System.Linq;</code> for them to appear.</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Extension methods are resolved at <strong>compile time</strong> and are
+      <em>not</em> polymorphic — they can't be overridden. They also lose to instance methods: if the type
+      later gains a real method with the same signature, that one wins silently and your extension stops
+      being called.
+      <br><br>
+      Also note an extension method <em>can</em> be called on <code>null</code> without throwing, because
+      there's no instance dereference. So validate the parameter.</p>
+  </div>
+
+  <h2 id="iterators">Iterators and <code>yield return</code> <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>yield return</code> lets a method hand back items <strong>one at a time, on demand</strong>,
+      instead of building a whole list first.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Without <code>yield</code>, you cook the entire buffet before anyone eats.</p>
+    <p>With <code>yield</code>, you cook each dish when a guest asks for it. If they leave after two
+      courses, you never cooked the rest.</p>
+  </div>
+
+  <pre data-label="csharp — nothing runs until you enumerate"><code class="language-csharp">public static IEnumerable&lt;int&gt; Numbers()
+{
+    Console.WriteLine("start");
+    yield return 1;
+    Console.WriteLine("after 1");
+    yield return 2;
+    Console.WriteLine("after 2");
+}
+
+var seq = Numbers();          // prints NOTHING - the method hasn't run yet
+foreach (var n in seq)        // now it runs, pausing at each yield
+    Console.WriteLine(n);
+
+// Output: start, 1, after 1, 2, after 2</code></pre>
+
+  <p>The compiler rewrites that method into a state machine class that remembers where it paused. It's the
+    same machinery <code>async/await</code> uses.</p>
+
+  <p><strong>Why it matters:</strong> memory. Reading a million-line file with <code>yield</code> holds one
+    line in memory at a time; returning a <code>List&lt;string&gt;</code> holds all million.</p>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — deferred execution surprises</div>
+    <p style="margin:0">Because the body doesn't run until enumeration, two things bite:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Argument validation is deferred too.</strong> A <code>throw</code> for a bad parameter
+        won't fire when the method is called — only when someone enumerates, which may be far away. Validate
+        in a non-iterator wrapper method.</li>
+      <li><strong>Enumerating twice runs it twice.</strong> If it hits a database or an API, you've just made
+        two calls. <code>.ToList()</code> once if you need to iterate more than once.</li>
+    </ul>
+  </div>
+
+  <h2 id="pattern-matching">Pattern matching <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Test the <em>shape</em> of a value — its type, its properties, its structure — and pull out the parts
+      you need, in one expression.</p>
+  </div>
+
+  <pre data-label="csharp — the old way" class="code-bad"><code class="language-csharp">if (shape is Circle)
+{
+    var c = (Circle)shape;
+    if (c.Radius &gt; 0) return Math.PI * c.Radius * c.Radius;
+}
+else if (shape is Rectangle)
+{
+    var r = (Rectangle)shape;
+    return r.Width * r.Height;
+}
+throw new ArgumentException();</code></pre>
+
+  <pre data-label="csharp — a switch expression over patterns" class="code-good"><code class="language-csharp">var area = shape switch
+{
+    Circle { Radius: &gt; 0 } c    =&gt; Math.PI * c.Radius * c.Radius,
+    Rectangle r                 =&gt; r.Width * r.Height,
+    null                        =&gt; throw new ArgumentNullException(nameof(shape)),
+    _                           =&gt; throw new ArgumentException($"Unknown shape {shape.GetType().Name}")
+};</code></pre>
+
+  <p>Notice <code>Circle { Radius: &gt; 0 }</code> — that's a type check, a property check and a variable
+    binding in one pattern.</p>
+
+  <div class="note tip">
+    <div class="note-title">Why this matters beyond tidiness</div>
+    <p style="margin:0">Over a <strong>sealed hierarchy</strong>, the compiler can tell you when a
+      <code>switch</code> expression doesn't handle every case. That turns "someone forgot to update the
+      switch" from a production bug into a build warning.
+      <br><br>
+      It's also why the classic argument for polymorphism over switches is weaker in modern C# — see
+      <a href="../03-solid/index.html#ocp">Open/Closed</a>.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Generics = one implementation, compile-time safety, no boxing. Constraints make <code>T</code> usable.</li>
+      <li>.NET generics are preserved at runtime, unlike Java's erased ones.</li>
+      <li><code>Func</code> returns, <code>Action</code> doesn't. LINQ is just methods taking <code>Func</code>.</li>
+      <li>Closures capture the <em>variable</em>. <code>for</code> loops need an explicit copy; <code>foreach</code> hasn't since C# 5.</li>
+      <li>Events leak if subscribers never detach, and one throwing handler blocks the rest.</li>
+      <li>Extension methods are compile-time and non-polymorphic; instance methods beat them.</li>
+      <li><code>yield return</code> is lazy — validation is deferred, and enumerating twice executes twice.</li>
+      <li>Pattern matching over a sealed hierarchy gives you exhaustiveness checking.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Capturing the loop variable</strong> in a <code>for</code> loop and getting the last value
+      every time.</li>
+    <li><strong>Never unsubscribing from events</strong>, so subscribers can't be collected.</li>
+    <li><strong>Enumerating a <code>yield</code> method twice</strong> and unknowingly hitting the database
+      twice.</li>
+    <li><strong>Argument validation inside an iterator</strong>, so it throws far away from the call.</li>
+    <li><strong>Generic methods with no constraint</strong>, then casting <code>T</code> to something —
+      which defeats the point.</li>
+    <li><strong>Extension methods on <code>object</code></strong> or over-broad types, polluting IntelliSense
+      everywhere.</li>
+    <li><strong>Returning <code>IEnumerable&lt;T&gt;</code> from a repository</strong> and letting the caller
+      enumerate it after the connection has closed.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What's the difference between <code>Func</code>, <code>Action</code> and <code>Predicate</code>?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They're all built-in delegate types — ways of holding a method in a variable."</p>
+        <p>"<code>Action</code> returns nothing. <code>Func</code> returns a value, and its last type
+          parameter is the return type — so <code>Func&lt;int, string&gt;</code> takes an int and returns a
+          string. <code>Predicate&lt;T&gt;</code> is really just <code>Func&lt;T, bool&gt;</code> with a
+          more descriptive name."</p>
+        <p>"In practice I use <code>Func</code> and <code>Action</code> almost exclusively.
+          <code>Predicate</code> mostly survives in older APIs like
+          <code>List&lt;T&gt;.FindAll</code>; LINQ standardised on <code>Func&lt;T, bool&gt;</code>."</p>
+        <p>"The reason this matters is that it's what LINQ is built on. <code>Where</code> takes a
+          <code>Func&lt;T, bool&gt;</code>, <code>Select</code> takes a
+          <code>Func&lt;T, TResult&gt;</code>. Once you see that, LINQ stops being magic — it's just methods
+          that take behaviour as a parameter."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know which type parameter is the return type?</li>
+        <li>Can you connect delegates to LINQ?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the difference between <code>Func&lt;T, bool&gt;</code> and
+            <code>Expression&lt;Func&lt;T, bool&gt;&gt;</code>?</li>
+          <li>How is a delegate different from an interface with one method?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What does this print, and why? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <pre data-label="csharp"><code class="language-csharp">var actions = new List&lt;Action&gt;();
+for (var i = 0; i &lt; 3; i++)
+    actions.Add(() =&gt; Console.Write(i));
+foreach (var a in actions) a();</code></pre>
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It prints <code>333</code>, not <code>012</code>."</p>
+        <p>"The lambdas capture the <em>variable</em> <code>i</code>, not its value at the time they were
+          created. In a <code>for</code> loop there's only one <code>i</code> for the whole loop, so all
+          three lambdas close over the same variable. By the time they actually run, the loop has finished
+          and <code>i</code> is 3."</p>
+        <p>"The fix is to give each iteration its own variable — declare a local copy inside the loop body
+          and capture that instead."</p>
+        <p>"There's a version detail worth knowing: this <em>was</em> a problem with <code>foreach</code>
+          too, and it was fixed in C# 5 by making the iteration variable per-iteration. It was deliberately
+          not changed for <code>for</code> loops, because there <code>i</code> genuinely is one variable
+          that the loop mutates — changing it would break code that relies on that."</p>
+        <p>"The related thing I'd mention is that closures keep captured variables alive. If a lambda
+          captures <code>this</code> — which happens implicitly if you touch any instance field — and it's
+          stored somewhere long-lived like an event handler or a static cache, the whole object can't be
+          collected. That's a real source of slow memory growth."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know closures capture variables, not values?</li>
+        <li>Do you know the <code>foreach</code> vs <code>for</code> distinction?</li>
+        <li>Bonus: do you connect closures to memory leaks?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "012" — the most common wrong answer.</li>
+        <li><span class="redflag">Red flag:</span> knowing the answer but not being able to explain <em>why</em>.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does the compiler actually generate for a closure?</li>
+          <li>How could a closure cause a memory leak?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why would you use <code>yield return</code> instead of returning a list?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Mainly memory and responsiveness. With <code>yield</code>, items are produced on demand, so
+          you hold one at a time instead of the whole collection. Reading a million-line file that way uses
+          constant memory; returning a list uses a million strings' worth."</p>
+        <p>"It also means the caller can stop early. If they only need the first ten matches, only ten get
+          produced — the rest of the work never happens. That composes well with LINQ, where
+          <code>Take(10)</code> genuinely stops the pipeline."</p>
+        <p>"Under the hood the compiler rewrites the method into a state machine that remembers where it
+          paused. It's the same mechanism async/await uses."</p>
+        <p>"The two traps I'd flag. First, <strong>deferred validation</strong> — a guard clause inside an
+          iterator doesn't run when the method is called, only when someone enumerates. So I put validation
+          in a normal wrapper method that then calls the private iterator. Second,
+          <strong>enumerating twice runs it twice</strong>, which is a real bug if it hits a database or an
+          API. If the caller might iterate more than once, materialise with <code>ToList()</code>."</p>
+        <p>"That second point is also why I'm careful about returning <code>IEnumerable&lt;T&gt;</code> from
+          a repository — the caller might enumerate it after the connection has been disposed."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand lazy evaluation, not just the syntax?</li>
+        <li>Do you know the deferred-validation and double-enumeration traps?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's <code>IAsyncEnumerable&lt;T&gt;</code> for?</li>
+          <li>What happens if you <code>yield return</code> inside a <code>try</code> with a <code>finally</code>?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Are C# generics erased at runtime? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"No — and that's a real difference from Java, which does erase them."</p>
+        <p>"In .NET, generic type information survives to runtime. The CLR generates a specialised
+          implementation for each value type argument, so <code>List&lt;int&gt;</code> genuinely stores ints
+          inline with no boxing. For reference types it shares a single implementation, because every
+          reference is the same size."</p>
+        <p>"The practical consequences: <code>typeof(List&lt;int&gt;)</code> and
+          <code>typeof(List&lt;string&gt;)</code> are different types. You can inspect generic arguments
+          via reflection. You can write <code>typeof(T)</code> inside a generic method and get the real
+          type. And <code>default(T)</code> works correctly — zero for value types, null for reference
+          types — because the runtime knows what <code>T</code> is."</p>
+        <p>"In Java none of that works, which is why you see people passing <code>Class&lt;T&gt;</code>
+          objects around as a workaround."</p>
+        <p>"The performance angle is the important half. Because value-type generics are specialised,
+          generics in .NET are genuinely zero-cost for value types — no boxing, and the JIT can inline
+          through them. That's why <code>List&lt;int&gt;</code> replaced <code>ArrayList</code> rather than
+          just wrapping it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the CLR implementation, not just the syntax?</li>
+        <li>Can you name the observable consequences?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does <code>default(T)</code> return, and how does the runtime know?</li>
+          <li>What are covariance and contravariance — and why is <code>IEnumerable&lt;out T&gt;</code>
+            covariant but <code>List&lt;T&gt;</code> not?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

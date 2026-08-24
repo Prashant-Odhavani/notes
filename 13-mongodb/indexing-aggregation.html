@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indexing &amp; Aggregation — MongoDB</title>
+<meta name="description" content="The ESR rule for compound indexes, multikey, text and TTL indexes, covered queries, explain output, and aggregation pipeline design.">
+<meta name="keywords" content="MongoDB index compound ESR rule equality sort range multikey index text index TTL index partial index sparse unique covered query explain executionStats COLLSCAN IXSCAN aggregation pipeline match sort group lookup unwind facet allowDiskUse">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="13-mongodb/indexing-aggregation.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Indexing &amp; Aggregation</h1>
+    <p class="subtitle">Compound index order follows one rule — ESR. Aggregation follows one rule — filter
+      early.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>ESR:</strong> Equality, then Sort, then Range. The compound index rule.</li>
+      <li><strong>Prefix rule applies</strong> — an index on <code>{a, b, c}</code> serves queries on
+        <code>a</code>, <code>{a,b}</code>, <code>{a,b,c}</code>.</li>
+      <li><strong>An unindexed sort is a hard failure</strong> past 100 MB, not just slow.</li>
+      <li><strong>Multikey</strong> for arrays — one index entry per element. Only one array field per
+        index.</li>
+      <li><strong>TTL index</strong> deletes expired documents automatically. Genuinely useful.</li>
+      <li><strong><code>$match</code> and <code>$project</code> first</strong> in a pipeline, always.</li>
+      <li><strong><code>explain("executionStats")</code></strong> — compare <code>nReturned</code> against
+        <code>totalDocsExamined</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="esr">The ESR rule <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Order compound index fields as: <strong>E</strong>quality first, then <strong>S</strong>ort, then
+      <strong>R</strong>ange.</p>
+    <p>It's the same reasoning as <a href="../10-sql/indexing.html#column-order">SQL composite indexes</a>, with
+      one important difference — <strong>sort comes before range</strong>, not after.</p>
+  </div>
+
+  <pre data-label="javascript — the query we're indexing for"><code class="language-javascript">db.order.find({
+    customerId: ObjectId("..."),          // Equality
+    status:     "shipped",                // Equality
+    total:      { $gte: 100 }             // Range
+}).sort({ createdAt: -1 })                // Sort</code></pre>
+
+  <pre data-label="javascript — ESR order" class="code-good"><code class="language-javascript">db.order.createIndex({
+    customerId: 1,      // E
+    status:     1,      // E
+    createdAt: -1,      // S
+    total:      1       // R
+});</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why sort before range — and why this differs from SQL</div>
+    <p style="margin:0">A range predicate makes everything after it in the index <em>unordered</em> with
+      respect to the query. So if <code>total</code> came before <code>createdAt</code>, the results within the
+      range wouldn't be in <code>createdAt</code> order and MongoDB would need an <strong>in-memory
+      sort</strong>.
+      <br><br>
+      An in-memory sort isn't just slower here — it has a <strong>100 MB hard limit</strong>. Exceed it and the
+      query <em>fails</em> with an error unless <code>allowDiskUse</code> is set.
+      <br><br>
+      SQL Server would spill to disk and be slow. MongoDB stops. That's why ESR puts sort before range: avoiding
+      the blocking sort matters more than narrowing the range scan.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>An unindexed sort is a correctness risk, not just a performance one.</strong></p>
+    <p>It works in development with 500 documents and fails in production at scale — with an error, not a
+      slowdown. That makes sort support the first thing to check when designing an index.</p>
+  </div>
+
+  <h2 id="index-types">Index types <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>For</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Single field</strong></td><td>One field</td><td>Direction only matters in compound indexes</td></tr>
+        <tr><td><strong>Compound</strong></td><td>Multiple fields</td><td>ESR. Prefix rule applies</td></tr>
+        <tr><td><strong>Multikey</strong></td><td>Array fields</td><td>Created automatically. <strong>One array field per index</strong></td></tr>
+        <tr><td><strong>Text</strong></td><td>Word search</td><td>One text index per collection. Basic — use Atlas Search for real search</td></tr>
+        <tr><td><strong>TTL</strong></td><td>Auto-expiry</td><td>Background task, roughly every 60 seconds</td></tr>
+        <tr><td><strong>Partial</strong></td><td>A subset of documents</td><td><strong>Preferred over sparse</strong> — more flexible</td></tr>
+        <tr><td><strong>Unique</strong></td><td>Enforcing uniqueness</td><td>Combine with partial for conditional uniqueness</td></tr>
+        <tr><td><strong>Wildcard</strong></td><td>Unknown field names</td><td>Escape hatch for truly dynamic shapes; expensive</td></tr>
+        <tr><td><strong>Hashed</strong></td><td>Shard key distribution</td><td>Equality only, no ranges</td></tr>
+        <tr><td><strong>2dsphere</strong></td><td>Geospatial</td><td>Near, within, intersects</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="multikey">Multikey — the array index</h3>
+
+  <pre data-label="javascript"><code class="language-javascript">// Document: { tags: ["postgres", "sql", "indexing"] }
+db.article.createIndex({ tags: 1 });      // becomes multikey automatically
+
+db.article.find({ tags: "sql" });         // uses the index</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Two multikey limits that surprise people</div>
+    <p style="margin:0"><strong>1. Only one array field per compound index.</strong>
+      <code>createIndex({ tags: 1, categories: 1 })</code> fails if both are arrays — the number of index
+      entries would be the product of both array lengths, which explodes.
+      <br><br>
+      <strong>2. Multikey indexes can't support a covered query.</strong> MongoDB can't reconstruct the original
+      array from index entries, so it always fetches the document. So the "index-only" optimisation is off the
+      table for any query touching an array field.
+      <br><br>
+      Also worth knowing: one index entry <em>per array element per document</em>. A document with 1,000 tags
+      contributes 1,000 index entries — which is another reason unbounded arrays are expensive.</p>
+  </div>
+
+  <h3 id="ttl">TTL indexes</h3>
+
+  <pre data-label="javascript — automatic cleanup" class="code-good"><code class="language-javascript">// Delete sessions 24 hours after createdAt
+db.session.createIndex({ createdAt: 1 }, { expireAfterSeconds: 86400 });
+
+// Per-document expiry: set expireAfterSeconds: 0 and store the exact expiry time
+db.token.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+// { expiresAt: ISODate("2024-06-01T12:00:00Z") } is deleted at that moment</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why the second form is the useful one</div>
+    <p style="margin:0"><code>expireAfterSeconds: 0</code> with an explicit <code>expiresAt</code> field lets
+      <strong>each document have its own lifetime</strong>. That's how you do sessions with variable duration,
+      idempotency keys with a per-operation TTL, or a cache with different expiry per entry.
+      <br><br>
+      The caveat: the background remover runs roughly <strong>every 60 seconds</strong>, so deletion is
+      approximate. Don't rely on TTL for anything security-sensitive — a token must be validated as expired in
+      code, not merely assumed gone. And on a replica set, deletion happens on the primary and replicates, so
+      secondaries may briefly still return the document.</p>
+  </div>
+
+  <h3 id="partial">Partial and conditional-unique indexes</h3>
+
+  <pre data-label="javascript" class="code-good"><code class="language-javascript">// Index only pending orders - tiny index on a huge collection
+db.order.createIndex(
+    { createdAt: 1 },
+    { partialFilterExpression: { status: "pending" } }
+);
+
+// Unique email, but only among non-deleted users
+db.user.createIndex(
+    { email: 1 },
+    { unique: true, partialFilterExpression: { deletedAt: { $exists: false } } }
+);</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The query must match the filter</div>
+    <p style="margin:0">MongoDB only uses a partial index when it can <strong>prove</strong> the query is a
+      subset of the filter expression. So a query with no <code>status</code> predicate won't use the index
+      above, even if every matching document happens to be pending.
+      <br><br>
+      Also: <code>unique</code> with a partial filter behaves differently from <code>sparse</code> — prefer
+      partial, it's clearer and more capable. <code>sparse</code> exists mostly for historical reasons.</p>
+  </div>
+
+  <h2 id="explain">Reading explain <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="javascript"><code class="language-javascript">db.order.find({ customerId: ObjectId("..."), status: "shipped" })
+        .sort({ createdAt: -1 })
+        .explain("executionStats");</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Field</th><th>What to look for</th></tr></thead>
+      <tbody>
+        <tr><td><code>stage: "COLLSCAN"</code></td><td><strong>Full collection scan</strong> — no usable index</td></tr>
+        <tr><td><code>stage: "IXSCAN"</code></td><td>Index scan. Good</td></tr>
+        <tr><td><code>stage: "FETCH"</code></td><td>Fetching documents after the index scan. Normal unless the count is huge</td></tr>
+        <tr><td><code>stage: "SORT"</code></td><td><strong>In-memory sort</strong> — the index didn't support the sort</td></tr>
+        <tr><td><code>nReturned</code></td><td>Documents returned</td></tr>
+        <tr><td><code>totalKeysExamined</code></td><td>Index entries read</td></tr>
+        <tr><td><code>totalDocsExamined</code></td><td>Documents read</td></tr>
+        <tr><td><code>executionTimeMillis</code></td><td>Wall clock</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The one number that matters</span>
+    <p><strong>The ratio of <code>totalDocsExamined</code> to <code>nReturned</code>.</strong></p>
+    <p><strong>1:1</strong> — ideal. The index found exactly the right documents.</p>
+    <p><strong>0 docs examined</strong> — even better: a <em>covered query</em>, answered from the index
+      alone.</p>
+    <p><strong>100,000:10</strong> — you're scanning to find ten documents. The index is wrong or missing.</p>
+    <p>And a <code>SORT</code> stage anywhere means the index doesn't support the sort — fix the index order.</p>
+  </div>
+
+  <pre data-label="javascript — a covered query examines zero documents" class="code-good"><code class="language-javascript">db.order.createIndex({ customerId: 1, status: 1, total: 1 });
+
+db.order.find(
+    { customerId: ObjectId("..."), status: "shipped" },
+    { _id: 0, total: 1 }              // MUST exclude _id unless it's in the index
+);
+// totalDocsExamined: 0 - answered entirely from the index</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Covered queries need three things</div>
+    <p style="margin:0">Every field in the <strong>query</strong>, every field in the
+      <strong>projection</strong>, and <strong><code>_id</code> explicitly excluded</strong> — because
+      <code>_id</code> is returned by default and isn't in your index.
+      <br><br>
+      Forgetting <code>_id: 0</code> is the usual reason a query that should be covered isn't. And as noted
+      above, a multikey index can never produce a covered query.</p>
+  </div>
+
+  <h2 id="aggregation">The aggregation pipeline <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="javascript — monthly revenue per customer, top 10"><code class="language-javascript">db.order.aggregate([
+  // 1. FILTER FIRST - can use an index, cuts everything downstream
+  { $match: { status: "completed",
+              createdAt: { $gte: ISODate("2024-01-01") } } },
+
+  // 2. Reduce the document shape early - less to carry through
+  { $project: { customerId: 1, total: 1, createdAt: 1 } },
+
+  // 3. Aggregate
+  { $group: {
+      _id: { customer: "$customerId",
+             month: { $dateTrunc: { date: "$createdAt", unit: "month" } } },
+      revenue: { $sum: "$total" },
+      orders:  { $sum: 1 }
+  }},
+
+  // 4. Sort and limit together - MongoDB optimises this into a top-K sort
+  { $sort:  { revenue: -1 } },
+  { $limit: 10 },
+
+  // 5. Join LAST, on 10 documents rather than a million
+  { $lookup: {
+      from: "customer", localField: "_id.customer",
+      foreignField: "_id", as: "customer"
+  }},
+  { $unwind: "$customer" },
+  { $project: { _id: 0, name: "$customer.name", revenue: 1, orders: 1 } }
+]);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Stage</th><th>Does</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><code>$match</code></td><td>Filter</td><td><strong>Use an index — put it first</strong></td></tr>
+        <tr><td><code>$project</code> / <code>$set</code></td><td>Reshape, compute fields</td><td>Reduce size early</td></tr>
+        <tr><td><code>$group</code></td><td>Aggregate</td><td><strong>Blocking</strong> — consumes the whole input</td></tr>
+        <tr><td><code>$sort</code></td><td>Order</td><td>Blocking unless served by an index</td></tr>
+        <tr><td><code>$lookup</code></td><td>Left outer join</td><td><strong>Expensive</strong> — do it late, on few documents</td></tr>
+        <tr><td><code>$unwind</code></td><td>One document per array element</td><td>Multiplies document count</td></tr>
+        <tr><td><code>$facet</code></td><td>Several pipelines on one input</td><td>Count plus page in one round trip</td></tr>
+        <tr><td><code>$merge</code> / <code>$out</code></td><td>Write results to a collection</td><td>On-demand materialised views</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The rule for pipeline order</span>
+    <p><strong>Reduce the data as early as possible.</strong></p>
+    <p><code>$match</code> first — it's the only stage that can use an index to avoid reading documents at all.
+      Then <code>$project</code> to shrink each document. Aggregate. Sort and limit. Join <em>last</em>, when
+      there are few documents left to join.</p>
+    <p>A <code>$lookup</code> before <code>$match</code> joins a million documents and then throws away
+      999,990 of them.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — know what the optimiser does for you</div>
+    <p style="margin:0">MongoDB reorders some stages automatically: it moves <code>$match</code> earlier past
+      <code>$project</code> where it safely can, and it merges <code>$sort</code> followed by
+      <code>$limit</code> into a <strong>top-K sort</strong> — which only keeps K documents in memory instead of
+      sorting everything.
+      <br><br>
+      That last one matters: <code>$sort</code> alone on a large set can hit the 100 MB memory limit, whereas
+      <code>$sort</code> + <code>$limit</code> together often won't.
+      <br><br>
+      But it <strong>cannot</strong> move <code>$match</code> past <code>$group</code> or
+      <code>$unwind</code>, because that would change the result. So a filter that logically applies to the
+      input but is written after a <code>$group</code> stays where you put it. Verify with
+      <code>explain</code> rather than trusting the optimiser to fix your ordering.</p>
+  </div>
+
+  <h3 id="memory-limits">Memory limits</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Limit</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>100 MB per blocking stage</strong></td><td><code>$sort</code>, <code>$group</code>. Exceeding it <strong>errors</strong> unless <code>allowDiskUse</code></td></tr>
+        <tr><td><strong>16 MB per output document</strong></td><td>A <code>$group</code> that accumulates a huge array into one document hits this</td></tr>
+        <tr><td><strong><code>allowDiskUse: true</code></strong></td><td>Spills to disk. Default since 6.0 for most stages</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The <code>$push</code> trap</div>
+    <p style="margin:0"><code>$group</code> with <code>$push</code> accumulating all matching documents into an
+      array can exceed the <strong>16 MB output document limit</strong> — and <code>allowDiskUse</code> does not
+      help, because that's a document size limit, not a memory limit.
+      <br><br>
+      If you need all the documents in a group, either <code>$limit</code> what you push, or restructure so the
+      grouping produces summary values rather than collections.</p>
+  </div>
+
+  <h2 id="lookup">$lookup — and when not to use it <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The honest position</span>
+    <p><code>$lookup</code> is a left outer join, and it works. It is also <strong>much less efficient than a
+      relational join</strong> — it executes as a per-document lookup against the foreign collection.</p>
+    <p>So it's fine on a small result set and a bad idea across millions of documents.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Reasonable</th><th>Reconsider the model</th></tr></thead>
+      <tbody>
+        <tr><td>After <code>$match</code>/<code>$limit</code>, joining tens of documents</td><td>Joining before filtering</td></tr>
+        <tr><td>Occasional reporting or admin queries</td><td><code>$lookup</code> on a hot read path</td></tr>
+        <tr><td>Ad-hoc analysis</td><td>Two or three <code>$lookup</code> stages chained</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The design answer</div>
+    <p style="margin:0">If a <code>$lookup</code> is on a frequently-used read path, that's usually a signal the
+      <a href="fundamentals.html#extended-reference">extended reference pattern</a> should have been applied —
+      copy the two or three fields you need into the document and skip the join entirely.
+      <br><br>
+      Always index the <code>foreignField</code>. Without an index it's a collection scan <em>per input
+      document</em>, which is catastrophic and easy to miss because it still returns correct results.
+      <br><br>
+      "Frequent <code>$lookup</code> means the schema needs revisiting" is a much better answer than optimising
+      the lookup, because it addresses why it's there.</p>
+  </div>
+
+  <h2 id="dotnet">Aggregation from C# <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — typed pipeline"><code class="language-csharp">var results = await _orders.Aggregate()
+    .Match(o =&gt; o.Status == OrderStatus.Completed &amp;&amp; o.CreatedAt &gt;= from)
+    .Group(o =&gt; o.CustomerId,
+           g =&gt; new { CustomerId = g.Key, Revenue = g.Sum(x =&gt; x.Total), Orders = g.Count() })
+    .SortByDescending(x =&gt; x.Revenue)
+    .Limit(10)
+    .ToListAsync(ct);
+
+// See the generated pipeline - do this in development
+var pipeline = _orders.Aggregate()
+    .Match(o =&gt; o.Status == OrderStatus.Completed)
+    .ToString();</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Log the commands in development</div>
+    <pre data-label="csharp"><code class="language-csharp">var settings = MongoClientSettings.FromConnectionString(cs);
+settings.ClusterConfigurator = cb =&gt; cb.Subscribe&lt;CommandStartedEvent&gt;(e =&gt;
+    logger.LogInformation("Mongo {Command}: {Json}", e.CommandName, e.Command.ToJson()));</code></pre>
+    <p style="margin:0">Same principle as <a href="../11-ef-core/index.html#leaky">logging EF Core's SQL</a>.
+      You cannot reason about index usage without seeing the query that was actually sent — and the LINQ
+      translation is not always what you'd expect.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>ESR: Equality, Sort, Range. Sort before range, unlike SQL.</li>
+      <li>An unindexed sort fails at 100 MB rather than merely being slow.</li>
+      <li>Prefix rule applies — one compound index serves several query shapes.</li>
+      <li>One array field per index; multikey can't produce a covered query.</li>
+      <li>TTL with <code>expireAfterSeconds: 0</code> gives per-document expiry, ±60 seconds.</li>
+      <li>Partial indexes over sparse; combine with unique for conditional uniqueness.</li>
+      <li>In explain, compare <code>totalDocsExamined</code> to <code>nReturned</code>; watch for
+        <code>SORT</code> and <code>COLLSCAN</code>.</li>
+      <li>Covered queries need <code>_id: 0</code> and every field in the index.</li>
+      <li><code>$match</code> first, <code>$lookup</code> last.</li>
+      <li><code>$sort</code> + <code>$limit</code> becomes a top-K sort; <code>$group</code> with
+        <code>$push</code> can blow the 16 MB output limit.</li>
+      <li>Frequent <code>$lookup</code> on a hot path means the schema should change.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Range before sort</strong> in a compound index, forcing an in-memory sort.</li>
+    <li><strong>One index per field</strong> instead of compound indexes matching real queries.</li>
+    <li><strong>Ignoring a <code>SORT</code> stage</strong> in explain until it fails in production.</li>
+    <li><strong>Forgetting <code>_id: 0</code></strong> and losing a covered query.</li>
+    <li><strong>Two array fields in one index</strong> — it just errors.</li>
+    <li><strong><code>$lookup</code> before <code>$match</code></strong>, joining everything then discarding
+      it.</li>
+    <li><strong>No index on the <code>foreignField</code></strong> of a <code>$lookup</code>.</li>
+    <li><strong><code>$group</code> with <code>$push</code></strong> exceeding 16 MB.</li>
+    <li><strong>Relying on the optimiser</strong> to move <code>$match</code> past
+      <code>$group</code> — it can't.</li>
+    <li><strong>Trusting TTL for security-sensitive expiry</strong> instead of validating in code.</li>
+    <li><strong>Never looking at the generated pipeline.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How do you decide the field order in a compound index? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I use the <strong>ESR rule</strong> — Equality, Sort, Range."</p>
+        <p>"So equality predicates first, then whatever the query sorts by, then range predicates. For a query
+          filtering on <code>customerId</code> and <code>status</code> with equality, filtering
+          <code>total</code> by range, and sorting by <code>createdAt</code>, the index would be
+          <code>{ customerId: 1, status: 1, createdAt: -1, total: 1 }</code>."</p>
+        <p>"The reasoning for equality first is the same as in SQL — those fields narrow the scan to a small
+          contiguous region of the index."</p>
+        <p>"But the interesting part is <strong>why sort comes before range here</strong>, which is the opposite
+          of the SQL rule. A range predicate makes everything after it in the index unordered relative to the
+          query, so if the range field came first, results wouldn't emerge in sort order and MongoDB would need
+          an in-memory sort."</p>
+        <p>"And an in-memory sort in MongoDB isn't just slower — it has a <strong>100 MB hard limit</strong>,
+          and exceeding it makes the query <em>fail</em> rather than spill to disk. So it's a correctness risk:
+          it works in development with a few hundred documents and errors in production. Avoiding the blocking
+          sort is worth more than narrowing the range scan, which is why ESR orders it that way."</p>
+        <p>"How I'd verify: <code>explain("executionStats")</code>, and check two things. Is there a
+          <code>SORT</code> stage? If so the index isn't supporting the sort. And what's the ratio of
+          <code>totalDocsExamined</code> to <code>nReturned</code>? Ideally 1:1 — if it's examining 100,000
+          documents to return 10, the index is wrong."</p>
+        <p>"Two other things I'd factor in. The <strong>prefix rule</strong> applies, so
+          <code>{a, b, c}</code> also serves queries on just <code>a</code> or <code>{a, b}</code> — which
+          means one well-designed compound index often replaces three single-field ones, and that's less write
+          overhead. And if a query only needs a couple of fields, extending the index to cover them gives a
+          <strong>covered query</strong> that examines zero documents — though I'd need to remember
+          <code>_id: 0</code> in the projection, since <code>_id</code> is returned by default and won't be in
+          the index."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know ESR by name?</li>
+        <li>Do you know <em>why</em> sort precedes range — the 100 MB failure?</li>
+        <li>Do you verify with explain, and know which numbers matter?</li>
+        <li>Bonus: prefix rule and covered queries.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if there are two sort fields?</li>
+          <li>Why can't a multikey index cover a query?</li>
+          <li>How many indexes is too many?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>An aggregation over 20 million orders takes 90 seconds. How would you improve it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start with <code>explain</code> on the pipeline and check whether the first stage is using an
+          index at all, because that decides everything downstream."</p>
+        <p>"<strong>Stage order first.</strong> The most common problem is a pipeline that doesn't reduce data
+          early. <code>$match</code> must be first — it's the only stage that can use an index to avoid reading
+          documents. Then <code>$project</code> to shrink each document before carrying it through. And
+          <code>$lookup</code> must be <em>last</em>: a lookup before the match joins 20 million documents and
+          then throws nearly all of them away. Moving a <code>$lookup</code> to after
+          <code>$match</code> and <code>$limit</code> can be the entire fix."</p>
+        <p>"I'd be careful not to assume the optimiser fixes this. It does move <code>$match</code> earlier past
+          <code>$project</code> where it safely can, and it merges <code>$sort</code> plus
+          <code>$limit</code> into a top-K sort — but it <strong>cannot</strong> move a <code>$match</code> past
+          <code>$group</code> or <code>$unwind</code>, because that would change the result. So a filter written
+          after a group stays there."</p>
+        <p>"<strong>Then indexes.</strong> The <code>$match</code> needs one, following ESR. And if there's a
+          <code>$lookup</code>, the <code>foreignField</code> must be indexed — without it that's a collection
+          scan <em>per input document</em>, which is catastrophic and easy to miss because the results are still
+          correct."</p>
+        <p>"<strong>Then check for blocking stages hitting limits.</strong> <code>$sort</code> and
+          <code>$group</code> have a 100 MB working limit; a <code>$group</code> using
+          <code>$push</code> can also exceed the 16 MB output document limit, and
+          <code>allowDiskUse</code> doesn't help there because it's a document size limit, not memory."</p>
+        <p>"But the bigger question I'd raise is <strong>whether this should be computed on demand at
+          all</strong>."</p>
+        <p>"If it's a dashboard that runs on every page load over 20 million documents, no amount of pipeline
+          tuning makes that a good idea — it's re-deriving the same answer repeatedly. Options, roughly in order
+          of how much I'd like them:"</p>
+        <p>"<strong>Pre-aggregate on write.</strong> Maintain a rollup collection — daily revenue per customer —
+          updated as orders are created, or by a scheduled job. Then the dashboard reads a few hundred documents
+          instead of scanning 20 million. That's the computed pattern, and it's usually the right answer for a
+          dashboard."</p>
+        <p>"<strong><code>$merge</code> into a materialised view</strong>, refreshed on a schedule. Same idea
+          with less bespoke code — and <code>$merge</code> can update incrementally rather than rebuilding,
+          so it can run frequently."</p>
+        <p>"<strong>Run it on a secondary</strong> with an analytics read preference — or an Atlas analytics
+          node — so a heavy report doesn't compete with production traffic. That doesn't make it faster, but it
+          stops it hurting everything else, which is often the actual complaint."</p>
+        <p>"<strong>Bucket the source data</strong>, if it's time-series in nature. If orders were bucketed
+          daily with pre-computed sums, the aggregation reads far fewer documents by construction."</p>
+        <p>"So my likely recommendation would be: fix the obvious pipeline ordering and indexing first because
+          that's cheap and might be enough, then move to a pre-aggregated rollup if it's a repeated dashboard
+          query. And if it's a genuinely ad-hoc analytical workload rather than an application feature, I'd
+          question whether it belongs in the operational database at all — that's what an analytics store is
+          for."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you check pipeline ordering before anything else?</li>
+        <li>Do you know what the optimiser can and can't reorder?</li>
+        <li>Do you know <code>$lookup</code>'s foreign index requirement?</li>
+        <li>Do you question whether it should be computed on demand?</li>
+        <li>Do you separate "make it faster" from "stop it hurting production"?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add <code>allowDiskUse</code>" as the fix.</li>
+        <li><span class="redflag">Red flag:</span> only tuning the pipeline, never questioning the
+          requirement.</li>
+        <li><span class="redflag">Red flag:</span> assuming the optimiser reorders everything.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you keep a rollup collection accurate?</li>
+          <li>How does <code>$merge</code> differ from <code>$out</code>?</li>
+          <li>What are the risks of reading from a secondary?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

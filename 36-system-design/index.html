@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview — System Design Exercises</title>
+<meta name="description" content="Nine worked designs and the method behind them, aimed at the senior .NET design interview rather than the FAANG-style one.">
+<meta name="keywords" content="system design interview senior dotnet worked examples design method what interviewers score trade-offs requirements estimation Azure system design exercises">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>System Design Exercises</h1>
+    <p class="subtitle">Nine designs worked through the way a real interview runs — and a method page that explains
+      what's actually being scored.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="different">The design interview you'll actually get <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>The FAANG-style interview</th><th>The senior .NET interview</th></tr></thead>
+      <tbody>
+        <tr><td>Scale</td><td>Hundreds of millions of users</td><td><strong>Thousands to millions</strong></td></tr>
+        <tr><td>Build or buy</td><td>Often "design the datastore"</td><td><strong>Use managed services well</strong></td></tr>
+        <tr><td>Focus</td><td>Novel distributed algorithms</td><td><strong>Correct use of known patterns</strong></td></tr>
+        <tr><td>The hard part</td><td>Theoretical scale</td><td><strong>Consistency, failure, and operability</strong></td></tr>
+        <tr><td>Estimation</td><td>Heavily weighted</td><td>Useful for sizing, rarely the point</td></tr>
+        <tr><td>What impresses</td><td>Depth on one component</td><td><strong>Judgement about trade-offs</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the question is usually "have you run something like this?"</div>
+    <p style="margin:0">At seven years' experience, an interviewer isn't checking whether you can invent a
+      consistent-hashing scheme. They're checking whether you've <strong>operated a real system and learned what
+      hurts</strong>.
+      <br><br>
+      Which means the things that score are specific and unglamorous: how you handle a payment that succeeded but
+      whose response was lost, what happens when the queue backs up, how you migrate the schema without downtime, how
+      you tell whether one tenant is causing the problem, and what you'd have alerted on.
+      <br><br>
+      "We'd use Cosmos DB" is a technology choice. "We'd use Cosmos with tenant as the partition key, and I'd want to
+      know the largest tenant's volume first because a very large one hits per-partition limits and adding RUs
+      doesn't help" is <strong>experience</strong>. Same sentence length, entirely different signal.
+      <br><br>
+      So the material in these pages leans toward failure modes, consistency choices and operability rather than
+      capacity arithmetic. That's where the marks are, and it's also where most candidates are thinnest.</p>
+  </div>
+
+  <h2 id="how-to-use">How to use these pages <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Read <a href="method.html">the method page</a> first</strong></td>
+          <td>Structure is what's scored. The designs assume it</td>
+        </tr>
+        <tr>
+          <td><strong>Attempt each design before reading it</strong></td>
+          <td>Twenty minutes on paper reveals what you don't know</td>
+        </tr>
+        <tr>
+          <td><strong>Compare, don't memorise</strong></td>
+          <td>The reasoning transfers; the specific design doesn't</td>
+        </tr>
+        <tr>
+          <td><strong>Say the trade-offs out loud</strong></td>
+          <td>Unspoken reasoning scores zero</td>
+        </tr>
+        <tr>
+          <td><strong>Note which failure modes you missed</strong></td>
+          <td>That's the reusable gap, not the missing component</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">These designs deliberately don't converge on one architecture</div>
+    <p style="margin:0">The booking system uses strong consistency and a relational database because double-booking is
+      unacceptable. The notification platform is eventually consistent and queue-driven because a two-second delay is
+      fine. The document pipeline is durable-orchestration-based because steps take minutes.
+      <br><br>
+      That's the point. <strong>A candidate who reaches for the same architecture regardless of requirements hasn't
+      understood the requirements.</strong> The most common failure in design interviews isn't ignorance — it's
+      applying a remembered pattern to a problem that doesn't need it.
+      <br><br>
+      So when reading these, pay attention to <em>which requirement forced which decision</em>. That's the
+      transferable part. The specific choice of service matters much less than being able to say why an alternative
+      was rejected.</p>
+  </div>
+
+  <h2 id="in-this-section">In this section</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Centres on</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="method.html">How to Run a Design Interview</a></td>
+          <td>Structure, requirements, estimation, and what interviewers score</td>
+        </tr>
+        <tr>
+          <td><a href="multi-tenant-saas.html">Multi-Tenant SaaS Platform</a></td>
+          <td><strong>Isolation model</strong>, tenant onboarding, noisy neighbours, per-tenant cost</td>
+        </tr>
+        <tr>
+          <td><a href="booking.html">High-Scale Booking System</a></td>
+          <td><strong>Preventing double-booking</strong> under concurrency; holds and expiry</td>
+        </tr>
+        <tr>
+          <td><a href="notifications.html">Notification &amp; Real-Time Platform</a></td>
+          <td><strong>Fan-out</strong>, delivery guarantees, preferences, and real-time transport</td>
+        </tr>
+        <tr>
+          <td><a href="payments.html">Payment Processing System</a></td>
+          <td><strong>Idempotency</strong>, reconciliation, webhooks, and money-safe failure handling</td>
+        </tr>
+        <tr>
+          <td><a href="document-processing.html">File / Document Processing</a></td>
+          <td><strong>Long-running pipelines</strong>, direct upload, orchestration, poison inputs</td>
+        </tr>
+        <tr>
+          <td><a href="event-driven-orders.html">Event-Driven Order System</a></td>
+          <td><strong>Sagas</strong>, the outbox pattern, compensation, and eventual consistency</td>
+        </tr>
+        <tr>
+          <td><a href="background-jobs.html">Distributed Background Jobs</a></td>
+          <td><strong>Scheduling</strong>, exactly-once execution, fairness, and long-running work</td>
+        </tr>
+        <tr>
+          <td><a href="rest-api-scale.html">Large-Scale REST API</a></td>
+          <td><strong>Versioning</strong>, pagination, caching, rate limits, and the public contract</td>
+        </tr>
+        <tr>
+          <td><a href="insurance-platform.html">Insurance Management Platform</a></td>
+          <td><strong>Regulated domain</strong>: audit, temporal data, complex rules, legacy integration</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The senior .NET design interview rewards judgement and operability, not novel algorithms.</li>
+      <li>Managed services used well beats infrastructure built from scratch.</li>
+      <li>Specific failure modes and consistency choices are where the marks are.</li>
+      <li>Attempt each design before reading it — the gaps are the value.</li>
+      <li>Learn which requirement forced which decision, not the design itself.</li>
+      <li>Reaching for one architecture regardless of requirements is the common failure.</li>
+      <li>Unspoken reasoning scores nothing — say the trade-offs out loud.</li>
+    </ul>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

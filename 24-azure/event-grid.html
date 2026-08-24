@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event Grid — Azure</title>
+<meta name="description" content="Topics, subscriptions, filtering, retries, dead-lettering and CloudEvents — push-based reactive eventing and where it fits.">
+<meta name="keywords" content="Azure Event Grid system topics custom topics domains event subscriptions filtering advanced filters retry policy dead letter CloudEvents webhook validation handshake MQTT namespace">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/event-grid.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Event Grid</h1>
+    <p class="subtitle">The push-based one. It's how Azure services tell you something happened, and its
+      routing-and-filtering model is what makes it different from a queue or a log.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Push, not pull.</strong> Event Grid calls your handler; you don't poll.</li>
+      <li><strong>System topics are free reactive hooks</strong> into Azure resource events.</li>
+      <li><strong>Filtering happens in the service</strong>, so handlers only receive what they asked for.</li>
+      <li><strong>Retries are built in</strong>, with exponential backoff and dead-lettering to blob.</li>
+      <li><strong>At-least-once, unordered.</strong> Handlers must be idempotent and order-independent.</li>
+      <li><strong>A webhook must complete the validation handshake</strong> before it gets events.</li>
+      <li><strong>Reacting to blob events beats polling</strong> — this is the main practical use.</li>
+    </ul>
+  </div>
+
+  <h2 id="model">The model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — publishers, topics, subscriptions, handlers"><code class="language-text">  Publisher                 Topic                Subscription           Handler
+  ---------                 -----                ------------           -------
+  Blob Storage    ----->  system topic  ---+-->  filter: .jpg  ----->  Function (thumbnails)
+  (BlobCreated)                            |
+                                           +-->  filter: .csv  ----->  Function (import)
+                                           |
+                                           +-->  no filter     ----->  Service Bus queue (audit)
+
+  Your app        ----->  custom topic  ---+-->  filter:
+  (OrderPlaced)                                  subject prefix
+                                                 + data.amount > 1000  --> Logic App (review)
+
+  Event Grid pushes. It retries. It dead-letters. You write no plumbing.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concept</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td><strong>System topic</strong></td><td>Built in to an Azure resource. Blob created, resource deleted, key rotated. <strong>No cost to create</strong></td></tr>
+        <tr><td><strong>Custom topic</strong></td><td>You publish your own application events to it</td></tr>
+        <tr><td><strong>Domain</strong></td><td>Thousands of topics under one endpoint, with per-topic authorisation. <strong>The multi-tenant answer</strong></td></tr>
+        <tr><td><strong>Subscription</strong></td><td>Routes matching events to one handler, with its own filter and retry policy</td></tr>
+        <tr><td><strong>Partner topic</strong></td><td>Events from a third-party SaaS publisher</td></tr>
+        <tr><td><strong>Namespace</strong></td><td>The newer tier adding <strong>MQTT</strong> and pull delivery</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — filtering in the service, not in the handler</div>
+    <p style="margin:0">The subscription is where filtering belongs, and it's the feature that makes Event Grid
+      worth using.
+      <br><br>
+      Without it, every handler receives every event and immediately discards most of them. On a busy storage
+      account that's a Function invocation — billed, cold-start-prone — for each event you don't care about.
+      <br><br>
+      With subject prefix and suffix filters plus <strong>advanced filters</strong> on the event payload, the
+      service decides. A subscription can say "only <code>.jpg</code> files, only under
+      <code>/uploads/</code>, only where <code>data.contentLength</code> is above a threshold" and the handler is
+      never invoked for anything else.
+      <br><br>
+      That's cheaper, simpler and more obvious: <strong>the routing rule is visible in the infrastructure
+      definition</strong> rather than buried as an early <code>return</code> in a function. Someone reading the
+      Bicep can see what triggers what.
+      <br><br>
+      Worth knowing the limits — advanced filters are capped per subscription (25 filters, 5 values each at time of
+      writing), so genuinely complex routing may still need logic in the handler. But the first pass belongs in the
+      subscription.</p>
+  </div>
+
+  <h2 id="vs">Where it sits against the other messaging services <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Event Grid</th><th>Service Bus</th><th>Event Hubs</th></tr></thead>
+      <tbody>
+        <tr><td>Direction</td><td><strong>Push</strong></td><td>Pull</td><td>Pull</td></tr>
+        <tr><td>Carries</td><td><strong>A notification</strong> — "this happened"</td><td>A command or a payload</td><td>A stream of data points</td></tr>
+        <tr><td>Ordering</td><td><strong>None</strong></td><td>Sessions give it</td><td>Per partition</td></tr>
+        <tr><td>Filtering</td><td><strong>Rich, in the service</strong></td><td>SQL rules on topics</td><td>None</td></tr>
+        <tr><td>Retry</td><td><strong>Built in, 24h default</strong></td><td>Delivery count + DLQ</td><td>Your code</td></tr>
+        <tr><td>Replay</td><td>No</td><td>No</td><td><strong>Yes</strong></td></tr>
+        <tr><td>Volume</td><td>High, per-event pricing</td><td>Moderate</td><td><strong>Very high</strong></td></tr>
+        <tr><td>Payload size</td><td>1 MB, <strong>but keep it small</strong></td><td>256 KB – 100 MB</td><td>1 MB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The distinction that decides it: notification or work?</div>
+    <p style="margin:0">Event Grid events are <strong>notifications</strong>. "A blob was created." "A resource was
+      deleted." "An order was placed." The event says <em>what happened</em>, with identifiers — and the handler
+      fetches whatever detail it needs.
+      <br><br>
+      Service Bus messages are <strong>work</strong>. "Process this payment." They're directed at a specific
+      consumer, must not be lost, need retry and dead-letter semantics per message, and often need ordering.
+      <br><br>
+      So the question is: <em>if this event is delivered twice, out of order, or 30 seconds late, is that
+      fine?</em> If yes, Event Grid. If it must be handled exactly in sequence with strong guarantees, Service
+      Bus.
+      <br><br>
+      A useful sanity check on payload design: <strong>an Event Grid event should be small</strong>. If you're
+      tempted to put the full order document in it, that's a sign the consumer is doing work rather than reacting to
+      a fact — and it creates a coupling where the publisher must know what every consumer needs.
+      <br><br>
+      This is the <a href="../20-microservices/communication.html">event-carried state transfer versus event
+      notification</a> trade-off, and Event Grid is firmly on the notification side.</p>
+  </div>
+
+  <h2 id="delivery">Delivery, retries and dead-lettering <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Behaviour</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Guarantee</strong></td><td><strong>At least once.</strong> Duplicates are normal</td></tr>
+        <tr><td><strong>Ordering</strong></td><td><strong>Not guaranteed.</strong> Ever</td></tr>
+        <tr><td><strong>Success</strong></td><td>A 2xx response. Anything else is a failure</td></tr>
+        <tr><td><strong>Retry</strong></td><td>Exponential backoff, <strong>up to 24 hours by default</strong></td></tr>
+        <tr><td><strong>Retry policy</strong></td><td>Configurable max attempts and event time-to-live</td></tr>
+        <tr><td><strong>Dead-letter</strong></td><td><strong>A blob container you configure.</strong> Off by default</td></tr>
+        <tr><td><strong>Output batching</strong></td><td>Optional, for higher throughput per delivery</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Dead-lettering is off by default, so failed events are silently discarded</div>
+    <p style="margin:0">This is the single most consequential default in Event Grid. If retries exhaust — the
+      handler was broken for longer than the TTL, or returned 500 every time — the event is
+      <strong>dropped</strong>, with no record anywhere unless you configured a dead-letter destination.
+      <br><br>
+      So a handler that was down for a day loses everything sent during that window, permanently, and nothing in the
+      portal tells you what you lost.
+      <br><br>
+      <strong>Configure a dead-letter blob container on every subscription.</strong> It costs nothing and it's the
+      difference between "we lost some events, we don't know which" and "here they are, we can replay them."
+      <br><br>
+      Then <strong>alert on that container being non-empty</strong>, because a dead-letter store nobody looks at is
+      the same as no dead-letter store. And note the delay — dead-lettering isn't immediate; events land after the
+      retry window closes, so the alert fires late by design.
+      <br><br>
+      Same principle as a <a href="service-bus.html#dead-letter">Service Bus DLQ</a>: the queue is only useful if
+      someone is watching it.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Unordered and at-least-once — plan for it, don't hope</div>
+    <p style="margin:0">Event Grid makes no ordering promise at all, and it will deliver duplicates. Both are stated
+      guarantees rather than edge cases, so a handler that assumes otherwise is simply wrong.
+      <br><br>
+      What that means concretely:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Handlers must be idempotent.</strong> Use the event <code>id</code>, which is stable across
+        retries of the same event, to detect a repeat.</li>
+      <li><strong>A created and a deleted event can arrive in either order.</strong> So processing "deleted" for
+        something you haven't seen created must be handled, not crash.</li>
+      <li><strong>Use the version or timestamp in the payload</strong>, not arrival order, to decide which state is
+        newer. Discard anything older than what you've applied.</li>
+      <li><strong>Prefer re-reading current state over trusting the payload.</strong> If the event says "blob
+        created", read the blob — that's correct regardless of ordering or duplication.</li>
+    </ul>
+    <p style="margin:8px 0 0">That last point is why the notification model is robust: an event that just says
+      <em>what</em> changed, with the handler fetching current state, is naturally tolerant of both
+      re-delivery and reordering. An event carrying full state is not.</p>
+  </div>
+
+  <pre data-label="csharp — an idempotent, order-tolerant handler" class="code-good"><code class="language-csharp">[Function("OnBlobCreated")]
+public async Task Run(
+    [EventGridTrigger] CloudEvent evt,
+    CancellationToken ct)
+{
+    // 1. Idempotency: the event id is stable across retries
+    if (!await _processed.TryMarkAsync(evt.Id, ct))
+    {
+        _log.DuplicateEvent(evt.Id);
+        return;                          // already handled - return 2xx, do not retry
+    }
+
+    var data = evt.Data!.ToObjectFromJson&lt;StorageBlobCreatedEventData&gt;();
+
+    // 2. Read current state rather than trusting the payload.
+    //    Correct even if events arrive out of order or twice.
+    var blob = _container.GetBlobClient(data.Url);
+    if (!await blob.ExistsAsync(ct))
+    {
+        _log.BlobAlreadyDeleted(data.Url);
+        return;                          // deleted since - not an error
+    }
+
+    await GenerateThumbnailAsync(blob, ct);
+
+    // 3. Anything that throws returns non-2xx, so Event Grid retries.
+    //    Transient failures are handled for you; permanent ones dead-letter.
+}</code></pre>
+
+  <h2 id="webhooks">Webhook validation <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="note warn">
+    <div class="note-title">The handshake, and why your endpoint gets no events</div>
+    <p style="margin:0">Before Event Grid sends events to an arbitrary HTTPS endpoint, the endpoint must prove it
+      wants them. Otherwise Event Grid could be used to flood a third-party URL — an amplification attack, since
+      anyone could subscribe someone else's endpoint.
+      <br><br>
+      So on subscription creation, Event Grid sends a <strong>validation event</strong> and the endpoint must either
+      echo back the <code>validationCode</code> in its response, or call the
+      <code>validationUrl</code> it was given.
+      <br><br>
+      Until that succeeds, <strong>the subscription is not active and no events flow.</strong> "I created a
+      subscription and nothing arrives" is almost always this.
+      <br><br>
+      The practical shortcut: with <strong>Azure Functions, Logic Apps, Service Bus, Event Hubs or Storage
+      Queues</strong> as the handler, there's no handshake — the platform handles it. It only applies to custom
+      webhooks.
+      <br><br>
+      One more thing that catches people: <strong>the subscription is disabled if the endpoint stays
+      unreachable</strong> for long enough. So an endpoint that was down during a long outage may need
+      re-enabling, not just fixing.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Authenticate the delivery, not just the subscription</div>
+    <p style="margin:0">A validated webhook is publicly reachable, so anyone who finds the URL can post to it. The
+      handshake proves the endpoint consented to receive events; it doesn't authenticate individual deliveries.
+      <br><br>
+      Options, roughly in order of preference: <strong>Entra ID authentication</strong> on the delivery, so Event
+      Grid presents a token your endpoint validates; <strong>delivery with a managed identity</strong> to a
+      protected endpoint; or at minimum a shared secret in a query parameter or header — weaker, and it should be
+      stored in Key Vault and rotated.
+      <br><br>
+      For internal handlers, prefer <strong>Functions, Service Bus or Event Hubs destinations</strong> over a
+      webhook entirely. Then delivery is authenticated by the platform and there's no public endpoint to defend.</p>
+  </div>
+
+  <h2 id="cloudevents">CloudEvents <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Event Grid schema</th><th>CloudEvents 1.0</th></tr></thead>
+      <tbody>
+        <tr><td>Origin</td><td>Azure-specific</td><td><strong>CNCF standard</strong></td></tr>
+        <tr><td>Portability</td><td>Azure only</td><td><strong>Cross-platform</strong></td></tr>
+        <tr><td>Fields</td><td><code>id</code>, <code>eventType</code>, <code>subject</code>, <code>data</code></td><td><code>id</code>, <code>type</code>, <code>source</code>, <code>data</code>, <code>subject</code></td></tr>
+        <tr><td>Recommendation</td><td>Legacy</td><td><strong>Use this for new work</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Use CloudEvents for anything new</div>
+    <p style="margin:0">Both schemas work and Event Grid can translate between them. <strong>CloudEvents is the
+      one to pick</strong> for new development.
+      <br><br>
+      It's a CNCF specification, so the same event format is understood by Knative, Kafka tooling, other clouds and
+      a wide range of libraries. Your event contract stops being Azure-shaped.
+      <br><br>
+      That matters more than it sounds: if a consumer ever moves off Azure, or you integrate with a partner who
+      isn't on Azure, a standard envelope is the difference between a configuration change and a translation
+      layer.
+      <br><br>
+      The <code>type</code> field is worth designing deliberately — reverse-DNS style, like
+      <code>com.contoso.orders.placed</code>, and <strong>versioned</strong>, because the event type is a published
+      contract and consumers filter on it. Renaming it later silently breaks every subscription filtering on the old
+      name.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Push-based: Event Grid calls your handler, retries and dead-letters for you.</li>
+      <li>System topics give free reactive hooks into Azure resource events.</li>
+      <li>Filter in the subscription, not the handler — cheaper and visible in IaC.</li>
+      <li>Events are notifications; keep payloads small and let handlers fetch state.</li>
+      <li>At-least-once and unordered, both guaranteed — handlers must be idempotent.</li>
+      <li>Use the event <code>id</code> for deduplication and payload version for ordering.</li>
+      <li>Dead-lettering is off by default; configure it and alert on the container.</li>
+      <li>Webhooks need the validation handshake; Azure-native handlers don't.</li>
+      <li>Authenticate deliveries too — prefer Entra ID over a shared secret.</li>
+      <li>Use CloudEvents for new work, and version the event type.</li>
+      <li>Reacting to blob events beats polling a container.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No dead-letter destination</strong>, so exhausted events vanish silently.</li>
+    <li><strong>A dead-letter container nobody monitors.</strong></li>
+    <li><strong>Assuming ordering</strong>, so a delete-before-create sequence crashes the handler.</li>
+    <li><strong>A non-idempotent handler</strong>, duplicating work on redelivery.</li>
+    <li><strong>Filtering in the handler</strong>, paying for invocations you discard.</li>
+    <li><strong>Large payloads</strong>, coupling the publisher to consumers' needs.</li>
+    <li><strong>Using Event Grid for work that needs ordering or per-message reliability.</strong></li>
+    <li><strong>Not completing the webhook handshake</strong>, then wondering where the events are.</li>
+    <li><strong>An unauthenticated public webhook.</strong></li>
+    <li><strong>The Event Grid schema for new work</strong> instead of CloudEvents.</li>
+    <li><strong>Renaming an event type</strong>, breaking every subscription filter.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>A file lands in blob storage and you need to process it. How do you wire that up? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>Event Grid, with a system topic on the storage account, subscribing a Function to
+          <code>BlobCreated</code>.</strong>"</p>
+        <p>"I'd specifically avoid the <strong>blob trigger</strong>, which is the obvious choice and the wrong one
+          at any scale. The classic blob trigger works by <em>polling</em> and scanning logs, so there can be a
+          delay of minutes on a container with many blobs, and it's unreliable for high volume."</p>
+        <p>"The Event Grid path is push-based: the storage account raises the event, Event Grid delivers it in
+          seconds, and there's no scanning. Microsoft's own guidance is to use the Event Grid blob trigger rather
+          than the polling one for anything beyond low volume."</p>
+        <p>"Then I'd do the filtering <strong>in the subscription</strong>, not in the function. A subject suffix
+          filter for the extension, a prefix filter for the folder, and advanced filters on the payload if needed —
+          so the function is only invoked for blobs it should actually process."</p>
+        <p>"That matters for two reasons: I'm not paying for invocations that immediately return, and the routing
+          rule is <strong>visible in the infrastructure definition</strong> rather than hidden as an early
+          <code>return</code> inside the code. Someone reading the Bicep can see what triggers what."</p>
+        <p>"On the handler, three things I'd get right."</p>
+        <p>"<strong>Idempotency.</strong> Event Grid is at-least-once, so the same event will sometimes arrive
+          twice. The event <code>id</code> is stable across retries, so I'd record processed ids and skip
+          repeats — importantly returning 2xx on a duplicate, because a non-2xx tells Event Grid to retry."</p>
+        <p>"<strong>Read the blob rather than trusting the event.</strong> The event tells me a URL; the blob is the
+          truth. That's naturally correct even if events arrive out of order or twice — and I'd handle the blob no
+          longer existing as a normal outcome rather than an error, because it may have been deleted since."</p>
+        <p>"<strong>Configure dead-lettering.</strong> This is off by default, and it's the important one. If my
+          function is broken for longer than the retry window — 24 hours by default — the events are
+          <strong>silently discarded</strong>. No record, no way to know what was lost. A dead-letter blob container
+          costs nothing and turns that into a replayable list. Plus an alert on it being non-empty, because a
+          dead-letter store nobody watches is the same as not having one."</p>
+        <p>"On error handling generally, I don't need retry logic in the function. Throwing returns a non-2xx and
+          Event Grid retries with exponential backoff — so transient failures are handled by the platform. I only
+          need to make sure a <em>permanent</em> failure doesn't retry pointlessly for 24 hours, so for something
+          like a malformed file I'd log it, record it somewhere, and return success."</p>
+        <p>"If processing is long-running or needs strict per-file ordering, I'd have Event Grid deliver to a
+          <strong>Service Bus queue</strong> instead of directly to a Function, and consume from there. That gets me
+          the queue semantics — sessions for ordering, delivery count, a proper DLQ — with Event Grid still doing the
+          detection. Event Grid for the trigger, Service Bus for the guarantees."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the polling blob trigger is the weaker option?</li>
+        <li>Do you filter in the subscription?</li>
+        <li>Do you make the handler idempotent using the event id?</li>
+        <li>Do you know dead-lettering is off by default?</li>
+        <li>Do you know when to insert Service Bus in the path?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> blob trigger with no awareness of the polling delay.</li>
+        <li><span class="redflag">Red flag:</span> no mention of duplicates or dead-lettering.</li>
+        <li><span class="redflag">Red flag:</span> custom retry logic inside the handler.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens if the function is down for two days?</li>
+          <li>How do you guarantee each file is processed once?</li>
+          <li>How would you handle a 20-minute processing job?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Event Grid, Service Bus or Event Hubs — how do you choose? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd decide on <strong>what the message is</strong>, not on throughput numbers — because the throughput
+          differences follow from the design rather than being the point."</p>
+        <p>"<strong>Service Bus when the message is work that must not be lost.</strong> 'Process this payment',
+          'send this invoice'. It tracks every message individually — a lock, a delivery count, a dead-letter
+          queue — which is what gives you per-message retry, poison handling, sessions for ordering and transactional
+          send. That bookkeeping is also what caps throughput, and it's worth paying for when each message
+          matters."</p>
+        <p>"<strong>Event Hubs when it's a high-volume stream you may want to replay.</strong> Telemetry, clicks,
+          metrics. It's a log, so reading advances a cursor rather than removing anything — multiple consumer groups
+          read independently, and I can reset an offset to reprocess. The cost is that there's no per-event state at
+          all, so no dead-letter and no per-message retry. Error handling is my code."</p>
+        <p>"<strong>Event Grid when it's a notification and something needs to react.</strong> 'A blob was created',
+          'a resource was deleted', 'an order was placed'. It's push-based, so no polling infrastructure, and the
+          filtering happens in the service so handlers only get what they subscribed to."</p>
+        <p>"The clarifying questions I'd actually ask:"</p>
+        <p>"<strong>Does order matter?</strong> Event Grid gives none at all — that alone eliminates it for many
+          cases. Service Bus sessions give per-session order. Event Hubs gives per-partition order."</p>
+        <p>"<strong>Do I need to replay?</strong> Only Event Hubs. If reprocessing history is a requirement, the
+          decision is made."</p>
+        <p>"<strong>Is a lost message acceptable?</strong> With Service Bus, no — it sits in the queue until handled
+          or dead-lettered. With Event Grid, retries exhaust after the TTL and the event is dropped
+          <em>unless dead-lettering is configured</em>, which is off by default. That default has surprised a lot of
+          teams."</p>
+        <p>"<strong>Who consumes it?</strong> One known consumer doing work points at Service Bus. Several unknown
+          or evolving consumers reacting points at Event Grid, because adding a subscription changes nothing for the
+          publisher."</p>
+        <p>"<strong>Push or pull?</strong> If the handler can't be reached — it's behind a firewall, or it needs to
+          control its own rate — push doesn't work and Event Grid is out, or needs a Service Bus queue as the
+          destination."</p>
+        <p>"The part I'd emphasise is that <strong>these compose, and the good designs usually use more than
+          one</strong>. Event Grid detects a blob and delivers to a Service Bus queue so the actual processing gets
+          queue semantics — sessions, delivery count, a real DLQ — with Event Grid doing the detection. Or Event Hubs
+          ingests telemetry at volume and a consumer converts the few events needing reliable handling into Service
+          Bus messages."</p>
+        <p>"So it's rarely 'pick one'. It's <strong>use each where its guarantees match the need</strong>, and be
+          able to say what each one is giving you. The failure mode is picking one service for everything and then
+          rebuilding the others' semantics badly on top of it — hand-rolled dead-lettering on Event Hubs, or polling
+          a queue because you needed push."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you decide on message semantics rather than throughput?</li>
+        <li>Can you name what each service uniquely provides?</li>
+        <li>Do you know Event Grid has no ordering and drops by default?</li>
+        <li>Do you see them as composable rather than exclusive?</li>
+        <li>Do you ask about consumers, replay and push versus pull?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> choosing purely on throughput figures.</li>
+        <li><span class="redflag">Red flag:</span> treating them as interchangeable.</li>
+        <li><span class="redflag">Red flag:</span> no mention of ordering or delivery guarantees.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Design the pipeline for IoT telemetry that also triggers alerts.</li>
+          <li>How would you get ordered processing from Event Grid?</li>
+          <li>When is Storage Queues good enough?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Development &amp; Code Review — SDLC</title>
+<meta name="description" content="PR size, what to actually look for in code review, review communication, Definition of Done, and what to automate instead of reviewing.">
+<meta name="keywords" content="code review pull request size definition of done coding standards static analysis roslyn analyzers pair programming refactoring incremental change review checklist blocking comments">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="29-sdlc/development.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Development &amp; Code Review</h1>
+    <p class="subtitle">The daily loop — and why code review is the highest-leverage and most consistently
+      misused practice in it.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>PR size is the strongest predictor of review quality. Past ~400 lines, defect detection collapses
+        and people approve on vibes.</li>
+      <li>Review is for what tests <em>can't</em> check: failure behaviour, backwards compatibility,
+        concurrency, security, migration safety.</li>
+      <li>Anything a machine can check should be checked by a machine. Style debates in review are wasted
+        attention.</li>
+      <li>Label comments <strong>blocking / suggestion / nit</strong>. Ambiguity about which is which is the
+        main source of review friction.</li>
+      <li>"Done" means deployed, observable and revertible — not "code complete".</li>
+      <li>Never mix a refactor and a behaviour change in one PR.</li>
+    </ul>
+  </div>
+
+  <h2 id="pr-size">Pull request size <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Small PRs aren't a discipline problem. They're a <strong>design skill</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>PR size</th><th>What actually happens</th></tr></thead>
+      <tbody>
+        <tr><td>&lt; 100 lines</td><td>Reviewed properly, usually within hours. Comments are substantive.</td></tr>
+        <tr><td>100–400 lines</td><td>Still reviewable in one sitting. Practical upper bound for real scrutiny.</td></tr>
+        <tr><td>400–1000 lines</td><td>Reviewed in skimming mode. Comments cluster on the first files and on style.</td></tr>
+        <tr><td>&gt; 1000 lines</td><td>Effectively unreviewed. "LGTM" and defects pass through.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>It's also a self-reinforcing loop: big PRs get reviewed slowly, slow review encourages batching,
+    batching makes PRs bigger. Worth breaking deliberately.</p>
+
+  <p><strong>How to actually get them small:</strong></p>
+
+  <ul>
+    <li><strong>Separate refactor from behaviour.</strong> Two PRs: one that provably changes nothing, one
+      that changes one thing.</li>
+    <li><strong>Merge behind a feature flag.</strong> Incomplete work can land safely if it's unreachable,
+      which removes the incentive to batch.</li>
+    <li><strong>Expand and contract for schemas.</strong> Add the column, backfill, switch reads, remove the
+      old one — four small safe changes instead of one dangerous one.</li>
+    <li><strong>Land the interface and tests first</strong>, then the implementation.</li>
+  </ul>
+
+  <div class="note tip">
+    <div class="note-title">Best practice</div>
+    <p style="margin:0">Write a short PR description covering: what changed, why, how you verified it, and
+      what the reviewer should look hardest at. Two minutes of writing saves twenty minutes of reviewer
+      archaeology — the cheapest thing you can do to get better reviews.</p>
+  </div>
+
+  <h2 id="what-to-review">What to actually look for <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>Junior reviewers find naming and formatting. Senior reviewers find what will page someone at 3am.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Category</th><th>Questions to ask of the diff</th></tr></thead>
+      <tbody>
+        <tr><td>Failure behaviour</td><td>What happens on timeout, partial write, duplicate delivery, or a null from that call? Is the failure logged with enough context to diagnose?</td></tr>
+        <tr><td>Concurrency</td><td>Can two requests hit this at once? Is there a read-modify-write with no guard? Any <code>async void</code>, or blocking on async code?</td></tr>
+        <tr><td>Data safety</td><td>Is the migration reversible? Does it lock a large table? Can old and new code run against this schema simultaneously?</td></tr>
+        <tr><td>Backwards compatibility</td><td>Does this break an API consumer, a stored message shape, or a payload already sitting in a queue?</td></tr>
+        <tr><td>Security</td><td>Input validated server-side? Authorization enforced <em>in the query</em>, not after retrieval? Concatenated SQL, secrets in config, PII in logs?</td></tr>
+        <tr><td>Resources</td><td>Disposal, connection lifetime, unbounded collections, unbounded retries, missing cancellation or timeouts.</td></tr>
+        <tr><td>Performance shape</td><td>N+1 query. Work in a loop that should be a set operation. Sequential awaits that could run concurrently. Loading a whole table to count it.</td></tr>
+        <tr><td>Observability</td><td>If this misbehaves in production, can you tell from telemetry?</td></tr>
+        <tr><td>Tests</td><td>Do they test behaviour or implementation? Would they fail if the logic were wrong? Is the error path covered?</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="example">A diff worth blocking on</h3>
+
+  <pre data-label="csharp — looks fine, has three serious bugs" class="code-bad"><code class="language-csharp">// PR: "Add loyalty points on order completion"
+public async Task CompleteOrderAsync(Guid orderId)
+{
+    var order = await _db.Orders.FirstAsync(o =&gt; o.Id == orderId);
+    order.Status = OrderStatus.Completed;
+
+    var customer = await _db.Customers.FirstAsync(c =&gt; c.Id == order.CustomerId);
+    customer.LoyaltyPoints += (int)(order.Total / 10);   // read-modify-write
+
+    await _db.SaveChangesAsync();
+    await _bus.PublishAsync(new OrderCompleted(orderId)); // dual write
+}</code></pre>
+
+  <p>None of these would be caught by a unit test with a mocked context:</p>
+
+  <ol class="steps">
+    <li><strong>Lost update.</strong> The loyalty increment is a read-modify-write with no concurrency
+      token. Two concurrent completions silently lose points.</li>
+    <li><strong>Wrong failure behaviour.</strong> <code>FirstAsync</code> throws on a missing order — a 500
+      instead of a 404. Worse, it throws on an already-completed order instead of being idempotent.</li>
+    <li><strong>Dual write.</strong> If the process dies between <code>SaveChangesAsync</code> and
+      <code>PublishAsync</code>, the order is complete and no consumer ever hears about it.</li>
+  </ol>
+
+  <pre data-label="csharp — after review" class="code-good"><code class="language-csharp">public async Task&lt;Result&gt; CompleteOrderAsync(Guid orderId, CancellationToken ct)
+{
+    var order = await _db.Orders.SingleOrDefaultAsync(o =&gt; o.Id == orderId, ct);
+
+    if (order is null) return Result.NotFound();
+    if (order.Status == OrderStatus.Completed) return Result.Ok();   // idempotent
+
+    order.Complete();                       // domain method enforces legal transition
+
+    var customer = await _db.Customers.SingleAsync(c =&gt; c.Id == order.CustomerId, ct);
+    customer.AddLoyaltyPoints(order.Total); // RowVersion causes a retry on conflict
+
+    // event committed in the SAME transaction as the state change
+    _db.OutboxMessages.Add(OutboxMessage.For(new OrderCompleted(order.Id)));
+
+    await _db.SaveChangesAsync(ct);
+    return Result.Ok();
+}</code></pre>
+
+  <p>The fix isn't "more code" — it's moving three decisions somewhere they can't be forgotten: the legal
+    transition into the domain object, delivery atomicity into the
+    <a href="../19-architecture/distributed-data.html">outbox</a>, and lost-update protection into an
+    <a href="../11-ef-core/transactions-concurrency.html">optimistic concurrency token</a>.</p>
+
+  <p>Note the added <code>CancellationToken</code> too — a request the client abandoned shouldn't keep
+    holding a connection.</p>
+
+  <h2 id="review-communication">Comments people actually act on</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Instead of</th><th>Write</th></tr></thead>
+      <tbody>
+        <tr><td>"This is wrong."</td><td>"If two requests hit this concurrently, both read the same balance — I think we lose an update. Worth a concurrency token?"</td></tr>
+        <tr><td>"Use a dictionary."</td><td>"Non-blocking: this is O(n) per item inside a loop over n items. A lookup dictionary would make it linear. Fine to defer."</td></tr>
+        <tr><td>"Why did you do it this way?"</td><td>"What led you to X over Y? I might be missing a constraint."</td></tr>
+        <tr><td>Twelve comments on naming</td><td>One comment: "Naming is inconsistent with the module convention — happy to pair on it, non-blocking."</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Three habits do most of the work:</strong></p>
+
+  <ol class="steps">
+    <li><strong>Label severity</strong> — <em>blocking</em>, <em>suggestion</em>, <em>nit</em> — so the
+      author knows what gates the merge.</li>
+    <li><strong>Explain the failure</strong>, not just the rule, so the author learns the reasoning rather
+      than the ritual.</li>
+    <li><strong>Switch to a call after three round trips.</strong> Async text is a terrible medium for
+      disagreement and an excellent medium for escalating it.</li>
+  </ol>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">The reviewer who rewrites the author's approach in comments. It's slow,
+      demoralising, and usually produces a worse result than a five-minute conversation. If a design is
+      genuinely wrong, the problem happened <em>before</em> the PR — the fix is earlier involvement, not a
+      longer comment thread.</p>
+  </div>
+
+  <h2 id="definition-of-done">Definition of Done <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>A shared DoD stops "done" meaning six different things. A realistic one:</p>
+
+  <ul>
+    <li>Acceptance criteria met, including the error paths.</li>
+    <li>Automated tests at the right level, passing in CI, and they'd fail if the logic were wrong.</li>
+    <li>Reviewed and approved; blocking comments resolved.</li>
+    <li>Telemetry added — the feature can be seen working or failing in production.</li>
+    <li>Backwards compatible, or a documented migration and rollback path exists.</li>
+    <li>Deployed to production (possibly flag-off) — not sitting in a branch.</li>
+    <li>Docs updated where behaviour changed: API docs, runbook, ADR.</li>
+    <li>No known defects deferred without a tracked ticket.</li>
+  </ul>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">"Done" including <strong>deployed and observable</strong> is a real dividing line.
+      Teams where done means "merged" accumulate a queue of unreleased changes, which makes every release
+      bigger, riskier and harder to diagnose — the opposite of what they intended.</p>
+  </div>
+
+  <h2 id="automation">What to automate instead of reviewing</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Tool (.NET)</th></tr></thead>
+      <tbody>
+        <tr><td>Formatting and style</td><td><code>.editorconfig</code> + <code>dotnet format</code>, enforced in CI</td></tr>
+        <tr><td>Common correctness / API misuse</td><td>Roslyn analyzers; treat selected rules as errors</td></tr>
+        <tr><td>Null-reference risk</td><td>Nullable reference types on, warnings as errors</td></tr>
+        <tr><td>Vulnerable packages</td><td><code>dotnet list package --vulnerable</code>, Dependabot</td></tr>
+        <tr><td>Secrets committed</td><td>Secret scanning / pre-commit hooks</td></tr>
+        <tr><td>Coverage of new code</td><td>Coverage delta on <em>new lines only</em> — never a global percentage target</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>The principle:</strong> every rule a human enforces in review gets enforced inconsistently and
+    resentfully. Encode it or drop it.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Keep PRs under ~400 lines. It's a design skill, not willpower.</li>
+      <li>Review for failure behaviour, concurrency, data safety and rollout — not naming.</li>
+      <li>Label comments by severity, and explain the failure not the rule.</li>
+      <li>Never mix refactoring with behaviour change — it breaks review <em>and</em> <code>git bisect</code>.</li>
+      <li>Automate everything a linter can check.</li>
+      <li>"Done" includes deployed, observable and revertible.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Enormous PRs</strong>, then complaining reviews are slow. The causation runs the other way.</li>
+    <li><strong>Review as style enforcement</strong> while concurrency and failure handling go unexamined.</li>
+    <li><strong>Approving without understanding</strong>, because the author is senior or the queue is long.</li>
+    <li><strong>Mixing refactoring with behaviour change</strong>, making both unreviewable and unbisectable.</li>
+    <li><strong>Requiring two approvals on everything</strong>, converting review into a queueing problem.</li>
+    <li><strong>No follow-through on non-blocking comments</strong> — they're either worth a ticket or worth
+      deleting.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What do you look for in a code review?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I read for the things automation and tests can't see. Formatting, naming conventions and obvious
+          null handling should be caught by analysers before the PR exists — if I'm spending review attention
+          there, the pipeline is under-configured."</p>
+        <p>"In priority order: failure behaviour — what this does on timeout, duplicate delivery or partial
+          failure. Concurrency — whether two requests can interleave and corrupt state. Data safety —
+          whether a migration is reversible and whether old and new code can coexist during a rolling
+          deploy. Authorization — whether it's enforced in the query rather than filtered afterwards. And
+          resource handling: disposal, timeouts, cancellation."</p>
+        <p>"Then design fit: does this belong in this layer, and will the next similar requirement fit or
+          force a copy-paste?"</p>
+        <p>"I read the tests as carefully as the code. Tests that assert on implementation details are a
+          liability — they break on every refactor and teach the team that tests are noise."</p>
+        <p>"And I'm explicit about severity. I label comments blocking, suggestion or nit, because the most
+          common review friction I've seen is an author not knowing whether a comment is a gate or an
+          opinion."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Does your review add value beyond a linter?</li>
+        <li>Do you think about production behaviour and rollout?</li>
+        <li>Do you communicate in a way that keeps a team functional?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> naming, formatting and "does it follow SOLID" as the whole answer.</li>
+        <li><span class="redflag">Red flag:</span> no mention of tests, failure paths or rollout safety.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>You're reviewing a 2,000-line PR. What do you do?</li>
+          <li>How do you review code in an area you don't know well?</li>
+          <li>Show me a bug you caught in review that tests wouldn't have.</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you handle a reviewer blocking your PR over something you disagree with?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I work out whether we're disagreeing about facts or preference, because they need
+          different handling."</p>
+        <p>"If it's factual — 'this will deadlock', 'this breaks the mobile client' — the fastest resolution
+          is evidence. Write the test, run it, share the result. That ends most factual disputes in minutes
+          and leaves no residue."</p>
+        <p>"If it's preference — a different but equally valid structure — I weigh it against the cost of the
+          argument. If their approach isn't worse, I take it. Consistency has real value, and the PR shipping
+          today has more value than my structural preference."</p>
+        <p>"If I think it's genuinely worse, I say why once, concretely, and ask what would change their
+          mind. If we're still stuck after one round trip, I switch medium — a ten-minute call resolves what
+          twenty comments won't."</p>
+        <p>"And if we still disagree, I'd rather escalate to a team decision than to authority: 'we disagree
+          on this pattern, let's decide it as a convention and write it down.' That turns a recurring
+          argument into a settled rule. What I avoid is either quietly resenting it or going around the
+          reviewer — both cost far more than the code."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Emotional maturity under disagreement — a strong predictor of seniority.</li>
+        <li>Can you separate substantive from stylistic disagreement?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the blocker is a principal engineer and you're new?</li>
+          <li>How do you stop the same argument recurring every sprint?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>You need to refactor a large legacy class and deliver a feature in it. How do you sequence it?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd never do both in one change. The reviewer can't distinguish the behaviour change from the
+          movement, and if something breaks in production, bisecting a combined commit tells you very
+          little."</p>
+        <p>"So: characterisation tests first, then refactor with no behaviour change, then the feature."</p>
+        <p>"Characterisation tests are the step people skip. Legacy code often has no tests and no spec, so
+          before touching it I write tests that assert what it <em>currently</em> does — including behaviour
+          that looks wrong. That gives me a net proving the refactor changed nothing, and it frequently
+          surfaces surprising existing behaviour that turns out to be depended on somewhere."</p>
+        <p>"Then I refactor in the smallest steps that keep the build green — extract a method, introduce a
+          seam, move a dependency to a constructor parameter — merging frequently rather than accumulating a
+          giant branch."</p>
+        <p>"If the class is genuinely hostile, I wouldn't attempt a full rewrite. I'd carve out just the part
+          the feature needs — a strangler approach at class scale — and leave the rest. Refactoring the whole
+          thing is rarely justified by the feature, and an unfinished large refactor is worse than none,
+          because it leaves two patterns in place."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Discipline about separating mechanical from semantic change.</li>
+        <li>Do you know how to work safely without a test suite?</li>
+        <li>Do you scope refactoring to the value it delivers?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "I'd rewrite it properly."</li>
+        <li><span class="redflag">Red flag:</span> refactoring with no tests, relying on careful reading.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>The class has a static dependency you can't inject. What now?</li>
+          <li>How do you write a characterisation test for something that hits the database and sends email?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

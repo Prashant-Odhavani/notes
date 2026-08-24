@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Red Flags — Final Interview Prep</title>
+<meta name="description" content="Answers that sound right and reveal shallow understanding — with the version an experienced engineer would give instead.">
+<meta name="keywords" content="interview red flags common wrong answers shallow understanding async makes it faster microservices for scalability distributed lock NoSQL is faster increase memory limit 100 percent coverage dispose HttpClient premature optimisation">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="37-final-prep/red-flags.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Red Flags</h1>
+    <p class="subtitle">Each of these is something you probably already know better. The problem is that the wrong
+      phrasing is what comes out under pressure.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="note tip">
+    <div class="note-title">Why this page is worth more than another topic</div>
+    <p style="margin:0">Most preparation adds knowledge. This page removes a specific liability:
+      <strong>answers that are technically adjacent to the truth and reveal that you've read about something rather
+      than run it.</strong>
+      <br><br>
+      An interviewer hearing "we'd use microservices for scalability" doesn't conclude you know nothing. They conclude
+      you've absorbed the marketing rather than the trade-off — which is a much more damaging inference at seven years
+      than at two.
+      <br><br>
+      The fix is cheap, because in almost every case below you already know the correct version. You just need the
+      right sentence to be the one that arrives first.</p>
+  </div>
+
+  <h2 id="async">"Async makes it faster" <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Red flag</th><th>What it reveals</th></tr></thead>
+      <tbody>
+        <tr><td>"We made it async so it's faster"</td><td>Async is confused with parallelism</td></tr>
+        <tr><td>"Async improves performance"</td><td>No model of what it actually does</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Say instead</div>
+    <p style="margin:0"><em>"Async doesn't make a single request faster — it's usually marginally slower because of the
+      state machine. What it does is <strong>free the thread while waiting on I/O</strong>, so the same server handles
+      far more concurrent requests before it saturates. It's a throughput and scalability property, not a latency
+      one."</em>
+      <br><br>
+      Then the consequence that shows you've debugged it: <em>"which is also why sync-over-async is so damaging — a
+      <code>.Result</code> holds a pool thread for the whole I/O, the pool only adds threads at one or two a second, so
+      requests queue and latency climbs while CPU stays low."</em>
+      <br><br>
+      That second sentence is what distinguishes the answer, because it's the observable consequence rather than the
+      definition.</p>
+  </div>
+
+  <h2 id="microservices">"Microservices for scalability" <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Red flag</th><th>What it reveals</th></tr></thead>
+      <tbody>
+        <tr><td>"Microservices so we can scale"</td><td>You can scale a monolith horizontally too</td></tr>
+        <tr><td>"Microservices are more maintainable"</td><td>Distributed systems are harder to maintain, not easier</td></tr>
+        <tr><td>A service per database table</td><td>Boundaries drawn from schema, not from transactions</td></tr>
+        <tr><td>Services sharing one database</td><td><strong>Coupling without independence — the worst of both</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Say instead</div>
+    <p style="margin:0"><em>"Microservices have exactly one primary benefit: <strong>independent
+      deployability</strong>. Everything else attributed to them is either narrower than claimed or a liability.
+      Scalability isn't a reason — a monolith scales horizontally perfectly well, and usually more cheaply."</em>
+      <br><br>
+      <em>"So the question is whether independent deployability is worth the cost: network calls that fail, no
+      transactions across boundaries, distributed tracing, versioned contracts, and eventual consistency you now have
+      to explain to the business. For one team of eight deploying together, it usually isn't — I'd start with a
+      <strong>modular monolith</strong> with boundaries enforced mechanically, so splitting later is mechanical rather
+      than archaeological."</em>
+      <br><br>
+      And the boundary rule: <em>"I'd draw boundaries from <strong>what must be transactional together</strong>, not
+      from nouns. The number of sagas in a design is a good proxy for whether the boundaries are right."</em></p>
+  </div>
+
+  <h2 id="nosql">"NoSQL is faster" / "NoSQL scales better" <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="note senior">
+    <div class="note-title">Say instead</div>
+    <p style="margin:0"><em>"NoSQL isn't faster in general — it's faster <strong>for the access pattern you designed
+      the key for</strong>, and worse for anything else. A point read by partition key is extremely fast; an
+      unanticipated query is expensive or impossible."</em>
+      <br><br>
+      <em>"So the trade is that you're moving work from query time to design time. Relational gives you flexible
+      querying and joins after the fact; document stores give you predictable performance <strong>if</strong> the access
+      patterns are known and stable. That's a genuine trade, not a hierarchy."</em>
+      <br><br>
+      The specific thing that shows experience: <em>"and the partition key is usually irreversible, so choosing it
+      before you know the access patterns and the size distribution is the expensive mistake. A very skewed key gives
+      you a hot partition, and adding capacity can't fix it because throughput divides per partition."</em>
+      <br><br>
+      Related flag: <strong>"NoSQL means no schema"</strong> — <em>"there's still a schema, it just lives in the
+      application and in every consumer, unversioned. That's usually harder to change, not easier."</em></p>
+  </div>
+
+  <h2 id="lock">"We'd use a distributed lock" <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="note senior">
+    <div class="note-title">Say instead</div>
+    <p style="margin:0"><em>"I'd check first whether the store already guarantees it, because a lock elsewhere is
+      weaker. An atomic conditional write — <code>UPDATE ... WHERE Status = 'Available'</code>, or a unique constraint,
+      or an ETag check — makes the condition and the effect the same operation, so there's no window."</em>
+      <br><br>
+      <em>"A Redis lock can't guarantee anything about a write to SQL. If the lock expires mid-operation, two callers
+      proceed and the invariant breaks with no error at all. So it adds a dependency and edge cases while providing a
+      weaker guarantee than the database already offers."</em>
+      <br><br>
+      The principle to state: <em><strong>"enforce an invariant in the store that owns the data.</strong> A lock
+      elsewhere is advisory; a constraint in the database is absolute."</em>
+      <br><br>
+      Distributed locks are legitimate for <em>coordination</em> — leader election, ensuring one instance runs a
+      scheduled job — where the consequence of a rare overlap is duplicated work rather than corrupted data. And even
+      there: <em>"a lock reduces the probability of concurrent execution; idempotency makes it harmless. If I could
+      only have one, I'd take idempotency."</em></p>
+  </div>
+
+  <h2 id="scale-out">"We'd scale out" <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Red flag</th><th>Why it's wrong</th></tr></thead>
+      <tbody>
+        <tr><td>"Add more instances"</td><td><strong>Correct for one of the two failure shapes, harmful for the other</strong></td></tr>
+        <tr><td>"Scale the database tier"</td><td>Often a missing index, not a capacity problem</td></tr>
+        <tr><td>"Add more RUs"</td><td>Cannot fix a hot partition</td></tr>
+        <tr><td>"Increase the memory limit"</td><td>Delays a leak rather than fixing it</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Say instead</div>
+    <p style="margin:0"><em>"Before scaling anything I'd want to know whether <strong>latency scales with
+      load</strong>. If it rises with concurrency, something is queueing — a connection pool, the thread pool, a lock,
+      a CPU limit being throttled. If it's constant regardless of load, it's a slow path — a missing index, an N+1, a
+      slow dependency."</em>
+      <br><br>
+      <em>"Those need opposite responses. Scaling out helps the second and can make the first <strong>worse</strong>,
+      because more instances compete for the same finite database connections — so 'the app is slow' becomes 'the app
+      can't connect', which is worse and looks unrelated."</em>
+      <br><br>
+      That single distinction is one of the highest-value things you can say in a scaling question, because it's the
+      opposite of the reflex answer and it's easy to justify.
+      <br><br>
+      Also worth having: <em>"scaling out only works if the app is stateless — and the one that does real damage is a
+      background timer inside the web app, which now runs on every instance. A nightly job fires three times and
+      nothing errors."</em></p>
+  </div>
+
+  <h2 id="caching">"We'd add a cache" <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="note senior">
+    <div class="note-title">Say instead</div>
+    <p style="margin:0"><em>"Caching is usually the right answer at a high read/write ratio, and I'd want to say what's
+      cached, for how long, and how it's invalidated — because those are the parts that go wrong."</em>
+      <br><br>
+      Then the three details that show you've operated one:
+      <br><br>
+      <em>"<strong>Jitter every TTL</strong>, because a stampede isn't about misses, it's about
+      <em>simultaneous</em> misses — identical TTLs set at a deployment all expire in the same second."</em>
+      <br><br>
+      <em>"<strong>Delete on write, don't update</strong> — two concurrent writers updating a cache can interleave and
+      leave it permanently wrong, whereas a delete's worst case is a redundant read."</em>
+      <br><br>
+      <em>"And <strong>a cache failure must never fail the request</strong>. If an unhandled Redis exception becomes a
+      500, we've made the cache a hard dependency and <em>reduced</em> availability below the database alone. Though
+      'the cache is optional' is only true if the database can survive 100% of the read load — which is worth knowing
+      before it happens."</em>
+      <br><br>
+      The security one, if it's multi-tenant: <em>"tenant id in every cache key. Omitting it means serving one
+      customer another's data, which is a breach rather than a bug — and it passes every single-tenant test."</em></p>
+  </div>
+
+  <h2 id="exceptions">Error handling flags <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Red flag</th><th>Better</th></tr></thead>
+      <tbody>
+        <tr><td><code>catch (Exception) { }</code></td><td>Catch what you can handle; let the rest reach the boundary handler</td></tr>
+        <tr><td>"We log and rethrow at every layer"</td><td>One log at the boundary, with context. Duplicates are noise</td></tr>
+        <tr><td><code>throw ex;</code></td><td><code>throw;</code> — the first resets the stack trace</td></tr>
+        <tr><td>Exceptions for expected outcomes</td><td>A result type for "not found" or "invalid"; exceptions for the exceptional</td></tr>
+        <tr><td>"We add retries"</td><td><strong>Timeout first, then breaker; retry with jitter, never on 4xx</strong></td></tr>
+        <tr><td>Returning the exception message to the client</td><td>A safe message plus a trace id; the detail stays internal</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The retry answer is the one that matters most</div>
+    <p style="margin:0">"Add retries" is the reflex response to any dependency failure, and on its own it makes things
+      worse.
+      <br><br>
+      Say instead: <em>"<strong>the timeout matters more than the retry</strong>, because without one there's no bound
+      on the damage — and <code>HttpClient</code>'s default is 100 seconds, which is catastrophic for a
+      service-to-service call. Then a circuit breaker, so I stop paying the timeout on every request once it's clearly
+      down. Then retries with <strong>exponential backoff and jitter</strong> — without jitter, a thousand clients that
+      failed together all retry together, so the dependency recovers, gets hit by a wall, and falls over again."</em>
+      <br><br>
+      <em>"And never retry a 4xx — the request is malformed or unauthorised, so retrying can't succeed and just adds
+      load to something already struggling."</em>
+      <br><br>
+      The framing that lands: <em>"my retries are part of the reason it stays down."</em></p>
+  </div>
+
+  <h2 id="testing">Testing flags <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Red flag</th><th>What it reveals</th></tr></thead>
+      <tbody>
+        <tr><td>"We aim for 100% coverage"</td><td>Coverage treated as a goal rather than a diagnostic</td></tr>
+        <tr><td>"We mock everything"</td><td>The logic is never tested — only the wiring</td></tr>
+        <tr><td>"We use the in-memory provider"</td><td>It doesn't reproduce SQL translation or constraints</td></tr>
+        <tr><td>"Integration tests are too slow so we skip them"</td><td>Production failures are mostly integration failures</td></tr>
+        <tr><td>"Our tests break whenever we refactor"</td><td>Testing implementation, not behaviour</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Say instead</div>
+    <p style="margin:0"><em>"I'd weight toward integration tests in .NET, because the failures that actually reach
+      production are integration failures — SQL translation, DI registration, serialisation, migrations — and a heavily
+      mocked unit test cannot catch any of them <strong>by construction</strong>."</em>
+      <br><br>
+      <em>"On mocking: mock at boundaries, not at class edges. If every collaborator is a mock, the test asserts that
+      the wiring is as written, which is a tautology — and it breaks on every refactor."</em>
+      <br><br>
+      <em>"Coverage is a diagnostic, not a target. 100% coverage with no assertions passes. What I'd actually want is
+      mutation testing, which measures whether the tests would <em>notice</em> a change."</em>
+      <br><br>
+      And the counterintuitive point worth making: <em>"the bigger problem is false positives — brittle tests. A suite
+      that breaks on every refactor prevents the thing it was written to enable, so people stop refactoring or start
+      ignoring failures. That's worse than a gap in coverage."</em></p>
+  </div>
+
+  <h2 id="dotnet">.NET specifics that get stated wrongly <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Red flag</th><th>Correction</th></tr></thead>
+      <tbody>
+        <tr><td>"Dispose <code>HttpClient</code> after each use"</td><td><strong>That's what causes socket exhaustion.</strong> Use <code>IHttpClientFactory</code></td></tr>
+        <tr><td>"A singleton <code>HttpClient</code> is the fix"</td><td>It caches DNS forever — a problem when a dependency fails over</td></tr>
+        <tr><td>"<code>struct</code> is faster than <code>class</code>"</td><td>Only when small; copying a large struct costs more</td></tr>
+        <tr><td>"<code>GC.Collect()</code> to free memory"</td><td>Almost always counterproductive</td></tr>
+        <tr><td>"Nullable reference types prevent nulls"</td><td>Compile-time only; no runtime enforcement</td></tr>
+        <tr><td>"<code>IEnumerable</code> and <code>IQueryable</code> are interchangeable"</td><td>The first executes in memory, the second translates to SQL</td></tr>
+        <tr><td>"<code>Task.Run</code> to make it async"</td><td>Moves blocking to another pool thread; solves nothing for I/O</td></tr>
+        <tr><td>"<code>lock</code> works across instances"</td><td>Process-local only</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The <code>HttpClient</code> one is the most common of all</div>
+    <p style="margin:0">It's worth being precise about, because both the naive answer and the naive fix are wrong and
+      interviewers know it.
+      <br><br>
+      <em>"<code>HttpClient</code> implements <code>IDisposable</code>, so disposing it per use looks correct — and
+      it's exactly what causes <strong>socket exhaustion</strong>. Each disposal leaves a connection in
+      <code>TIME_WAIT</code>, so under load you run out of outbound ports and calls start failing while CPU and memory
+      look completely fine."</em>
+      <br><br>
+      <em>"But a static singleton isn't the answer either, because it <strong>caches DNS resolution for the lifetime
+      of the process</strong> — so when a dependency fails over to a new address, you keep trying the old one."</em>
+      <br><br>
+      <em>"<code>IHttpClientFactory</code> solves both: it pools handlers and rotates them on a bounded
+      <code>PooledConnectionLifetime</code>. Which matters especially in Kubernetes, where pods are replaced
+      constantly, so a long-held connection to a deleted pod fails intermittently after every deployment."</em>
+      <br><br>
+      Knowing that the <em>obvious fix</em> has its own failure mode is what makes this a strong answer rather than a
+      corrected one.</p>
+  </div>
+
+  <h2 id="attitude">Attitude flags <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Red flag</th><th>What it suggests</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Defending a choice after being shown it's wrong</strong></td><td>You'd do the same on a team</td></tr>
+        <tr><td><strong>Blaming previous developers</strong></td><td>How you'll talk about this team later</td></tr>
+        <tr><td><strong>Inventing a number rather than saying you'd check</strong></td><td>Everything else becomes less trustworthy</td></tr>
+        <tr><td>"The requirements were unclear so it's not my fault"</td><td>No ownership of clarifying them</td></tr>
+        <tr><td>Presenting every decision as obvious</td><td>Hasn't operated anything long enough to see the cost</td></tr>
+        <tr><td>Dismissing a whole technology</td><td>Preference mistaken for judgement</td></tr>
+        <tr><td>"The AI wrote it"</td><td>Not accountable for what you commit</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — changing your mind is a positive, not a concession</div>
+    <p style="margin:0">Interviewers push on decisions, sometimes to test conviction and often because they've spotted a
+      real problem. The strong response engages with the substance:
+      <br><br>
+      <em>"You're right that a single writer caps throughput. If we needed more than a few thousand writes a second
+      I'd partition by region — I chose the simpler option because the stated requirement was a few hundred."</em>
+      <br><br>
+      That shows you know the <strong>boundary</strong> of your own decision, which is what judgement actually is.
+      Defending something you can now see is wrong is the worse outcome, because it predicts how you'd behave in a
+      design review.
+      <br><br>
+      Equally, <strong>"I don't know"</strong> with a method is a good answer: <em>"I'd check the documented
+      per-partition throughput before committing to that key."</em> Nobody knows every limit. Inventing one damages
+      everything else you said, because the interviewer usually knows the real number.
+      <br><br>
+      And on legacy code: describe it neutrally. <em>"It was built for different constraints, and the cost of changing
+      it had grown"</em> lands very differently from <em>"it was a mess"</em> — and the first is almost always more
+      accurate.</p>
+  </div>
+
+  <h2 id="phrases">Phrases to retire <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Instead of</th><th>Say</th></tr></thead>
+      <tbody>
+        <tr><td>"It's best practice"</td><td>"It's usually right because…, and I'd deviate when…"</td></tr>
+        <tr><td>"For scalability"</td><td>Name the specific bottleneck it relieves</td></tr>
+        <tr><td>"It's more maintainable"</td><td>Name what becomes easier to change, and what becomes harder</td></tr>
+        <tr><td>"We'd monitor it"</td><td>Name the metric and the threshold you'd alert on</td></tr>
+        <tr><td>"We'd add logging"</td><td>Say what you'd log and which question it answers</td></tr>
+        <tr><td>"It just works"</td><td>Explain the mechanism, or say you'd check</td></tr>
+        <tr><td>"That's an anti-pattern"</td><td>Say what goes wrong and when it's acceptable anyway</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">"Best practice" is the weakest phrase available</div>
+    <p style="margin:0">It signals that a rule was absorbed rather than understood, and it invites the follow-up
+      <em>"why?"</em> — which you then have to answer anyway, from a worse starting position.
+      <br><br>
+      Saying <em>"this is usually right because X, and I'd deviate when Y"</em> answers the follow-up pre-emptively and
+      demonstrates the thing "best practice" was standing in for.
+      <br><br>
+      Same with <strong>"anti-pattern"</strong>. Most so-called anti-patterns are reasonable in some context — a
+      service locator in a plugin host, a shared database during a migration, a singleton for genuinely global
+      immutable state. Saying <em>"the problem with this is X, though it's defensible when Y"</em> is more useful and
+      more accurate than a label.
+      <br><br>
+      The general habit: <strong>replace the label with the consequence.</strong> It's the same move as choosing the
+      failure mode over the feature description, and it's what makes an answer sound like experience rather than
+      revision.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Async is throughput, not latency — and sync-over-async is the observable consequence.</li>
+      <li>Microservices buy independent deployability; scalability isn't a reason.</li>
+      <li>NoSQL is faster for the pattern you designed the key for, worse for others.</li>
+      <li>Prefer the store's atomic conditional write over a distributed lock.</li>
+      <li>Ask whether latency scales with load before scaling anything.</li>
+      <li>Caching: jitter TTLs, delete on write, never let a cache failure fail the request.</li>
+      <li>Timeout before retry; jitter always; never retry a 4xx.</li>
+      <li>Weight toward integration tests; coverage is a diagnostic, not a target.</li>
+      <li>Brittle tests are a worse problem than coverage gaps.</li>
+      <li><code>IHttpClientFactory</code> — and know why both disposal and a singleton are wrong.</li>
+      <li>Change your mind when shown a real problem; say "I don't know" with a method.</li>
+      <li>Replace "best practice" and "anti-pattern" with the actual consequence.</li>
+    </ul>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

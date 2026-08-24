@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React — Overview</title>
+<meta name="description" content="The one idea React is built on, what changed with hooks and Server Components, and the mental shifts for a developer coming from Angular or .NET.">
+<meta name="keywords" content="React overview declarative UI as function of state hooks vs class components server components React 19 vs Angular for .NET developers unidirectional data flow">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="32-react/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>React</h1>
+    <p class="subtitle">One idea, applied consistently: the UI is a function of state. Almost everything else
+      follows from that.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="the-one-idea">The one idea <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>You don't tell React what to change. You <strong>describe what the UI should look like for the current
+      state</strong>, and React works out the DOM operations.</p>
+    <p>When state changes, your component function runs again, producing a new description. React compares it to
+      the previous one and applies the difference.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>jQuery is giving someone step-by-step directions: turn left, then right, then stop.</p>
+    <p>React is giving them the destination address. How they get there is not your concern — and if the
+      destination changes, you just give the new address.</p>
+  </div>
+
+  <pre data-label="jsx — the whole model in one component"><code class="language-jsx">function OrderStatus({ order }) {
+  const [expanded, setExpanded] = useState(false);
+
+  // This is a DESCRIPTION, not a set of instructions.
+  // It re-runs whenever `order` or `expanded` changes.
+  return (
+    &lt;div&gt;
+      &lt;button onClick={() =&gt; setExpanded(!expanded)}&gt;
+        {order.reference} — {order.status}
+      &lt;/button&gt;
+      {expanded &amp;&amp; &lt;OrderLines lines={order.lines} /&gt;}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>UI = f(state).</strong></p>
+    <p>There is no list of DOM updates to remember. You can't forget to update the button when the status
+      changes, because the button's text is <em>declared</em> as a function of the status.</p>
+    <p>That's the bug class <a href="../30-web-fundamentals/jquery.html#why-it-faded">imperative DOM
+      manipulation</a> creates, and it disappears rather than being managed.</p>
+  </div>
+
+  <h2 id="from-dotnet">Mental shifts from C# and Angular <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Expectation</th><th>React's model</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>A component is a class with methods and fields</td>
+          <td><strong>A function that runs on every render.</strong> Local variables don't persist</td>
+        </tr>
+        <tr>
+          <td>State is mutable — <code>this.items.Add(x)</code></td>
+          <td><strong>State is replaced, never mutated.</strong> <code>setItems([...items, x])</code></td>
+        </tr>
+        <tr>
+          <td>DI container resolves dependencies</td>
+          <td><strong>No DI container.</strong> Props, context, or module imports</td>
+        </tr>
+        <tr>
+          <td>Framework provides routing, HTTP, forms</td>
+          <td><strong>You choose libraries.</strong> React renders; that's all</td>
+        </tr>
+        <tr>
+          <td>Two-way binding</td>
+          <td><strong>One-way.</strong> Data down via props, changes up via callbacks</td>
+        </tr>
+        <tr>
+          <td>Lifecycle hooks for each phase</td>
+          <td><code>useEffect</code> for synchronising with things outside React</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The shift that causes the most confusion</div>
+    <p style="margin:0"><strong>A component function runs from top to bottom on every single render.</strong>
+      <br><br>
+      So a local variable is recreated each time. A function defined in the body is a <em>new function
+      object</em> on every render. An object literal is a new object.
+      <br><br>
+      That's why hooks exist: <code>useState</code> is how a value survives between renders,
+      <code>useRef</code> is how a mutable box survives, <code>useMemo</code> and
+      <code>useCallback</code> are how you keep the same object identity when something downstream compares by
+      reference.
+      <br><br>
+      Coming from a class-based framework, the instinct is that the component is an <em>instance</em> with
+      persistent fields. It isn't. Internalising "the function re-runs entirely" explains most of React's
+      apparent strangeness — including
+      <a href="fundamentals.html#stale-closures">stale closures</a>, which are the same
+      <a href="../30-web-fundamentals/javascript.html#closures">capture-the-variable</a> behaviour from plain
+      JavaScript.</p>
+  </div>
+
+  <h2 id="what-changed">What changed, and when <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Old</th><th>Current</th><th>Since</th></tr></thead>
+      <tbody>
+        <tr><td>Class components, lifecycle methods</td><td><strong>Function components and hooks</strong></td><td>16.8 — classes still work, rarely written</td></tr>
+        <tr><td><code>componentDidMount</code> etc.</td><td><code>useEffect</code></td><td>16.8</td></tr>
+        <tr><td>Redux for all state</td><td><strong>Server state in React Query; little global client state</strong></td><td>Practice shift, ~2020 onward</td></tr>
+        <tr><td>Manual <code>memo</code>/<code>useMemo</code> tuning</td><td>React Compiler auto-memoises</td><td>19 (opt-in)</td></tr>
+        <tr><td>Client-side everything</td><td><strong>Server Components</strong> for non-interactive parts</td><td>19 stable, via frameworks</td></tr>
+        <tr><td><code>forwardRef</code> wrapper</td><td><code>ref</code> as a normal prop</td><td>19</td></tr>
+        <tr><td>Manual form submission state</td><td><code>useActionState</code>, <code>useFormStatus</code></td><td>19</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the state-management shift matters more than the API changes</div>
+    <p style="margin:0">The biggest practical change in React over the last five years isn't a new hook. It's the
+      realisation that <strong>most "global state" was actually cached server data</strong>.
+      <br><br>
+      Teams used to put fetched API data in Redux, then hand-write loading flags, error states, cache
+      invalidation and refetch logic — hundreds of lines of boilerplate per feature.
+      <br><br>
+      <strong>React Query and similar libraries own that entirely.</strong> Once server data lives there, most
+      applications need very little genuine global client state — a theme, the current user, maybe a sidebar
+      toggle. Which is why "do we need Redux?" is now usually answered "probably not".
+      <br><br>
+      Saying that distinguishes someone who's worked through the shift from someone who learned React from older
+      material. Covered on <a href="state-data.html">the state page</a>.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">Components, JSX &amp; Hooks</a></td>
+          <td>Props and state, the rules of hooks, <code>useEffect</code> and its dependency array, stale
+              closures, <code>useRef</code>, context, custom hooks</td>
+        </tr>
+        <tr>
+          <td><a href="rendering-performance.html">Rendering &amp; Performance</a></td>
+          <td>What triggers a re-render, reconciliation and keys, <code>memo</code>/<code>useMemo</code>/
+              <code>useCallback</code>, profiling, the React Compiler</td>
+        </tr>
+        <tr>
+          <td><a href="state-data.html">State Management &amp; Data Fetching</a></td>
+          <td><strong>The one with the most practical value.</strong> Server versus client state, React Query,
+              when Redux is justified, forms, routing</td>
+        </tr>
+        <tr>
+          <td><a href="testing-security.html">Testing, Errors &amp; Security</a></td>
+          <td>Testing Library philosophy, error boundaries, XSS via
+              <code>dangerouslySetInnerHTML</code>, token handling</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="ecosystem">The libraries you're expected to know <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Need</th><th>Usual choice</th><th>Angular equivalent</th></tr></thead>
+      <tbody>
+        <tr><td>Routing</td><td>React Router, or a framework's router</td><td>Built in</td></tr>
+        <tr><td>Server data</td><td><strong>TanStack Query</strong> (React Query)</td><td><code>HttpClient</code> plus your own caching</td></tr>
+        <tr><td>Global client state</td><td>Zustand, or Context. Redux Toolkit for large apps</td><td>A service with signals or subjects</td></tr>
+        <tr><td>Forms</td><td>React Hook Form</td><td>Reactive forms, built in</td></tr>
+        <tr><td>Validation</td><td>Zod</td><td>Validators</td></tr>
+        <tr><td>Testing</td><td>Testing Library + Vitest/Jest</td><td>TestBed, built in</td></tr>
+        <tr><td>Full framework</td><td>Next.js, Remix</td><td>Angular itself</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">This list is the actual trade-off with Angular</div>
+    <p style="margin:0">Angular ships routing, HTTP, forms, DI and testing. React ships a renderer, and you
+      assemble the rest.
+      <br><br>
+      The upside is picking best-in-class tools and not carrying what you don't use — React Query genuinely has
+      no Angular equivalent of similar maturity.
+      <br><br>
+      The downside is <strong>decision cost and divergence</strong>. Two React codebases at the same company can
+      look completely different, so moving between them means relearning the architecture. Angular's
+      opinionation is what prevents that.
+      <br><br>
+      Neither is wrong. But "React is more flexible" and "Angular is more consistent" are the same fact viewed
+      from either side, and being able to say that is a better answer than advocating for one.</p>
+  </div>
+
+  <details class="qa">
+    <summary>Angular or React for a new project? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My first answer is <strong>whichever the team already knows</strong> — and I'd mean that seriously
+          rather than as a way of avoiding the question. Both are mature and capable. Framework familiarity
+          outweighs the technical differences for almost every real project, and choosing the one the team
+          doesn't know costs months of reduced velocity plus the mistakes people make while learning."</p>
+        <p>"If the team has no strong preference, the differences that actually matter:"</p>
+        <p>"<strong>Angular is a framework; React is a library.</strong> Angular ships routing, HTTP, forms, DI
+          and testing, and there's one obvious way to do each. React ships a renderer and you choose the rest —
+          React Router, React Query, React Hook Form, a state library."</p>
+        <p>"That's the real trade. Angular's opinionation means ten developers write similar code and a new
+          starter recognises the structure. React's flexibility means better tool choices and more divergence —
+          two React codebases at the same company can look nothing alike, so moving between teams means
+          relearning the architecture."</p>
+        <p>"So I'd lean <strong>Angular for a large or rotating team</strong>, particularly in an enterprise where
+          consistency and onboarding matter more than picking the optimal library. And <strong>React for a small
+          aligned team</strong>, or where the ecosystem has something specific you want."</p>
+        <p>"For a <strong>.NET team specifically</strong>, Angular tends to feel natural — constructor injection,
+          decorators, TypeScript throughout, an injector hierarchy that behaves like ASP.NET Core's service
+          lifetimes. The concepts transfer rather than needing to be learned fresh. React's model — a function
+          that re-runs entirely, immutable state, no DI container — takes more adjustment for someone used to
+          class instances with mutable fields."</p>
+        <p>"Where React has a genuine edge: <strong>server-side rendering and the data layer</strong>. Next.js is
+          more mature than Angular Universal, and React Query has no Angular equivalent of comparable maturity for
+          server-state caching. If the application is content-heavy and SEO matters, or the data layer is
+          complex, that's a real consideration."</p>
+        <p>"What I'd push back on is choosing based on benchmarks or popularity. Performance differences between
+          them are dominated by how <em>you</em> write the code — a badly-written React app with unnecessary
+          re-renders is slower than a well-written Angular app with <code>OnPush</code>, and vice versa. And
+          hiring-pool arguments cut both ways depending on the market."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you lead with team familiarity rather than technical advocacy?</li>
+        <li>Can you state the framework-versus-library trade honestly?</li>
+        <li>Do you know where each genuinely has an edge?</li>
+        <li>Do you resist benchmark-driven reasoning?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "React, it's faster" or "Angular, it's more
+          enterprise".</li>
+        <li><span class="redflag">Red flag:</span> no acknowledgement of team context.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What would make you migrate an existing app?</li>
+          <li>How do you handle state in React without Redux?</li>
+          <li>What's the SSR story in each?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section assumes the
+      <a href="../30-web-fundamentals/javascript.html">JavaScript page</a>, particularly
+      <a href="../30-web-fundamentals/javascript.html#closures">closures</a> — React's most confusing bugs are
+      closure bugs, and they're much easier to reason about once that's solid.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

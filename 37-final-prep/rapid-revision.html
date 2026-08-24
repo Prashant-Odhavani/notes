@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rapid Revision — Final Interview Prep</title>
+<meta name="description" content="One compact block per topic: the facts that come up most, phrased as consequences rather than definitions. For gap-finding and the morning of.">
+<meta name="keywords" content="rapid revision cheat sheet dotnet interview summary C# async EF Core SQL Redis Cosmos Kafka microservices testing Azure Kubernetes git system design one page recall">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="37-final-prep/rapid-revision.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Rapid Revision</h1>
+    <p class="subtitle">Phrased as consequences, not definitions. If you can state the <em>why</em> for a line, you
+      know it. If you can only recognise it, that's your gap.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="note tip">
+    <div class="note-title">How to use this page</div>
+    <p style="margin:0">Go line by line and try to say the reasoning aloud. Not the fact — the mechanism and its
+      consequence.
+      <br><br>
+      "<code>ConfigureAwait(false)</code> in libraries" is recall. "Because a library shouldn't force a context capture
+      the caller may not need, and in a UI app resuming on the captured context is what turns a
+      <code>.Result</code> into a deadlock" is understanding.
+      <br><br>
+      Anywhere you can state the fact and not the consequence, open the full page for that topic. That's the whole
+      method: <strong>this page finds gaps; the topic pages close them.</strong></p>
+  </div>
+
+  <h2 id="csharp">C# and the runtime <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">Language</div>
+    <ul>
+      <li><strong>Value vs reference type</strong> — where it lives matters less than copy-on-assign semantics.</li>
+      <li><strong><code>struct</code> for small immutable values</strong>; copying a large struct costs more than a
+        reference.</li>
+      <li><strong><code>record</code></strong> gives value equality, <code>with</code> expressions, and a concise
+        constructor. Reference type unless <code>record struct</code>.</li>
+      <li><strong><code>string</code> is immutable</strong> — concatenation in a loop allocates each time; use
+        <code>StringBuilder</code>.</li>
+      <li><strong>Boxing</strong> allocates. It's why <code>List&lt;T&gt;</code> beats
+        <code>ArrayList</code>.</li>
+      <li><strong><code>IDisposable</code></strong> releases unmanaged resources deterministically; the GC won't do it
+        promptly.</li>
+      <li><strong>Nullable reference types</strong> are compile-time only — no runtime enforcement.</li>
+      <li><strong><code>Span&lt;T&gt;</code></strong> for zero-allocation slicing; stack-only, so no async.</li>
+      <li><strong><code>IEnumerable</code> is lazy</strong> — enumerating twice executes twice.</li>
+      <li><strong>Closures capture variables, not values</strong> — the classic loop-variable bug (fixed for
+        <code>foreach</code> since C# 5).</li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">Async</div>
+    <ul>
+      <li><strong>async is about not blocking threads</strong>, not about speed. One request isn't faster; the server
+        handles more.</li>
+      <li><strong><code>.Result</code>/<code>.Wait()</code> holds a pool thread</strong> for the whole I/O. The pool
+        adds threads at ~1–2/sec, so requests queue — <strong>latency climbs, CPU stays low</strong>.</li>
+      <li><strong>One <code>.Result</code> deep in the chain is enough</strong> to starve the pool.</li>
+      <li><strong><code>async void</code></strong> — exceptions can't be caught by the caller and crash the process.
+        Only for event handlers.</li>
+      <li><strong><code>ConfigureAwait(false)</code></strong> in libraries: don't force a context capture the caller
+        may not need.</li>
+      <li><strong><code>Task.WhenAll</code></strong> for parallel I/O; <code>Parallel.ForEach</code> is for CPU work.</li>
+      <li><strong><code>CancellationToken</code> all the way down</strong>, or cancellation does nothing.</li>
+      <li><strong><code>ValueTask</code></strong> only for hot paths that often complete synchronously; awaiting twice
+        is undefined.</li>
+      <li><strong><code>IAsyncEnumerable</code></strong> to stream without buffering everything.</li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">GC and memory</div>
+    <ul>
+      <li><strong>Generational</strong> — Gen0 collections are cheap, Gen2 is expensive.</li>
+      <li><strong>Large Object Heap</strong> (85 KB+) isn't compacted by default — fragments.</li>
+      <li><strong>Server GC</strong> is the ASP.NET Core default: per-core heaps, holds memory, tuned for throughput.</li>
+      <li><strong>In a container, the GC sizes its heap from the memory limit</strong> — so a tight limit means
+        aggressive collection, high CPU, and possibly an OOM anyway. Raising it can <em>reduce</em> CPU.</li>
+      <li><strong>High CPU is often allocation, not computation.</strong></li>
+      <li><strong>Leaks in .NET</strong>: unbounded caches and static collections, unsubscribed events, captured
+        scoped services in a singleton, <code>HttpClient</code> per request (sockets, not managed memory).</li>
+      <li><strong>Rising and never recovering after GC = a leak.</strong> Tracks concurrency = per-request
+        buffering.</li>
+    </ul>
+  </div>
+
+  <h2 id="design">OOP, SOLID and patterns <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">Principles</div>
+    <ul>
+      <li><strong>SRP</strong> — one reason to change, not "one thing".</li>
+      <li><strong>OCP</strong> — extend without modifying; strategy or polymorphism instead of a growing switch.</li>
+      <li><strong>LSP</strong> — a subtype must honour the base contract. Throwing
+        <code>NotSupportedException</code> breaks it.</li>
+      <li><strong>ISP</strong> — a fat interface forces implementers to stub methods.</li>
+      <li><strong>DIP</strong> — depend on abstractions; the concrete type is chosen at composition.</li>
+      <li><strong>Composition over inheritance</strong> — inheritance couples you to the base's changes.</li>
+      <li><strong>Idiomatic .NET often <em>is</em> the pattern</strong>: constructor injection is Strategy,
+        <code>DbSet</code> is Repository, <code>DbContext</code> is Unit of Work, middleware is Chain of
+        Responsibility.</li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">Patterns worth naming</div>
+    <ul>
+      <li><strong>Strategy</strong> — replaces a growing switch on type. Loses to a three-case switch.</li>
+      <li><strong>Factory</strong> — when construction has rules or dependencies; often just DI.</li>
+      <li><strong>Singleton</strong> — almost every criticism is really of static global access.
+        <code>AddSingleton</code> is the answer.</li>
+      <li><strong>Mediator</strong> — the real reason is <code>IPipelineBehavior</code>, not controller decoupling.
+        Costs navigability.</li>
+      <li><strong>CQRS comes in levels</strong> — separate models on one database is nearly free; separate stores buys
+        eventual consistency. <strong>CQRS ≠ event sourcing.</strong></li>
+      <li><strong>Outbox</strong> — the only way to make a database write and a publish atomic.</li>
+      <li><strong>Decorator</strong> — cross-cutting behaviour without touching the implementation.</li>
+    </ul>
+  </div>
+
+  <h2 id="aspnet">ASP.NET Core and APIs <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">Framework</div>
+    <ul>
+      <li><strong>Middleware order matters</strong> — exception handling first, auth before authorisation, routing
+        before endpoints.</li>
+      <li><strong>Lifetimes</strong>: singleton per app, scoped per request, transient per resolution. <strong>A
+        scoped service captured by a singleton is a bug</strong> — and a real source of cross-request leaks.</li>
+      <li><strong><code>IOptions</code></strong> is bound once; <code>IOptionsMonitor</code>/<code>Snapshot</code> see
+        changes. Dynamic config with <code>IOptions</code> silently does nothing.</li>
+      <li><strong><code>IHttpClientFactory</code></strong> — fixes socket exhaustion <em>and</em> DNS caching.
+        Essential in Kubernetes, where pods are replaced constantly.</li>
+      <li><strong>Minimal APIs vs controllers</strong> — performance is similar; choose on team and structure.</li>
+      <li><strong>Rate limiting is per-instance</strong> — it multiplies on scale-out unless distributed.</li>
+      <li><strong>Health checks</strong>: liveness must not check dependencies, or one blip restarts every
+        instance.</li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">HTTP and REST</div>
+    <ul>
+      <li><strong>PUT is idempotent, POST isn't.</strong> PATCH depends on how you define it.</li>
+      <li><strong>Status codes carry meaning</strong>: 400 malformed, 401 unauthenticated, 403 authenticated but not
+        allowed, 404 hides existence, 409 conflict, 422 semantically invalid, 429 throttled.</li>
+      <li><strong>Problem Details (RFC 9457)</strong> for machine-readable errors, with a trace id.</li>
+      <li><strong><code>ETag</code></strong> does two jobs — 304 caching <em>and</em> <code>If-Match</code> optimistic
+        concurrency (412 on conflict).</li>
+      <li><strong>Never <code>Cache-Control: public</code></strong> on an authenticated response — a shared cache can
+        serve one user's data to another.</li>
+      <li><strong>Keyset pagination</strong> — offset is slow at depth <em>and</em> silently skips rows during an
+        export.</li>
+      <li><strong>Idempotency keys</strong> on POST, enforced by a unique index, not an application check.</li>
+      <li><strong>Version the whole API</strong>, additively where possible; track usage per consumer or you can never
+        deprecate.</li>
+    </ul>
+  </div>
+
+  <h2 id="data">Data access <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">EF Core</div>
+    <ul>
+      <li><strong>Change tracking costs</strong> — <code>AsNoTracking()</code> for reads.</li>
+      <li><strong>N+1</strong> — lazy loading in a loop. Fix with <code>Include</code> or a projection; find it by
+        counting dependency calls per operation.</li>
+      <li><strong><code>Select</code> a projection</strong> rather than loading whole entities you won't use.</li>
+      <li><strong>Client-side evaluation</strong> is an exception in modern EF Core rather than a silent
+        fallback — good.</li>
+      <li><strong><code>DbContext</code> is not thread-safe</strong> and is scoped per request.</li>
+      <li><strong>Global query filters</strong> for tenant isolation — and the filter must read the tenant at
+        <em>query</em> time, or the cached model bakes one tenant's id in for everyone.</li>
+      <li><strong>Filters don't apply to raw SQL</strong> or <code>ExecuteUpdate</code>/<code>ExecuteDelete</code>.</li>
+      <li><strong>Never the in-memory provider</strong> for testing query behaviour — Testcontainers with real
+        migrations.</li>
+      <li><strong>Migrations run as a Job</strong>, not at app startup with multiple replicas.</li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">SQL</div>
+    <ul>
+      <li><strong>Clustered index = the physical order</strong>; one per table. Non-clustered is a separate structure
+        with a pointer back.</li>
+      <li><strong>Covering index</strong> — <code>INCLUDE</code> the columns needed to avoid a key lookup.</li>
+      <li><strong>Index order matters</strong>: equality, then range, then sort (ESR).</li>
+      <li><strong>Every index costs on write.</strong> Read wins are paid for on write.</li>
+      <li><strong>Gradual slowdown = a scan meeting more rows. Sudden = a plan change.</strong></li>
+      <li><strong>Parameter sniffing</strong> — one cached plan compiled for an atypical parameter; the same query is
+        fast for some inputs and slow for others.</li>
+      <li><strong>Query Store</strong> shows when a plan regressed and can force the old one.</li>
+      <li><strong>Estimated vs actual rows</strong> is the most informative number in a plan.</li>
+      <li><strong>A transaction's cost is its duration</strong> — never an HTTP call inside one.</li>
+      <li><strong>Isolation levels</strong>: read committed default; snapshot avoids readers blocking writers at the
+        cost of version-store pressure.</li>
+      <li><strong>Deadlocks</strong> are usually inconsistent lock ordering; retry the victim.</li>
+      <li><strong>Azure SQL: DTU is a composite</strong> — check CPU, data IO and log IO separately. Log write rate
+        throttles writes while CPU looks low.</li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">NoSQL and Redis</div>
+    <ul>
+      <li><strong>Partition key is the decision you can't undo</strong> — it sets the scale ceiling and which queries
+        are cheap.</li>
+      <li><strong>A hot partition can't be fixed with capacity</strong> — throughput divides per partition, so adding
+        RUs gives each one a smaller share. Increase key cardinality.</li>
+      <li><strong>Aggregate RU utilisation hides a hot partition completely</strong> — 429s at 15% is the
+        signature.</li>
+      <li><strong>Cosmos consistency</strong>: five levels; session is the useful default, and the session token must
+        propagate across instances.</li>
+      <li><strong>Change feed is a built-in outbox</strong> in Cosmos and DynamoDB.</li>
+      <li><strong>DynamoDB filter expressions don't reduce cost</strong> — you pay for what was read, not
+        returned.</li>
+      <li><strong>Redis is single-threaded per node</strong> — one slow command blocks every client. Never
+        <code>KEYS</code>.</li>
+      <li><strong>Cache-aside</strong>: delete on write, don't update — two concurrent updates can leave it
+        permanently wrong.</li>
+      <li><strong>Jitter every TTL.</strong> A stampede is about <em>simultaneous</em> misses.</li>
+      <li><strong>Cache the absence</strong> briefly, or unknown ids bypass the cache entirely.</li>
+      <li><strong>A cache failure must never fail the request</strong> — and "the cache is optional" is only true if
+        the database survives 100% of the load.</li>
+      <li><strong>Tenant id in every cache key.</strong> Omitting it is a breach.</li>
+    </ul>
+  </div>
+
+  <h2 id="distributed">Distributed systems <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">Messaging</div>
+    <ul>
+      <li><strong>Queue vs log</strong>: a queue removes on read and tracks each message (retry, DLQ); a log advances
+        a cursor and keeps the data (replay, many consumers).</li>
+      <li><strong>Event Hubs and Kafka have no dead-letter</strong> — a poison event stalls a partition unless your
+        code handles it.</li>
+      <li><strong>Exactly-once delivery is impossible</strong>; at-least-once + an idempotent consumer gives an
+        exactly-once <em>effect</em>.</li>
+      <li><strong>Deduplicate in the same transaction as the work</strong>, or you can do the work and fail to record
+        it.</li>
+      <li><strong>Ordering is per partition at best.</strong> Prefer version-based rejection over enforcing order.</li>
+      <li><strong>Design events as state, not deltas</strong>, so duplicates and reordering are harmless.</li>
+      <li><strong>Consumer lag: the trend matters, not the depth.</strong> One partition lagging = skew or a
+        stall.</li>
+      <li><strong>Consumers can't exceed the partition count.</strong></li>
+      <li><strong>Keep events small</strong> — identifiers and the fact, so consumers read current state.</li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">Resilience</div>
+    <ul>
+      <li><strong>Slow is worse than dead.</strong> A dead dependency fails fast; a slow one exhausts your threads and
+        takes down unrelated endpoints.</li>
+      <li><strong>Timeout first</strong>, then circuit breaker, then bulkhead. <code>HttpClient</code>'s 100-second
+        default is far too long.</li>
+      <li><strong>Backoff needs jitter</strong>, or synchronised retries keep a recovered service down.</li>
+      <li><strong>Never retry a 4xx</strong>; don't stack retries at three layers (27 requests for one call).</li>
+      <li><strong>Compensation is not rollback</strong> — it's a new business action. Irreversible steps go last.</li>
+      <li><strong>A saga has no isolation</strong> — an explicit <code>Pending</code> status is the semantic lock.</li>
+      <li><strong>Every store gives one atomic conditional write</strong> — ETag, <code>rowversion</code>,
+        <code>SET NX</code>, condition expressions. Every correct coordination pattern is built on it.</li>
+      <li><strong>Check-then-act is the bug</strong>, everywhere.</li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">Architecture</div>
+    <ul>
+      <li><strong>Microservices have exactly one primary benefit: independent deployability.</strong> Everything else
+        is narrower than claimed or a liability.</li>
+      <li><strong>Modular monolith first</strong>, with boundaries enforced mechanically so splitting later is
+        mechanical.</li>
+      <li><strong>"What must be transactional together?"</strong> defines service boundaries better than nouns
+        do.</li>
+      <li><strong>The number of sagas is a proxy for whether the boundaries are right.</strong></li>
+      <li><strong>A shared database between services isn't microservices</strong> — you have coupling without
+            independence.</li>
+      <li><strong>Return the trace id to the client</strong>; it's how a support ticket becomes a distributed
+        trace.</li>
+    </ul>
+  </div>
+
+  <h2 id="testing">Testing <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">Testing</div>
+    <ul>
+      <li><strong>False positives (brittle tests) are the bigger problem</strong> — a suite that breaks on every
+        refactor prevents the thing it was written to enable.</li>
+      <li><strong>Mock at boundaries, not class edges.</strong> Over-mocking tests the wiring, never the logic.</li>
+      <li><strong>Weight toward integration tests in .NET</strong>, because the failures that reach production are
+        integration failures — SQL translation, DI registration, serialisation, migrations.</li>
+      <li><strong>Testcontainers, never EF Core's in-memory provider</strong> for query or constraint behaviour.</li>
+      <li><strong>Coverage is a diagnostic, not a target.</strong> Mutation testing measures what coverage can't.</li>
+      <li><strong><code>async void</code> tests silently pass</strong> — enable xUnit1001 as an error.</li>
+      <li><strong>Test the concurrency case</strong> — submit the same operation twice simultaneously. It's the case
+        nobody tests and the one that fails.</li>
+    </ul>
+  </div>
+
+  <h2 id="cloud">Azure and containers <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">Azure</div>
+    <ul>
+      <li><strong>Managed identity wherever supported</strong> — no credential to leak, rotate or commit.</li>
+      <li><strong>Key Vault is throttled</strong> — cache at startup. Which is exactly what makes rotation not take
+        effect, so bound the refresh.</li>
+      <li><strong>A committed secret must be rotated</strong>; deleting the file does nothing.</li>
+      <li><strong>App Service: ARR affinity is on by default</strong> and defeats scale-out for stateless apps.</li>
+      <li><strong>A slot swap applies production settings and restarts <em>before</em> switching</strong> — so staging
+        never tested production config. Configure warm-up.</li>
+      <li><strong>SNAT port exhaustion</strong> — outbound calls fail while every normal metric looks fine.</li>
+      <li><strong>Service Bus vs Event Hubs vs Event Grid</strong>: work, stream, notification.</li>
+      <li><strong>Event Grid dead-lettering is off by default</strong> — failed events are silently discarded.</li>
+      <li><strong>Functions scaling out overwhelms a fixed-capacity database</strong> — cap the scale-out.</li>
+      <li><strong>Event Hubs/Cosmos triggers cap instances at the partition count.</strong></li>
+      <li><strong>Storage: redundancy is not backup.</strong> Geo-replication is asynchronous, so failover can lose
+        writes. Immutability policies are the ransomware answer.</li>
+      <li><strong>Direct upload via a user delegation SAS</strong> — revocable, and no account key.</li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">Containers and Kubernetes</div>
+    <ul>
+      <li><strong>A container is a host process</strong> with namespaces and cgroups — no guest OS, weaker isolation
+        than a VM.</li>
+      <li><strong>Layer caching</strong>: copy project files and restore <em>before</em> copying source.</li>
+      <li><strong>Layers are additive</strong> — a deleted secret is still in the image.</li>
+      <li><strong>Requests decide scheduling; memory limits kill, CPU limits throttle.</strong></li>
+      <li><strong>Memory request = limit</strong> (incompressible); consider no CPU limit (compressible).</li>
+      <li><strong>CPU throttling hides in average CPU</strong> — check throttled seconds.</li>
+      <li><strong>No readiness probe = no safe rollout.</strong></li>
+      <li><strong>Liveness must not check dependencies</strong>, or one blip restarts every pod.</li>
+      <li><strong>Endpoint removal races SIGTERM</strong> — a <code>preStop</code> sleep is the fix for deploy-time
+        502s.</li>
+      <li><strong>Secrets are base64, not encrypted.</strong> Use workload identity.</li>
+      <li><strong>Container Apps before AKS</strong> unless you need the Kubernetes API itself.</li>
+    </ul>
+  </div>
+
+  <h2 id="delivery">Delivery <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">Git and CI/CD</div>
+    <ul>
+      <li><strong>A commit is an immutable content-addressed snapshot</strong>; a branch is a pointer. That's why
+        rebase creates new commits.</li>
+      <li><strong>The reflog is your undo</strong> — ~90 days. Nothing committed is really lost.</li>
+      <li><strong>Rebase your own unpushed work; never a shared branch.</strong></li>
+      <li><strong>Reset for local mistakes, revert for public ones.</strong>
+        <code>--force-with-lease</code>, never plain force.</li>
+      <li><strong>Build once, deploy that artefact</strong> to every environment.</li>
+      <li><strong>OIDC federated on the environment</strong> — no stored secret, and bound so a leak is useless.</li>
+      <li><strong>Expand and contract</strong> for schema change: both versions run during a rolling deploy.</li>
+      <li><strong>Terraform state holds secrets in plaintext</strong>; <code>for_each</code> not <code>count</code>;
+        apply the <em>saved</em> plan.</li>
+      <li><strong>Bicep has no state</strong> and no provider lag — but incremental mode never deletes.</li>
+      <li><strong>Read the plan for destroy and replace</strong> — the code diff won't show it.</li>
+    </ul>
+  </div>
+
+  <h2 id="frontend">Front-end essentials <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">JavaScript, Angular, React</div>
+    <ul>
+      <li><strong>The event loop</strong>: microtasks drain completely before the next macrotask.</li>
+      <li><strong>Closures capture variables, not values.</strong></li>
+      <li><strong>Angular change detection</strong>: <code>OnPush</code> only re-renders on reference change — mutating
+        an object silently does nothing.</li>
+      <li><strong>Four flattening operators</strong>: <code>switchMap</code> cancels (typeahead),
+        <code>concatMap</code> queues, <code>mergeMap</code> races, <code>exhaustMap</code> ignores while busy (submit
+        buttons).</li>
+      <li><strong>Unsubscribe or leak</strong> — <code>takeUntilDestroyed</code>.</li>
+      <li><strong>React: server state vs client state</strong> is the distinction that removes most state-management
+        complexity.</li>
+      <li><strong><code>useEffect</code> dependencies</strong> — a missing one is a stale closure; an object literal
+        re-runs every render.</li>
+      <li><strong>Keys must be stable ids</strong>, never the array index.</li>
+    </ul>
+  </div>
+
+  <h2 id="method">Method, for the design and diagnosis rounds <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="quickrev">
+    <div class="note-title">Production diagnosis</div>
+    <ul>
+      <li><strong>Characterise before diagnosing</strong> — all requests or a tail? since when? did anything
+        deploy?</li>
+      <li><strong>"Does it scale with load?"</strong> splits queueing from a slow path — and they need opposite
+        responses.</li>
+      <li><strong>Percentiles, never averages.</strong> The p50–p99 gap is the information.</li>
+      <li><strong>Split by dimension early</strong> — instance, partition, tenant. Aggregates reassure while one unit
+        fails.</li>
+      <li><strong>Name the specific metric.</strong> That's the line that scores.</li>
+      <li><strong>Label mitigations as mitigations</strong>, and capture evidence before restarting anything.</li>
+      <li><strong>Finish with "how would we have known sooner?"</strong></li>
+    </ul>
+  </div>
+
+  <div class="quickrev">
+    <div class="note-title">System design</div>
+    <ul>
+      <li><strong>Requirements first</strong>, and write down the exclusions.</li>
+      <li><strong>"What must be strongly consistent?"</strong> is usually the pivotal question — and the answer differs
+        per part of the system.</li>
+      <li><strong>Estimate to reach a decision</strong>, then stop. Say when scale is a non-issue.</li>
+      <li><strong>Data model before architecture</strong>; the boxes follow from it.</li>
+      <li><strong>Name the trade-off</strong>: choice, reason, cost, and when you'd choose differently.</li>
+      <li><strong>Volunteer failure modes</strong> — duplicates, slow dependencies, partial failure, schema change.</li>
+      <li><strong>Finish on operability.</strong> The best alert is a business metric that stopped.</li>
+    </ul>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">The eight lines to have ready</div>
+    <p style="margin:0">If everything else goes, these transfer across almost every question:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Slow is worse than dead.</strong></li>
+      <li><strong>At-least-once plus an idempotent consumer gives an exactly-once effect.</strong></li>
+      <li><strong>Adding capacity never fixes a hot key.</strong></li>
+      <li><strong>The aggregate metric is never the one you hit.</strong></li>
+      <li><strong>Check-then-act is a race; one atomic conditional write is the fix.</strong></li>
+      <li><strong>Compensation is not rollback.</strong></li>
+      <li><strong>A control that depends on someone remembering isn't a control.</strong></li>
+      <li><strong>Choose the simplest thing that meets the requirement.</strong></li>
+    </ul>
+    <p style="margin:8px 0 0">Each is a <em>consequence</em> rather than a fact, which is why they're worth having
+      verbatim. They also each open onto a longer answer if the interviewer follows up — which is exactly what you
+      want.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

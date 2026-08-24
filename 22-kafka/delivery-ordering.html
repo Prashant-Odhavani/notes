@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delivery Semantics &amp; Ordering — Kafka</title>
+<meta name="description" content="At-most, at-least and exactly-once semantics; the idempotent producer; Kafka transactions; partition keys and what ordering really guarantees.">
+<meta name="keywords" content="Kafka delivery semantics at least once exactly once idempotent producer transactions read committed isolation level partition key ordering rebalance duplicate consumer offset commit dead letter topic">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="22-kafka/delivery-ordering.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Delivery Semantics &amp; Ordering</h1>
+    <p class="subtitle">Kafka does offer exactly-once — with conditions that are usually not met. Knowing where
+      the boundary sits is the whole topic.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>At-least-once is the practical default</strong> — commit after processing.</li>
+      <li><strong>The idempotent producer removes duplicates from producer retries</strong>, not from consumer
+        redelivery.</li>
+      <li><strong>Kafka transactions give exactly-once for Kafka-to-Kafka</strong> only.</li>
+      <li><strong>If your consumer writes to a database, transactions don't cover it</strong> — you still need
+        idempotency.</li>
+      <li><strong>Ordering is per partition</strong>, and a rebalance can still cause reprocessing.</li>
+      <li><strong>Dead-lettering is something you build</strong> — Kafka has no equivalent.</li>
+    </ul>
+  </div>
+
+  <h2 id="three-semantics">The three semantics <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Semantic</th><th>How you get it</th><th>Failure mode</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>At-most-once</strong></td>
+          <td>Commit the offset <em>before</em> processing</td>
+          <td><strong>Message loss</strong> — a crash after commit skips it forever</td>
+        </tr>
+        <tr>
+          <td><strong>At-least-once</strong></td>
+          <td>Commit <em>after</em> processing</td>
+          <td><strong>Duplicates</strong> — a crash before commit reprocesses</td>
+        </tr>
+        <tr>
+          <td><strong>Exactly-once</strong></td>
+          <td>Transactions, <em>or</em> at-least-once plus idempotent handling</td>
+          <td>Complexity, and narrower applicability than advertised</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The practical answer</span>
+    <p><strong>At-least-once delivery plus idempotent processing.</strong> That's what almost every production
+      system uses, and it produces an exactly-once <em>effect</em>.</p>
+    <p>Kafka's transactional exactly-once is real, and it applies to a narrower case than people assume — which
+      is the distinction worth getting right.</p>
+  </div>
+
+  <h2 id="idempotent-producer">The idempotent producer <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The problem it solves</span>
+    <p>A producer sends a message, the broker writes it, and the acknowledgement is lost in transit. The producer
+      retries — and now the message is in the log <strong>twice</strong>.</p>
+    <p>The idempotent producer fixes this: each producer gets an id, and each message carries a sequence number
+      per partition. The broker rejects a duplicate sequence number, so retries are safe.</p>
+  </div>
+
+  <pre data-label="csharp — one setting, and it should be on" class="code-good"><code class="language-csharp">var config = new ProducerConfig
+{
+    BootstrapServers = brokers,
+    EnableIdempotence = true,        // producer id + per-partition sequence numbers
+    Acks = Acks.All,                 // implied by idempotence, but be explicit
+    MessageSendMaxRetries = int.MaxValue,
+    MaxInFlight = 5                  // must be <= 5 for idempotence to hold
+};</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">What it does <em>not</em> cover</div>
+    <p style="margin:0">This is the distinction that matters. The idempotent producer prevents duplicates caused
+      by <strong>producer retries within one session</strong>. That's it.
+      <br><br>
+      It does <strong>not</strong> prevent: your application code calling <code>ProduceAsync</code> twice because
+      of a bug or a retry higher up; duplicates after a <strong>producer restart</strong>, since a new session
+      gets a new producer id; or <strong>consumer</strong> reprocessing after a crash or rebalance.
+      <br><br>
+      So enabling it is correct and free, and it solves one narrow problem. It is not "Kafka has exactly-once
+      now" — and treating it that way is a common misreading.</p>
+  </div>
+
+  <h2 id="transactions">Kafka transactions <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What they actually do</span>
+    <p>A transaction lets a producer write to several partitions <em>and</em> commit consumer offsets
+      <strong>atomically</strong>.</p>
+    <p>That makes the <strong>consume → transform → produce</strong> pattern exactly-once: either the output
+      messages and the offset commit both land, or neither does.</p>
+  </div>
+
+  <pre data-label="csharp — the consume-transform-produce pattern"><code class="language-csharp">producer.InitTransactions(TimeSpan.FromSeconds(10));
+
+while (!ct.IsCancellationRequested)
+{
+    var result = consumer.Consume(ct);
+    if (result is null) continue;
+
+    producer.BeginTransaction();
+    try
+    {
+        var output = Transform(result.Message.Value);
+        producer.Produce("orders-enriched", new Message&lt;string, string&gt;
+        {
+            Key = result.Message.Key, Value = output
+        });
+
+        // The offset commit is PART of the transaction
+        producer.SendOffsetsToTransaction(
+            [new TopicPartitionOffset(result.TopicPartition, result.Offset + 1)],
+            consumer.ConsumerGroupMetadata, TimeSpan.FromSeconds(10));
+
+        producer.CommitTransaction();
+    }
+    catch
+    {
+        producer.AbortTransaction();
+        throw;
+    }
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Transactions only cover Kafka — this is the limit people miss</div>
+    <p style="margin:0">Kafka transactions are atomic <strong>across Kafka partitions and offsets</strong>.
+      Nothing else.
+      <br><br>
+      So if your consumer writes to SQL Server and then commits the offset, <strong>the transaction gives you
+      nothing</strong> — the database write is outside its scope. A crash between the database commit and the
+      offset commit means reprocessing, and the database write happens twice.
+      <br><br>
+      Which is the overwhelmingly common case: most consumers write to a database, not to another topic.
+      <br><br>
+      So the honest position: <strong>Kafka's exactly-once applies to stream processing</strong> — reading a
+      topic, transforming, writing a topic. For consumers with external side effects you're back to
+      <strong>at-least-once plus idempotency</strong>, and the transaction machinery buys you nothing while
+      costing throughput.
+      <br><br>
+      Being able to state that boundary precisely is one of the strongest Kafka signals available, because
+      "Kafka supports exactly-once" is widely repeated without the qualifier.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Your consumer writes to</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Another Kafka topic</strong></td><td>Transactions — genuine exactly-once</td></tr>
+        <tr><td><strong>A database</strong></td><td><strong>At-least-once + idempotent write.</strong> Transactions don't help</td></tr>
+        <tr><td><strong>An external API</strong></td><td>At-least-once + an idempotency key on the API</td></tr>
+        <tr><td><strong>Sending email or SMS</strong></td><td>At-least-once + a dedupe record before sending</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Consumers must opt in to see only committed data</div>
+    <p style="margin:0">Transactional writes are visible to consumers by default, even before commit. To read
+      only committed data you must set <code>isolation.level=read_committed</code>.
+      <br><br>
+      With the default <code>read_uncommitted</code>, a consumer sees messages from transactions that later
+      <strong>abort</strong> — so you get data that was explicitly rolled back.
+      <br><br>
+      That's a genuine footgun: the producer side is configured carefully for exactly-once and the consumer
+      quietly reads uncommitted output. Both ends have to be configured.</p>
+  </div>
+
+  <h2 id="consumer-idempotency">Making consumers idempotent <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — dedupe and work in one database transaction" class="code-good"><code class="language-csharp">public async Task ConsumeAsync(ConsumeResult&lt;string, string&gt; result, CancellationToken ct)
+{
+    // A natural key from the log position - stable across redeliveries
+    var messageKey = $"{result.Topic}:{result.Partition.Value}:{result.Offset.Value}";
+
+    await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+    _db.ProcessedMessages.Add(new ProcessedMessage(messageKey, DateTime.UtcNow));
+    try
+    {
+        await _db.SaveChangesAsync(ct);          // unique constraint on messageKey
+    }
+    catch (DbUpdateException) when (IsUniqueViolation)
+    {
+        return;                                  // already processed
+    }
+
+    await ApplyAsync(result.Message, ct);        // the actual work
+    await _db.SaveChangesAsync(ct);
+    await tx.CommitAsync(ct);                    // both commit together
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Topic-partition-offset is a good dedupe key</div>
+    <p style="margin:0">Unlike a queue message id, Kafka gives you a <strong>naturally stable identifier</strong>
+      for free: the combination of topic, partition and offset uniquely identifies a message in the log, and it's
+      identical on every redelivery.
+      <br><br>
+      One caveat: it identifies a <em>log position</em>, not a logical event. If the producer published the same
+      logical event twice — at different offsets — dedupe by position won't catch it. For that you need a business
+      key or an event id in the payload.
+      <br><br>
+      So: <strong>offset-based dedupe protects against redelivery; a payload event id protects against duplicate
+      publication.</strong> Which you need depends on whether the producer is idempotent, and knowing the
+      difference is worth stating.</p>
+  </div>
+
+  <h2 id="ordering">What ordering actually guarantees <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Guaranteed</th><th>Not guaranteed</th></tr></thead>
+      <tbody>
+        <tr><td>Order within a partition</td><td><strong>Order across partitions</strong></td></tr>
+        <tr><td>Order for a given key (same partition)</td><td>Order across a topic</td></tr>
+        <tr><td>Offsets increase monotonically per partition</td><td>That a message is processed exactly once</td></tr>
+        <tr><td>A consumer reads a partition in order</td><td><strong>That it won't reprocess after a rebalance</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A rebalance can cause reprocessing even with correct code</div>
+    <p style="margin:0">When a consumer joins, leaves or is deemed dead, Kafka <strong>rebalances</strong> —
+      reassigning partitions across the group.
+      <br><br>
+      If a consumer was mid-batch and hadn't committed, the partition moves to another consumer which
+      <strong>starts from the last committed offset</strong> — so those messages are processed again, by a
+      different consumer.
+      <br><br>
+      That's correct behaviour and unavoidable. It means <strong>idempotency isn't only about crashes</strong> —
+      routine deployments trigger rebalances, so every rolling deploy is an opportunity for reprocessing.
+      <br><br>
+      Two mitigations. Commit more frequently, which narrows the window at the cost of more commit overhead. And
+      handle <code>PartitionsRevoked</code> to commit before releasing the partition, which makes a graceful
+      handover clean.
+      <br><br>
+      But the durable answer is idempotency, because an ungraceful failure has no handover at all.</p>
+  </div>
+
+  <pre data-label="csharp — commit on revocation for a clean handover" class="code-good"><code class="language-csharp">var consumer = new ConsumerBuilder&lt;string, string&gt;(config)
+    .SetPartitionsRevokedHandler((c, partitions) =&gt;
+    {
+        // Losing these partitions - commit what we've finished
+        try { c.Commit(); }
+        catch (KafkaException ex) { _logger.LogWarning(ex, "Commit on revoke failed"); }
+    })
+    .Build();</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Cooperative rebalancing reduces the disruption</div>
+    <p style="margin:0">The classic strategy is <strong>eager</strong>: every consumer stops and gives up all
+      partitions, then everything is reassigned. So adding one consumer briefly halts the entire group — a
+      "stop-the-world" rebalance.
+      <br><br>
+      <code>partition.assignment.strategy=CooperativeSticky</code> only moves the partitions that need to move,
+      and consumers keep processing the rest. On a large group that's the difference between a brief hiccup and a
+      multi-second stall on every deployment.
+      <br><br>
+      It's the default in newer clients and worth verifying explicitly, because an eager rebalance on a group of
+      thirty consumers during a rolling deploy is a visible latency spike.</p>
+  </div>
+
+  <h2 id="dead-letter">Dead-lettering in Kafka <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">There is no built-in mechanism</span>
+    <p>Kafka has no dead-letter queue. An offset is a position, so you cannot mark one message as failed and
+      continue past it — committing past a message acknowledges it.</p>
+    <p>So dead-lettering is something you <strong>implement</strong>.</p>
+  </div>
+
+  <pre data-label="csharp — the pattern you have to write yourself" class="code-good"><code class="language-csharp">try
+{
+    await ApplyAsync(result.Message, ct);
+}
+catch (Exception ex) when (IsPermanent(ex))
+{
+    // Produce to an error topic WITH enough context to diagnose and replay
+    await producer.ProduceAsync("orders.dlq", new Message&lt;string, string&gt;
+    {
+        Key = result.Message.Key,
+        Value = result.Message.Value,
+        Headers = new Headers
+        {
+            { "original-topic",     Encoding.UTF8.GetBytes(result.Topic) },
+            { "original-partition", Encoding.UTF8.GetBytes(result.Partition.Value.ToString()) },
+            { "original-offset",    Encoding.UTF8.GetBytes(result.Offset.Value.ToString()) },
+            { "error",              Encoding.UTF8.GetBytes(ex.Message) },
+            { "traceparent",        Encoding.UTF8.GetBytes(Activity.Current?.Id ?? "") },
+            { "failed-at",          Encoding.UTF8.GetBytes(DateTime.UtcNow.ToString("O")) }
+        }
+    }, ct);
+}
+
+consumer.StoreOffset(result);   // commit either way, so the partition progresses</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the ordering consequence of dead-lettering</div>
+    <p style="margin:0">Committing past a failed message <strong>breaks the ordering guarantee for that key</strong>.
+      If message 5 for customer A is dead-lettered and message 6 is processed, then A's events have been applied
+      out of order — and if you later replay message 5, it applies <em>after</em> 6.
+      <br><br>
+      That may be fine, or it may corrupt state, depending entirely on whether the handlers are commutative.
+      <br><br>
+      So dead-lettering in Kafka is a <strong>deliberate choice of availability over ordering</strong>, per
+      partition. The alternative — halting the partition until the message is fixed — preserves ordering and
+      stops all progress for every key in that partition.
+      <br><br>
+      Knowing that this is a trade-off with no free option, rather than a feature to configure, is the senior
+      answer. And it's a reason to prefer <strong>state-based over delta-based messages</strong>: if the payload
+      says "quantity is now 5" rather than "add 2", replaying out of order is harmless.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Retry topics, and their cost</div>
+    <p style="margin:0">A common pattern is tiered retry topics — <code>orders.retry.5m</code>,
+      <code>orders.retry.1h</code> — with a consumer that waits before reprocessing. That gives delayed retry,
+      which Kafka has no native support for.
+      <br><br>
+      The cost is that a message moved to a retry topic has <strong>left its original partition</strong>, so it
+      has lost all ordering relationship with its siblings. And you've added topics and consumers to operate.
+      <br><br>
+      It works, and it's a lot of machinery to reproduce something Service Bus does natively with
+      <code>ScheduleMessageAsync</code>. Worth mentioning as a reason the broker choice matters.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>At-least-once plus idempotency is the practical answer for almost every consumer.</li>
+      <li>The idempotent producer only prevents duplicates from producer retries in one session.</li>
+      <li>Kafka transactions are atomic across Kafka partitions and offsets — nothing external.</li>
+      <li>If the consumer writes to a database, transactions buy you nothing.</li>
+      <li>Consumers need <code>read_committed</code> or they see aborted transactions.</li>
+      <li>Topic-partition-offset is a good dedupe key for redelivery; a payload event id for duplicate
+        publication.</li>
+      <li>Rebalances cause reprocessing, so every rolling deploy exercises your idempotency.</li>
+      <li>Commit on <code>PartitionsRevoked</code>, and use cooperative rebalancing.</li>
+      <li>Kafka has no dead-letter queue — you build it with an error topic.</li>
+      <li>Dead-lettering trades ordering for availability, per partition.</li>
+      <li>State-based messages make out-of-order replay harmless.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Believing <code>EnableIdempotence</code> gives end-to-end exactly-once.</strong></li>
+    <li><strong>Using transactions with a database consumer</strong> and assuming it's covered.</li>
+    <li><strong>Leaving <code>isolation.level</code> at <code>read_uncommitted</code></strong>, so aborted data
+      is read.</li>
+    <li><strong>Non-idempotent consumers</strong>, so every rebalance duplicates work.</li>
+    <li><strong>Not committing on partition revocation.</strong></li>
+    <li><strong>Eager rebalancing</strong> on a large consumer group.</li>
+    <li><strong>No error topic</strong>, so a poison message blocks the partition forever.</li>
+    <li><strong>Dead-lettering without considering the ordering break.</strong></li>
+    <li><strong>Delta-based messages</strong> that can't tolerate replay.</li>
+    <li><strong>A dedupe table that's never pruned.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Does Kafka support exactly-once delivery? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Yes, with a significant qualifier that's usually left off: <strong>Kafka's exactly-once applies to
+          Kafka-to-Kafka processing</strong>, not to your consumer's side effects."</p>
+        <p>"Let me separate the three things people conflate."</p>
+        <p>"<strong>The idempotent producer</strong> — <code>enable.idempotence=true</code> — gives each producer
+          an id and each message a per-partition sequence number, so the broker rejects duplicates. That solves
+          exactly one problem: a producer retry after a lost acknowledgement writing the message twice. It does
+          <em>not</em> cover your application calling produce twice, a producer restart, or any consumer-side
+          reprocessing. It's free and correct and narrow."</p>
+        <p>"<strong>Kafka transactions</strong> are the real exactly-once mechanism. A producer can write to
+          several partitions and commit consumer offsets <strong>atomically</strong> — so for consume, transform,
+          produce, either the output and the offset commit both land or neither does. That genuinely is
+          exactly-once for stream processing."</p>
+        <p>"<strong>But the transaction only spans Kafka.</strong> If my consumer reads a topic and writes to SQL
+          Server, the database write is outside the transaction's scope. A crash between the database commit and
+          the offset commit means reprocessing, and the row is written twice. The transaction machinery gives me
+          nothing while costing throughput."</p>
+        <p>"And that's the overwhelmingly common case — most consumers write to a database or call an API, not to
+          another topic."</p>
+        <p>"So the practical answer: <strong>at-least-once delivery plus idempotent processing</strong>, which
+          produces an exactly-once effect. I'd implement that with a dedupe record committed in the
+          <em>same database transaction</em> as the work — if the dedupe record commits separately, a crash
+          between them marks the message processed when it wasn't, turning duplicate delivery into lost work,
+          which is worse."</p>
+        <p>"Kafka helps here: <strong>topic-partition-offset is a naturally stable dedupe key</strong>, identical
+          on every redelivery, so you don't need the producer to supply a message id. Though note that identifies
+          a log <em>position</em> — if the producer published the same logical event at two offsets, you'd need a
+          business key in the payload to catch that."</p>
+        <p>"One configuration detail worth flagging: if you do use transactions, consumers must set
+          <strong><code>isolation.level=read_committed</code></strong>. The default is
+          <code>read_uncommitted</code>, so a consumer will see messages from transactions that later
+          <em>abort</em> — data that was explicitly rolled back. Configuring the producer carefully for
+          exactly-once and leaving the consumer at the default is a real and quiet failure."</p>
+        <p>"And I'd mention that <strong>rebalances cause reprocessing too</strong>, not just crashes. Adding a
+          consumer, or a rolling deployment, triggers a rebalance — an uncommitted partition moves to another
+          consumer which restarts from the last committed offset. So every deploy exercises your idempotency,
+          which is a good argument for it being real rather than theoretical."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you separate idempotent producer from transactions?</li>
+        <li>Do you know transactions don't cover external writes?</li>
+        <li>Do you land on at-least-once plus idempotency?</li>
+        <li>Do you know the same-transaction dedupe requirement?</li>
+        <li>Do you know about <code>read_committed</code>?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "yes, just enable idempotence".</li>
+        <li><span class="redflag">Red flag:</span> "no, exactly-once is impossible" with no nuance.</li>
+        <li><span class="redflag">Red flag:</span> assuming transactions cover a database write.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the throughput cost of transactions?</li>
+          <li>How would you dedupe if the producer isn't idempotent?</li>
+          <li>How do you prune the dedupe table?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A message keeps failing and it's blocking the partition. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is a structural gap in Kafka rather than a misconfiguration, so I'd start by naming why it
+          happens: <strong>an offset is a position, not a per-message acknowledgement.</strong> Committing offset
+          6 implicitly acknowledges everything before it. So there is no way to skip message 5 and continue —
+          committing past it <em>is</em> acknowledging it."</p>
+        <p>"That's why Kafka has no dead-letter queue. Service Bus can mark one message dead and move on because
+          it tracks per-message state; Kafka tracks one integer per consumer group."</p>
+        <p>"So the options, and none of them are free."</p>
+        <p>"<strong>1. Halt the partition and alert.</strong> Stop consuming, page someone, fix the underlying
+          problem, resume. Preserves ordering perfectly and stops all progress for <em>every</em> key in that
+          partition — so one bad order for one customer blocks thousands of unrelated customers. Rarely
+          acceptable."</p>
+        <p>"<strong>2. Produce to an error topic and commit anyway.</strong> This is what most systems do — the
+          hand-built equivalent of dead-lettering. Catch the permanent failure, produce the message to
+          <code>orders.dlq</code> with headers carrying the original topic, partition, offset, the exception and
+          the trace id, then commit the offset so the partition progresses."</p>
+        <p>"<strong>3. Tiered retry topics</strong> for delayed retry, since Kafka has no native scheduled
+          delivery. A consumer on <code>orders.retry.5m</code> waits then reprocesses. It works and it's a lot of
+          machinery to reproduce something Service Bus does with one method call."</p>
+        <p>"The consequence I'd make explicit, because it's the part usually missed: <strong>option 2 breaks the
+          ordering guarantee for that key.</strong> If message 5 for customer A is dead-lettered and message 6 is
+          processed, A's events have been applied out of order — and replaying 5 later applies it <em>after</em>
+          6."</p>
+        <p>"Whether that's acceptable depends entirely on whether the handlers are commutative. Which is a strong
+          argument for <strong>state-based rather than delta-based messages</strong>: if the payload says
+          'quantity is now 5', out-of-order replay is harmless. If it says 'add 2', it corrupts the total."</p>
+        <p>"So <strong>dead-lettering in Kafka is choosing availability over ordering, per partition</strong>, and
+          that should be a deliberate decision rather than a default someone configured."</p>
+        <p>"Practically I'd also: <strong>validate at the boundary</strong> so a message that can't be
+          deserialised goes straight to the error topic on the first attempt rather than being retried three
+          times while blocking; <strong>distinguish transient from permanent</strong> so I'm not dead-lettering a
+          message that failed because a dependency was briefly down; <strong>alert on error-topic depth greater
+          than zero</strong>, because an unmonitored error topic is silent data loss; and <strong>build the replay
+          tooling up front</strong>, since the whole point is reprocessing after a fix and teams discover during
+          an incident that they never wrote it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <em>why</em> Kafka can't skip a message?</li>
+        <li>Do you know dead-lettering is something you build?</li>
+        <li>Do you spot the ordering break?</li>
+        <li>Do you connect it to state-vs-delta message design?</li>
+        <li>Do you plan monitoring and replay?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "use the dead-letter queue" — Kafka has none.</li>
+        <li><span class="redflag">Red flag:</span> skipping the message with no ordering discussion.</li>
+        <li><span class="redflag">Red flag:</span> retrying forever.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you replay from the error topic safely?</li>
+          <li>What if the failure is a schema change?</li>
+          <li>Would Service Bus have been a better choice here?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

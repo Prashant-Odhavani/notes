@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Procedures, Views, Functions &amp; Triggers — SQL</title>
+<meta name="description" content="When server-side logic helps and when it hurts: stored procedures, views, scalar vs table-valued functions, and why triggers cause outages.">
+<meta name="keywords" content="stored procedure view indexed view scalar function table-valued function inline UDF multi-statement TVF trigger SET NOCOUNT ON dynamic SQL sp_executesql SQL injection temp table table variable RAISERROR THROW TRY CATCH">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/programmability.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Procedures, Views, Functions &amp; Triggers</h1>
+    <p class="subtitle">Server-side logic. Some of it is genuinely valuable; some of it is the reason a query
+      is 100× slower than it should be.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Scalar UDFs are the biggest hidden performance killer in SQL Server.</strong> One in a
+        <code>WHERE</code> clause runs per row and blocks parallelism.</li>
+      <li><strong>Inline table-valued functions are fine.</strong> Multi-statement TVFs are not — they're a
+        black box to the optimiser.</li>
+      <li><strong>Views don't store data or improve performance.</strong> They're names for queries. Only
+        <em>indexed</em> views materialise.</li>
+      <li><strong>Triggers run inside your transaction</strong>, invisibly, on every write. Treat them as a
+        last resort.</li>
+      <li><strong>Always <code>SET NOCOUNT ON</code></strong> in procedures — it removes a network round trip
+        per statement.</li>
+      <li><strong>Dynamic SQL:</strong> <code>sp_executesql</code> with parameters, never string
+        concatenation.</li>
+      <li><strong>The stored-proc-vs-ORM debate is mostly settled</strong> — use both, for what each is good
+        at.</li>
+    </ul>
+  </div>
+
+  <h2 id="udfs">Scalar functions — the performance trap <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A scalar UDF looks like a normal function call. But before SQL Server 2019 it was
+      <strong>interpreted, row by row</strong> — like calling a method inside a loop over a million rows, with
+      no ability to see inside it.</p>
+  </div>
+
+  <pre data-label="sql — looks harmless" class="code-bad"><code class="language-sql">CREATE FUNCTION dbo.GetCustomerTier(@customerId int)
+RETURNS varchar(20)
+AS
+BEGIN
+    DECLARE @total decimal(19,4);
+    SELECT @total = SUM(Total) FROM [Order] WHERE CustomerId = @customerId;
+    RETURN CASE WHEN @total &gt; 10000 THEN 'Gold'
+                WHEN @total &gt; 1000  THEN 'Silver'
+                ELSE 'Bronze' END;
+END;
+GO
+
+-- Runs the function - and its aggregate query - ONCE PER CUSTOMER ROW
+SELECT Id, Name, dbo.GetCustomerTier(Id) AS Tier
+FROM   Customer;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Why it's slow</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Per-row execution</strong></td><td>100,000 customers = 100,000 executions of that inner query</td></tr>
+        <tr><td><strong>No parallelism</strong></td><td>A scalar UDF makes the <em>whole query plan</em> serial, even the parts that don't use it</td></tr>
+        <tr><td><strong>Invisible cost</strong></td><td>Pre-2019 the plan shows the UDF as almost free. The real cost doesn't appear anywhere</td></tr>
+        <tr><td><strong>Kills SARGability</strong></td><td>A UDF in <code>WHERE</code> means no index seek</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="sql — the same logic, set-based" class="code-good"><code class="language-sql">SELECT c.Id, c.Name,
+       CASE WHEN t.Total &gt; 10000 THEN 'Gold'
+            WHEN t.Total &gt; 1000  THEN 'Silver'
+            ELSE 'Bronze' END AS Tier
+FROM Customer c
+LEFT JOIN (
+    SELECT CustomerId, SUM(Total) AS Total
+    FROM   [Order]
+    GROUP BY CustomerId
+) t ON t.CustomerId = c.Id;</code></pre>
+
+  <div class="note info">
+    <div class="note-title">SQL Server 2019+ improved this — with conditions</div>
+    <p style="margin:0"><strong>Scalar UDF inlining</strong> (compatibility level 150+) rewrites simple scalar
+      UDFs into the calling query, so they can be optimised and parallelised properly.
+      <br><br>
+      But it only applies to <strong>inlineable</strong> functions — no loops, no cursors, no
+      <code>EXEC</code>, no time-dependent functions, no aggregates in some cases. A complex UDF still runs
+      per row.
+      <br><br>
+      So the honest answer in an interview is: "much better on 2019+ at compatibility level 150, but I'd still
+      check <code>sys.sql_modules.is_inlineable</code> rather than assume, and I'd prefer set-based logic
+      anyway."</p>
+  </div>
+
+  <h3 id="tvf">Inline vs multi-statement table-valued functions <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <pre data-label="sql — inline TVF: good" class="code-good"><code class="language-sql">CREATE FUNCTION dbo.OrdersForCustomer(@customerId int)
+RETURNS TABLE
+AS
+RETURN                                    -- single statement, no BEGIN/END
+(
+    SELECT Id, CreatedUtc, Total
+    FROM   [Order]
+    WHERE  CustomerId = @customerId
+);</code></pre>
+
+  <pre data-label="sql — multi-statement TVF: avoid" class="code-bad"><code class="language-sql">CREATE FUNCTION dbo.OrdersForCustomerMS(@customerId int)
+RETURNS @r TABLE (Id int, CreatedUtc datetime2, Total decimal(19,4))
+AS
+BEGIN                                     -- BEGIN/END = multi-statement
+    INSERT @r SELECT Id, CreatedUtc, Total FROM [Order] WHERE CustomerId = @customerId;
+    RETURN;
+END;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Inline TVF</th><th>Multi-statement TVF</th></tr></thead>
+      <tbody>
+        <tr><td>Optimiser treatment</td><td><strong>Expanded into the outer query</strong>, like a view</td><td>A black box — executed separately</td></tr>
+        <tr><td>Row estimate</td><td>Accurate, from the underlying tables</td><td><strong>Fixed guess</strong> — 1 row pre-2014, 100 after</td></tr>
+        <tr><td>Predicate pushdown</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Verdict</td><td>Use freely</td><td>Avoid unless there's no alternative</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">How to tell them apart instantly</span>
+    <p><strong><code>BEGIN</code> means trouble.</strong></p>
+    <p>An inline TVF is <code>RETURNS TABLE AS RETURN (SELECT ...)</code> — no <code>BEGIN</code>. Anything
+      with <code>BEGIN...END</code> is multi-statement and opaque to the optimiser.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why the fixed estimate is so damaging</div>
+    <p style="margin:0">A multi-statement TVF that actually returns 500,000 rows is estimated at 100.
+      <br><br>
+      So the optimiser picks a nested-loop join and a tiny memory grant. Then reality arrives: 500,000
+      iterations of the loop, and a sort that spills to disk because the grant was sized for 100 rows.
+      <br><br>
+      That's not "a bit slower" — it's frequently a 100× difference, and it looks inexplicable until you know
+      the estimate is hardcoded.</p>
+  </div>
+
+  <h2 id="views">Views <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A view is a <strong>saved query with a name</strong>. It stores no data and does nothing for
+      performance — the query still runs when you select from it.</p>
+    <p>Its value is abstraction and security, not speed.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Good use</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Security boundary</strong></td><td>Grant access to a view exposing only some columns or rows, not the base table</td></tr>
+        <tr><td><strong>Hiding join complexity</strong></td><td>One name instead of a five-table join repeated everywhere</td></tr>
+        <tr><td><strong>Compatibility shim</strong></td><td>Rename or restructure a table and keep a view with the old shape</td></tr>
+        <tr><td><strong>Row-level filtering</strong></td><td>A tenant-scoped view, though a query filter is usually better</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The nested-view problem</div>
+    <p style="margin:0">Views built on views built on views. Each level looks reasonable; the flattened query
+      is a 20-table join.
+      <br><br>
+      Two consequences. The optimiser has a compile-time budget, and past a certain complexity it stops
+      searching and returns whatever it has — so you get a mediocre plan for a query nobody wrote. And you
+      often join to tables you don't need any columns from, because a lower-level view included them.
+      <br><br>
+      <strong>My rule: one level of nesting.</strong> If you need more, the logic probably belongs in a
+      procedure or a materialised table.</p>
+  </div>
+
+  <h3 id="indexed-views">Indexed views — actual materialisation</h3>
+
+  <pre data-label="sql — a view that stores its results"><code class="language-sql">CREATE VIEW dbo.vw_CustomerRevenue
+WITH SCHEMABINDING                          -- required
+AS
+SELECT CustomerId,
+       SUM(Total)   AS Revenue,
+       COUNT_BIG(*) AS Orders               -- COUNT_BIG, not COUNT
+FROM   dbo.[Order]
+GROUP BY CustomerId;
+GO
+
+CREATE UNIQUE CLUSTERED INDEX IX_vw_CustomerRevenue
+    ON dbo.vw_CustomerRevenue(CustomerId);  -- this materialises it</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Indexed views: real cost, real restrictions</div>
+    <p style="margin:0">The results are physically stored and maintained <strong>synchronously</strong> — every
+      write to <code>[Order]</code> now also updates the indexed view, <em>inside the same transaction</em>.
+      Reads get much faster; writes get slower and contend more.
+      <br><br>
+      Restrictions are significant: <code>SCHEMABINDING</code>, deterministic expressions only,
+      <code>COUNT_BIG</code> not <code>COUNT</code>, no outer joins, no subqueries, no
+      <code>DISTINCT</code>, no <code>HAVING</code>, and specific <code>SET</code> options required on every
+      connection that writes to the base tables.
+      <br><br>
+      Good for a stable, heavily-read aggregate on a table with modest write volume. Bad on a hot write path
+      — there, an async read model is the better trade.</p>
+  </div>
+
+  <h2 id="procedures">Stored procedures <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="sql — a procedure written properly" class="code-good"><code class="language-sql">CREATE OR ALTER PROCEDURE dbo.usp_CreateOrder
+    @CustomerId int,
+    @Total      decimal(19,4),
+    @OrderId    int OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;                 -- no per-statement row-count messages
+    SET XACT_ABORT ON;              -- any error aborts the whole transaction
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        INSERT dbo.[Order] (CustomerId, Total, CreatedUtc)
+        VALUES (@CustomerId, @Total, SYSUTCDATETIME());
+
+        SET @OrderId = SCOPE_IDENTITY();   -- SCOPE_IDENTITY, not @@IDENTITY
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() &lt;&gt; 0 ROLLBACK TRANSACTION;
+        THROW;                      -- preserves the original error
+    END CATCH
+END;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Line</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td><code>SET NOCOUNT ON</code></td><td>Suppresses "n rows affected" messages. Each one is a network packet — in a loop that's a measurable cost</td></tr>
+        <tr><td><code>SET XACT_ABORT ON</code></td><td>Without it, some errors leave the transaction open and the procedure continues. This is the single most common source of orphaned transactions</td></tr>
+        <tr><td><code>SCOPE_IDENTITY()</code></td><td><code>@@IDENTITY</code> returns the last identity in the <em>session</em> — including one inserted by a trigger. That's a real bug, not a style point</td></tr>
+        <tr><td><code>XACT_STATE()</code></td><td>Checks whether a transaction is still rollback-able before trying</td></tr>
+        <tr><td><code>THROW</code></td><td>Re-raises with the original error number and message. <code>RAISERROR</code> loses that</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="procs-vs-orm">Procedures vs an ORM <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Stored procedures</th><th>ORM (EF Core)</th></tr></thead>
+      <tbody>
+        <tr><td>Version control</td><td>Harder — needs migration discipline</td><td>Lives with the code naturally</td></tr>
+        <tr><td>Testability</td><td>Needs a database</td><td>Unit-testable in places</td></tr>
+        <tr><td>Refactoring</td><td>No compiler help</td><td>Compiler and IDE support</td></tr>
+        <tr><td>Query control</td><td><strong>Total</strong> — hints, plan guides, exact SQL</td><td>Generated; sometimes surprising</td></tr>
+        <tr><td>Fixing prod without deploying</td><td><strong>Yes</strong></td><td>No</td></tr>
+        <tr><td>Bulk / set-based work</td><td><strong>Much better</strong></td><td>Poor — tends toward row-by-row</td></tr>
+        <tr><td>Developer speed</td><td>Slower for CRUD</td><td><strong>Much faster</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The pragmatic position</span>
+    <p><strong>ORM for CRUD and domain logic. SQL — procedure or raw query — for set-based and
+      performance-critical work.</strong></p>
+    <p>"All logic in stored procedures" and "never write SQL" are both positions that cost teams real money.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The "procedures are faster because plans are cached" claim</div>
+    <p style="margin:0">This was true long ago and isn't a meaningful advantage now. SQL Server caches plans
+      for parameterised ad-hoc queries too, and EF Core parameterises everything it generates.
+      <br><br>
+      The genuine advantages of procedures are <strong>control over the exact SQL</strong>, the ability to fix
+      a query in production without a deployment, and a smaller permissions surface — you can grant
+      <code>EXECUTE</code> on a procedure without granting table access at all.
+      <br><br>
+      Correcting the plan-cache myth is a good signal, because it's repeated constantly.</p>
+  </div>
+
+  <h2 id="dynamic-sql">Dynamic SQL <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — SQL injection, in a stored procedure" class="code-bad"><code class="language-sql">CREATE PROCEDURE dbo.usp_SearchBad @name nvarchar(100)
+AS
+BEGIN
+    DECLARE @sql nvarchar(max) =
+        N'SELECT * FROM Customer WHERE Name LIKE ''%' + @name + '%''';
+    EXEC(@sql);                     -- @name = "'; DROP TABLE Customer --"
+END;</code></pre>
+
+  <pre data-label="sql — parameterised" class="code-good"><code class="language-sql">CREATE PROCEDURE dbo.usp_Search @name nvarchar(100)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @sql nvarchar(max) =
+        N'SELECT Id, Name FROM dbo.Customer WHERE Name LIKE @p';
+
+    EXEC sp_executesql @sql,
+         N'@p nvarchar(102)',
+         @p = '%' + @name + '%';
+END;</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">A stored procedure is not automatically injection-safe</div>
+    <p style="margin:0">This is a persistent myth. Procedures are safe when they use <em>parameters</em>. A
+      procedure that concatenates strings is exactly as vulnerable as concatenating in C# — arguably worse,
+      because it usually runs with higher privileges.
+      <br><br>
+      <code>sp_executesql</code> takes parameters; <code>EXEC(@sql)</code> does not. That's the distinction.
+      <br><br>
+      For identifiers that genuinely can't be parameterised — a dynamic table or column name — validate
+      against a whitelist and wrap with <code>QUOTENAME()</code>. Never interpolate raw input into an
+      identifier position.</p>
+  </div>
+
+  <h2 id="triggers">Triggers <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A trigger is code that runs automatically on <code>INSERT</code>, <code>UPDATE</code> or
+      <code>DELETE</code> — <strong>inside the same transaction</strong> as the statement that fired it.</p>
+    <p>So it's invisible logic on your write path, and its failures are your failures.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Why triggers cause outages</div>
+    <ul style="margin:8px 0 0">
+      <li><strong>Invisible.</strong> A developer reading the C# and the procedure has no reason to suspect
+        additional work is happening.</li>
+      <li><strong>Inside your transaction.</strong> A slow trigger makes every write slow and extends lock
+        duration.</li>
+      <li><strong>Fail together.</strong> A trigger error rolls back the original statement, so a bug in
+        auditing stops orders being placed.</li>
+      <li><strong>Cascade.</strong> Triggers fire triggers, up to 32 levels. Debugging that is genuinely
+        difficult.</li>
+      <li><strong>Set-based, not row-based.</strong> <code>inserted</code> and <code>deleted</code> hold
+        <em>all</em> affected rows — a trigger written for one row silently corrupts data on a 1,000-row
+        update.</li>
+    </ul>
+  </div>
+
+  <pre data-label="sql — the row-assumption bug" class="code-bad"><code class="language-sql">CREATE TRIGGER trg_Order_Audit ON dbo.[Order] AFTER UPDATE
+AS
+BEGIN
+    DECLARE @id int;
+    SELECT @id = Id FROM inserted;      -- 1000 rows updated -> ONE arbitrary id
+    INSERT Audit (OrderId, ChangedUtc) VALUES (@id, SYSUTCDATETIME());
+    -- 999 changes never audited, and which one you got is undefined
+END;</code></pre>
+
+  <pre data-label="sql — set-based, and safe" class="code-good"><code class="language-sql">CREATE TRIGGER trg_Order_Audit ON dbo.[Order] AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF @@ROWCOUNT = 0 RETURN;           -- cheap exit on no-op updates
+
+    INSERT dbo.Audit (OrderId, OldTotal, NewTotal, ChangedUtc)
+    SELECT i.Id, d.Total, i.Total, SYSUTCDATETIME()
+    FROM   inserted i
+    JOIN   deleted  d ON d.Id = i.Id
+    WHERE  i.Total &lt;&gt; d.Total;          -- only log actual changes
+END;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Defensible trigger uses</th><th>Better handled elsewhere</th></tr></thead>
+      <tbody>
+        <tr><td>Auditing you must guarantee even for direct SQL writes</td><td>Business logic — put it in the domain model</td></tr>
+        <tr><td>Enforcing an invariant a constraint can't express</td><td>Sending notifications — use the outbox pattern</td></tr>
+        <tr><td>Making a legacy schema work without touching old callers</td><td>Maintaining denormalized aggregates on hot tables</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Modern alternatives worth naming</div>
+    <p style="margin:0"><strong>Temporal tables</strong> (<code>SYSTEM_VERSIONING = ON</code>) give you full
+      row history maintained by the engine — no trigger to write or maintain, and it handles set-based updates
+      correctly by construction. If the requirement is "keep history of this table", that's the answer now.
+      <br><br>
+      <strong>Change Data Capture</strong> or <strong>change tracking</strong> for feeding downstream systems,
+      instead of a trigger that writes to a queue table.</p>
+  </div>
+
+  <h2 id="temp-objects">Temp tables vs table variables <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>#temp</code></th><th><code>@table</code></th></tr></thead>
+      <tbody>
+        <tr><td>Statistics</td><td><strong>Yes</strong></td><td><strong>No</strong> — estimates 1 row</td></tr>
+        <tr><td>Indexes</td><td>Any</td><td>PK/unique only</td></tr>
+        <tr><td>Transactions</td><td>Participates and rolls back</td><td><strong>Survives rollback</strong></td></tr>
+        <tr><td>Parallelism</td><td>Allowed</td><td>Forces serial in many cases</td></tr>
+        <tr><td>Best for</td><td>Anything over a few hundred rows</td><td>Small sets; table-valued parameters</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Table variables estimate one row no matter what they contain.</strong></p>
+    <p>Put 200,000 rows in one and the optimiser still plans for one — nested loops, tiny memory grant, spills.
+      Default to <code>#temp</code> unless you specifically need a table-valued parameter.</p>
+    <p>The rollback difference is occasionally useful: a table variable keeps its contents after a rollback, so
+      you can record what went wrong.</p>
+  </div>
+
+  <h2 id="error-handling">Error handling <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="sql — capture details, then rethrow"><code class="language-sql">BEGIN TRY
+    -- work
+END TRY
+BEGIN CATCH
+    IF XACT_STATE() &lt;&gt; 0 ROLLBACK TRANSACTION;
+
+    INSERT dbo.ErrorLog (Number, Severity, Procedure_, Line, Message, OccurredUtc)
+    VALUES (ERROR_NUMBER(), ERROR_SEVERITY(), ERROR_PROCEDURE(),
+            ERROR_LINE(), ERROR_MESSAGE(), SYSUTCDATETIME());
+
+    THROW;                          -- rethrow unchanged for the caller
+END CATCH</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">What <code>TRY...CATCH</code> does not catch</div>
+    <p style="margin:0">Compile errors, most severity-20+ errors, and <strong>connection-level
+      failures</strong> such as a timeout or a killed session.
+      <br><br>
+      That last one matters: a command timeout in .NET doesn't run your <code>CATCH</code> block, so the
+      transaction can be left open until the connection is reset. <code>SET XACT_ABORT ON</code> is the
+      mitigation, and it's why it belongs in every procedure that opens a transaction.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Scalar UDFs run per row and force a serial plan. Inlining in 2019+ helps only if the function
+        qualifies.</li>
+      <li>Inline TVFs are expanded like views. Multi-statement TVFs are black boxes with a hardcoded row
+        estimate.</li>
+      <li><code>BEGIN</code> in a function body means multi-statement — that's the tell.</li>
+      <li>Views store nothing. Only indexed views materialise, synchronously, at write cost.</li>
+      <li>Limit view nesting to one level.</li>
+      <li><code>SET NOCOUNT ON</code> and <code>SET XACT_ABORT ON</code> in every procedure.</li>
+      <li><code>SCOPE_IDENTITY()</code>, never <code>@@IDENTITY</code>.</li>
+      <li>Procedures are only injection-safe if they use parameters. <code>sp_executesql</code>, not
+        <code>EXEC</code>.</li>
+      <li>Triggers are set-based and run in your transaction. Prefer temporal tables for history.</li>
+      <li><code>#temp</code> for anything sizeable; table variables estimate one row.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Scalar UDF in a <code>SELECT</code> or <code>WHERE</code></strong> over a large table.</li>
+    <li><strong>Multi-statement TVF</strong> where an inline one would work.</li>
+    <li><strong>Views on views on views.</strong></li>
+    <li><strong>Missing <code>SET NOCOUNT ON</code></strong>, adding a round trip per statement.</li>
+    <li><strong>Missing <code>SET XACT_ABORT ON</code></strong>, leaving transactions open after errors.</li>
+    <li><strong><code>@@IDENTITY</code></strong> returning a trigger's identity value.</li>
+    <li><strong>String concatenation in dynamic SQL</strong> inside a procedure.</li>
+    <li><strong>Triggers assuming a single row.</strong></li>
+    <li><strong>Business logic in triggers</strong>, invisible to everyone reading the application.</li>
+    <li><strong>Table variables holding large result sets.</strong></li>
+    <li><strong><code>RAISERROR</code> instead of <code>THROW</code></strong>, losing the original error.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Why are scalar functions a performance problem? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Three reasons, and the third is the one that catches people."</p>
+        <p>"<strong>Per-row execution.</strong> A scalar UDF in a <code>SELECT</code> list or
+          <code>WHERE</code> clause is invoked once per row. If it contains a query — say an aggregate over
+          another table — you've turned one query into a million."</p>
+        <p>"<strong>It forces a serial plan.</strong> This is the big one. A scalar UDF anywhere in the query
+          makes the <em>entire plan</em> serial, including the parts that have nothing to do with the function.
+          So a query that would have used eight cores now uses one."</p>
+        <p>"<strong>The cost is invisible.</strong> Pre-2019, execution plans attribute almost no cost to the
+          UDF. So you look at the plan, see nothing obviously wrong, and the query is still slow. You have to
+          know to look for it — that's why it's such a common hidden problem."</p>
+        <p>"There's also a SARGability angle: a UDF wrapped around an indexed column in <code>WHERE</code>
+          means no index seek, because the index is sorted by the raw value, not the function's output."</p>
+        <p>"The fix is to make it set-based — usually rewriting the function's logic as a join to a derived
+          table or a <code>CASE</code> expression in the outer query. Or convert it to an <strong>inline
+          table-valued function</strong> and <code>CROSS APPLY</code> it, because inline TVFs are expanded
+          into the calling query and optimised as one unit."</p>
+        <p>"On SQL Server 2019 and later there's <strong>scalar UDF inlining</strong> at compatibility level
+          150, which rewrites simple scalar UDFs into the query and largely fixes this. But it only applies to
+          <em>inlineable</em> functions — no loops, no cursors, no <code>EXEC</code>, various other
+          restrictions. So I'd check <code>sys.sql_modules.is_inlineable</code> rather than assume it's handled,
+          and I'd still write it set-based if I had the choice."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know about the serial plan, not just per-row execution?</li>
+        <li>Do you know the cost is hidden in the plan?</li>
+        <li>Are you aware of 2019 inlining <em>and</em> its limits?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Inline vs multi-statement TVF?</li>
+          <li>How would you find scalar UDFs hurting a workload?</li>
+          <li>Rewrite this UDF set-based.</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you use a trigger? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Rarely, and I'd want a specific reason — because triggers are invisible logic on the write path."</p>
+        <p>"The problems: a trigger runs <strong>inside the transaction</strong> of the statement that fired
+          it, so it makes every write slower and holds locks longer. If it errors, the original statement rolls
+          back — meaning a bug in your audit logic stops orders being placed. They cascade up to 32 levels
+          deep, which is miserable to debug. And nobody reading the application code has any reason to know
+          they exist."</p>
+        <p>"The bug I'd specifically call out: <strong>triggers are set-based, not row-based</strong>.
+          <code>inserted</code> and <code>deleted</code> contain <em>all</em> affected rows. So
+          <code>SELECT @id = Id FROM inserted</code> works perfectly in testing with single-row updates, and
+          then a 1,000-row batch update silently audits one arbitrary row and loses 999. That's a data-loss bug
+          that passes every test."</p>
+        <p>"Where I'd still use one: <strong>auditing that must hold even for writes that bypass the
+          application</strong> — a support engineer running an <code>UPDATE</code>, a migration script, a
+          second application. That's the same argument as constraints over application validation, and it's
+          genuinely valid."</p>
+        <p>"Also enforcing an invariant a constraint can't express, or making a legacy schema change work
+          without touching old callers."</p>
+        <p>"Where I wouldn't: business logic, notifications, or maintaining denormalized aggregates on a hot
+          table. Notifications should use the outbox pattern — write the intent in the same transaction,
+          publish after commit — so a failing email doesn't roll back an order."</p>
+        <p>"And for the most common case, auditing, I'd reach for <strong>temporal tables</strong> now instead.
+          The engine maintains full row history, it handles set-based updates correctly by construction, and
+          there's no trigger code to get wrong. If the requirement is 'keep history of this table', writing a
+          trigger for it in 2024 is doing work the engine already does."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know triggers are set-based? That's the bug that matters.</li>
+        <li>Do you know they run in the caller's transaction?</li>
+        <li>Do you know temporal tables exist?</li>
+        <li>Can you name a legitimate use rather than just dismissing them?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Write a correct set-based audit trigger.</li>
+          <li>How do temporal tables work?</li>
+          <li><code>INSTEAD OF</code> vs <code>AFTER</code> triggers?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Should business logic live in stored procedures or application code? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My default is <strong>domain logic in the application, set-based data work in SQL</strong> — and
+          I'd treat 'everything in procedures' and 'never write SQL' as two failure modes rather than two
+          camps."</p>
+        <p>"The case for application code: it's version-controlled with the feature that needs it, the compiler
+          helps when you refactor, it's testable without a database, and it's where the domain model lives so
+          the logic sits next to the concepts it operates on. For most business rules that's decisive."</p>
+        <p>"The case for SQL is narrower but real. <strong>Set-based work</strong> — a bulk update over a
+          million rows, a complex aggregation, a data migration. An ORM does that row by row and it's orders of
+          magnitude slower. <strong>Total control over the query</strong> when you need a specific plan, a
+          hint, or an indexed-view match. <strong>Fixing production without a deployment</strong>, which
+          occasionally matters a great deal. And <strong>a smaller permissions surface</strong> — you can grant
+          <code>EXECUTE</code> on a procedure without granting any table access, which is genuinely useful in
+          regulated environments."</p>
+        <p>"One myth I'd correct: 'procedures are faster because plans are cached'. That was true long ago.
+          SQL Server caches plans for parameterised ad-hoc queries too, and EF Core parameterises everything.
+          It's not a reason to choose procedures today."</p>
+        <p>"The concrete failure mode of all-in-procedures: logic scattered across 400 procedures with no
+          compiler checking, no unit tests, and no way to know what calls what. Renaming a column becomes a
+          text search. I've worked in that and it's very slow to change safely."</p>
+        <p>"The concrete failure mode of never-write-SQL: someone loads 50,000 entities into memory to compute
+          a sum, or a nightly job takes six hours because it does row-by-row updates through the ORM."</p>
+        <p>"So in practice: EF Core for CRUD and the domain model, raw SQL or a procedure for the handful of
+          places where set-based or plan control matters — and those live in version control as migration
+          scripts, not as objects someone edited in Management Studio, because that's the part that actually
+          causes pain."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have a defensible position, or a dogmatic one?</li>
+        <li>Can you name the failure modes of both extremes?</li>
+        <li>Do you know the plan-cache argument is outdated?</li>
+        <li>Do you raise version control for procedures?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "procedures are faster" as the main argument.</li>
+        <li><span class="redflag">Red flag:</span> "never use stored procedures" with no acknowledgement of
+          bulk operations.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you version-control procedures?</li>
+          <li>How do you do a bulk update efficiently from .NET?</li>
+          <li>How do you test a procedure?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

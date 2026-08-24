@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distributed Data &amp; Consistency — Architecture</title>
+<meta name="description" content="Idempotency, the outbox and inbox patterns, sagas, eventual consistency, dead-letter queues and why distributed transactions are avoided.">
+<meta name="keywords" content="idempotency outbox pattern inbox pattern saga compensating transaction eventual consistency dual write two phase commit distributed transaction dead letter queue CAP theorem exactly once">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="19-architecture/distributed-data.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Distributed Data &amp; Consistency</h1>
+    <p class="subtitle">What replaces transactions once your data lives in more than one place. This is the
+      highest-value page in the section for interviews.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Dual write</strong> — writing to a database and a message broker in one method. Not
+        atomic. This is the bug the outbox exists to fix.</li>
+      <li><strong>Outbox</strong> — write the event to a table in the same transaction, dispatch it
+        separately. Guarantees the event is never lost.</li>
+      <li><strong>Inbox</strong> — record processed message IDs so a redelivery is skipped. That's
+        idempotency for consumers.</li>
+      <li><strong>Idempotency</strong> — doing it twice has the same effect as once. Mandatory with
+        at-least-once delivery.</li>
+      <li><strong>Saga</strong> — a multi-step process across services with compensating actions instead of
+        rollback.</li>
+      <li>Exactly-once delivery doesn't exist. You get at-least-once <em>delivery</em> plus idempotent
+        <em>processing</em>, which behaves like exactly-once.</li>
+    </ul>
+  </div>
+
+  <h2 id="dual-write">Start with the bug: the dual write <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>Almost everything on this page exists because of this one problem.</p>
+
+  <pre data-label="csharp — looks completely reasonable, loses data" class="code-bad"><code class="language-csharp">public async Task CompleteOrderAsync(Guid orderId, CancellationToken ct)
+{
+    var order = await _db.Orders.SingleAsync(o =&gt; o.Id == orderId, ct);
+    order.Complete();
+
+    await _db.SaveChangesAsync(ct);                          // 1. database commits
+    await _bus.PublishAsync(new OrderCompleted(orderId), ct); // 2. broker publish
+}</code></pre>
+
+  <p>Two separate systems, two separate commits, no transaction spanning them. So:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What fails</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>Publish fails after the DB commit</td><td>Order is complete, but fulfilment never hears. <strong>Silently lost work.</strong></td></tr>
+        <tr><td>Process crashes between the two lines</td><td>Same — order complete, no event</td></tr>
+        <tr><td>Swap the order (publish first)</td><td>Event published, DB commit fails. Consumers react to something that never happened. <strong>Worse.</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>You cannot make two independent systems commit atomically without a distributed transaction — and
+      distributed transactions are avoided for good reasons (see <a href="#2pc">below</a>).</p>
+    <p>So instead you make <strong>one</strong> of them the source of truth, and derive the other from it.
+      That's the outbox.</p>
+  </div>
+
+  <h2 id="outbox">The outbox pattern <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="oneline"><b>One line:</b> write the message into your own database, in the same transaction as
+    the data change, then publish it separately.</div>
+
+  <pre data-label="csharp — one transaction, two rows" class="code-good"><code class="language-csharp">public async Task CompleteOrderAsync(Guid orderId, CancellationToken ct)
+{
+    var order = await _db.Orders.SingleAsync(o =&gt; o.Id == orderId, ct);
+    order.Complete();
+
+    // Same DbContext, same transaction as the order change.
+    _db.OutboxMessages.Add(new OutboxMessage
+    {
+        Id          = Guid.NewGuid(),
+        Type        = nameof(OrderCompleted),
+        Payload     = JsonSerializer.Serialize(new OrderCompleted(orderId)),
+        OccurredUtc = DateTime.UtcNow
+    });
+
+    await _db.SaveChangesAsync(ct);   // both commit, or neither does
+}</code></pre>
+
+  <pre data-label="csharp — a separate dispatcher publishes and marks sent" class="code-good"><code class="language-csharp">public sealed class OutboxDispatcher(IServiceScopeFactory scopes, IMessageSender bus)
+    : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            using var scope = scopes.CreateScope();          // scoped DbContext per batch
+            var db = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+
+            var batch = await db.OutboxMessages
+                .Where(m =&gt; m.ProcessedUtc == null)
+                .OrderBy(m =&gt; m.OccurredUtc)                 // preserve ordering
+                .Take(50)
+                .ToListAsync(ct);
+
+            foreach (var message in batch)
+            {
+                await bus.PublishAsync(message.Type, message.Payload, ct);
+                message.ProcessedUtc = DateTime.UtcNow;
+                await db.SaveChangesAsync(ct);   // mark after publish
+            }
+
+            if (batch.Count == 0) await Task.Delay(TimeSpan.FromSeconds(1), ct);
+        }
+    }
+}</code></pre>
+
+  <p><strong>Why this is correct:</strong> the event and the state change commit together, so the event can
+    never be lost. The dispatcher can crash, restart, or run twice — the message is safely in the table until
+    it's marked sent.</p>
+
+  <div class="note warn">
+    <div class="note-title">What you've traded</div>
+    <p style="margin:0">The outbox gives you <strong>at-least-once</strong> delivery, not exactly-once. If
+      the dispatcher publishes and then crashes before marking the row, the message is published again on
+      restart.
+      <br><br>
+      That's fine — and it's the correct trade. Duplicate delivery is recoverable if consumers are
+      idempotent. Lost messages are not recoverable at all.</p>
+  </div>
+
+  <h3 id="outbox-ops">Operating an outbox</h3>
+
+  <ul>
+    <li><strong>Monitor the age of the oldest unsent row</strong>, not the count. If it's growing, the
+      dispatcher is stuck or the broker is down.</li>
+    <li><strong>Purge processed rows</strong> on a schedule, or the table grows forever and the polling query
+      slows down.</li>
+    <li><strong>Index on <code>(ProcessedUtc, OccurredUtc)</code></strong> — the dispatcher query runs
+      constantly.</li>
+    <li><strong>Handle multiple dispatcher instances</strong> — use a lock, a lease column, or
+      <code>UPDLOCK/READPAST</code> so two instances don't publish the same row.</li>
+    <li><strong>Polling vs change feed:</strong> polling is simple and works everywhere. Some databases let
+      you tail the log instead (SQL Server CDC, Postgres logical replication, Cosmos change feed), which
+      lowers latency at the cost of more infrastructure.</li>
+  </ul>
+
+  <h2 id="idempotency">Idempotency <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Idempotent means: <strong>doing it twice has the same effect as doing it once.</strong></p>
+    <p>Once you accept at-least-once delivery, this stops being optional. It's what makes duplicates
+      harmless.</p>
+  </div>
+
+  <p>Four ways to achieve it, roughly in order of preference:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>How</th><th>Best for</th></tr></thead>
+      <tbody>
+        <tr><td>Naturally idempotent operation</td><td><code>SET status = 'Shipped'</code> rather than <code>status = status + 1</code></td><td>State assignment. The cheapest option — no extra machinery</td></tr>
+        <tr><td>Inbox / dedupe table</td><td>Record processed message IDs; skip if seen</td><td>Message consumers</td></tr>
+        <tr><td>Idempotency key</td><td>Caller supplies a key; you store the result and replay it</td><td>Public APIs, payments</td></tr>
+        <tr><td>Conditional write</td><td>Optimistic concurrency / ETag / <code>WHERE version = @expected</code></td><td>Anything with a version, and stale-update prevention</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="inbox">The inbox pattern</h3>
+
+  <pre data-label="csharp — dedupe and process in one transaction" class="code-good"><code class="language-csharp">public async Task HandleAsync(OrderCompleted message, Guid messageId, CancellationToken ct)
+{
+    // Fast path: already handled.
+    if (await _db.InboxMessages.AnyAsync(m =&gt; m.Id == messageId, ct))
+        return;
+
+    await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+    // Record and process TOGETHER, so a crash can't record without processing.
+    _db.InboxMessages.Add(new InboxMessage { Id = messageId, ProcessedUtc = DateTime.UtcNow });
+    await DoTheWorkAsync(message, ct);
+
+    await _db.SaveChangesAsync(ct);
+    await tx.CommitAsync(ct);
+}</code></pre>
+
+  <p>Two details that matter:</p>
+
+  <ul>
+    <li>The inbox row and the actual work must be in the <strong>same transaction</strong>. Recording first
+      and processing after means a crash in between loses the work permanently.</li>
+    <li>The initial <code>AnyAsync</code> check is an optimisation, not the guarantee. Two concurrent
+      deliveries can both pass it — so the <strong>primary key on <code>InboxMessages.Id</code></strong> is
+      what actually enforces uniqueness. One of them will fail on insert, which is correct.</li>
+  </ul>
+
+  <h3 id="idempotency-key">Idempotency keys for APIs</h3>
+
+  <pre data-label="http — the caller supplies the key so retries are safe"><code class="language-http">POST /api/payments
+Idempotency-Key: 7f3a9c21-4e8b-11ee-be56-0242ac120002
+Content-Type: application/json
+
+{ "orderId": "...", "amount": 4999, "currency": "GBP" }</code></pre>
+
+  <p>The server stores the key with the response. A repeat with the same key returns the
+    <strong>stored response</strong> rather than charging again. This is exactly how Stripe and most payment
+    providers work, and it's why retrying a payment after a timeout is safe with them.</p>
+
+  <div class="note danger">
+    <div class="note-title">Production trap</div>
+    <p style="margin:0">The dangerous window is a <strong>timeout</strong>, because you genuinely don't know
+      whether the operation succeeded. The request may have completed server-side and only the response was
+      lost.
+      <br><br>
+      Without an idempotency key, retrying is a coin flip between "failed request" and "charged twice". With
+      one, the retry is safe by construction — and this is the single most valuable thing to say in a
+      payments interview question.</p>
+  </div>
+
+  <h2 id="saga">Sagas <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="oneline"><b>One line:</b> a business process across several services, where each step has a
+    compensating action instead of a rollback.</div>
+
+  <p>You can't roll back a transaction another service already committed. So instead of undoing, you
+    <strong>do something that counteracts it</strong>.</p>
+
+  <pre data-label="an order saga with compensation" class="code-good"><code class="language-text" data-nohl>FORWARD PATH                          COMPENSATION (if a later step fails)
+─────────────────────────────         ──────────────────────────────────────
+1. Reserve stock             ────▶    Release stock
+2. Authorize payment         ────▶    Void / refund the authorization
+3. Create shipment           ────▶    Cancel the shipment
+4. Send confirmation                  (nothing to undo - already sent)
+
+Step 3 fails  →  run compensations for steps 2 and 1, in reverse order.</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Compensation is not rollback</div>
+    <p style="margin:0">A rollback makes it as if nothing happened. A compensation is a <em>new
+      action</em> that offsets the effect — and it's visible.
+      <br><br>
+      A refund isn't an un-charge: the customer saw the charge, their statement shows both lines, and their
+      bank may have sent an alert. Sometimes there's <em>no</em> compensation — you can't un-send an email.
+      <br><br>
+      That's why saga step order matters: <strong>put the irreversible steps last.</strong></p>
+  </div>
+
+  <h3 id="saga-styles">Orchestrated vs choreographed sagas</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Orchestrated</th><th>Choreographed</th></tr></thead>
+      <tbody>
+        <tr><td>Who drives it</td><td>A coordinator service</td><td>Each service reacts to the previous event</td></tr>
+        <tr><td>Process visibility</td><td>In one place — readable and queryable</td><td>Emergent; exists nowhere</td></tr>
+        <tr><td>"Where is order 123?"</td><td>Query the orchestrator</td><td>Check six services' logs</td></tr>
+        <tr><td>Compensation logic</td><td>Centralised, obvious home</td><td>Scattered — and easily forgotten</td></tr>
+        <tr><td>Coupling</td><td>Orchestrator knows everyone</td><td>Services only know events</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>For anything with compensation, orchestrate.</strong> The deciding factor is that someone will
+    eventually ask what state a process is in, and choreography makes that expensive. More on both styles in
+    <a href="event-driven.html#choreography-orchestration">event-driven architecture</a>.</p>
+
+  <h3 id="saga-hard-parts">The parts people forget</h3>
+
+  <ul>
+    <li><strong>The saga state must be persisted.</strong> If the orchestrator restarts mid-process, it has
+      to resume — so "which step are we on" is a database row, not memory.</li>
+    <li><strong>Compensations can fail too.</strong> They need retries, and eventually a human. A refund that
+      fails silently is worse than the original problem.</li>
+    <li><strong>Timeouts per step.</strong> A saga waiting forever for a reply is stuck invisibly. Every step
+      needs a deadline and a decision about what happens when it passes.</li>
+    <li><strong>Semantic locks.</strong> Between reserving stock and confirming, that stock is in an
+      in-between state. Make it explicit — "reserved" rather than pretending it's still available.</li>
+  </ul>
+
+  <h2 id="2pc">Why not just use distributed transactions? <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p>Two-phase commit (2PC) does exist — a coordinator asks all participants to prepare, then tells them all
+    to commit. It gives real atomicity. So why is it avoided?</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Problem</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td>Locks held across the whole protocol</td><td>Every participant holds locks until everyone agrees. Throughput collapses under load</td></tr>
+        <tr><td>Coordinator is a single point of failure</td><td>If it dies after "prepare", participants are blocked holding locks, waiting for an answer that isn't coming</td></tr>
+        <tr><td>Availability is multiplicative</td><td>The transaction needs <em>every</em> participant available. Five at 99.9% ≈ 99.5%</td></tr>
+        <tr><td>Poor support</td><td>Most modern datastores, message brokers and HTTP APIs don't participate in 2PC at all</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>The honest summary:</strong> 2PC trades availability for consistency, and does it in a way that
+    scales badly. For most business processes, a saga with eventual consistency is the better trade — the
+    business already tolerates it (an order being "processing" for thirty seconds is normal).</p>
+
+  <h2 id="eventual-consistency">Eventual consistency, practically <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="oneline"><b>One line:</b> the system converges to a consistent state, but there's a window
+    where different parts disagree.</div>
+
+  <p>The technical part is easy. The hard part is that <strong>users see the window</strong> — and that's a
+    product decision, not just a technical one.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Situation</th><th>How to handle it</th></tr></thead>
+      <tbody>
+        <tr><td>User saves, then immediately reads</td><td>Read-your-own-writes: serve that user from the write store, or return the updated value in the write response</td></tr>
+        <tr><td>List still shows the old value</td><td>Optimistic UI — display the change locally while it propagates</td></tr>
+        <tr><td>Process takes seconds</td><td>Show an explicit pending state. Honest, and it sets expectations</td></tr>
+        <tr><td>Two users edit the same thing</td><td>Optimistic concurrency with a version — detect and tell them, don't silently overwrite</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Asking <strong>"how stale is acceptable, and for whom?"</strong> before designing.
+      <br><br>
+      Most business data tolerates seconds of staleness. Some tolerates minutes. A few things — account
+      balances at the point of withdrawal, seat allocation, inventory at checkout — tolerate none, and those
+      need to stay in one transactional boundary.
+      <br><br>
+      Getting that classification right upfront is what makes the rest of the design possible.</p>
+  </div>
+
+  <h2 id="dlq">Dead-letter queues <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="oneline"><b>One line:</b> where messages go when they can't be processed, so they don't block
+    everything behind them.</div>
+
+  <p>A message can fail forever — malformed payload, a referenced entity that no longer exists, a bug. Without
+    a DLQ it's retried indefinitely and blocks the queue. That's a <strong>poison message</strong>.</p>
+
+  <p>The standard flow:</p>
+
+  <ol class="steps">
+    <li>Delivery fails; the message returns to the queue.</li>
+    <li>After N attempts (Service Bus defaults to 10 — verify current values), it moves to the DLQ.</li>
+    <li>The main queue keeps flowing. Nothing is blocked.</li>
+    <li><strong>Someone gets alerted</strong>, investigates, fixes, and replays.</li>
+  </ol>
+
+  <div class="note danger">
+    <div class="note-title">Production trap</div>
+    <p style="margin:0">Step 4 is the one teams skip. A DLQ nobody monitors is a silent data-loss bucket —
+      messages accumulate for weeks and you find out when a customer asks why their order never shipped.
+      <br><br>
+      <strong>Alert on DLQ count &gt; 0.</strong> Not a threshold — any message in the DLQ means something
+      needs a human. And build the replay tooling <em>before</em> you need it, not during the incident.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Dual writes silently lose data. The outbox is the fix, and it's not optional at scale.</li>
+      <li>Outbox gives at-least-once. That's the right trade — duplicates recover, losses don't.</li>
+      <li>Idempotency is mandatory once you have at-least-once. Inbox table, idempotency key, or a naturally idempotent operation.</li>
+      <li>Sagas compensate, they don't roll back. Put irreversible steps last.</li>
+      <li>Saga state must be persisted, and compensations need their own retries and alerting.</li>
+      <li>2PC is avoided for availability and lock-duration reasons, not because it doesn't work.</li>
+      <li>Alert on any message reaching the DLQ, and build replay tooling in advance.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Dual writes</strong> — the most common distributed data bug, and it's silent.</li>
+    <li><strong>Publishing before the commit</strong>, so consumers react to changes that roll back.</li>
+    <li><strong>No idempotency</strong>, so a redelivery double-charges or double-ships.</li>
+    <li><strong>Inbox record committed separately from the work</strong>, so a crash between them loses the
+      message permanently.</li>
+    <li><strong>Saga state held in memory</strong>, so a restart loses in-flight processes.</li>
+    <li><strong>Irreversible steps early in a saga</strong> — you can't compensate a sent email.</li>
+    <li><strong>Unmonitored DLQ.</strong></li>
+    <li><strong>Eventual consistency introduced without telling product</strong>, so users get confusing UX
+      nobody designed.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>You save to the database and publish an event. How do you guarantee both happen? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"You can't, if you do them as two separate operations — that's the dual-write problem. There's no
+          transaction spanning your database and the broker, so if the publish fails after the commit, the
+          state changed and nobody heard about it. And doing it the other way round is worse: consumers react
+          to something that then rolled back."</p>
+        <p>"The fix is the <strong>outbox pattern</strong>. Instead of publishing directly, I insert the event
+          into an Outbox table in my own database, in the same transaction as the state change. Now they're
+          atomic — both commit or neither does."</p>
+        <p>"Then a separate background dispatcher polls that table, publishes the messages, and marks them
+          sent. If it crashes, the messages are still in the table, so it just picks up where it left off."</p>
+        <p>"What that gives me is <strong>at-least-once</strong> delivery, not exactly-once. If the dispatcher
+          publishes and dies before marking the row, it'll publish again on restart. That's the right trade —
+          duplicates are recoverable if consumers are idempotent, but lost messages aren't recoverable at
+          all."</p>
+        <p>"So the outbox always comes with idempotent consumers. On the consuming side I'd use an inbox
+          table: record the message ID and do the work in one transaction, and skip if the ID is already
+          there. The primary key on that table is what actually enforces it, not the existence check."</p>
+        <p>"Operationally, the things I'd watch are the age of the oldest unsent row — growing means the
+          dispatcher is stuck — and purging processed rows so the table doesn't grow forever. And if there are
+          multiple dispatcher instances, they need a lease or lock so they don't publish the same row twice."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you recognise the dual-write problem by name?</li>
+        <li>Do you know the outbox gives at-least-once, and pair it with idempotency unprompted?</li>
+        <li>Have you actually operated one — the monitoring and purging details?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "wrap both in a try/catch and retry the publish" — the
+          process can die between them.</li>
+        <li><span class="redflag">Red flag:</span> "use a distributed transaction" without knowing why 2PC is avoided.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you stop two dispatcher instances publishing the same message?</li>
+          <li>How do you preserve ordering with an outbox?</li>
+          <li>What's the latency cost, and how would you reduce it?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Two services need to stay consistent but can't share a transaction. What do you do? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd challenge the split. If two things genuinely must be transactionally consistent at all
+          times, that's strong evidence they belong in the same service and the same database. The service
+          boundary is probably in the wrong place, and no pattern fully compensates for that."</p>
+        <p>"If the boundary is right — different teams, different scaling, a real ownership reason — then I'd
+          use a <strong>saga</strong> and accept eventual consistency."</p>
+        <p>"Concretely: model the business process as a sequence of steps, each with a compensating action.
+          Reserve stock, authorise payment, create shipment. If a later step fails, run the compensations in
+          reverse — release the stock, void the authorisation."</p>
+        <p>"The important nuance is that compensation isn't rollback. A refund isn't an un-charge — the
+          customer saw the charge and their bank may have alerted them. And some things have no compensation
+          at all; you can't un-send an email. So I'd order the steps to put the irreversible ones last."</p>
+        <p>"I'd orchestrate rather than choreograph, because with compensation involved someone will
+          absolutely ask 'where is order 123 and why is it stuck?' An orchestrator makes the process
+          queryable and gives compensation an obvious home. The state has to be persisted so it survives a
+          restart, and every step needs a timeout so a saga can't wait forever invisibly."</p>
+        <p>"And I'd get product involved, because eventual consistency is user-visible. 'Your order is being
+          processed' as an explicit state is much better than pretending it's instant and having users refresh
+          into confusing intermediate states."</p>
+        <p>"The thing I wouldn't do is reach for two-phase commit. It holds locks across all participants for
+          the duration, the coordinator is a single point of failure that can leave participants blocked, and
+          most modern datastores and brokers don't support it anyway."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you question the boundary before accepting the constraint?</li>
+        <li>Do you know compensation ≠ rollback, with a concrete example?</li>
+        <li>Do you treat eventual consistency as a product decision?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "use a distributed transaction" with no awareness of the cost.</li>
+        <li><span class="redflag">Red flag:</span> describing a saga with no mention of failure or compensation.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if a compensating action itself fails?</li>
+          <li>How do you detect a saga that's stuck?</li>
+          <li>How would you test a saga's failure paths?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you make a message consumer idempotent?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd check whether the operation is already naturally idempotent, because that's the cheapest
+          answer. Setting a status to 'Shipped' can run twice harmlessly. Incrementing a counter can't. If I
+          can express the work as an assignment rather than a delta, I don't need any extra machinery."</p>
+        <p>"If it isn't naturally idempotent, the standard approach is an <strong>inbox table</strong>. Every
+          message carries a unique ID, and I record processed IDs. On arrival, if the ID is already there, I
+          skip."</p>
+        <p>"The critical detail is that the inbox record and the actual work must be in the <strong>same
+          transaction</strong>. If I record first and process after, a crash in between means the message is
+          marked done but the work never happened — and it'll never be retried, so it's lost silently. That's
+          worse than the duplicate I was trying to prevent."</p>
+        <p>"The other detail: the existence check is an optimisation, not the guarantee. Two concurrent
+          deliveries can both pass it. What actually enforces uniqueness is the primary key on the inbox
+          table — one insert fails, which is exactly right. So I'd catch the unique-violation and treat it as
+          'already processed'."</p>
+        <p>"For public APIs I'd use the same idea with a client-supplied <code>Idempotency-Key</code> header,
+          storing the response against the key and replaying it on a repeat. That's how payment providers work,
+          and it's what makes retrying after a timeout safe — which is the case that really matters, because
+          a timeout leaves you genuinely unsure whether the operation succeeded."</p>
+        <p>"Operationally, the inbox table needs a retention policy. Keeping IDs forever is unnecessary — the
+          window only needs to be longer than the maximum possible redelivery delay, so something like a few
+          days, with a cleanup job."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know natural idempotency is the cheapest option?</li>
+        <li>Do you get the same-transaction requirement and why?</li>
+        <li>Do you know the PK, not the check, is the real guarantee?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the work involves calling another service that isn't idempotent?</li>
+          <li>How long do you keep processed message IDs?</li>
+          <li>How does this interact with ordering?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

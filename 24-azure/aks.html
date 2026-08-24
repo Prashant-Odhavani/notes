@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AKS — Azure</title>
+<meta name="description" content="Cluster architecture, node pools, scaling, workload identity, networking models and upgrades — plus an honest account of when not to choose it.">
+<meta name="keywords" content="AKS Azure Kubernetes Service node pools system user spot cluster autoscaler node autoprovisioning KEDA workload identity Azure CNI overlay kubenet ingress upgrades maintenance window PodDisruptionBudget Container Apps">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/aks.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>AKS</h1>
+    <p class="subtitle">The most capable compute option and the one with the highest operational cost. Knowing when
+      <em>not</em> to pick it is most of the senior signal.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Microsoft manages the control plane</strong>; you own and pay for the nodes.</li>
+      <li><strong>Separate system and user node pools.</strong> Don't let workloads compete with kube-system.</li>
+      <li><strong>Three scaling layers:</strong> pods (HPA/KEDA), nodes (autoscaler), cluster capacity.</li>
+      <li><strong>Workload identity, not secrets</strong> — a pod gets an Entra identity.</li>
+      <li><strong>Azure CNI Overlay is the current default choice</strong> for IP efficiency.</li>
+      <li><strong>Upgrades are your responsibility</strong>, and versions age out on a schedule.</li>
+      <li><strong>Requests and limits decide scheduling</strong> and are the most common misconfiguration.</li>
+      <li><strong>Container Apps first.</strong> AKS when you need what only Kubernetes gives.</li>
+    </ul>
+  </div>
+
+  <h2 id="when">When AKS is the right answer <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Need</th><th>Reach for</th></tr></thead>
+      <tbody>
+        <tr><td>A web app or API, no container requirement</td><td><strong>App Service</strong></td></tr>
+        <tr><td>Event-driven, short-lived work</td><td><strong>Functions</strong></td></tr>
+        <tr><td>Containers, microservices, scale to zero, no cluster to run</td><td><strong>Container Apps</strong></td></tr>
+        <tr><td>One container, minimal orchestration</td><td>Container Instances</td></tr>
+        <tr><td><strong>Full Kubernetes API, operators, service mesh, existing Helm estate, multi-cloud portability, GPU or specialised hardware scheduling</strong></td><td><strong>AKS</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — AKS is a platform decision, not a deployment choice</div>
+    <p style="margin:0">Kubernetes gives you enormous capability, and the price is a permanent operational
+      commitment: cluster upgrades on a schedule, node image patching, capacity planning, networking design, RBAC,
+      admission policy, and the expertise to debug it when a pod won't schedule at 2am.
+      <br><br>
+      That's a reasonable trade for a platform team supporting many services. It's a poor one for three
+      microservices, where you'll spend more time on the cluster than on the code — and the cluster becomes a
+      single point of both failure and knowledge.
+      <br><br>
+      <strong>Azure Container Apps</strong> is built for that middle ground: containers, revisions, scale to zero,
+      KEDA-based event scaling, Dapr if you want it, and <em>no cluster</em>. It runs on AKS underneath, which is
+      why it feels similar, without you operating it.
+      <br><br>
+      So the calibrated answer is: <strong>Container Apps unless you need something only the Kubernetes API
+      provides</strong> — custom operators, a service mesh, CRDs, StatefulSets, a large existing Helm estate, or
+      genuine multi-cloud portability. Those are real reasons. "We want containers" is not one.
+      <br><br>
+      Saying that out loud is a strong signal, because the failure mode in interviews is treating Kubernetes as the
+      default modern answer. Choosing the simplest thing that meets the requirement is the more senior
+      instinct.</p>
+  </div>
+
+  <h2 id="architecture">Cluster architecture <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="text — what you own and what you don't"><code class="language-text">  MICROSOFT MANAGES (free tier: no SLA;  Standard: 99.95% with AZs)
+    api server, etcd, scheduler, controller manager
+
+  YOU OWN AND PAY FOR
+    node pools  ->  VM scale sets  ->  your pods
+
+  Node pools:
+    system pool   CoreDNS, metrics-server, CSI drivers      taint: CriticalAddonsOnly
+    user pool(s)  your workloads                            2+ nodes, across zones
+    spot pool     interruptible batch work                   taint: kubernetes.azure.com/scalesetpriority=spot
+
+  Tiers:  Free (dev)  |  Standard (production, SLA)  |  Premium (LTS, extended support)</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Separate your system and user node pools</div>
+    <p style="margin:0">If application pods share nodes with <code>kube-system</code>, a memory-hungry workload can
+      starve <strong>CoreDNS</strong> or <strong>metrics-server</strong>.
+      <br><br>
+      The result is bad in a specific and confusing way: DNS resolution starts failing intermittently across the
+      whole cluster, so every service appears broken while nothing in any application's logs explains it. And
+      metrics-server dying means the HPA stops scaling — so the cluster can't respond to the load that caused
+      it.
+      <br><br>
+      A dedicated <strong>system node pool with the <code>CriticalAddonsOnly</code> taint</strong> keeps application
+      pods off those nodes. It costs a couple of small VMs and removes a whole class of cluster-wide incident.
+      <br><br>
+      Same reasoning as keeping reporting off the production database: <strong>don't let a workload you can shed
+      compete with infrastructure you can't.</strong></p>
+  </div>
+
+  <h2 id="scaling">Three layers of scaling <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Layer</th><th>Mechanism</th><th>Scales on</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Pods</strong></td><td>Horizontal Pod Autoscaler</td><td>CPU and memory</td></tr>
+        <tr><td><strong>Pods</strong></td><td><strong>KEDA</strong></td><td><strong>Queue depth, event rate, custom metrics — and to zero</strong></td></tr>
+        <tr><td><strong>Nodes</strong></td><td>Cluster autoscaler</td><td><strong>Pending pods that can't be scheduled</strong></td></tr>
+        <tr><td><strong>Nodes</strong></td><td>Node autoprovisioning (Karpenter-based)</td><td>Picks VM sizes to fit pending pods</td></tr>
+        <tr><td>Burst</td><td>Virtual nodes (ACI)</td><td>Overflow without adding VMs</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — KEDA over HPA for anything queue-driven</div>
+    <p style="margin:0">CPU is a poor proxy for the work a queue consumer has to do. A pod pulling from Service Bus
+      might sit at 15% CPU while ten thousand messages back up, because it's waiting on I/O — so the HPA sees an
+      idle pod and scales <em>down</em> exactly when there's a backlog.
+      <br><br>
+      <strong>KEDA scales on the thing that actually matters</strong>: queue length, Event Hubs lag, Kafka lag, a
+      Prometheus query, a cron schedule. It's an AKS add-on, so there's no separate installation to maintain.
+      <br><br>
+      And it <strong>scales to zero</strong>, which the HPA cannot. A consumer with no messages costs nothing —
+      that's a real saving for batch and off-peak workloads, and it's the same mechanism Container Apps uses
+      underneath.
+      <br><br>
+      The trade to mention: scale-from-zero has a cold start, so a latency-sensitive path needs a minimum replica
+      count. And scaling on queue depth needs a sensible target and cooldown, or you'll thrash — pods starting and
+      stopping faster than they can drain anything.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Requests and limits are the most consequential thing you'll configure</div>
+    <p style="margin:0">Two numbers per container, and they behave differently:</p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Requests</strong> are what the scheduler reserves. They decide <em>where a pod can be placed</em>
+        and how much node capacity is considered used.</li>
+      <li><strong>Limits</strong> are the hard ceiling. Exceeding a CPU limit gets you
+        <strong>throttled</strong>; exceeding a memory limit gets the container
+        <strong>OOM-killed</strong> — immediately, with no grace.</li>
+    </ul>
+    <p style="margin:8px 0 0">What goes wrong:
+      <br><br>
+      <strong>No requests set.</strong> The scheduler assumes near-zero, packs the node, and everything degrades
+      together under load. This is the most common one, and it's silent until traffic arrives.
+      <br><br>
+      <strong>Requests far above real use.</strong> The cluster looks full at 20% actual utilisation and the
+      autoscaler adds nodes you don't need. Pure cost.
+      <br><br>
+      <strong>Memory limit too low.</strong> Containers restart under load, which reads as instability rather than
+      configuration. And note that .NET sizes the GC heap from the
+      <em>limit</em> — so a badly-set limit changes runtime behaviour, not just the kill threshold.
+      <br><br>
+      The practical advice: <strong>set memory request and limit equal</strong>, because memory is incompressible
+      and overcommitting it means an OOM kill instead of graceful slowdown. For CPU, <strong>set a request and
+      consider leaving the limit off</strong> — CPU is compressible, so a burst is better absorbed than throttled.
+      Then derive the numbers from observed usage rather than guessing.</p>
+  </div>
+
+  <h2 id="identity">Workload identity <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="yaml — a pod with an Entra identity and no secrets" class="code-good"><code class="language-yaml">apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orders-api
+  annotations:
+    azure.workload.identity/client-id: "00000000-0000-0000-0000-000000000000"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: orders-api }
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        azure.workload.identity/use: "true"     # required, easy to forget
+    spec:
+      serviceAccountName: orders-api            # federated to the managed identity
+      containers:
+        - name: api
+          image: myacr.azurecr.io/orders-api:1.4.2   # never :latest
+          resources:
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits:   { memory: "256Mi" }        # equal to request; no CPU limit
+          readinessProbe:                        # remove from load balancer when not ready
+            httpGet: { path: /health/ready, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:                         # RESTART the container - different job
+            httpGet: { path: /health/live, port: 8080 }
+            periodSeconds: 15
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }  # let endpoints propagate before shutdown</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — federated credentials mean no secret exists</div>
+    <p style="margin:0"><strong>Workload identity</strong> federates a Kubernetes service account to an Entra
+      managed identity. The pod receives a projected service-account token, exchanges it for an Entra token, and
+      calls Azure SQL, Key Vault or Storage with it.
+      <br><br>
+      So there's <strong>no client secret in a Kubernetes Secret</strong> — which matters, because Kubernetes
+      Secrets are base64-encoded, not encrypted, readable by anyone with namespace access, and visible in
+      <code>etcd</code> backups.
+      <br><br>
+      It replaces the older <strong>pod-managed identity</strong>, which is deprecated. Worth knowing that if you
+      meet it in an existing cluster: it relied on intercepting the instance-metadata endpoint, which was slower and
+      more fragile.
+      <br><br>
+      Two details that catch people. The <strong><code>azure.workload.identity/use: "true"</code> label</strong> is
+      required on the pod template, and without it nothing happens — no error, just failed authentication. And the
+      federated credential must name the <strong>exact namespace and service-account</strong>, so moving a workload
+      to a different namespace breaks it in a way that looks like a permissions problem.
+      <br><br>
+      For genuine secrets that must exist — a third-party key — use the <strong>Secrets Store CSI driver</strong> to
+      mount them from Key Vault, so they're never Kubernetes objects at all.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Readiness and liveness do different jobs</div>
+    <p style="margin:0">The distinction is worth being exact about, because getting it wrong causes outages rather
+      than preventing them.
+      <br><br>
+      <strong>Readiness</strong> controls whether the pod receives traffic. Failing it removes the pod from the
+      service endpoints; the container keeps running. That's the right response to "I'm warming up" or "my
+      dependency is briefly unavailable."
+      <br><br>
+      <strong>Liveness</strong> restarts the container. That's only correct for a pod that is genuinely
+      unrecoverable — deadlocked, or in a corrupted state.
+      <br><br>
+      The failure mode: <strong>a liveness probe that checks the database.</strong> When the database has a 30-second
+      blip, every pod fails liveness and every container restarts — simultaneously, cluster-wide. You've converted a
+      brief dependency issue into a full outage, and the restarts add a thundering-herd of reconnections on top.
+      <br><br>
+      So liveness checks only what a restart could fix. Readiness may check dependencies. And add a
+      <strong><code>preStop</code> delay</strong>, because endpoint removal isn't instantaneous — without it a pod
+      can stop accepting connections while the load balancer is still sending them, which shows up as a handful of
+      502s on every deployment.</p>
+  </div>
+
+  <h2 id="networking">Networking <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Model</th><th>Pod IPs</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Azure CNI (node subnet)</strong></td><td><strong>From the VNet</strong></td><td>Directly routable; <strong>consumes VNet IPs heavily</strong></td></tr>
+        <tr><td><strong>Azure CNI Overlay</strong></td><td>A private overlay CIDR</td><td><strong>The current recommended default</strong> — VNet IPs for nodes only</td></tr>
+        <tr><td>Kubenet</td><td>Overlay with UDRs</td><td>Legacy, being retired. Don't start here</td></tr>
+        <tr><td>Cilium (Azure CNI powered by Cilium)</td><td>Either</td><td>eBPF dataplane, better performance and network policy</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">IP exhaustion is the classic AKS design mistake</div>
+    <p style="margin:0">With traditional Azure CNI, <strong>every pod takes a VNet IP address</strong> — and IPs are
+      pre-allocated per node based on the maximum pods per node, whether or not pods exist.
+      <br><br>
+      So a node configured for 110 pods reserves 110 addresses the moment it joins. Thirty nodes is 3,300 addresses,
+      and a <code>/24</code> subnet holds 251. Teams routinely discover this when the cluster
+      <strong>cannot scale out</strong> — the autoscaler adds a node, there are no IPs, and the node never becomes
+      ready.
+      <br><br>
+      And a subnet can't be resized in place once it's in use, so the fix is rebuilding the cluster on a bigger
+      subnet. That's why it's a design mistake rather than a configuration one.
+      <br><br>
+      <strong>Azure CNI Overlay</strong> is the answer and the current recommendation: pods get IPs from a separate
+      overlay CIDR, so only <em>nodes</em> consume VNet addresses. You scale to thousands of pods on a small
+      subnet.
+      <br><br>
+      The trade: overlay pod IPs aren't directly routable from outside the cluster, so a scenario needing to reach a
+      pod IP directly from elsewhere in the VNet needs the node-subnet model. That's uncommon, and worth confirming
+      rather than assuming.</p>
+  </div>
+
+  <h2 id="upgrades">Upgrades <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Reality</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Version support</strong></td><td>Roughly a year per minor version. <strong>You will upgrade regularly</strong></td></tr>
+        <tr><td><strong>Skipping versions</strong></td><td>Not allowed — one minor version at a time</td></tr>
+        <tr><td><strong>Order</strong></td><td><strong>Control plane first</strong>, then node pools</td></tr>
+        <tr><td><strong>Node upgrades</strong></td><td>Surge new nodes, cordon, drain, remove old ones</td></tr>
+        <tr><td><strong>Auto-upgrade channels</strong></td><td>Patch, stable, rapid — with maintenance windows</td></tr>
+        <tr><td><strong>API deprecations</strong></td><td><strong>The actual risk.</strong> Removed APIs break manifests</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The upgrade risk is deprecated APIs, not the upgrade itself</div>
+    <p style="margin:0">The mechanics are well handled: AKS surges new nodes, drains the old ones and replaces them.
+      That part rarely surprises anyone.
+      <br><br>
+      What breaks is <strong>removed API versions</strong>. Kubernetes deprecates and then removes API groups, so a
+      manifest or Helm chart referencing a removed version fails to apply <em>after</em> the control plane
+      upgrade — and often only when something next tries to deploy, which can be days later and appears
+      unrelated.
+      <br><br>
+      AKS surfaces deprecated API usage in diagnostics, and there are tools like <code>kubent</code> that scan
+      manifests. Checking before upgrading is a five-minute job that prevents the whole problem.
+      <br><br>
+      Two operational safeguards. <strong>PodDisruptionBudgets</strong> so a drain can't take every replica of a
+      service at once — though a PDB that's too strict will <em>block</em> the drain indefinitely, which is its own
+      incident. And <strong>maintenance windows</strong>, so auto-upgrade doesn't roll nodes during your peak
+      hours.
+      <br><br>
+      Because upgrades come round every few months regardless of your roadmap, treat them as scheduled work.
+      Falling out of support is worse: no patches, no support, and eventually a forced multi-version jump — which
+      you can't do in one step, so you're chaining upgrades under pressure.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Container Apps first; AKS when you need the Kubernetes API itself.</li>
+      <li>Microsoft runs the control plane; you own, patch and pay for nodes.</li>
+      <li>Dedicated system node pool with <code>CriticalAddonsOnly</code>.</li>
+      <li>Pods scale with HPA or KEDA; nodes with the cluster autoscaler.</li>
+      <li>KEDA for queue-driven work, and it can scale to zero.</li>
+      <li>Requests decide scheduling; memory limits kill, CPU limits throttle.</li>
+      <li>Memory request equal to limit; consider no CPU limit.</li>
+      <li>Workload identity means no secret exists — the <code>use: "true"</code> label is required.</li>
+      <li>Readiness removes traffic; liveness restarts. Never check dependencies in liveness.</li>
+      <li>Add a <code>preStop</code> delay to avoid 502s on deployment.</li>
+      <li>Azure CNI Overlay avoids VNet IP exhaustion.</li>
+      <li>Upgrade regularly; the real risk is removed APIs.</li>
+      <li>PodDisruptionBudgets and maintenance windows — but a strict PDB blocks drains.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Choosing AKS for three services</strong> when Container Apps would do.</li>
+    <li><strong>Application pods on the system node pool</strong>, starving CoreDNS.</li>
+    <li><strong>No resource requests</strong>, so the scheduler overpacks nodes.</li>
+    <li><strong>Requests far above actual usage</strong>, paying for idle nodes.</li>
+    <li><strong>Liveness probes that check the database</strong>, restarting every pod during a blip.</li>
+    <li><strong>No <code>preStop</code> hook</strong>, dropping in-flight requests on deploy.</li>
+    <li><strong>Secrets in Kubernetes Secrets</strong> instead of workload identity or the CSI driver.</li>
+    <li><strong>Missing the workload-identity label</strong> and debugging it as a permissions issue.</li>
+    <li><strong>Traditional Azure CNI on a small subnet</strong>, hitting IP exhaustion.</li>
+    <li><strong>HPA on CPU for a queue consumer</strong>, scaling down under backlog.</li>
+    <li><strong>Falling out of version support</strong>, then chaining upgrades under pressure.</li>
+    <li><strong><code>:latest</code> image tags</strong>, so you can't tell what's running or roll back.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Would you run this .NET microservice estate on AKS? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My honest default is <strong>no, start with Azure Container Apps</strong> — and move to AKS only when
+          there's something specific it can't do. I'd want to explain the reasoning rather than just the
+          preference."</p>
+        <p>"Kubernetes gives real capability, and it comes with a permanent operational commitment: cluster upgrades
+          every few months, node image patching, capacity planning, network design, RBAC and admission policy, and
+          the expertise to debug why a pod won't schedule during an incident."</p>
+        <p>"That's a sensible trade for a platform team supporting many teams. For a handful of services it's a
+          <strong>large ongoing cost paid in engineering time</strong>, and it concentrates both operational risk and
+          knowledge in the one or two people who understand the cluster."</p>
+        <p>"<strong>Container Apps covers most of what people actually want from Kubernetes</strong>: containers,
+          revisions, blue-green and traffic splitting, KEDA-based scaling including scale to zero, managed identity,
+          Dapr if useful — with no cluster to operate. It runs on AKS underneath, which is why it behaves
+          similarly."</p>
+        <p>"So I'd ask what specifically requires Kubernetes. The answers that <em>do</em> justify AKS:"</p>
+        <p>"<strong>The Kubernetes API itself</strong> — custom operators, CRDs, StatefulSets for something like a
+          self-managed database, admission webhooks. <strong>A service mesh</strong> with mTLS and fine-grained
+          traffic policy beyond what Container Apps offers. <strong>An existing Helm and manifest
+          estate</strong> that would be expensive to rewrite. <strong>Genuine multi-cloud
+          portability</strong> as a stated requirement, not an aspiration. Or <strong>specialised
+          scheduling</strong> — GPUs, specific node hardware, topology constraints."</p>
+        <p>"Those are legitimate. 'We want containers' or 'it's the industry standard' aren't, and neither is 'we
+          might need it later' — you can move to AKS when the need is real, and the container images transfer."</p>
+        <p>"<strong>If we do go with AKS</strong>, the things I'd get right from the start, because they're expensive
+          to retrofit:"</p>
+        <p>"<strong>Networking.</strong> Azure CNI Overlay, so pods don't consume VNet IPs. Traditional CNI
+          pre-allocates addresses per node based on max pods, so a modest subnet exhausts quickly and the cluster
+          simply <em>cannot scale out</em> — the autoscaler adds a node and it never becomes ready. A subnet can't be
+          resized in place, so the fix is rebuilding the cluster. That's the mistake I'd most want to avoid."</p>
+        <p>"<strong>Node pools.</strong> A dedicated system pool with the <code>CriticalAddonsOnly</code> taint, so
+          application pods can never starve CoreDNS or metrics-server. If CoreDNS is starved, DNS fails
+          intermittently cluster-wide and nothing in the application logs explains it. If metrics-server dies, the
+          HPA stops scaling — during the load that caused it."</p>
+        <p>"<strong>Identity.</strong> Workload identity, federating a service account to a managed identity, so
+          there are no secrets in Kubernetes Secrets — which are base64, not encrypted, and visible in etcd backups.
+          Secrets Store CSI driver for anything that genuinely must be a secret."</p>
+        <p>"<strong>Resource requests and limits</strong> on everything, derived from observed usage. Memory request
+          equal to limit, because memory is incompressible and overcommitting means an OOM kill rather than
+          slowdown — and .NET sizes its GC heap from the limit, so it changes runtime behaviour too. CPU request set,
+          limit often omitted, since CPU is compressible and throttling is worse than absorbing a burst."</p>
+        <p>"<strong>Probes done correctly.</strong> Readiness removes a pod from load balancing; liveness restarts
+          the container. A liveness probe that checks the database means a 30-second database blip restarts every pod
+          simultaneously — turning a dependency wobble into a full outage that you caused. Plus a
+          <code>preStop</code> delay, or you drop in-flight requests on every deployment."</p>
+        <p>"<strong>Scaling with KEDA</strong> rather than CPU-based HPA for queue consumers. A consumer waiting on
+          I/O sits at low CPU while thousands of messages back up, so an HPA scales it <em>down</em> under
+          backlog."</p>
+        <p>"<strong>An upgrade plan</strong>, treated as scheduled work. Each minor version is supported for about a
+          year, you can't skip versions, and the actual risk is <em>removed APIs</em> breaking manifests after a
+          control-plane upgrade. Falling out of support means a forced chain of upgrades under pressure."</p>
+        <p>"The summary I'd give: <strong>AKS is a platform decision with a permanent staffing implication.</strong>
+          If the organisation has or wants a platform capability, it's a good foundation. If it's three teams
+          shipping services, Container Apps delivers most of the value with a fraction of the operational
+          surface — and choosing the simpler thing that meets the requirement is the decision I'd defend."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you evaluate simpler options first?</li>
+        <li>Can you name what genuinely requires Kubernetes?</li>
+        <li>Do you know the IP exhaustion trap?</li>
+        <li>Do you get requests, limits and probes right?</li>
+        <li>Do you treat upgrades as ongoing work?</li>
+        <li>Do you frame it as an organisational commitment?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> AKS as the automatic modern choice.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of the operational cost.</li>
+        <li><span class="redflag">Red flag:</span> liveness probes checking dependencies.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you decide requests and limits?</li>
+          <li>How do you handle a cluster upgrade with no downtime?</li>
+          <li>What does Container Apps not give you?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Pods are being OOM-killed under load. Walk through it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd confirm it <em>is</em> an OOM kill rather than something else, because several failures look
+          similar. <code>kubectl describe pod</code> shows the last state with reason
+          <strong><code>OOMKilled</code></strong> and exit code 137. If instead it's exit 143 or a failing liveness
+          probe, that's a different problem — a restart caused by the probe, not by memory."</p>
+        <p>"Then the question is which of three things is happening, because the fixes are different."</p>
+        <p>"<strong>The limit is simply too low for legitimate usage.</strong> The most common case. The number was
+          guessed at, or copied from another service, and real traffic needs more. I'd look at actual working set
+          over time — container memory metrics — and set the limit above observed peak with headroom."</p>
+        <p>"The .NET-specific detail worth raising: <strong>the runtime sizes its GC heap from the container
+          limit.</strong> So the limit isn't just a kill threshold, it changes how the GC behaves. A limit set very
+          tight makes the GC run far more aggressively — high CPU, worse latency — and the pod may be spending its
+          time collecting rather than working. Raising the limit can improve CPU as well as stop the kills, which
+          surprises people."</p>
+        <p>"I'd also check <strong>Server GC</strong>. It's the default for ASP.NET Core and it's tuned for
+          throughput, so it holds more memory and allocates per-core heaps. In a container with a low memory limit
+          and several visible cores that's a bad fit — Workstation GC, or configuring heap limits, is often the right
+          call for small containers. It's a genuine trade: more memory-efficient, somewhat lower throughput."</p>
+        <p>"<strong>A memory leak.</strong> If usage climbs monotonically and never recovers after a GC, that's a
+          leak rather than a sizing problem — and raising the limit only delays it. In .NET the usual suspects are
+          <code>HttpClient</code> instances created per request, static collections that only grow, event handlers
+          never unsubscribed, or <code>IDisposable</code> not disposed. I'd take a dump — <code>dotnet-gcdump</code>
+          — and compare heap contents over time to find what's accumulating."</p>
+        <p>"<strong>A load-proportional spike.</strong> If memory tracks concurrency, something is buffering per
+          request: reading an entire upload into memory, materialising a full query result, or building a large
+          response in a string. That's a code fix — stream instead of buffer, page the query — not a limit
+          increase."</p>
+        <p>"On configuration, two things I'd correct if they're wrong."</p>
+        <p>"<strong>Request and limit for memory should be equal.</strong> If the request is lower, the scheduler
+          places pods based on the smaller number and the node is overcommitted — so under load pods compete for
+          memory that was never reserved, and the kernel kills whichever crosses its limit first. Setting them equal
+          gives the pod the Guaranteed QoS class, so it isn't the first eviction candidate when the node comes under
+          pressure."</p>
+        <p>"<strong>Check whether the node itself is under memory pressure</strong>, which is a different failure:
+          the kubelet starts evicting pods, and pods with requests below usage go first. <code>kubectl describe
+          node</code> shows the conditions. If that's what's happening, the fix is node sizing and correct requests
+          rather than per-pod limits."</p>
+        <p>"For mitigation while investigating: raise the limit to stop the restarts, since a restarting pod is worse
+          than a memory-hungry one, and add an alert on container restarts so it doesn't go unnoticed next time. But
+          I'd be clear that's containment, not a fix — if it's a leak, the same thing happens at the higher
+          number."</p>
+        <p>"The general point: <strong>a memory limit is a statement about the application's behaviour</strong>, so
+          getting it right means measuring rather than guessing, and it interacts with GC configuration in a way
+          that's specific to .NET and easy to miss."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you confirm the failure mode before acting?</li>
+        <li>Do you know .NET sizes the GC heap from the container limit?</li>
+        <li>Do you distinguish a leak from under-sizing from per-request buffering?</li>
+        <li>Do you know why request should equal limit for memory?</li>
+        <li>Do you consider node-level eviction?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "increase the memory limit" and stop there.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of GC interaction with limits.</li>
+        <li><span class="redflag">Red flag:</span> not distinguishing a leak from a sizing problem.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you capture a heap dump from a pod?</li>
+          <li>Server GC or Workstation GC in a container, and why?</li>
+          <li>What QoS class does the pod have, and does it matter?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

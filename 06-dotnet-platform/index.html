@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>.NET Platform Fundamentals — Overview</title>
+<meta name="description" content="The runtime, SDK, hosting model, dependency injection, configuration and logging that every .NET application is built on.">
+<meta name="keywords" content="dotnet platform runtime sdk cli hosting dependency injection configuration logging generic host interview">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="06-dotnet-platform/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>.NET Platform Fundamentals</h1>
+    <p class="subtitle">The layer between your C# and the operating system: what runs your code, how the
+      app starts up, and how everything gets wired together.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>C# compiles to <strong>IL</strong>; the <strong>CLR</strong> runs it, JIT-compiling to machine code
+        as it goes.</li>
+      <li>One <strong>SDK</strong> can build for many target frameworks. The SDK version and the runtime
+        version are different things.</li>
+      <li>The <strong>generic host</strong> is the startup model for everything — web apps, workers, console
+        tools. It owns DI, configuration, logging and shutdown.</li>
+      <li><strong>DI lifetimes:</strong> singleton (one per app), scoped (one per request), transient (one
+        per resolve).</li>
+      <li>Injecting a <strong>scoped</strong> service into a <strong>singleton</strong> is the captive
+        dependency bug — it's the mistake that comes up most.</li>
+      <li>Configuration is a <strong>layered</strong> system: later providers override earlier ones.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-here">Why this comes before ASP.NET Core <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>Most tutorials teach ASP.NET Core and the platform together, which makes it hard to tell what belongs to
+    the web framework and what belongs to .NET itself.</p>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Dependency injection, configuration, logging and the host are <strong>not web features</strong>.</p>
+    <p>They're platform features. A background worker or a console app uses exactly the same ones.</p>
+  </div>
+
+  <p>Separating them matters practically: it's why a well-structured solution can share the same wiring
+    between an API and a worker service, and it's why an interviewer asking "explain DI lifetimes" isn't
+    asking a web question.</p>
+
+  <h2 id="the-stack">The pieces, from bottom to top <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Layer</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Operating system</strong></td><td>Threads, memory, file handles, sockets</td></tr>
+        <tr><td><strong>CLR</strong> (runtime)</td><td>Loads assemblies, JIT-compiles IL, runs the GC, enforces type safety</td></tr>
+        <tr><td><strong>BCL</strong> (base class library)</td><td><code>string</code>, <code>List&lt;T&gt;</code>, <code>HttpClient</code>, <code>File</code></td></tr>
+        <tr><td><strong>Generic host</strong></td><td>Startup, DI container, configuration, logging, graceful shutdown</td></tr>
+        <tr><td><strong>Your application</strong></td><td>ASP.NET Core, a worker, a console tool</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>The CLR is the <strong>engine</strong>. The BCL is the <strong>standard parts catalogue</strong>. The
+      generic host is the <strong>chassis and wiring harness</strong> — it's what makes the engine and parts
+      into a vehicle that starts, runs and stops cleanly.</p>
+    <p>ASP.NET Core is then just one <em>body</em> you can bolt onto that chassis.</p>
+  </div>
+
+  <h2 id="contents">Section contents</h2>
+  <div class="card-grid" data-section-index></div>
+
+  <div class="note info">
+    <div class="note-title">Where this sits in the learning path</div>
+    <p style="margin:0">You've finished <strong>Part 1</strong> — the C# language, OOP, SOLID, LINQ, and the
+      runtime topics of memory, async and concurrency.
+      <br><br>
+      This section starts <strong>Part 2</strong>. It covers the platform, then
+      <a href="../07-aspnet-core/index.html">ASP.NET Core</a> builds a web framework on top of it, and
+      <a href="../08-http-web-apis/index.html">HTTP &amp; API design</a> covers the protocol and contract
+      side.
+      <br><br>
+      Async from <a href="../05-csharp-advanced/async-await.html">section 05</a> is assumed throughout — the
+      hosting and DI material leans on it heavily.</p>
+  </div>
+
+  <h2 id="how-interviewed">How this area is interviewed <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Three questions dominate, and they're all really the same question in different clothes: <em>do you
+    understand object lifetimes?</em></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>What it's testing</th></tr></thead>
+      <tbody>
+        <tr><td>"Explain the DI lifetimes."</td><td>Table stakes. Everyone can list them</td></tr>
+        <tr><td>"What happens if you inject a scoped service into a singleton?"</td><td>The real question. Captive dependencies</td></tr>
+        <tr><td>"How do you use a <code>DbContext</code> in a background service?"</td><td>Whether you know you need to create a scope manually</td></tr>
+        <tr><td>"Where does configuration come from, and what wins?"</td><td>Whether you understand the provider chain</td></tr>
+        <tr><td>"How do you handle graceful shutdown?"</td><td>Whether you've operated something in Kubernetes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Connecting DI lifetimes to a <strong>failure you've seen</strong>. For example:
+      <br><br>
+      "We had a singleton cache service that took an <code>IOptions&lt;T&gt;</code> and a
+      <code>DbContext</code>. It worked in development and then started throwing
+      <code>ObjectDisposedException</code> under load, because the context it captured on the first request
+      was disposed at the end of that request. The fix was injecting
+      <code>IServiceScopeFactory</code> and creating a scope per operation."
+      <br><br>
+      That's a much stronger answer than reciting the three lifetimes.</p>
+  </div>
+
+  <h2 id="version-context">A note on versions <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <p>This area changed shape significantly, and interviewers sometimes probe whether you know the history:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Era</th><th>Startup model</th></tr></thead>
+      <tbody>
+        <tr><td>.NET Framework</td><td><code>Global.asax</code>, <code>web.config</code>, no built-in DI</td></tr>
+        <tr><td>.NET Core 1–2</td><td><code>Startup.cs</code> with <code>ConfigureServices</code> and <code>Configure</code></td></tr>
+        <tr><td>.NET Core 3 – .NET 5</td><td>Generic host + <code>Startup.cs</code></td></tr>
+        <tr><td>.NET 6+</td><td><strong>Minimal hosting</strong> — everything in <code>Program.cs</code>, no <code>Startup</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Examples in this handbook use the .NET 6+ minimal hosting model. If you've mostly worked with
+    <code>Startup.cs</code>, the concepts map directly — <code>ConfigureServices</code> becomes
+    <code>builder.Services</code>, and <code>Configure</code> becomes the middleware calls on
+    <code>app</code>.</p>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL Interview Problems</title>
+<meta name="description" content="Worked SQL problems with the reasoning interviewers actually listen for — second highest salary, gaps and islands, running totals, deduplication, consecutive events.">
+<meta name="keywords" content="SQL interview problems second highest salary nth highest gaps and islands running total deduplicate duplicates consecutive days median top N per group pivot self join window function practice">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/practice-problems.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>SQL Interview Problems</h1>
+    <p class="subtitle">Ten problems that come up repeatedly. The query matters less than the reasoning —
+      so each one includes what to say while you write it.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">How to handle a SQL problem in an interview</div>
+    <ul>
+      <li><strong>Ask about ties and nulls first.</strong> "Second highest — if two people share the top
+        salary, is the second highest the same value or the next distinct one?" That question alone earns
+        credit.</li>
+      <li><strong>Say what you're reaching for and why</strong> before writing. "This is top-N-per-group, so a
+        window function."</li>
+      <li><strong>Mention the index</strong> you'd want. Almost nobody does, and it's the difference between a
+          correct answer and a good one.</li>
+      <li><strong>State your assumptions out loud</strong> rather than silently picking one.</li>
+    </ul>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Schema used throughout</div>
+    <pre data-label="sql"><code class="language-sql">Employee (Id, Name, DepartmentId, Salary, HireDate, ManagerId)
+Department(Id, Name)
+[Order]   (Id, CustomerId, Total, CreatedUtc, Status)
+Customer  (Id, Name, Email, CreatedUtc)
+Login     (UserId, LoginDate)</code></pre>
+  </div>
+
+  <h2 id="p1">1. Second highest salary <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Ask this before writing anything</span>
+    <p>"If two employees both earn the highest salary, is the second highest that same value, or the next
+      distinct one?"</p>
+    <p>Almost always they mean the next <strong>distinct</strong> value — and asking shows you've noticed the
+      ambiguity that makes this a real question rather than a lookup.</p>
+  </div>
+
+  <pre data-label="sql — distinct salary levels: DENSE_RANK" class="code-good"><code class="language-sql">WITH Ranked AS (
+    SELECT Name, Salary,
+           DENSE_RANK() OVER (ORDER BY Salary DESC) AS rnk
+    FROM   Employee
+)
+SELECT Name, Salary FROM Ranked WHERE rnk = 2;</code></pre>
+
+  <pre data-label="sql — second-highest row, ties broken arbitrarily"><code class="language-sql">SELECT Name, Salary
+FROM   Employee
+ORDER BY Salary DESC
+OFFSET 1 ROWS FETCH NEXT 1 ROW ONLY;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Semantics</th></tr></thead>
+      <tbody>
+        <tr><td><code>DENSE_RANK() = 2</code></td><td><strong>Second distinct salary.</strong> Returns everyone earning it. Usually correct</td></tr>
+        <tr><td><code>ROW_NUMBER() = 2</code></td><td>Second <em>row</em>. With tied top salaries, returns another person on the top salary</td></tr>
+        <tr><td><code>OFFSET 1 FETCH 1</code></td><td>Same as <code>ROW_NUMBER</code>, and non-deterministic on ties</td></tr>
+        <tr><td><code>MAX(...) WHERE &lt; MAX(...)</code></td><td>Works, doesn't generalise to Nth, harder to read</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">What to say out loud</div>
+    <p style="margin:0">"I'll use <code>DENSE_RANK</code> because it treats tied salaries as one level, so
+      rank 2 is genuinely the second-highest <em>salary</em> rather than the second row. If you wanted exactly
+      one person I'd use <code>ROW_NUMBER</code> with a tiebreaker so it's deterministic. And <code>rnk = 2</code>
+      generalises straight to Nth, which the <code>MAX</code>-based version doesn't."
+      <br><br>
+      Follow-up they'll ask: <em>what if there is no second salary?</em> This returns an empty set. If they need
+      a <code>NULL</code> row instead, that's a <code>LEFT JOIN</code> from a single-row derived table.</p>
+  </div>
+
+  <h2 id="p2">2. Nth highest per group <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — top 3 earners in each department" class="code-good"><code class="language-sql">WITH Ranked AS (
+    SELECT e.Name, d.Name AS Department, e.Salary,
+           DENSE_RANK() OVER (PARTITION BY e.DepartmentId
+                              ORDER BY e.Salary DESC) AS rnk
+    FROM Employee e
+    JOIN Department d ON d.Id = e.DepartmentId
+)
+SELECT Department, Name, Salary
+FROM   Ranked
+WHERE  rnk &lt;= 3
+ORDER BY Department, Salary DESC;</code></pre>
+
+  <pre data-label="sql — the CROSS APPLY alternative"><code class="language-sql">SELECT d.Name AS Department, e.Name, e.Salary
+FROM Department d
+CROSS APPLY (
+    SELECT TOP (3) Name, Salary
+    FROM   Employee
+    WHERE  DepartmentId = d.Id
+    ORDER BY Salary DESC
+) e;</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">The performance point that impresses</div>
+    <p style="margin:0"><code>PARTITION BY</code> numbers <strong>every</strong> employee, then discards all
+      but the top three. <code>CROSS APPLY</code> does one small seek per department and stops at three.
+      <br><br>
+      With an index on <code>(DepartmentId, Salary DESC)</code>, <code>APPLY</code> is usually much faster —
+      especially with many departments and many employees each.
+      <br><br>
+      Say it as: "Both are correct. I'd start with the window function for readability, and switch to
+      <code>CROSS APPLY</code> if this were hot, because it can stop after three rows per department instead of
+      ranking everyone."
+      <br><br>
+      Note <code>CROSS APPLY</code> with <code>TOP</code> returns exactly 3 rows even when there's a tie at
+      third — a semantic difference, not just a performance one, and worth stating.</p>
+  </div>
+
+  <h2 id="p3">3. Remove duplicates, keep the newest <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — the canonical answer" class="code-good"><code class="language-sql">WITH Dupes AS (
+    SELECT Id,
+           ROW_NUMBER() OVER (PARTITION BY Email
+                              ORDER BY CreatedUtc DESC, Id DESC) AS rn
+    FROM   Customer
+)
+DELETE FROM Dupes WHERE rn &gt; 1;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Detail</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>ROW_NUMBER</code>, not <code>RANK</code></td><td><code>RANK</code> would give tied rows the same rank 1 and delete <strong>neither</strong></td></tr>
+        <tr><td><code>, Id DESC</code> tiebreaker</td><td>Without it, rows sharing a timestamp make the survivor non-deterministic — the same query can keep a different row on each run</td></tr>
+        <tr><td><code>DELETE FROM Dupes</code></td><td>You can delete through a CTE. Surprises people, and it's the cleanest form</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">What a good candidate adds unprompted</div>
+    <p style="margin:0"><strong>"On a big table I'd batch this"</strong> —
+      <code>DELETE TOP (5000) FROM Dupes WHERE rn &gt; 1</code> in a loop, to stay under
+      <a href="transactions.html#escalation">lock escalation</a> and keep the log manageable.
+      <br><br>
+      <strong>"And then I'd add a unique constraint on Email"</strong>, so the duplicates can't come back. That
+      second point is the one that separates fixing the data from fixing the problem — and interviewers notice
+      it.</p>
+  </div>
+
+  <h2 id="p4">4. Consecutive days — gaps and islands <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The problem</span>
+    <p>Find users who logged in on <strong>3 or more consecutive days</strong>.</p>
+    <p>This is the classic "gaps and islands" pattern, and it has a trick worth memorising because it looks
+      like magic otherwise.</p>
+  </div>
+
+  <pre data-label="sql — the row-number difference trick" class="code-good"><code class="language-sql">WITH Numbered AS (
+    SELECT UserId, LoginDate,
+           ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY LoginDate) AS rn
+    FROM (SELECT DISTINCT UserId, LoginDate FROM Login) d
+),
+Grouped AS (
+    -- Consecutive dates minus consecutive row numbers = a CONSTANT per run
+    SELECT UserId, LoginDate,
+           DATEADD(day, -rn, LoginDate) AS grp
+    FROM   Numbered
+)
+SELECT UserId,
+       MIN(LoginDate) AS StreakStart,
+       MAX(LoginDate) AS StreakEnd,
+       COUNT(*)       AS Days
+FROM   Grouped
+GROUP BY UserId, grp
+HAVING COUNT(*) &gt;= 3;</code></pre>
+
+  <div class="analogy">
+    <span class="an-label">Why the trick works</span>
+    <p>Take dates 1, 2, 3 then 7, 8. Row numbers are 1, 2, 3, 4, 5.</p>
+    <p>Subtract: <code>1-1, 2-2, 3-3</code> → all give 0. Then <code>7-4, 8-5</code> → both give 3.</p>
+    <p>Consecutive dates increment at the same rate as row numbers, so the <em>difference is constant within a
+      run</em> and jumps at every gap. That constant becomes your grouping key.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Two details that show experience</div>
+    <p style="margin:0"><strong><code>SELECT DISTINCT</code> first.</strong> If a user logs in twice on one
+      day, the row numbers advance twice and the difference breaks. Almost everyone misses this, and it's a
+      correctness bug not a style point.
+      <br><br>
+      <strong>Name the pattern.</strong> Saying "this is gaps and islands" tells the interviewer you've seen
+      the class of problem, not just solved this instance. The same technique handles consecutive order
+      numbers, contiguous date ranges, and session-grouping by inactivity.</p>
+  </div>
+
+  <h2 id="p5">5. Running total and month-over-month change <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="sql" class="code-good"><code class="language-sql">WITH Monthly AS (
+    SELECT DATEFROMPARTS(YEAR(CreatedUtc), MONTH(CreatedUtc), 1) AS Month,
+           SUM(Total) AS Revenue
+    FROM   [Order]
+    GROUP BY DATEFROMPARTS(YEAR(CreatedUtc), MONTH(CreatedUtc), 1)
+)
+SELECT
+    Month,
+    Revenue,
+    SUM(Revenue) OVER (ORDER BY Month
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotal,
+    LAG(Revenue) OVER (ORDER BY Month) AS PrevMonth,
+    Revenue - LAG(Revenue) OVER (ORDER BY Month) AS Change,
+    CAST(100.0 * (Revenue - LAG(Revenue) OVER (ORDER BY Month))
+         / NULLIF(LAG(Revenue) OVER (ORDER BY Month), 0) AS decimal(10,2)) AS PctChange
+FROM Monthly
+ORDER BY Month;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Detail</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td><code>ROWS BETWEEN</code> explicitly</td><td>The default frame is <code>RANGE</code>, which includes all rows with the same <code>ORDER BY</code> value. Explicit <code>ROWS</code> is correct and faster</td></tr>
+        <tr><td><code>NULLIF(..., 0)</code></td><td>Prevents divide-by-zero. Returns <code>NULL</code> instead of erroring</td></tr>
+        <tr><td><code>CAST(100.0 * ...)</code></td><td><code>100.0</code> not <code>100</code> — integer division would truncate to 0</td></tr>
+        <tr><td>Aggregate first, window second</td><td>Window functions can't nest inside aggregates, so the monthly rollup has to be its own step</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The gap that catches people</div>
+    <p style="margin:0">If a month has no orders it's absent from <code>Monthly</code> entirely — so
+      <code>LAG</code> returns the previous month <em>that had data</em>, not the previous calendar month.
+      <br><br>
+      Silently wrong for a report. The fix is a calendar table (or a recursive CTE generating months)
+      <code>LEFT JOIN</code>ed to the data.
+      <br><br>
+      Raising this unprompted is a strong signal — it's the kind of bug that ships and then produces numbers
+      nobody can reconcile.</p>
+  </div>
+
+  <h2 id="p6">6. Customers with no orders <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <pre data-label="sql — preferred" class="code-good"><code class="language-sql">SELECT c.Id, c.Name
+FROM   Customer c
+WHERE  NOT EXISTS (SELECT 1 FROM [Order] o WHERE o.CustomerId = c.Id);</code></pre>
+
+  <pre data-label="sql — the anti-join form"><code class="language-sql">SELECT c.Id, c.Name
+FROM      Customer c
+LEFT JOIN [Order] o ON o.CustomerId = c.Id
+WHERE     o.Id IS NULL;</code></pre>
+
+  <pre data-label="sql — avoid" class="code-bad"><code class="language-sql">SELECT Id, Name FROM Customer
+WHERE Id NOT IN (SELECT CustomerId FROM [Order]);
+-- Returns ZERO ROWS if any CustomerId is NULL</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Say the null point — it's the whole reason this gets asked</div>
+    <p style="margin:0">"I'd use <code>NOT EXISTS</code> rather than <code>NOT IN</code>, because if the
+      subquery returns even one <code>NULL</code>, <code>NOT IN</code> returns no rows at all. The logic is
+      that <code>x NOT IN (1, NULL)</code> means <code>x &lt;&gt; 1 AND x &lt;&gt; NULL</code>, and comparing
+      to <code>NULL</code> is unknown — so the predicate can never be true."
+      <br><br>
+      "It fails silently with no error, which is why it survives testing on data that happens to have no
+      nulls."</p>
+  </div>
+
+  <h2 id="p7">7. Median <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="sql — PERCENTILE_CONT (SQL Server 2012+)" class="code-good"><code class="language-sql">SELECT DISTINCT
+    DepartmentId,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Salary)
+        OVER (PARTITION BY DepartmentId) AS MedianSalary
+FROM Employee;</code></pre>
+
+  <pre data-label="sql — the portable version, worth knowing"><code class="language-sql">WITH Ranked AS (
+    SELECT Salary,
+           ROW_NUMBER() OVER (ORDER BY Salary) AS rn,
+           COUNT(*)    OVER ()                 AS total
+    FROM   Employee
+)
+SELECT AVG(CAST(Salary AS decimal(19,4))) AS Median
+FROM   Ranked
+WHERE  rn IN ((total + 1) / 2, (total + 2) / 2);   -- handles odd and even</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">Why the second version's <code>WHERE</code> works</span>
+    <p>With 7 rows: <code>(7+1)/2 = 4</code> and <code>(7+2)/2 = 4</code> — the same row, so
+      <code>AVG</code> of one value.</p>
+    <p>With 8 rows: <code>(8+1)/2 = 4</code> and <code>(8+2)/2 = 5</code> — two rows, averaged.</p>
+    <p>Integer division handles both cases with no <code>CASE</code> statement. Worth explaining rather than
+      just writing.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title"><code>PERCENTILE_CONT</code> vs <code>PERCENTILE_DISC</code></div>
+    <p style="margin:0"><code>PERCENTILE_CONT</code> <strong>interpolates</strong> between the two middle
+      values — a true median, and it can return a value not present in the data.
+      <br><br>
+      <code>PERCENTILE_DISC</code> returns an <strong>actual value from the dataset</strong>.
+      <br><br>
+      For salary, <code>CONT</code> is usually what's wanted. Also note <code>PERCENTILE_CONT</code> is a window
+      function, not an aggregate — hence the <code>DISTINCT</code> and <code>OVER</code>, which surprises
+      people expecting to use it with <code>GROUP BY</code>.</p>
+  </div>
+
+  <h2 id="p8">8. Pivot: months as columns <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="sql — conditional aggregation (portable, readable)" class="code-good"><code class="language-sql">SELECT
+    CustomerId,
+    SUM(CASE WHEN MONTH(CreatedUtc) = 1 THEN Total ELSE 0 END) AS Jan,
+    SUM(CASE WHEN MONTH(CreatedUtc) = 2 THEN Total ELSE 0 END) AS Feb,
+    SUM(CASE WHEN MONTH(CreatedUtc) = 3 THEN Total ELSE 0 END) AS Mar
+FROM   [Order]
+WHERE  YEAR(CreatedUtc) = 2024
+GROUP BY CustomerId;</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">The answer that ends the question well</div>
+    <p style="margin:0">"I'd write this with conditional aggregation because it's portable and readable. But
+      the more useful point is that <strong>pivoting in SQL requires knowing the columns at query time</strong>.
+      If the set of columns is dynamic, you need dynamic SQL, and that gets unpleasant to maintain and secure.
+      <br><br>
+      I'd usually return the data in its long form and pivot in the presentation layer — Excel, the reporting
+      tool, or the UI. Those are designed for it and it keeps the SQL simple."
+      <br><br>
+      Also worth noting: <code>WHERE YEAR(CreatedUtc) = 2024</code> is
+      <a href="indexing.html#sargable">not SARGable</a>. I'd write it as a date range —
+      <code>&gt;= '2024-01-01' AND &lt; '2025-01-01'</code> — so an index seek is possible. Catching that in your
+      own answer is a good signal.</p>
+  </div>
+
+  <h2 id="p9">9. Employees earning more than their manager <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <pre data-label="sql — self join" class="code-good"><code class="language-sql">SELECT e.Name AS Employee, e.Salary,
+       m.Name AS Manager,  m.Salary AS ManagerSalary
+FROM      Employee e
+JOIN      Employee m ON m.Id = e.ManagerId      -- INNER: excludes the CEO
+WHERE     e.Salary &gt; m.Salary;</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The clarification to raise</div>
+    <p style="margin:0">"An <code>INNER JOIN</code> here excludes anyone with no manager — the CEO. That's
+      probably right, since 'earns more than their manager' is undefined for them. But if you wanted them
+      included I'd use a <code>LEFT JOIN</code> and treat a null manager salary explicitly."
+      <br><br>
+      Stating the boundary case rather than silently choosing is what they're listening for. Self-join
+      questions are usually testing whether you think about the root of the hierarchy.</p>
+  </div>
+
+  <h2 id="p10">10. Latest row per key <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why this one matters</span>
+    <p>This is the most common shape in real work — latest status per order, current price per product, newest
+      login per user.</p>
+    <p>The naive version is subtly wrong, so it's a good test.</p>
+  </div>
+
+  <pre data-label="sql — wrong: the MAX and the row can disagree" class="code-bad"><code class="language-sql">SELECT CustomerId, MAX(CreatedUtc) AS Latest, Total   -- which Total?
+FROM   [Order]
+GROUP BY CustomerId, Total;                            -- wrong grouping to compensate</code></pre>
+
+  <pre data-label="sql — correct" class="code-good"><code class="language-sql">WITH Latest AS (
+    SELECT *,
+           ROW_NUMBER() OVER (PARTITION BY CustomerId
+                              ORDER BY CreatedUtc DESC, Id DESC) AS rn
+    FROM   [Order]
+)
+SELECT CustomerId, Id, CreatedUtc, Total, Status
+FROM   Latest
+WHERE  rn = 1;</code></pre>
+
+  <pre data-label="sql — faster with the right index"><code class="language-sql">SELECT c.Id, c.Name, o.Id AS LatestOrderId, o.Total
+FROM Customer c
+OUTER APPLY (                              -- OUTER keeps customers with no orders
+    SELECT TOP (1) Id, Total, CreatedUtc
+    FROM   [Order]
+    WHERE  CustomerId = c.Id
+    ORDER BY CreatedUtc DESC, Id DESC
+) o;</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The two things to say</div>
+    <p style="margin:0"><strong>Why the naive version fails:</strong> <code>MAX(CreatedUtc)</code> gives you
+      the latest date, but the other columns in the row aren't tied to it — so you either get a grouping error
+      or you add columns to <code>GROUP BY</code> and change the meaning entirely. You need the whole
+      <em>row</em>, not the max of one column.
+      <br><br>
+      <strong>The index:</strong> "I'd want <code>(CustomerId, CreatedUtc DESC)</code>. With that,
+      <code>OUTER APPLY</code> does a single-row seek per customer, which beats numbering every order and
+      discarding all but one."
+      <br><br>
+      And <code>OUTER</code> rather than <code>CROSS</code> — that's the detail that distinguishes "customers
+      and their latest order" from "customers who have ordered".</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Patterns worth memorising</span>
+    <ul>
+      <li><strong>Nth highest / top N per group</strong> → <code>DENSE_RANK</code> or
+        <code>ROW_NUMBER</code> in a CTE, filter outside. <code>CROSS APPLY</code> when it's hot.</li>
+      <li><strong>Deduplication</strong> → <code>ROW_NUMBER</code> partitioned by the duplicate key, delete
+        <code>rn &gt; 1</code>. Then add the unique constraint.</li>
+      <li><strong>Consecutive runs</strong> → date minus row number is constant within a run. Distinct
+        first.</li>
+      <li><strong>Running totals / period comparison</strong> → window functions with an explicit
+        <code>ROWS</code> frame, and <code>LAG</code>.</li>
+      <li><strong>"Has no related rows"</strong> → <code>NOT EXISTS</code>, never <code>NOT IN</code>.</li>
+      <li><strong>Latest row per key</strong> → <code>ROW_NUMBER = 1</code>, or <code>OUTER APPLY TOP 1</code>
+        with the right index.</li>
+      <li><strong>Ties are always the hidden question.</strong> Ask before you write.</li>
+      <li><strong>Mention the index.</strong> It's the cheapest way to stand out.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Mistakes candidates make</h2>
+  <ul>
+    <li><strong>Writing immediately</strong> without clarifying ties, nulls or expected output shape.</li>
+    <li><strong>Silence.</strong> The interviewer is assessing reasoning, and can't hear any.</li>
+    <li><strong><code>RANK</code> where <code>ROW_NUMBER</code> is needed</strong>, so deduplication deletes
+      nothing.</li>
+    <li><strong>No tiebreaker in <code>ORDER BY</code></strong>, making the result non-deterministic.</li>
+    <li><strong>Integer division</strong> — <code>100 * a / b</code> truncating to zero.</li>
+    <li><strong>Forgetting <code>DISTINCT</code></strong> in gaps-and-islands.</li>
+    <li><strong>Missing calendar gaps</strong> in period-over-period comparisons.</li>
+    <li><strong>Never mentioning indexes.</strong></li>
+    <li><strong>Non-SARGable predicates</strong> like <code>YEAR(col) = 2024</code> in your own answer.</li>
+    <li><strong>Not saying "on a large table I'd batch this"</strong> for a bulk delete.</li>
+  </ul>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

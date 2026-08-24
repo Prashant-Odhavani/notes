@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Planner, EXPLAIN &amp; Tuning — PostgreSQL</title>
+<meta name="description" content="Reading EXPLAIN ANALYZE properly, why estimates go wrong, join strategies, and the configuration settings that actually matter.">
+<meta name="keywords" content="EXPLAIN ANALYZE BUFFERS PostgreSQL planner cost estimate rows actual loops seq scan bitmap heap scan nested loop hash join merge join work_mem shared_buffers random_page_cost effective_cache_size statistics ANALYZE extended statistics pg_stat_statements auto_explain">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="12-postgresql/performance.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Planner, EXPLAIN &amp; Tuning</h1>
+    <p class="subtitle">Reading <code>EXPLAIN ANALYZE</code> properly is the whole skill. The tuning knobs
+      matter far less than people think — with three exceptions.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong><code>EXPLAIN (ANALYZE, BUFFERS)</code></strong> — always both. Buffers tells you cache vs
+        disk.</li>
+      <li><strong>Compare <code>rows=</code> estimated against <code>actual rows</code></strong>. A big gap
+        explains almost every bad plan.</li>
+      <li><strong>Multiply by <code>loops</code></strong> — actual rows is <em>per loop</em>. This trips
+        everyone up once.</li>
+      <li><strong>No <code>NOLOCK</code> equivalent needed</strong>; <code>EXPLAIN ANALYZE</code> actually runs
+        the query, so wrap writes in a rolled-back transaction.</li>
+      <li><strong><code>pg_stat_statements</code></strong> is the equivalent of Query Store. Enable it.</li>
+      <li><strong>Three settings that matter most:</strong> <code>work_mem</code>,
+        <code>random_page_cost</code>, <code>effective_cache_size</code>.</li>
+      <li><strong>A sequential scan isn't a bug</strong> — for large result sets it's correct.</li>
+    </ul>
+  </div>
+
+  <h2 id="explain">Reading EXPLAIN <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — the form to use" class="code-good"><code class="language-sql">EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)
+SELECT o.id, o.total, c.name
+FROM   "order" o
+JOIN   customer c ON c.id = o.customer_id
+WHERE  o.created_at &gt;= now() - interval '7 days'
+ORDER BY o.created_at DESC
+LIMIT  50;</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Option</th><th>Gives you</th></tr></thead>
+      <tbody>
+        <tr><td><code>ANALYZE</code></td><td><strong>Actually runs it</strong> — real row counts and timings</td></tr>
+        <tr><td><code>BUFFERS</code></td><td>Shared hits vs reads — <strong>cache or disk</strong></td></tr>
+        <tr><td><code>VERBOSE</code></td><td>Output columns per node</td></tr>
+        <tr><td><code>SETTINGS</code></td><td>Any non-default planner settings in effect</td></tr>
+        <tr><td><code>WAL</code></td><td>WAL volume generated — useful for write tuning</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title"><code>ANALYZE</code> executes the statement</div>
+    <p style="margin:0">Unlike SQL Server's estimated plan, <code>EXPLAIN ANALYZE</code> genuinely runs the
+      query — including <code>UPDATE</code> and <code>DELETE</code>.
+      <br><br>
+      To analyse a write safely:
+      <br><br>
+      <code>BEGIN; EXPLAIN (ANALYZE, BUFFERS) UPDATE ...; ROLLBACK;</code>
+      <br><br>
+      Easy to forget, and expensive to forget on production.</p>
+  </div>
+
+  <h3 id="reading-nodes">What the numbers mean</h3>
+
+  <pre data-label="text — annotated output"><code class="language-text">Limit  (cost=0.43..8.51 rows=50 width=48) (actual time=0.021..0.198 rows=50 loops=1)
+  -&gt;  Nested Loop  (cost=0.43..1420.11 rows=8800 width=48)
+                   (actual time=0.019..0.190 rows=50 loops=1)
+        -&gt;  Index Scan Backward using ix_order_created on "order" o
+              (cost=0.43..980.22 rows=8800 width=24)
+              (actual time=0.011..0.061 rows=50 loops=1)
+              Index Cond: (created_at &gt;= (now() - '7 days'::interval))
+              Buffers: shared hit=54
+        -&gt;  Index Scan using customer_pkey on customer c
+              (cost=0.00..0.05 rows=1 width=32)
+              (actual time=0.002..0.002 rows=1 loops=50)      &lt;-- 50 loops
+              Index Cond: (id = o.customer_id)
+              Buffers: shared hit=150
+Planning Time: 0.180 ms
+Execution Time: 0.245 ms</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>cost=start..total</code></td><td>Arbitrary units. Only useful for <em>comparing</em> plans, never as an absolute</td></tr>
+        <tr><td><code>rows=</code></td><td><strong>Estimate.</strong> Compare with actual</td></tr>
+        <tr><td><code>actual time=first..last</code></td><td>Milliseconds to first row, and to last row</td></tr>
+        <tr><td><code>actual rows=</code></td><td><strong>Per loop</strong>, not the total</td></tr>
+        <tr><td><code>loops=</code></td><td>How many times this node ran. Multiply</td></tr>
+        <tr><td><code>shared hit</code></td><td>Found in cache — cheap</td></tr>
+        <tr><td><code>shared read</code></td><td><strong>Read from disk</strong> — the expensive one</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The <code>loops</code> mistake everyone makes once</div>
+    <p style="margin:0"><code>actual rows=1 loops=50000</code> is <strong>50,000 rows</strong>, not one. Same
+      for time: <code>actual time=0.002</code> with 50,000 loops is 100ms total, not 0.002ms.
+      <br><br>
+      This is <em>the</em> reason people misread Postgres plans. An inner node that looks trivially cheap can be
+      the entire runtime once you multiply.
+      <br><br>
+      Rule: <strong>always read <code>loops</code> before concluding a node is cheap.</strong> A nested loop
+      with a huge outer input is exactly what a bad estimate produces.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Use a plan visualiser</div>
+    <p style="margin:0">Paste the output into <em>explain.dalibo.com</em> or <em>explain.depesz.com</em>. They do
+      the loop multiplication for you, highlight where estimates diverged badly, and show which node actually
+      consumed the time.
+      <br><br>
+      Mentioning that you use one is a small practical signal — nobody reads large plans by eye.</p>
+  </div>
+
+  <h2 id="scan-nodes">Scan and join nodes <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Node</th><th>Means</th><th>Concerning when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Seq Scan</strong></td><td>Reads the whole table</td><td>You expected few rows. Fine when returning most of the table</td></tr>
+        <tr><td><strong>Index Scan</strong></td><td>Walk the index, fetch each row from the heap</td><td>High row count — the heap fetches dominate</td></tr>
+        <tr><td><strong>Index Only Scan</strong></td><td>Answered from the index alone</td><td>Good — but check <code>Heap Fetches</code> isn't high</td></tr>
+        <tr><td><strong>Bitmap Heap Scan</strong></td><td>Collect row locations, sort them, read the heap in physical order</td><td>Normal for mid-range selectivity. Watch for <code>lossy</code></td></tr>
+        <tr><td><strong>Nested Loop</strong></td><td>For each outer row, probe the inner</td><td><strong>Large outer input</strong> — the classic bad-estimate symptom</td></tr>
+        <tr><td><strong>Hash Join</strong></td><td>Build a hash table, probe it</td><td><code>Batches &gt; 1</code> means it spilled to disk</td></tr>
+        <tr><td><strong>Merge Join</strong></td><td>Both inputs sorted, merged</td><td>Usually cheapest when inputs are already ordered</td></tr>
+        <tr><td><strong>Sort</strong></td><td>Ordering rows</td><td><code>Sort Method: external merge Disk</code> — spilled</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">Bitmap scans — the one with no SQL Server equivalent</span>
+    <p>Between "few rows" (index scan) and "most rows" (seq scan) there's a middle ground.</p>
+    <p>A <strong>bitmap scan</strong> reads the index to build a bitmap of which pages contain matches, then
+      reads those pages in <em>physical order</em> — turning scattered random I/O into sequential I/O.</p>
+    <p>It's usually a sign the planner made a sensible choice. If you see <code>lossy</code>, the bitmap
+      exceeded <code>work_mem</code> and degraded to page granularity, so it re-checks each row —
+      more <code>work_mem</code> helps.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Spills are the biggest single cost to look for</div>
+    <p style="margin:0"><code>Sort Method: external merge  Disk: 84320kB</code> means the sort didn't fit in
+      <code>work_mem</code> and went to disk. Same for <code>Buckets: ... Batches: 8</code> on a hash join.
+      <br><br>
+      That's frequently a 10–100× difference on that node, and it's the most actionable thing in a plan.
+      <br><br>
+      Two fixes, and the order matters: <strong>fix the estimate</strong> (statistics, rewrite the predicate) so
+      it plans for the real row count, or <strong>raise <code>work_mem</code></strong> for that session or
+      query. Raising it globally is risky — see below.</p>
+  </div>
+
+  <h2 id="estimates">Why estimates go wrong <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Stale statistics</strong></td><td><code>ANALYZE tablename;</code> — and check autovacuum is running</td></tr>
+        <tr><td><strong>Correlated columns</strong></td><td>The planner assumes independence. <code>CREATE STATISTICS</code> for real correlations</td></tr>
+        <tr><td><strong>Skewed data with too few buckets</strong></td><td>Raise <code>default_statistics_target</code>, or per column with <code>ALTER TABLE ... SET STATISTICS</code></td></tr>
+        <tr><td><strong>Function in a predicate</strong></td><td>Planner has no statistics for it. Expression index, or <code>CREATE STATISTICS</code> on the expression (PG 14+)</td></tr>
+        <tr><td><strong><code>jsonb</code> key extraction</strong></td><td>Poor statistics inherently. Extract to a column if it's hot</td></tr>
+        <tr><td><strong>Table just bulk-loaded</strong></td><td>Run <code>ANALYZE</code> explicitly — don't wait for autovacuum</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="sql — extended statistics for correlated columns" class="code-good"><code class="language-sql">-- The planner thinks these are independent, so it multiplies selectivities
+-- and badly underestimates. City and postcode are obviously correlated.
+CREATE STATISTICS stx_address_city_post (dependencies, ndistinct)
+    ON city, postcode FROM address;
+
+ANALYZE address;</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the independence assumption</div>
+    <p style="margin:0">By default the planner assumes columns are statistically independent, so it estimates
+      <code>WHERE city = 'Ahmedabad' AND state = 'Gujarat'</code> as
+      <em>selectivity(city) × selectivity(state)</em>.
+      <br><br>
+      But every Ahmedabad row is already Gujarat. So the real selectivity is just the city's — and the estimate
+      can be out by a factor of thirty.
+      <br><br>
+      That underestimate then produces a nested loop and a tiny <code>work_mem</code> grant, and the query
+      falls off a cliff.
+      <br><br>
+      <code>CREATE STATISTICS</code> (PostgreSQL 10+) teaches the planner about the dependency. Knowing this
+      exists is a strong signal, because it's the fix for a whole class of "the plan is inexplicably terrible"
+      problems — and SQL Server's equivalent (multi-column statistics) works differently enough to be worth
+      mentioning.</p>
+  </div>
+
+  <h2 id="finding">Finding the expensive queries <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — pg_stat_statements: the Query Store equivalent"><code class="language-sql">CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+-- requires shared_preload_libraries = 'pg_stat_statements' and a restart
+
+SELECT calls,
+       round(total_exec_time::numeric, 1)          AS total_ms,
+       round(mean_exec_time::numeric, 2)           AS mean_ms,
+       rows,
+       round(100.0 * shared_blks_hit
+             / nullif(shared_blks_hit + shared_blks_read, 0), 1) AS cache_hit_pct,
+       left(query, 90) AS query
+FROM   pg_stat_statements
+ORDER BY total_exec_time DESC        -- TOTAL, not mean
+LIMIT  20;</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Order by total time, not mean.</strong></p>
+    <p>A 5-second query run twice a day costs 10 seconds. An 80ms query run 40,000 times an hour costs nearly
+      an hour of CPU.</p>
+    <p>The second is the real problem, and nobody has complained about it.</p>
+  </div>
+
+  <pre data-label="sql — auto_explain: capture plans for slow queries automatically"><code class="language-sql">-- postgresql.conf
+-- shared_preload_libraries = 'pg_stat_statements,auto_explain'
+-- auto_explain.log_min_duration = '500ms'
+-- auto_explain.log_analyze = on
+-- auto_explain.log_buffers = on
+-- auto_explain.log_nested_statements = on</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why <code>auto_explain</code> is worth the overhead</div>
+    <p style="margin:0">The hardest performance problems are intermittent — a query that's fast when you test
+      it and slow at 3am under a different data distribution or a different plan.
+      <br><br>
+      <code>auto_explain</code> logs the <em>actual plan</em> for anything over a threshold, so you get the bad
+      plan rather than trying to reproduce it. That's often the difference between solving it and guessing.
+      <br><br>
+      <code>log_analyze</code> does add per-query overhead, so use a sensible threshold rather than logging
+      everything.</p>
+  </div>
+
+  <h2 id="settings">The settings that actually matter <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Setting</th><th>Default</th><th>Typical</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>shared_buffers</code></td><td>128 MB</td><td><strong>25% of RAM</strong></td>
+          <td>Postgres' own page cache</td>
+        </tr>
+        <tr>
+          <td><code>effective_cache_size</code></td><td>4 GB</td><td><strong>50–75% of RAM</strong></td>
+          <td>A <em>hint</em> — how much the OS is likely caching. Costs nothing, changes plans</td>
+        </tr>
+        <tr>
+          <td><code>work_mem</code></td><td>4 MB</td><td>16–64 MB</td>
+          <td>Per <strong>operation</strong> memory for sorts and hashes</td>
+        </tr>
+        <tr>
+          <td><code>maintenance_work_mem</code></td><td>64 MB</td><td>512 MB–2 GB</td>
+          <td>Vacuum and index builds</td>
+        </tr>
+        <tr>
+          <td><code>random_page_cost</code></td><td>4.0</td><td><strong>1.1 on SSD</strong></td>
+          <td>Random vs sequential I/O cost ratio</td>
+        </tr>
+        <tr>
+          <td><code>max_connections</code></td><td>100</td><td>100–200 + PgBouncer</td>
+          <td>Each connection is a process</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title"><code>work_mem</code> is per operation, not per query</div>
+    <p style="margin:0">A single query with three sorts and two hash joins can use <strong>five times</strong>
+      <code>work_mem</code>. With parallel workers, multiply again.
+      <br><br>
+      So <code>work_mem = 256MB</code> with 100 connections is not a 25 GB worst case — it's much higher, and
+      that's how you get an out-of-memory kill on the database.
+      <br><br>
+      <strong>The right approach:</strong> a modest global value, then raise it for the specific queries that
+      need it — <code>SET LOCAL work_mem = '256MB'</code> inside a transaction, or per-role for a reporting
+      user. Tuning it globally to fix one report is the classic mistake.</p>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — <code>random_page_cost</code> on SSDs</div>
+    <p style="margin:0">The default of 4.0 encodes the assumption that a random read costs four times a
+      sequential one — true for spinning disks, wrong for SSDs and cloud block storage, where the ratio is
+      closer to 1.1.
+      <br><br>
+      Leaving it at 4.0 makes the planner systematically <strong>overvalue sequential scans and undervalue
+      index scans</strong>. So you get seq scans on queries that should be using an index, and adding indexes
+      doesn't help because the planner won't choose them.
+      <br><br>
+      Lowering it to 1.1 on SSD-backed storage is one of the highest-value single changes on a badly-tuned
+      instance, and it's free. <code>effective_cache_size</code> is the other one — it allocates nothing, it
+      just tells the planner how much caching to assume, and leaving it at 4 GB on a 64 GB machine makes index
+      scans look far more expensive than they are.</p>
+  </div>
+
+  <h2 id="parallel">Parallel query <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Setting</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>max_parallel_workers_per_gather</code></td><td>Workers per <code>Gather</code> node (default 2)</td></tr>
+        <tr><td><code>max_parallel_workers</code></td><td>Total across the instance</td></tr>
+        <tr><td><code>parallel_setup_cost</code></td><td>Overhead assumed for starting workers</td></tr>
+        <tr><td><code>min_parallel_table_scan_size</code></td><td>Below this, don't bother (default 8 MB)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">What disables parallelism</div>
+    <p style="margin:0">Parallel plans are silently ruled out by: a <code>VOLATILE</code> function in the query,
+      writes (<code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> can't be parallelised in the same
+      way), cursors, and <code>FOR UPDATE</code>.
+      <br><br>
+      The one that catches people: a user-defined function must be marked <code>PARALLEL SAFE</code>, and the
+      default is <code>PARALLEL UNSAFE</code>. So adding an innocuous helper function to a
+      <code>SELECT</code> can turn an 8-worker plan into a serial one, with no indication why.
+      <br><br>
+      That's the Postgres analogue of <a href="../10-sql/programmability.html#udfs">scalar UDFs forcing a serial
+      plan on SQL Server</a> — same failure, different mechanism.</p>
+  </div>
+
+  <h2 id="workflow">A tuning workflow <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <ol class="steps">
+    <li><strong><code>pg_stat_statements</code></strong>, ordered by total time. Find what actually costs.</li>
+    <li><strong><code>EXPLAIN (ANALYZE, BUFFERS)</code></strong> on the worst one.</li>
+    <li><strong>Compare estimated vs actual rows</strong> at each node, remembering
+      <code>loops</code>.</li>
+    <li><strong>Look for spills</strong> — external merge sorts, hash batches &gt; 1.</li>
+    <li><strong>Check <code>shared read</code> vs <code>hit</code></strong> — is this an I/O or a CPU
+      problem?</li>
+    <li><strong>Fix the cause:</strong> statistics, an index, a rewrite, or extended statistics.</li>
+    <li><strong>Re-measure.</strong> One change at a time.</li>
+  </ol>
+
+  <div class="note tip">
+    <div class="note-title">Before tuning a query, check the boring things</div>
+    <p style="margin:0"><strong>Is the table bloated?</strong> A table 4× its necessary size means every scan
+      reads 4× the pages. That's a <a href="operations.html#vacuum">vacuum problem</a>, not a query problem, and
+      no amount of query tuning fixes it.
+      <br><br>
+      <strong>Are statistics current?</strong> <code>pg_stat_user_tables.last_analyze</code>.
+      <br><br>
+      <strong>Is <code>random_page_cost</code> still 4.0 on SSD storage?</strong> If so, fix that before
+      concluding the planner is making bad choices — it's making rational choices from wrong inputs.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li><code>EXPLAIN (ANALYZE, BUFFERS)</code> — and remember <code>ANALYZE</code> executes the
+        statement.</li>
+      <li><code>actual rows</code> is per loop. Multiply by <code>loops</code>.</li>
+      <li>Cost units are only meaningful for comparing plans.</li>
+      <li>Bitmap heap scans are a healthy middle ground, not a problem.</li>
+      <li>Spills to disk are the most actionable finding — fix the estimate first, then
+        <code>work_mem</code>.</li>
+      <li>The planner assumes column independence; <code>CREATE STATISTICS</code> fixes correlated
+        columns.</li>
+      <li><code>pg_stat_statements</code> ordered by total time; <code>auto_explain</code> for intermittent
+        problems.</li>
+      <li><code>work_mem</code> is per operation — set it modestly and raise it per query.</li>
+      <li><code>random_page_cost = 1.1</code> on SSD, and set <code>effective_cache_size</code> properly. Both
+        free.</li>
+      <li>A <code>PARALLEL UNSAFE</code> function silently disables parallel plans.</li>
+      <li>Check bloat and statistics before blaming the query.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Reading <code>actual rows</code> without <code>loops</code></strong> and misjudging which node
+      is expensive.</li>
+    <li><strong>Running <code>EXPLAIN ANALYZE</code> on an <code>UPDATE</code></strong> outside a
+      transaction.</li>
+    <li><strong>Treating cost units as milliseconds.</strong></li>
+    <li><strong>Assuming a Seq Scan is always wrong.</strong></li>
+    <li><strong>Raising <code>work_mem</code> globally</strong> to fix one report, then running out of
+      memory.</li>
+    <li><strong>Leaving <code>random_page_cost</code> at 4.0 on SSDs</strong> and wondering why indexes are
+      ignored.</li>
+    <li><strong>Leaving <code>effective_cache_size</code> at the default</strong> on a large machine.</li>
+    <li><strong>Not enabling <code>pg_stat_statements</code></strong>, so there's no baseline.</li>
+    <li><strong>Ordering by mean time</strong> and missing the frequent cheap query.</li>
+    <li><strong>Tuning a query on a bloated table.</strong></li>
+    <li><strong>Adding an unsafe function and losing parallelism silently.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Walk me through reading an <code>EXPLAIN ANALYZE</code> output. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd run it as <code>EXPLAIN (ANALYZE, BUFFERS)</code> — buffers matters because it tells me whether
+          the pages came from cache or disk, which decides whether this is an I/O problem or a CPU one."</p>
+        <p>"First thing to be careful about: <strong><code>ANALYZE</code> actually executes the
+          statement</strong>. Unlike SQL Server's estimated plan, this runs it — including writes. So for an
+          <code>UPDATE</code> I'd wrap it in <code>BEGIN ... ROLLBACK</code>."</p>
+        <p>"Then I read it <strong>inside out</strong> — the most indented nodes execute first, and results flow
+          upward."</p>
+        <p>"The number I look at first is <strong>estimated <code>rows=</code> versus <code>actual
+          rows</code></strong> at each node. That single comparison explains most bad plans, because the
+          planner chose the join strategy and the memory allocation from those estimates. If it expected 100
+          rows and got 2 million, it picked a nested loop where it needed a hash join, and sized the sort memory
+          for 100 rows."</p>
+        <p>"The trap I'd flag explicitly: <strong><code>actual rows</code> is per loop, not the total</strong>.
+          So <code>actual rows=1 loops=50000</code> is 50,000 rows, and <code>actual time=0.002</code> with
+          50,000 loops is 100ms, not 0.002ms. That's the single most common way people misread a Postgres plan
+          — an inner node looks free until you multiply."</p>
+        <p>"Next I look for <strong>spills</strong>. <code>Sort Method: external merge Disk: 84MB</code> means
+          the sort exceeded <code>work_mem</code> and went to disk; <code>Batches: 8</code> on a hash join means
+          the same. That's often a 10 to 100 times difference on that node, and it's the most actionable thing
+          in the output."</p>
+        <p>"Then <strong>buffers</strong>: <code>shared hit</code> is cache, <code>shared read</code> is disk. A
+          node with heavy reads points at either a missing index, insufficient memory, or a bloated table making
+          every scan read more pages than it should."</p>
+        <p>"One thing I <em>don't</em> do is treat the <code>cost=</code> numbers as time. They're arbitrary
+          units, only meaningful for comparing candidate plans — and they're derived from the same estimates
+          that may be wrong."</p>
+        <p>"For anything non-trivial I'd paste it into a visualiser like explain.dalibo.com. It does the loop
+          multiplication, highlights where estimates diverged, and shows which node actually consumed the time.
+          Nobody reads a large plan by eye reliably."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>ANALYZE</code> executes the query?</li>
+        <li>Do you look at estimated vs actual rows first?</li>
+        <li><strong>Do you know about <code>loops</code>?</strong> This is the discriminating detail.</li>
+        <li>Do you look for spills and buffer reads?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's a bitmap heap scan and when is it chosen?</li>
+          <li>What would you do about a spilling sort?</li>
+          <li>Why might estimates be wrong?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>The planner keeps choosing a sequential scan even though a suitable index exists. Why? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd work through this roughly in order of how often it's the answer, and the first one is a
+          Postgres-specific configuration issue people miss."</p>
+        <p>"<strong>One — <code>random_page_cost</code> is still at its default of 4.0.</strong> That encodes
+          the assumption that a random read costs four times a sequential one, which was true for spinning
+          disks and is wrong for SSDs and cloud storage, where it's closer to 1.1. Leaving it at 4.0 makes the
+          planner systematically overvalue sequential scans and undervalue index scans. So it's not making a
+          bad decision — it's making a rational decision from wrong inputs, and adding more indexes won't help.
+          Same for <code>effective_cache_size</code>: left at the 4 GB default on a 64 GB machine, index scans
+          look far more expensive than they are. Both are free to fix."</p>
+        <p>"<strong>Two — the planner is right.</strong> If the query returns a large fraction of the table, a
+          sequential scan genuinely is cheaper than an index scan plus a heap fetch per row. That's not a bug.
+          I'd check the actual row count before assuming otherwise — this is also why a bitmap heap scan often
+          appears in the middle ground, and that's a healthy choice rather than a problem."</p>
+        <p>"<strong>Three — bad row estimates.</strong> If it thinks the predicate matches most of the table it
+          picks a scan. I'd compare estimated with actual rows. Common causes: stale statistics after a bulk
+          load, or <strong>correlated columns</strong> — the planner assumes independence, so
+          <code>city = 'Ahmedabad' AND state = 'Gujarat'</code> gets estimated as the product of two
+          selectivities when every Ahmedabad row is already Gujarat. That can be out by thirty times.
+          <code>CREATE STATISTICS ... (dependencies, ndistinct)</code> fixes it."</p>
+        <p>"<strong>Four — the index can't serve this predicate.</strong> A plain B-tree can't support
+          <code>LIKE 'abc%'</code> unless the database is in the C locale, because sort order doesn't match
+          byte-prefix order in other collations. You need a <code>text_pattern_ops</code> index. That one
+          catches people who add an index for a prefix search and see no change at all."</p>
+        <p>"<strong>Five — a type mismatch.</strong> Comparing a <code>bigint</code> column to a
+          <code>numeric</code> parameter, or a <code>text</code> column to a differently-collated value, can
+          prevent index use. Same family of problem as implicit conversion on SQL Server."</p>
+        <p>"<strong>Six — the expression doesn't match.</strong> If the index is on
+          <code>lower(email)</code> the query must use <code>lower(email) = ...</code>, exactly. And a function
+          wrapping a column with no matching expression index means no index scan at all."</p>
+        <p>"<strong>Seven — table bloat.</strong> If the table is four times larger than it needs to be, the
+          planner's cost model reflects that size and a scan looks even worse than it should. But the real fix
+          there is vacuum, not the query."</p>
+        <p>"How I'd actually test it: <code>SET enable_seqscan = off</code> for the session and re-run
+          <code>EXPLAIN ANALYZE</code>. If the index plan is genuinely faster, the cost model is
+          mis-calibrated — which points at settings or statistics. If it's slower, the planner was right all
+          along. That's a diagnostic switch, not a fix; I'd never leave it set."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know about <code>random_page_cost</code> and SSDs? That's the Postgres-specific answer.</li>
+        <li>Do you accept the planner is sometimes right?</li>
+        <li>Do you know the collation issue with prefix <code>LIKE</code>?</li>
+        <li>Do you know the <code>enable_seqscan</code> diagnostic trick, and that it's not a fix?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add a hint" — Postgres deliberately has no query hints.</li>
+        <li><span class="redflag">Red flag:</span> leaving <code>enable_seqscan = off</code> in
+          production.</li>
+        <li><span class="redflag">Red flag:</span> no mention of checking estimates.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why does PostgreSQL not have query hints?</li>
+          <li>What does <code>CREATE STATISTICS</code> actually store?</li>
+          <li>How would you find out if a table is bloated?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

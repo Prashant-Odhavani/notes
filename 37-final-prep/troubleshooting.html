@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troubleshooting &amp; Performance — Final Interview Prep</title>
+<meta name="description" content="Production debugging narratives: the questions to ask, the tools that answer them, and six scenarios with the diagnosis said out loud.">
+<meta name="keywords" content="production troubleshooting interview performance debugging dotnet-counters dotnet-stack dotnet-gcdump thread pool starvation memory leak intermittent failure slow endpoint one instance CPU spike diagnosis narrative">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="37-final-prep/troubleshooting.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Troubleshooting &amp; Performance</h1>
+    <p class="subtitle">Six scenarios, said out loud. What's scored is the order you check things in and whether you
+      name the specific metric.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="note tip">
+    <div class="note-title">The four questions that narrow almost anything</div>
+    <p style="margin:0">Before any hypothesis, these four eliminate most of the possibility space — and asking them out
+      loud is itself most of the score:
+      <br><br>
+      <strong>1. All requests or a subset?</strong> A subset means a specific code path, tenant, or instance. All means
+      something shared.
+      <br><br>
+      <strong>2. Does it scale with load?</strong> Latency rising with concurrency means <em>queueing</em>. Constant
+      latency means a <em>slow path</em>. Those need opposite responses, and this is the single most valuable
+      question.
+      <br><br>
+      <strong>3. When did it start, and did anything deploy?</strong> Gradual means data growth. Sudden with a deploy
+      means a code change. Sudden without one means a plan change, a dependency, or infrastructure.
+      <br><br>
+      <strong>4. One instance or all of them?</strong> One instance is a completely different problem — and aggregate
+      metrics hide it entirely.</p>
+  </div>
+
+  <h2 id="tools">The tools, and what each answers <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="bash — .NET diagnostics, runnable in a container"><code class="language-bash"># Attach to a shell-less image with an ephemeral container
+kubectl debug -it orders-api-7d4f --image=mcr.microsoft.com/dotnet/sdk:9.0 --target=api
+
+dotnet-counters monitor -p 1        # LIVE: thread pool queue length, GC, exceptions/sec
+dotnet-stack report   -p 1          # ALL thread stacks - finds deadlocks and blocked threads
+dotnet-gcdump collect -p 1          # heap contents - compare two, minutes apart, for leaks
+dotnet-trace collect  -p 1 --profile cpu-sampling    # where CPU is actually going
+dotnet-dump collect   -p 1          # full dump, for offline analysis
+
+# Kubernetes
+kubectl describe pod ...            # EVENTS first - exit reason, OOMKilled, probe failures
+kubectl logs ... --previous         # ESSENTIAL for CrashLoopBackOff
+kubectl top pods                    # actual usage vs requests</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Tool / metric</th></tr></thead>
+      <tbody>
+        <tr><td>Is it us or a dependency?</td><td><strong>Dependency duration vs total request duration</strong></td></tr>
+        <tr><td>One slow call or many fast ones?</td><td><strong>Dependency count per <code>operation_Id</code></strong> — finds N+1</td></tr>
+        <tr><td>Are requests queueing?</td><td><code>dotnet-counters</code>: thread pool queue length</td></tr>
+        <tr><td>Blocked threads or a deadlock?</td><td><code>dotnet-stack</code> — many threads, same frame</td></tr>
+        <tr><td>Is the container throttled?</td><td><strong><code>container_cpu_cfs_throttled_seconds_total</code></strong>, not CPU %</td></tr>
+        <tr><td>Is it GC?</td><td>Gen2 count, pause time, allocation rate</td></tr>
+        <tr><td>Is it a leak?</td><td><strong>Two <code>gcdump</code>s compared</strong> — what grew?</td></tr>
+        <tr><td>One tenant or everyone?</td><td>Requests and errors grouped by the tenant dimension</td></tr>
+        <tr><td>Why did the pod die?</td><td><code>describe pod</code> — exit 137 is OOMKilled</td></tr>
+        <tr><td>Did a plan change?</td><td><strong>Query Store</strong> — plan history per query</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="scenarios">Six scenarios <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>Latency is 5 seconds. CPU is 20%. The database says queries take 10ms. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Those three facts together are diagnostic. The database is fast and the CPU is idle, so
+          <strong>the time is spent waiting, and not on the database doing work</strong>. Requests are almost certainly
+          queueing <em>before</em> they reach it."</p>
+        <p>"<strong>First hypothesis: thread pool starvation from sync-over-async.</strong> A blocking call —
+          <code>.Result</code>, <code>.Wait()</code> — holds a pool thread for the entire I/O. The pool injects new
+          threads at roughly one or two a second, so under load requests arrive faster than threads free up. The 10ms
+          query really is 10ms; the request spent 4.99 seconds waiting for a thread to run it on."</p>
+        <p>"I'd confirm with <code>dotnet-counters</code>: <strong>queue length rising, thread count climbing
+          slowly</strong>. And <code>dotnet-stack</code> — if dozens of threads are parked on the same
+          <code>.GetAwaiter().GetResult()</code> frame, that's conclusive."</p>
+        <p>"<strong>Second candidate with the same signature: connection pool exhaustion.</strong> The distinguishing
+          detail is that the wait happens before any query executes, and the error mentions the pool — 'timeout period
+          elapsed prior to obtaining a connection'. That also fits 'the database says queries are fast', because the
+          database only sees queries that got a connection."</p>
+        <p>"<strong>Third, if this is a container: CPU throttling.</strong> A CPU limit is enforced per 100ms period, so
+          a container consuming its quota is <em>paused</em> for the remainder. Average CPU looks low precisely because
+          it's paused rather than idle — which is why 20% isn't the reassurance it appears to be. I'd check throttled
+          seconds, not CPU percent."</p>
+        <p>"<strong>Fourth: lock contention</strong> — a <code>lock</code> serialising requests through a critical
+          section. Also low CPU, also scales with concurrency, and <code>dotnet-stack</code> distinguishes it because
+          the blocked threads share a different frame."</p>
+        <p>"The question that separates them fastest: <strong>does latency scale with concurrency?</strong> If yes it's
+          queueing — one of these four. If a single request in isolation is also slow, it's a genuinely slow path and I'd
+          be looking somewhere else entirely."</p>
+        <p>"On mitigation: <code>ThreadPool.SetMinThreads</code> raises the floor and buys time, and I'd be explicit
+          that it's a workaround — it hides the problem at moderate load and the same wall reappears higher up. The fix
+          is async all the way down, and <strong>one <code>.Result</code> deep in the chain is enough</strong>, so a
+          fully async controller can still starve. Analyzer rules catch it at build time, which is the structural
+          version."</p>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Memory grows steadily and the pod is OOM-killed every few hours. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd confirm it <em>is</em> an OOM kill: <code>kubectl describe pod</code> shows last state
+          <code>OOMKilled</code> with exit code 137. If it's exit 143 or a failing liveness probe, that's a different
+          problem — a restart caused by the probe rather than by memory."</p>
+        <p>"Then the <strong>shape</strong> of the growth, which distinguishes three causes."</p>
+        <p>"<strong>Rises and never recovers after GC → a leak.</strong> Something roots the objects. Raising the limit
+          only delays it."</p>
+        <p>"<strong>Tracks concurrency, falls afterwards → per-request buffering.</strong> Reading an entire upload into
+          memory, materialising a whole query result. That's a code fix — stream instead of buffer, page the
+          query."</p>
+        <p>"<strong>Sawtooth with a stable ceiling → normal.</strong> That's the GC working."</p>
+        <p>"For a leak, the technique is <strong>two <code>dotnet-gcdump</code>s several minutes apart, compared</strong>.
+          What grew between them is the answer, and the retention path shows what's rooting it. Much faster than
+          reasoning about the code."</p>
+        <p>"The .NET suspects, in order: <strong>an unbounded cache</strong> or static dictionary that only grows —
+          <code>IMemoryCache</code> with no <code>SizeLimit</code> is the most common by a distance. Event handlers
+          never unsubscribed. A long-lived delegate capturing a scoped service, which keeps a whole
+          <code>DbContext</code> and its change tracker alive. And a DI lifetime mistake — a scoped service captured by
+          a singleton."</p>
+        <p>"<strong><code>HttpClient</code> per request</strong> is worth checking too, though it leaks sockets rather
+          than managed memory, so it presents as connection failures instead."</p>
+        <p>"<strong>The container-specific detail I'd raise:</strong> .NET sizes its GC heap from the container memory
+          limit, so the limit is an <em>input to the runtime</em>, not just a kill threshold. A limit set too tight
+          makes the GC run far more aggressively — high CPU, more pause time — and it may still be killed. So
+          <strong>raising the limit can reduce CPU</strong>, which is genuinely counterintuitive."</p>
+        <p>"And I'd check <strong>Server GC</strong>: it's the ASP.NET Core default, allocates per-core heaps and holds
+          memory rather than returning it. In a small container with many visible cores that's a poor fit, and
+          Workstation GC can be measurably better — a real trade between memory efficiency and throughput."</p>
+        <p>"Also: leave <strong>headroom below the limit</strong>. The GC heap isn't the only memory the process uses —
+          native allocations, thread stacks and the runtime itself all count against the cgroup — so a heap limit at
+          100% of the container limit still gets OOM-killed."</p>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A query that took 50ms now takes 8 seconds. Nothing was deployed. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"'Nothing deployed' rules out a code change, so either <strong>the data changed or the plan changed</strong>.
+          The question that separates them is whether the degradation was <em>gradual or sudden</em>."</p>
+        <p>"<strong>Gradual</strong> — slower over weeks — is almost certainly a <strong>scan meeting more rows</strong>.
+          The query was always doing a scan; it just didn't matter at 50,000 rows and does at five million. Nothing
+          changed except the data, which is why it feels mysterious. The fix is an index, confirmed from the plan
+          showing a scan where a seek should be."</p>
+        <p>"<strong>Sudden, with no deployment</strong>, points at a plan change — and specifically
+          <strong>parameter sniffing</strong>."</p>
+        <p>"The mechanism: SQL Server compiles a plan for the first parameter values it sees and caches it. If that
+          first execution was for a customer with ten orders, the plan uses nested loops with seeks — perfect for ten
+          rows, catastrophic for a customer with a million. So the <em>same query text</em> is fast for some parameters
+          and slow for others."</p>
+        <p>"And it flips without warning: a restart, a failover, a statistics update or memory pressure causes a
+          recompile, and whichever parameter arrives first sets the plan for everyone. That's exactly 'it was fine
+          yesterday'."</p>
+        <p>"<strong>Query Store is how I'd confirm it.</strong> It keeps plan history per query, so I can see the point
+          the plan changed and compare the two. On Azure SQL it's on by default. It also gives me the fastest
+          mitigation — <strong>force the previous plan</strong> — which is minutes rather than hours. I'd label that as
+          a mitigation, since a forced plan is a pinned hint that can become wrong as data changes."</p>
+        <p>"<strong>Other candidates.</strong> <strong>Stale statistics</strong> after a large data load — a big gap
+          between estimated and actual rows in the plan is the tell, and it's usually the most informative number in a
+          plan. <strong>Blocking</strong>, if it's intermittent rather than consistent: wait statistics distinguish it
+          immediately, since <code>LCK_</code> waits mean blocking rather than a slow plan. And a
+          <strong>dropped index</strong> if there's been maintenance — cheap to rule out."</p>
+        <p>"On prevention: an alert on p95 duration per query from Query Store, so a regression is caught in hours
+          rather than when someone complains. Automatic plan correction is worth considering too — Azure SQL can detect
+          a regression and revert the plan without anyone being paged."</p>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>One instance out of six is serving errors. The others are fine. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That it's <em>one</em> instance is the most informative fact — it rules out anything shared. The code, the
+          database, the configuration and the dependencies are identical across all six, so the cause is
+          <strong>state local to that instance</strong>."</p>
+        <p>"I'd start by noting that <strong>aggregate metrics hide this completely</strong>: one instance in six
+          failing every request shows as a 17% error rate, which looks like a moderate problem rather than a third of
+          affected users seeing total failure. So the first move is to split every metric by instance."</p>
+        <p>"The candidates, roughly in order."</p>
+        <p>"<strong>A corrupted or exhausted connection pool.</strong> That instance's pool has drained — connections
+          not disposed on some path, or a burst it never recovered from — so every request times out waiting for one.
+          Restarting fixes it, which is why this often looks self-healing and recurs."</p>
+        <p>"<strong>Memory pressure or GC thrashing.</strong> That instance has grown, the GC is running constantly, and
+          latency has become timeouts. <code>kubectl top</code> or per-instance memory metrics show it immediately."</p>
+        <p>"<strong>A stale cached value.</strong> An in-process cache on that instance holds something wrong — an
+          expired token it isn't refreshing, a cached DNS entry pointing at a replaced pod, a configuration value read
+          before a change. This is where a singleton <code>HttpClient</code> caching DNS bites: the dependency failed
+          over and that instance keeps trying the old address."</p>
+        <p>"<strong>Something local it can't reach.</strong> A node-level network problem, a disk that's full, or a
+          mounted secret that failed to refresh."</p>
+        <p>"<strong>A partition or lease it owns.</strong> If instances own partitions — an Event Hubs processor, a
+          sharded consumer — then that instance's <em>partition</em> may be the problem rather than the instance."</p>
+        <p>"<strong>How I'd act.</strong> Take it out of rotation rather than restarting immediately, so I can capture a
+          dump and stack traces first — a restart destroys exactly the evidence I need, and this will recur. Then
+          replace it, which restores service."</p>
+        <p>"<strong>Prevention</strong> is the more interesting half, and it's two things. A <strong>readiness
+          probe</strong> that would have removed it automatically — that's precisely what health checks are for, and if
+          it kept receiving traffic while broken then the probe isn't checking anything meaningful. And
+          <strong>alerting on per-instance error rate</strong>, not just the aggregate, so one bad instance surfaces as
+          a specific alert rather than as a slightly elevated overall number."</p>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Intermittent failures, roughly 1% of requests, no pattern anyone can see. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"'No pattern' usually means <strong>nobody has grouped by the right dimension yet</strong>, so that's where
+          I'd start rather than with a hypothesis."</p>
+        <p>"I'd group the failures by <strong>instance, tenant, endpoint, time-of-day, and payload
+          characteristics</strong>. One percent spread evenly is a very different problem from one percent concentrated
+          in one tenant or one instance — and it's common for 'random' to become obvious once split by
+          dimension."</p>
+        <p>"Then I'd look for a <strong>correlation in time</strong>: does it spike on a schedule? That points at a
+          batch job, a cache expiry, a token refresh, a backup window, or a scaling event. A regular period is a strong
+          clue — a ten-minute rhythm is almost always a cache TTL."</p>
+        <p>"<strong>The candidates that produce genuinely low-rate intermittent failures:</strong>"</p>
+        <p>"<strong>A race condition.</strong> Small window, so it needs concurrency to hit. Check-then-act is the usual
+          shape — two requests both check, both proceed. It correlates with load and it will look random at low
+          traffic."</p>
+        <p>"<strong>Connection or pod churn.</strong> In Kubernetes especially: a pooled connection to a pod that's been
+          replaced fails on next use. That produces exactly this signature — a small percentage, clustered around
+          deployments and scaling events. <code>IHttpClientFactory</code> with a bounded
+          <code>PooledConnectionLifetime</code> is the fix."</p>
+        <p>"<strong>A specific instance</strong>, which is why grouping by instance comes first."</p>
+        <p>"<strong>Data-dependent failures.</strong> A particular record breaks a code path — a null someone didn't
+          expect, an unusual character, a value out of range. Grouping by the failing entity id usually reveals
+          it."</p>
+        <p>"<strong>Lock or deadlock victims.</strong> A deadlock victim is a transient failure by design, so a low rate
+          of them is normal-ish — the question is whether the rate is rising and whether the application retries."</p>
+        <p>"<strong>Retry exhaustion on a marginal dependency.</strong> If a dependency fails 5% of the time and you
+          retry twice, you'd see about 0.01% — so 1% suggests either no retries or a worse dependency than
+          assumed."</p>
+        <p>"<strong>What I'd need to make progress</strong>, and I'd say this directly: enough telemetry to
+          <em>find a specific failed request</em> and trace it end to end. If sampling is dropping the failures, I'd
+          exclude exceptions from sampling — which is the right configuration anyway, since failures are rare and
+          individually valuable while successes are numerous and interchangeable."</p>
+        <p>"The framing: <strong>intermittent failures are almost never random. They're a pattern in a dimension you
+          haven't looked at.</strong> The work is finding the dimension, not guessing the cause."</p>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>The database is hammered every ten minutes and requests time out. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A regular ten-minute period is a very strong signal — that's almost certainly a <strong>cache TTL</strong>,
+          and I'd expect to find a ten-minute expiry in the code. It's a <strong>cache stampede</strong>."</p>
+        <p>"The mechanism: the entries were all populated at roughly the same moment — usually at a deployment, when
+          every instance starts cold — and given <em>identical</em> TTLs. So they all expire in the same second, every
+          concurrent request misses, and hundreds of identical queries hit the database at once."</p>
+        <p>"Then it sustains itself: the database saturates, queries slow, requests time out before they can
+          repopulate the cache, so the next wave misses too. And the rhythm persists because each repopulation resets
+          the clock in unison."</p>
+        <p>"The point worth making is that <strong>the cache made this worse than having no cache</strong> — without it
+          the database would see steady load; with it, the load arrives as synchronised walls."</p>
+        <p>"<strong>Confirming it:</strong> correlate database load with cache miss rate. Misses spiking at the same
+          instant as the database spike is conclusive."</p>
+        <p>"<strong>The fix is nearly free: jitter every TTL</strong> — randomise by ±15%. One line, and it's the whole
+          fix for the common case, because a stampede is about <em>simultaneous</em> misses rather than misses. Spread
+          the same number across ninety seconds and the database won't notice."</p>
+        <p>"<strong>If it's a single very hot key</strong> — a pricing table, a config blob — jitter doesn't help, because
+          it's one key expiring once. There I'd use <strong>single-flight</strong>: the first caller takes a short lock
+          and repopulates while others wait briefly or serve the stale value. Or serve stale and refresh in the
+          background, which is usually the best user-facing behaviour — a few seconds of staleness in exchange for
+          never having a user-visible miss."</p>
+        <p>"<strong>Cache warming on startup</strong> for the deployment trigger, gated behind the readiness probe so
+          an instance doesn't take traffic until it's useful."</p>
+        <p>"<strong>Two adjacent things I'd check while I'm there.</strong> Does a cache failure fail the request? If an
+          unhandled Redis exception becomes a 500, we've made the cache a hard dependency and <em>reduced</em>
+          availability below the database alone. And <strong>can the database survive losing the cache
+          entirely?</strong> If it absorbs 90% of reads, losing it means 10× load — so 'the cache is optional' is only
+          true if the source can take the traffic."</p>
+        <p>"<strong>Prevention:</strong> alert on cache miss rate rather than only database load, because the miss spike
+          precedes the symptom. And treat identical TTLs as something to catch in review, since jitter costs
+          nothing."</p>
+      </div>
+    </div>
+  </details>
+
+  <div class="note senior">
+    <div class="note-title">What these six have in common</div>
+    <p style="margin:0">Every one is diagnosed by the same two moves: <strong>ask whether it scales with load</strong>,
+      and <strong>split the metric by a dimension</strong>.
+      <br><br>
+      Queueing versus slow path decides whether scaling out helps or hurts. Splitting by instance, tenant, partition or
+      endpoint turns "no pattern" into a specific cause — because <strong>the aggregate is reassuring while a single
+      unit fails</strong>.
+      <br><br>
+      And three of the six had a symptom that pointed at the wrong subsystem: thread starvation looked like a database
+      problem, CPU throttling looked like idle capacity, and a cache stampede looked like a database capacity issue. So
+      the habit worth having is <strong>distrusting the obvious attribution</strong> and confirming with a metric that
+      distinguishes.
+      <br><br>
+      Finally, in every case the answer ends with <em>how would we have known sooner?</em> — because that's frequently
+      the real question, and it's the part most candidates leave out.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Four narrowing questions: subset or all, scales with load, when and did anything deploy, one instance or
+        all.</li>
+      <li>"Does it scale with load?" separates queueing from a slow path — opposite fixes.</li>
+      <li>Latency with low CPU: thread starvation, pool exhaustion, CPU throttling, or lock contention.</li>
+      <li>CPU percent hides throttling — check throttled seconds.</li>
+      <li>Memory: never recovering is a leak; tracks concurrency is buffering; sawtooth is normal.</li>
+      <li>Compare two gcdumps — what grew is the answer.</li>
+      <li>.NET sizes the GC heap from the container limit, so a tight limit raises CPU.</li>
+      <li>Gradual query slowdown is a scan; sudden is a plan change — Query Store shows which.</li>
+      <li>One instance failing rules out everything shared; aggregates hide it.</li>
+      <li>Capture evidence before restarting — it will recur.</li>
+      <li>Intermittent failures are a pattern in a dimension you haven't grouped by.</li>
+      <li>Never sample exceptions away — failures are rare and individually valuable.</li>
+      <li>A regular period is a cache TTL; jitter is the free fix.</li>
+      <li>Finish with how you'd have detected it sooner.</li>
+    </ul>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

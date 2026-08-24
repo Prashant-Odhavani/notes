@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Top Interview Questions — Final Interview Prep</title>
+<meta name="description" content="The highest-frequency questions across every topic, with the answer that scores and the follow-up you should expect.">
+<meta name="keywords" content="top dotnet interview questions async await value reference types dependency injection lifetimes EF Core N+1 index SOLID REST idempotency caching transactions middleware exception handling most asked">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="37-final-prep/top-questions.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Top Interview Questions</h1>
+    <p class="subtitle">The ones that come up almost every time. Each has a version that satisfies and a version that
+      impresses — the difference is usually one added consequence.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="note tip">
+    <div class="note-title">The pattern that turns a good answer into a strong one</div>
+    <p style="margin:0">Every answer below follows the same shape: <strong>state the mechanism, then the consequence
+      you've seen in production.</strong>
+      <br><br>
+      "A struct is a value type, a class is a reference type" is correct and forgettable. Adding "which is why a large
+      struct passed around costs more than a reference, and why <code>List&lt;T&gt;</code> beats
+      <code>ArrayList</code> — boxing allocates" turns recall into understanding.
+      <br><br>
+      That's the whole technique, and it works on every question in this handbook. <strong>The mechanism gets you a
+      pass; the consequence gets you the role.</strong></p>
+  </div>
+
+  <h2 id="csharp">C# fundamentals <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>What's the difference between a value type and a reference type? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A value type holds its data directly; a reference type holds a reference to data elsewhere. So
+          <strong>assignment copies the value in one case and copies the reference in the other</strong> — which is the
+          behaviour that actually matters."</p>
+        <p>"I'd avoid saying 'stack versus heap', because it's an implementation detail and often wrong: a value type
+          that's a field of a class lives on the heap with it, and a captured local ends up on the heap too. The
+          copy semantics are the reliable distinction."</p>
+        <p>"Practical consequences. <strong>Passing a large struct copies it</strong>, so it can cost more than passing
+          a reference — which is why structs are for small immutable values. <strong>Boxing allocates</strong>, which is
+          why <code>List&lt;T&gt;</code> beats <code>ArrayList</code>. And <strong>mutating a struct in a
+          collection</strong> often modifies a copy, which is a genuinely confusing bug."</p>
+        <p>"<code>record</code> is worth mentioning: value <em>equality</em> without being a value type, unless it's a
+          <code>record struct</code>. That separation of equality from storage is what people find surprising."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>When would you use a struct?</li>
+          <li>What is boxing and why does it matter?</li>
+          <li>Is <code>string</code> a value or reference type? (Reference, but immutable, so it behaves value-like.)</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain async/await. Does it make code faster? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>No — a single request isn't faster, and is marginally slower</strong> because of the state machine.
+          What async does is <strong>free the thread while waiting on I/O</strong>, so the same server handles far more
+          concurrent requests before saturating. It's a throughput property, not a latency one."</p>
+        <p>"Mechanically: <code>await</code> on an incomplete task returns the thread to the pool and registers a
+          continuation. When the I/O completes, the continuation runs — possibly on a different thread."</p>
+        <p>"The consequence I'd lead with, because it's the observable one: <strong>sync-over-async starves the thread
+          pool</strong>. A <code>.Result</code> holds a pool thread for the entire I/O, and the pool only injects new
+          threads at one or two a second — so under load requests queue, latency climbs steeply, and
+          <strong>CPU stays low because nothing is computing</strong>."</p>
+        <p>"It typically presents as a database problem when the queries are fine. And <strong>one
+          <code>.Result</code> deep in the call chain is enough</strong>, so a fully async controller can still
+          starve."</p>
+        <p>"Two more things I'd get right. <strong><code>async void</code></strong> — exceptions can't be caught by the
+          caller and crash the process; only for event handlers. And <strong><code>ConfigureAwait(false)</code> in
+          libraries</strong>, so you don't force a context capture the caller may not need."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>How would you diagnose thread pool starvation?</li>
+          <li>What does <code>ConfigureAwait(false)</code> actually do?</li>
+          <li>When is <code>Task.Run</code> appropriate? (CPU work, not to "make it async".)</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does <code>IDisposable</code> solve, and when do you implement it? <span class="lvl lvl-i">🟡 Intermediate</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It gives <strong>deterministic release</strong> of things the GC won't handle promptly — file handles,
+          sockets, database connections, unmanaged memory. The GC will eventually collect the object, but 'eventually'
+          isn't good enough for a connection from a finite pool."</p>
+        <p>"I implement it when a type <em>owns</em> such a resource, or owns another disposable. And I'd use
+          <code>using</code> or <code>await using</code> so disposal happens even on an exception path."</p>
+        <p>"Two things worth knowing. A <strong>finalizer</strong> is a safety net for unmanaged resources and it makes
+          collection more expensive, so it's only warranted when wrapping a raw handle — and
+          <code>SafeHandle</code> usually removes the need. And <strong><code>IAsyncDisposable</code></strong> exists
+          because some cleanup is genuinely I/O — flushing a stream, closing a connection gracefully — and blocking in
+          <code>Dispose</code> is how you deadlock."</p>
+        <p>"The one that catches people: <strong>disposing <code>HttpClient</code> per use is wrong</strong>, even
+          though it's disposable. Each disposal leaves a socket in <code>TIME_WAIT</code>, so under load you exhaust
+          outbound ports. <code>IHttpClientFactory</code> is the answer."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>Why is disposing <code>HttpClient</code> a problem?</li>
+          <li>What happens if you don't dispose a <code>DbContext</code>?</li>
+          <li>When would you write a finalizer?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h2 id="aspnet">ASP.NET Core <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>Explain the DI lifetimes. What goes wrong if you get them wrong? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>Singleton</strong> — one instance for the application. <strong>Scoped</strong> — one per request.
+          <strong>Transient</strong> — a new one every time it's resolved."</p>
+        <p>"The failure that matters is <strong>a scoped service captured by a singleton</strong>. The singleton holds
+          the first request's instance forever — so a <code>DbContext</code> intended to live for one request is shared
+          across every subsequent request. That gives you a growing change tracker, thread-safety violations because
+          <code>DbContext</code> isn't thread-safe, and stale data."</p>
+        <p>"Worse in multi-tenant systems: if the captured service holds tenant context, <strong>one request can serve
+          another tenant's data</strong> — intermittently and under load, which is the hardest version of that bug to
+          find."</p>
+        <p>"The good news is that <strong>scope validation catches it at startup</strong> in development, so it's
+          usually a build-time failure rather than a production one. Worth enabling in all environments."</p>
+        <p>"The subtler case is a singleton needing scoped work — a background service wanting a
+          <code>DbContext</code>. There you inject <code>IServiceScopeFactory</code> and create a scope per unit of
+          work, rather than resolving the scoped service once."</p>
+        <p>"On <strong>transient versus scoped</strong>: transient is fine for cheap stateless services, and it means
+          two collaborators in one request get different instances — which matters if the service holds any per-request
+          state."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>How does a background service use a <code>DbContext</code>?</li>
+          <li>What's the lifetime of <code>DbContext</code> by default, and why?</li>
+          <li>Why does <code>IOptions</code> not see configuration changes?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does middleware work, and does order matter? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Middleware is a <strong>pipeline of components</strong>, each holding a reference to the next. A request
+          passes through them in registration order, and the response passes back <em>out</em> through them in reverse
+          — so each one can act before and after the rest of the pipeline. It's the Chain of Responsibility
+          pattern."</p>
+        <p>"<strong>Order matters absolutely</strong>, and getting it wrong usually fails silently rather than
+          erroring."</p>
+        <p>"Exception handling goes <strong>first</strong>, so it wraps everything after it — registered later and it
+          can't catch what ran before it. <strong>Routing before endpoints</strong>, obviously. And
+          <strong>authentication before authorisation</strong>, because authorisation needs an identity to
+          evaluate — reversed, every authenticated request looks anonymous and you get 401s you can't
+          explain."</p>
+        <p>"CORS before anything that would short-circuit, or the preflight never gets its headers. Response
+          compression and caching need to be positioned to see the response you actually want them to act on."</p>
+        <p>"The general principle: <strong>anything that short-circuits must come after everything that needs to see
+          the request.</strong>"</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>Where would you put a middleware that adds a correlation id?</li>
+          <li>What happens if authorisation runs before authentication?</li>
+          <li>How do you short-circuit the pipeline?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h2 id="data">Data access <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>What's an N+1 query and how do you find it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"One query fetches N rows, then iterating them triggers a query <em>per row</em> — so N+1 round trips
+          instead of one or two. Classically caused by lazy loading inside a loop, or by projecting a navigation
+          property that wasn't included."</p>
+        <p>"The reason it's worth knowing well is <strong>how it hides</strong>. Each individual query is fast — two
+          milliseconds — so nothing looks slow. There's no slow query to find in the plan cache, and no latency
+          percentile reveals it, because no single operation is slow. It's four hundred fast things."</p>
+        <p>"So the way I'd find it is by <strong>counting dependency calls per operation</strong> in Application
+          Insights — grouping the dependencies table by <code>operation_Id</code> and looking for operations making
+          hundreds of calls. That's the query that surfaces it, and it's not one people usually run."</p>
+        <p>"Fixes: <code>Include</code> when you need the related entities, or better a <strong>projection</strong> with
+          <code>Select</code> so you fetch only the columns you use. <code>AsSplitQuery</code> if a single joined query
+          produces a cartesian explosion instead."</p>
+        <p>"And prevention rather than detection: EF Core can be configured to <strong>throw on lazy
+          loading</strong>, which turns an N+1 into a test failure. That's the structural fix — it can't reach
+          production."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>When would <code>Include</code> be worse than a projection?</li>
+          <li>What's a cartesian explosion, and what's <code>AsSplitQuery</code> for?</li>
+          <li>How would you catch this in CI?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do indexes work, and when do they not help? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"An index is a sorted structure — a B-tree — that lets the engine <strong>seek</strong> to matching rows
+          instead of <strong>scanning</strong> the whole table. A <em>clustered</em> index is the physical row order, so
+          there's one per table; a <em>non-clustered</em> index is a separate structure with a pointer back to the
+          row."</p>
+        <p>"<strong>Column order matters</strong>, and it's the thing most often wrong: equality predicates first, then
+          range, then anything you sort by. An index on <code>(Status, CreatedAt)</code> serves
+          <code>WHERE Status = x ORDER BY CreatedAt</code>; reversed, it doesn't."</p>
+        <p>"<strong>Covering</strong> the query with <code>INCLUDE</code> columns avoids the key lookup back to the
+          table, which is often where most of the remaining cost is."</p>
+        <p>"When indexes <em>don't</em> help: <strong>low selectivity</strong> — an index on a boolean matching half the
+          table is worse than a scan, and the optimiser will correctly ignore it. <strong>A function applied to the
+          column</strong> — <code>WHERE YEAR(Date) = 2024</code> isn't sargable, so rewrite it as a range.
+          <strong>Leading wildcards</strong> in <code>LIKE</code>. And <strong>a mismatched data type</strong> forcing
+          an implicit conversion, which silently disables the index — that one is genuinely hard to spot."</p>
+        <p>"The cost side, which is the part people skip: <strong>every index is maintained on every write.</strong> A
+          table with twelve indexes does thirteen writes per insert. So on a write-heavy table, indexes are a real
+          trade rather than free — and the DMVs will tell you which ones have never been used."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>Why did adding an index make writes slower?</li>
+          <li>What is a covering index?</li>
+          <li>Why would the optimiser ignore an index you created?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain transactions and isolation levels. <span class="lvl lvl-i">🟡 Intermediate</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A transaction gives ACID — atomicity, consistency, isolation, durability. In practice
+          <strong>isolation is the one with choices</strong>, and the choices trade correctness against
+          concurrency."</p>
+        <p>"<strong>Read uncommitted</strong> allows dirty reads — you can see uncommitted data that may be rolled
+          back. <strong>Read committed</strong> is the SQL Server default and prevents that.
+          <strong>Repeatable read</strong> also prevents a row changing under you. <strong>Serializable</strong>
+          prevents phantoms too, at the cost of range locks and much more blocking."</p>
+        <p>"<strong>Snapshot isolation</strong> is the one I'd highlight, because it's often the right answer:
+          readers see a consistent version and <em>don't block writers</em>. The cost is version-store pressure in
+          <code>tempdb</code> and the possibility of update conflicts."</p>
+        <p>"The practical point I'd make is that <strong>a transaction's cost is its duration</strong>, not its size.
+          It holds locks until it commits — so the worst thing you can do is put an <strong>HTTP call inside a
+          transaction</strong>. The lock is then held for however long a third party takes, and under load that
+          cascades into timeouts that look like a database problem."</p>
+        <p>"Also worth knowing: <strong>lock escalation</strong>, where a bulk update crossing about 5,000 row locks
+          takes a table lock instead and blocks everything — so batch large updates. And
+          <strong>deadlocks</strong>, which are usually two paths taking locks in different orders; the fix is
+          consistent ordering plus a retry, since a deadlock victim is a transient failure by design."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>What is a phantom read?</li>
+          <li>Would you ever use <code>READ UNCOMMITTED</code>?</li>
+          <li>How do you handle a deadlock in application code?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h2 id="api">APIs and distributed basics <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>What makes an operation idempotent, and why does it matter? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Idempotent means <strong>performing it more than once has the same effect as performing it once</strong>.
+          <code>PUT</code> and <code>DELETE</code> are idempotent by definition; <code>POST</code> generally isn't."</p>
+        <p>"It matters because <strong>retries are unavoidable</strong>. A response can be lost after the work
+          succeeded — a timeout, a dropped connection, a process dying — and the caller can't tell the difference
+          between 'it failed' and 'it worked and I didn't hear'. So it retries, and without idempotency you get a
+          double charge or a duplicate order."</p>
+        <p>"The important framing: <strong>nothing was broken</strong> in that scenario. Both sides behaved correctly
+          and the outcome is still wrong — which is why idempotency is a design requirement rather than a bug fix."</p>
+        <p>"How I'd implement it. Prefer <strong>naturally idempotent operations</strong> — 'set status to Shipped' is
+          safe to repeat, 'increment the counter' isn't. Where that's not possible, an
+          <strong>idempotency key</strong> supplied by the caller, stored with the result, so a repeat returns the
+          original outcome."</p>
+        <p>"Two details that make or break it. The key must come from the <strong>client</strong>, because a
+          server-generated key gives every retry a new value and deduplicates nothing. And it must be enforced by a
+          <strong>unique index</strong> — insert first and treat the constraint violation as a duplicate. An
+          application-level 'have we seen this?' check is check-then-act, which two concurrent callers both
+          pass."</p>
+        <p>"The principle: <strong>make the database the arbiter, not your code.</strong>"</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>How long do you keep idempotency keys?</li>
+          <li>What do you return if a duplicate arrives while the first is still in flight?</li>
+          <li>Is <code>PATCH</code> idempotent?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you add a cache, and what goes wrong? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"When reads greatly outnumber writes and the same data is read repeatedly. I'd want the read/write ratio
+          first, because that's what decides whether it's worth the complexity — at 20:1 caching is load-bearing, at
+          2:1 it's probably not worth the failure modes."</p>
+        <p>"And I'd be specific about <strong>what</strong>, <strong>for how long</strong>, and <strong>how it's
+          invalidated</strong>, because those are the parts that go wrong. Reference data can cache for hours; an order
+          for a minute with invalidation on write; a permission check barely at all, because stale authorisation is a
+          security issue rather than a stale display."</p>
+        <p>"What goes wrong, in order of how often I've seen it."</p>
+        <p>"<strong>Stampede.</strong> Identical TTLs — typically set when every instance started at a deployment — all
+          expire in the same second, so every request misses simultaneously and the database gets hit by a wall.
+          <strong>Jitter every TTL</strong>; that's one line and it's the whole fix, because a stampede is about
+          <em>simultaneous</em> misses rather than misses."</p>
+        <p>"<strong>Stale data.</strong> I'd invalidate on write rather than waiting for the TTL — and specifically
+          <strong>delete rather than update</strong>, because two concurrent writers updating a cache can interleave and
+          leave it permanently wrong. A delete's worst case is a redundant database read."</p>
+        <p>"<strong>The cache becoming a hard dependency.</strong> If an unhandled Redis exception becomes a 500, we've
+          <em>reduced</em> availability below the database alone. So every access is wrapped and falls through to the
+          source. Though 'the cache is optional' is only true if the database survives 100% of the read load, which is
+          worth knowing before it happens."</p>
+        <p>"And in a multi-tenant system, <strong>tenant id in every key</strong>. Omitting it serves one customer
+          another's data — a breach, not a bug, and it passes every single-tenant test."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>What happens when Redis goes down entirely?</li>
+          <li>How do you handle a single very hot key?</li>
+          <li>Why delete rather than update the cache?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you handle exceptions in a web API? <span class="lvl lvl-i">🟡 Intermediate</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>One handler at the boundary</strong> — exception-handling middleware, or
+          <code>IExceptionHandler</code> — that logs with context and maps to a response. Not try/catch in every
+          controller action."</p>
+        <p>"The response is <strong>Problem Details</strong>, so it's machine-readable, with a <strong>trace id</strong>
+          included. That trace id is what turns a support ticket into a distributed trace — the customer quotes a
+          reference and I retrieve the whole request."</p>
+        <p>"I'd catch only what I can actually handle. Catching broadly and swallowing means a failure becomes a wrong
+          answer instead of an error, which is much harder to diagnose. And <code>throw;</code> rather than
+          <code>throw ex;</code>, since the latter resets the stack trace."</p>
+        <p>"On what's an exception at all: <strong>expected outcomes shouldn't be exceptions</strong>. 'Not found' and
+          'validation failed' are normal results — a result type or a validation response is clearer and much cheaper
+          than throwing on a hot path."</p>
+        <p>"And <strong>never return the exception message to the client</strong>. It leaks internal detail — table
+          names, file paths, sometimes connection strings. A safe message plus the trace id; the detail stays in the
+          logs."</p>
+        <p>"One thing I'd add for a payment or similarly sensitive path: <strong>don't log request bodies</strong>. A
+          well-meaning debug log can put card data or personal data into a log store that far more people can
+          read."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>How do you distinguish a client error from a server error?</li>
+          <li>Where do you log, and what do you include?</li>
+          <li>How does the client correlate an error with your logs?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h2 id="design">Design fundamentals <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>Explain SOLID. Which principle do you find most useful? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd go through them quickly and then say which ones actually change my code, because reciting five
+          definitions isn't the interesting part."</p>
+        <p>"<strong>Single responsibility</strong> — one reason to change. Not 'one thing', which is too vague to apply;
+          the useful test is whether two different stakeholders would ask you to change the same class for different
+          reasons."</p>
+        <p>"<strong>Open/closed</strong> — extend without modifying. In practice that's polymorphism or a strategy
+          instead of a switch that grows every time a case is added."</p>
+        <p>"<strong>Liskov substitution</strong> — a subtype must honour the base contract. The clearest violation is
+          overriding a method to throw <code>NotSupportedException</code>: it compiles, satisfies the type system, and
+          breaks callers."</p>
+        <p>"<strong>Interface segregation</strong> — a fat interface forces implementers to stub methods they don't
+          support, which is usually the same smell as the LSP violation."</p>
+        <p>"<strong>Dependency inversion</strong> — depend on abstractions, with the concrete type chosen at
+          composition. That's what makes testing at boundaries possible."</p>
+        <p>"<strong>Most useful in practice: dependency inversion and single responsibility</strong> — those two
+          change how I structure code daily. Open/closed I'd apply when a third case appears, not pre-emptively,
+          because building extensibility for cases that never arrive is its own cost."</p>
+        <p>"The thing I'd add: <strong>in .NET, idiomatic code often <em>is</em> the pattern.</strong> Constructor
+          injection is Strategy plus DIP. <code>DbSet</code> is a Repository. <code>DbContext</code> is a Unit of Work.
+          Middleware is Chain of Responsibility. Recognising a principle in ordinary code is more useful than being
+          able to draw the diagram."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>Give an example of an LSP violation you've seen.</li>
+          <li>Can SOLID be taken too far?</li>
+          <li>Is a repository over EF Core worth it?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>REST: what do the status codes mean, and what's the difference between PUT and PATCH? <span class="lvl lvl-b">🟢 Beginner</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>PUT replaces the whole resource</strong> and is idempotent — sending it twice leaves the same state.
+          <strong>PATCH applies a partial modification</strong>, and whether it's idempotent depends on the operations:
+          'set name to X' is, 'append to a list' isn't."</p>
+        <p>"That matters for retries. A client can safely retry a PUT after a timeout; retrying a PATCH depends on what
+          the patch does."</p>
+        <p>"On status codes, the distinctions worth being precise about: <strong>401 is unauthenticated</strong> — you
+          haven't proved who you are. <strong>403 is authenticated but not permitted.</strong> Confusing them makes
+          clients retry with the same credentials pointlessly."</p>
+        <p>"<strong>404 versus 403</strong> is a design decision: returning 404 for something that exists but isn't
+          yours <em>hides existence</em>, which is often what you want for security."</p>
+        <p>"<strong>400 is malformed</strong>, <strong>422 is well-formed but semantically invalid</strong>,
+          <strong>409 is a conflict</strong> with current state, <strong>412 is a failed precondition</strong> —
+          which is what <code>If-Match</code> returns and gives you optimistic concurrency for free.
+          <strong>429 is throttled</strong>, and should come with <code>Retry-After</code>."</p>
+        <p>"<strong>202 Accepted</strong> is worth mentioning because it's underused: for anything that takes longer
+          than a request should, accept it and return a status URL rather than holding the connection until it times
+          out."</p>
+      </div>
+      <div class="followups">
+        <div class="note-title">Expect next</div>
+        <ul>
+          <li>What would you return when creating a resource?</li>
+          <li>How do you handle optimistic concurrency over HTTP?</li>
+          <li>Is a POST that creates nothing still a POST?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>State the mechanism, then the production consequence. That's the whole technique.</li>
+      <li>Async is throughput; sync-over-async starves the pool and looks like a database problem.</li>
+      <li>Copy semantics, not stack-versus-heap, is the value/reference distinction.</li>
+      <li>A scoped service captured by a singleton is the DI bug that matters.</li>
+      <li>Middleware order: exception handling first, authentication before authorisation.</li>
+      <li>N+1 hides because every query is fast — count dependencies per operation.</li>
+      <li>Index column order: equality, range, sort. Every index costs on write.</li>
+      <li>A transaction's cost is its duration — no HTTP calls inside one.</li>
+      <li>Idempotency: client-supplied key, unique index, database as arbiter.</li>
+      <li>Caching: jitter TTLs, delete on write, never a hard dependency, tenant in the key.</li>
+      <li>One exception handler at the boundary, Problem Details, trace id, no leaked detail.</li>
+      <li>In .NET, idiomatic code often <em>is</em> the pattern.</li>
+      <li>401 vs 403, 400 vs 422, and 202 for anything slow.</li>
+    </ul>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

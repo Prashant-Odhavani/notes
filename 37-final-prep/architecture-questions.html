@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture Questions — Final Interview Prep</title>
+<meta name="description" content="Design and trade-off questions with model answers: choosing a store, drawing boundaries, consistency, sync versus async, and splitting a monolith.">
+<meta name="keywords" content="architecture interview questions choose database SQL vs NoSQL service boundaries strong vs eventual consistency synchronous asynchronous splitting a monolith strangler pattern layered clean architecture trade-offs">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="37-final-prep/architecture-questions.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Architecture Questions</h1>
+    <p class="subtitle">Questions with no single right answer. What's scored is whether you can name the trade-off and
+      say what would change your mind.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="note tip">
+    <div class="note-title">The answer shape that works for all of these</div>
+    <p style="margin:0">Every question here is best answered in four moves:
+      <br><br>
+      <strong>1. Ask what you'd need to know.</strong> Two or three specific questions, not "it depends".
+      <br><br>
+      <strong>2. Commit to a recommendation</strong> under stated assumptions. Refusing to choose reads as
+      indecision.
+      <br><br>
+      <strong>3. Name the cost</strong> of your choice, before being asked.
+      <br><br>
+      <strong>4. Say what would change your mind</strong> — the threshold at which the other option wins.
+      <br><br>
+      That fourth move is the one candidates skip, and it's the strongest, because it demonstrates you know the
+      <em>boundary</em> of your own decision rather than just its content.</p>
+  </div>
+
+  <h2 id="store">Choosing a data store <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>SQL or NoSQL for a new system? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd ask three things: <strong>are the access patterns known and stable, does anything need multi-entity
+          transactions, and how much do we need to query in ways we haven't anticipated?</strong>"</p>
+        <p>"<strong>My default is relational</strong>, and I'd defend that positively rather than as a fallback. It
+          gives transactions across entities, flexible querying after the fact, constraints enforced by the database,
+          and a very large pool of people who understand it. For most business systems that's exactly what you
+          want."</p>
+        <p>"The property I'd emphasise is <strong>querying you didn't anticipate</strong>. Business requirements change,
+          and a relational schema lets you answer a new question with a new query — possibly plus an index. A document
+          store optimised for known access patterns makes an unanticipated query expensive or impossible."</p>
+        <p>"<strong>I'd choose a document store when</strong> the access patterns are genuinely known and stable, the
+          data is naturally hierarchical and read as a unit, throughput or global distribution requirements exceed what
+          a single relational primary gives, or the schema varies genuinely per item rather than accidentally."</p>
+        <p>"The cost I'd name: <strong>the partition key is usually irreversible.</strong> In Cosmos DB or DynamoDB you
+          cannot change it without a migration, and it determines both the scale ceiling and which queries are cheap.
+          So choosing it before you understand the access patterns <em>and</em> the size distribution is the expensive
+          mistake — a skewed key gives you a hot partition, and adding capacity can't fix that because throughput
+          divides per partition."</p>
+        <p>"I'd also push back on 'NoSQL means no schema'. There's still a schema — it just lives in the application and
+          in every consumer, unversioned. That's usually harder to change, not easier."</p>
+        <p>"<strong>What would change my mind:</strong> a genuine need for single-digit-millisecond reads at very high
+          volume, multi-region active-active writes, or a document shape that a relational model would fragment across
+          eight tables and always join back together."</p>
+        <p>"And I'd say that <strong>using both is normal</strong> — relational as the system of record, a document
+          store or search index as a projection for specific read patterns. That's usually better than forcing one
+          store to do everything."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you have a default, and can you justify it positively?</li>
+        <li>Do you value unanticipated querying?</li>
+        <li>Do you know the partition key is irreversible?</li>
+        <li>Do you reject "no schema"?</li>
+        <li>Do you name a threshold that would change the answer?</li>
+      </ul>
+    </div>
+  </details>
+
+  <h2 id="boundaries">Drawing boundaries <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>How do you decide where one service ends and another begins? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My primary test is <strong>what must be transactional together</strong>. If two things must change
+          atomically, they belong in one service with one database. Splitting them means replacing a transaction with a
+          saga — compensation logic, eventual consistency, partial-failure states — for no benefit."</p>
+        <p>"So I work outward from consistency requirements rather than from nouns in the requirements. 'We have orders,
+          customers and products, so three services' produces boundaries that need distributed transactions to
+          function."</p>
+        <p>"<strong>Second test: what changes together.</strong> If a typical feature touches three services, those
+          boundaries are wrong — you've created coordination overhead without independence. That's measurable
+          afterwards: look at how many services a typical pull request touches."</p>
+        <p>"<strong>Third: who owns it.</strong> A boundary that doesn't align with a team is a boundary nobody
+          maintains. Conway's law applies whether you plan for it or not."</p>
+        <p>"The signal I'd use to judge an existing design: <strong>the number of sagas.</strong> Sagas are the cost of
+          a boundary crossing something that should have been atomic, so lots of them means the boundaries are
+          wrong."</p>
+        <p>"On <strong>data ownership</strong>: exactly one service owns each piece of data and everyone else reads via
+          its API or a projection. Two services writing to the same table isn't microservices — it's coupling without
+          independence, which is the worst of both. And I'd call out shared databases specifically, because they're the
+          most common way a microservices migration goes wrong."</p>
+        <p>"<strong>What would change my mind</strong> about keeping something together: genuinely different scaling
+          characteristics, a regulatory need to isolate a workload, or a component with a completely different release
+          cadence owned by another team."</p>
+        <p>"And the honest default: <strong>start with fewer, larger boundaries.</strong> Merging two services is easy;
+          splitting a wrongly-drawn one involves data migration. Given that you rarely know the right boundaries early,
+          the asymmetry argues for starting coarse."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Is your primary test transactional rather than nominal?</li>
+        <li>Do you consider what changes together, and team ownership?</li>
+        <li>Do you use saga count as a signal?</li>
+        <li>Do you insist on single ownership of data?</li>
+        <li>Do you note the asymmetry between merging and splitting?</li>
+      </ul>
+    </div>
+  </details>
+
+  <h2 id="consistency">Consistency <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>Strong or eventual consistency? How do you decide? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by rejecting the framing slightly: <strong>it isn't a system-wide choice.</strong> Different parts
+          of one system deserve different guarantees, and treating it as a single decision is the mistake."</p>
+        <p>"The question I'd actually ask per piece of data is <strong>'what's the cost of being wrong?'</strong> A stale
+          product description costs nothing. A stale stock level oversells. A stale permission check is a security
+          incident. Those three obviously don't want the same guarantee."</p>
+        <p>"In a booking system, <strong>seat allocation must be strongly consistent</strong> — double-booking is
+          unacceptable — while the search index can be seconds stale and nobody minds. Spending strong consistency only
+          where it's needed is what makes the rest of the system scalable."</p>
+        <p>"<strong>Strong consistency costs</strong>: a single writer or coordination, which limits throughput and
+          usually rules out multi-region active-active. <strong>Eventual consistency costs</strong>: every reader has to
+          handle staleness, which shows up in the UI and in every consumer's logic."</p>
+        <p>"The specific staleness users notice is <strong>read-after-write</strong>. Placing an order and not seeing it
+          in the list reads as a lost order, and produces a duplicate attempt. So I'd return the created resource in
+          the response, or read a user's own recent writes from the authoritative store, or show the pending state
+          honestly — 'your order is being processed' rather than an empty list."</p>
+        <p>"Most other staleness is invisible, which is why that one is worth designing around specifically."</p>
+        <p>"Two mechanisms I'd mention. Where strong consistency is needed, the tool is usually
+          <strong>one atomic conditional write</strong> — a conditional UPDATE, a unique constraint, an ETag check —
+          rather than a lock. And where eventual consistency is acceptable, an explicit
+          <strong><code>Pending</code> status</strong> makes the intermediate state safe to observe, which is what makes
+          it tolerable to everything else reading the data."</p>
+        <p>"<strong>What would change my mind:</strong> if the business genuinely cannot tolerate any window — money
+          movement, safety-critical allocation — then I'd accept the throughput cost. And in the other direction, if a
+          strongly-consistent design was capping throughput below requirements, I'd look for the narrowest invariant
+          that genuinely needs it rather than relaxing everything."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you reject it as a system-wide choice?</li>
+        <li>Do you frame it as the cost of being wrong?</li>
+        <li>Do you know read-after-write is the visible problem?</li>
+        <li>Do you reach for a conditional write rather than a lock?</li>
+        <li>Do you know a pending status makes intermediate state safe?</li>
+      </ul>
+    </div>
+  </details>
+
+  <h2 id="sync-async">Synchronous or asynchronous <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <details class="qa">
+    <summary>When should a service call be synchronous versus a message? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The test I'd use is: <strong>does the caller need the answer to continue?</strong>"</p>
+        <p>"If yes — a validation result, a price, an availability check — it's synchronous. Putting a queue there just
+          adds a hop and a polling mechanism, so you've made it slower and given yourself two systems to debug."</p>
+        <p>"If no — send an email, update a search index, recalculate a report — it's a message. The caller returns
+          immediately and the work happens reliably."</p>
+        <p>"The second question, which decides more than people expect: <strong>what should happen if the other side is
+          down?</strong>"</p>
+        <p>"With a synchronous call, the caller fails — or worse, hangs. And <strong>slow is worse than dead</strong>: a
+          dependency responding in 30 seconds instead of 200 milliseconds holds a thread per request, so the thread
+          pool exhausts and <em>every</em> endpoint becomes slow, including ones that don't touch that dependency. One
+          slow dependency takes down the whole service."</p>
+        <p>"With a message, the queue absorbs it. The work is delayed rather than lost, and the caller doesn't
+          care. That's often the deciding argument — not latency, but <em>failure containment</em>."</p>
+        <p>"So if synchronous is unavoidable, it needs a <strong>timeout first</strong> — and <code>HttpClient</code>'s
+          100-second default is far too long for a service call — then a circuit breaker so you stop paying the timeout
+          on every request, then a bulkhead so that dependency can only consume a slice of your capacity."</p>
+        <p>"<strong>A middle option worth naming</strong>: accept the request synchronously, return 202 with a status
+          URL, and process asynchronously. That gives the caller immediate acknowledgement with async durability, and
+          it's the right shape for anything that takes longer than a request should."</p>
+        <p>"<strong>What would change my mind</strong> about going async: if the flow needs to be atomic with something
+          else, a queue in the middle replaces a transaction with a saga — so I'd keep it synchronous and in one
+          service. And if debuggability matters more than resilience for a low-risk internal call, synchronous is
+          genuinely simpler: a stack trace beats correlating a message through a dead-letter queue."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you use "does the caller need the answer?" as the test?</li>
+        <li>Do you know slow is worse than dead?</li>
+        <li>Do you order timeout, breaker, bulkhead?</li>
+        <li>Do you know 202-with-status-URL as the middle option?</li>
+        <li>Do you note that a queue breaks a transaction?</li>
+      </ul>
+    </div>
+  </details>
+
+  <h2 id="monolith">Splitting a monolith <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <details class="qa">
+    <summary>You've inherited a large monolith. How do you approach modernising it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First: <strong>I wouldn't assume it needs splitting.</strong> 'Monolith' isn't a diagnosis. I'd want to know
+          what's actually painful — is it deployment risk, build time, teams colliding, one component needing different
+          scaling, or just that it's old and unloved? Those have different answers, and the last one isn't a
+          problem."</p>
+        <p>"<strong>Then I'd stabilise before restructuring.</strong> Tests around the parts we'll touch, a reliable
+          pipeline, and observability — because you cannot safely refactor something you can't deploy confidently or
+          observe. That's unglamorous and it's the prerequisite; teams that skip it end up with a half-migrated system
+          they can't reason about."</p>
+        <p>"<strong>Then modularise in place</strong>, before extracting anything. Establish module boundaries inside
+          the codebase and enforce them mechanically — an architecture test that fails the build on cross-module
+          references."</p>
+        <p>"That step gets undervalued and it delivers most of the benefit. If the pain is teams colliding, module
+          boundaries solve it without any distributed-systems cost. And if you do extract later, the seams already
+          exist and are already proven — so extraction becomes mechanical rather than archaeological."</p>
+        <p>"<strong>If extraction is genuinely justified</strong>, I'd use the <strong>strangler pattern</strong>: route
+          traffic through a facade, move one capability at a time behind it, and keep the old path until the new one is
+          proven. Never a big-bang rewrite — those have a poor record: they take longer than estimated, reintroduce
+          fixed bugs, and stop feature work for months."</p>
+        <p>"<strong>What I'd extract first:</strong> something with clear boundaries, low coupling, and real value in
+          being separate. Ideally something that's genuinely painful <em>and</em> genuinely separable. A first extraction
+          that goes well buys credibility for the rest; one that turns into a six-month slog kills the programme."</p>
+        <p>"<strong>The hard part is always the data</strong>, and I'd say so explicitly. Splitting the code is
+          comparatively easy; splitting a database where everything joins to everything is where these efforts die.
+          The sequence is: identify the tables the extracted service owns, remove other components' direct access to
+          them — replacing joins with API calls, which will be slower and is the real cost — and only then physically
+          separate."</p>
+        <p>"Two failure modes I'd name. <strong>A shared database between the new service and the monolith</strong> —
+          coupling without independence, all the cost and none of the benefit, and by far the most common outcome. And
+          <strong>the endless migration</strong>: a system permanently half-migrated, running two architectures with
+          double the operational surface, because the programme lost sponsorship. That's worse than either end
+          state."</p>
+        <p>"So I'd want each step to deliver standalone value, so stopping partway still leaves things better rather
+          than worse."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Do you interrogate whether splitting is needed at all?</li>
+        <li>Do you stabilise and observe before restructuring?</li>
+        <li>Do you modularise in place first?</li>
+        <li>Strangler rather than rewrite?</li>
+        <li>Do you identify the data as the hard part?</li>
+        <li>Do you name the shared-database and endless-migration failure modes?</li>
+      </ul>
+    </div>
+  </details>
+
+  <h2 id="layering">Layering and structure <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <details class="qa">
+    <summary>Clean architecture — worth it, or over-engineering? <span class="lvl lvl-a">🔴 Advanced</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It depends on which part you mean, because it's usually adopted as a package and only some of it earns its
+          keep."</p>
+        <p>"<strong>The valuable core is dependency inversion at the boundaries</strong>: domain logic that doesn't
+          depend on EF Core, ASP.NET Core or a specific HTTP client. That makes the logic testable without
+          infrastructure, and it means an infrastructure change doesn't ripple into business rules. Genuinely worth
+          it."</p>
+        <p>"<strong>What often isn't worth it</strong> is the ceremony that comes with it. A repository interface with
+          one implementation that wraps <code>DbSet</code> adds indirection while giving you nothing —
+          <code>DbSet</code> <em>is</em> a repository and <code>DbContext</code> <em>is</em> a unit of work. Mapping
+          between four representations of the same concept for every operation is real cost paid every time you touch
+          it. And an interface per class, created reflexively, makes navigation harder for no benefit."</p>
+        <p>"So my position: <strong>keep the dependency direction, drop the ceremony.</strong> Domain logic free of
+          infrastructure references, and otherwise the simplest structure that expresses the code."</p>
+        <p>"For a CRUD-heavy application I'd go further and say most of it is overhead. If an endpoint reads a row and
+          returns it, routing that through a command, a handler, a repository, a domain entity and three mappers is
+          pure cost — and it makes the codebase harder to learn."</p>
+        <p>"<strong>Where I'd invest the structure is where the logic is</strong>. Vertical slices work well here:
+          organise by feature rather than by layer, so everything for one operation sits together, and apply more
+          structure only to the slices that are genuinely complex. A simple lookup stays simple; a pricing calculation
+          gets a proper domain model."</p>
+        <p>"<strong>What would change my mind</strong> toward more structure: a genuinely complex domain with real
+          invariants and rules, a long-lived system where infrastructure will certainly be replaced, or a large team
+          needing consistency more than local optimality. Those are real reasons — I'd just want one of them to be
+          true."</p>
+        <p>"The general principle: <strong>structure should be proportional to the complexity it manages.</strong>
+          Uniform structure applied regardless of complexity is a cost with no corresponding benefit."</p>
+      </div>
+      <h5>What they're checking</h5>
+      <ul>
+        <li>Can you separate the valuable part from the ceremony?</li>
+        <li>Do you know <code>DbSet</code> is already a repository?</li>
+        <li>Do you vary structure with complexity rather than applying it uniformly?</li>
+        <li>Can you say what would justify more structure?</li>
+      </ul>
+    </div>
+  </details>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Ask, recommend, name the cost, then say what would change your mind.</li>
+      <li>Relational by default — the value is querying you didn't anticipate.</li>
+      <li>Partition keys are irreversible; "no schema" means an unversioned schema in the application.</li>
+      <li>Draw boundaries from what must be transactional; saga count signals wrong boundaries.</li>
+      <li>One owner per piece of data — a shared database is coupling without independence.</li>
+      <li>Start coarse: merging is easy, splitting involves data migration.</li>
+      <li>Consistency is per-data, not system-wide — ask what being wrong costs.</li>
+      <li>Read-after-write is the staleness users actually notice.</li>
+      <li>Sync when the caller needs the answer; async for failure containment.</li>
+      <li>Slow is worse than dead — timeout, breaker, bulkhead, in that order.</li>
+      <li>202 with a status URL is the underused middle option.</li>
+      <li>Modularise in place before extracting; strangler, never rewrite.</li>
+      <li>The data is the hard part of splitting a monolith.</li>
+      <li>Keep clean architecture's dependency direction, drop the ceremony.</li>
+      <li>Structure proportional to complexity, not uniform.</li>
+    </ul>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

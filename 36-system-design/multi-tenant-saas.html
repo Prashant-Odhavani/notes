@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Tenant SaaS Platform — System Design Exercises</title>
+<meta name="description" content="A worked design: isolation model, tenant routing, onboarding, noisy-neighbour control, per-tenant cost and the migration path to dedicated infrastructure.">
+<meta name="keywords" content="multi tenant SaaS design isolation model shared database schema per tenant database per tenant tenant catalogue routing onboarding provisioning noisy neighbour per tenant quota cost attribution tenant migration GDPR erasure">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/multi-tenant-saas.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Multi-Tenant SaaS Platform</h1>
+    <p class="subtitle">The isolation model is the decision everything else follows from — and it's the one you
+      can't cheaply change later.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Assumed answer</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td>How many tenants?</td><td><strong>500 growing to 5,000</strong></td><td>Rules out database-per-tenant on cost and operations</td></tr>
+        <tr><td>Size distribution?</td><td><strong>Median 20 users, largest 5,000</strong></td><td>250× skew — the design must handle both ends</td></tr>
+        <tr><td>Any tenant needing data residency?</td><td>Yes, a few in the EU and one in Australia</td><td>Forces per-tenant placement, so routing indirection is mandatory</td></tr>
+        <tr><td>Isolation requirement?</td><td>Logical is acceptable; some enterprises will ask for dedicated</td><td>Need both models supported</td></tr>
+        <tr><td>What must be strongly consistent?</td><td>Everything within a tenant. Nothing across tenants</td><td><strong>Tenant is a natural transaction boundary</strong></td></tr>
+        <tr><td>Scale?</td><td>~500 requests/sec peak</td><td>Modest — this is not a scale problem</td></tr>
+        <tr><td>Out of scope</td><td>The application domain itself, billing integration, the UI</td><td>Lets us go deep on isolation and operations</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The two answers that shape everything</div>
+    <p style="margin:0"><strong>250× size skew</strong> means any design tuned for the median tenant will break for
+      the largest. Every query, every pagination decision, every export has to work at both ends — and the largest
+      tenant may need different infrastructure entirely.
+      <br><br>
+      <strong>Data residency</strong> means a tenant's data must be placed in a specific region. That single
+      requirement makes <em>routing indirection</em> non-negotiable: the application must resolve where a tenant's
+      data lives at runtime rather than reading one connection string from configuration.
+      <br><br>
+      Which is convenient, because that same indirection is what later lets you move a tenant to dedicated
+      infrastructure. One requirement forces the mechanism that solves three problems.
+      <br><br>
+      And note what the scale figure does: <strong>500 requests a second is not a scale problem.</strong> A single
+      well-indexed database handles it. So this design is about isolation, fairness and operations — not
+      throughput — and saying that early stops you designing the wrong thing.</p>
+  </div>
+
+  <h2 id="isolation">The isolation decision <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Model</th><th>Isolation</th><th>Cost per tenant</th><th>Operations</th><th>Noisy neighbour</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Shared database, shared schema</strong><br>(<code>TenantId</code> column)</td>
+          <td>Logical only</td>
+          <td><strong>Lowest</strong></td>
+          <td><strong>One database to migrate and back up</strong></td>
+          <td>Worst — everything is shared</td>
+        </tr>
+        <tr>
+          <td>Shared database, schema per tenant</td>
+          <td>Better</td>
+          <td>Low</td>
+          <td><strong>Migrations × tenants</strong></td>
+          <td>Still shared resources</td>
+        </tr>
+        <tr>
+          <td><strong>Database per tenant</strong></td>
+          <td><strong>Strong</strong></td>
+          <td>High</td>
+          <td>Migrations, backups, monitoring × tenants</td>
+          <td><strong>Contained</strong></td>
+        </tr>
+        <tr>
+          <td>Elastic pool of per-tenant databases</td>
+          <td>Strong</td>
+          <td>Moderate</td>
+          <td>Same as above, with shared capacity</td>
+          <td>Mostly contained</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">The decision: shared schema by default, with an escape hatch</div>
+    <p style="margin:0"><strong>Shared database with a <code>TenantId</code> column</strong> for the 490-odd standard
+      tenants, and <strong>a dedicated database for anyone who needs it</strong> — enterprises demanding isolation,
+      tenants with residency requirements, and the outlier that's 250× the median.
+      <br><br>
+      The reasoning: at 5,000 tenants, database-per-tenant means 5,000 migrations per release, 5,000 backup
+      configurations and 5,000 sets of monitoring. That's not a cost problem so much as an
+      <strong>operational one</strong> — a failed migration on tenant 3,847 is a support ticket nobody notices for a
+      week, and the fleet becomes impossible to keep uniform.
+      <br><br>
+      The honest cost of shared schema is that <strong>isolation depends on your code being correct</strong> rather
+      than on infrastructure. One missing <code>WHERE TenantId</code> is a data breach. That's a real risk and the
+      whole reason the enforcement below has to be structural.
+      <br><br>
+      What makes this a strong answer rather than a compromise is <strong>supporting both models from day
+      one</strong>. If the code can already route a tenant to a different database, then "this enterprise customer
+      needs dedicated infrastructure" is a data migration rather than a re-architecture — and you can quote a price
+      for it instead of saying no.
+      <br><br>
+      Retrofitting that later is genuinely expensive, which is why it belongs in the initial design even though most
+      tenants will never use it.</p>
+  </div>
+
+  <h2 id="routing">Tenant catalogue and routing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — resolve the tenant, then resolve where its data lives"><code class="language-text">  Request  ->  Gateway / APIM
+                  |
+                  v
+             Validate JWT          tenant id comes from the TOKEN, never a header
+                  |
+                  v
+             TenantContext (scoped)     { TenantId, Tier, Region }
+                  |
+                  v
+             Tenant Catalogue           small, cached, in its own store
+                  |                     tenant -> connection string
+                  |                            -> storage account
+                  |                            -> region, tier, feature flags
+                  v
+             DbContext for THAT tenant
+                  |
+                  v
+             Query, with the tenant filter applied by the model, not by hand</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the catalogue is the piece that makes everything else possible</div>
+    <p style="margin:0">A tenant catalogue is a small lookup — tenant id to connection string, storage account,
+      region, tier and configuration — resolved per request and heavily cached.
+      <br><br>
+      It looks like plumbing. It's what enables four separate capabilities that are otherwise impossible:
+      <br><br>
+      <strong>Data residency</strong>, by placing a tenant's row in a different region's database.
+      <strong>Moving a tenant</strong> to dedicated infrastructure, which becomes a row update plus a data copy.
+      <strong>Per-tenant configuration and staged rollouts</strong>, enabling a feature for ten tenants before all of
+      them. And <strong>mixed isolation models</strong> in one codebase.
+      <br><br>
+      Without it, the connection string is one configuration value and none of those are available at any price.
+      <br><br>
+      Two implementation notes worth stating. It must be <strong>cached aggressively</strong> — it's read on every
+      request and changes rarely — with invalidation on tenant update, because a catalogue lookup per request is a
+      hot key on your most critical path.
+      <br><br>
+      And it's a <strong>single point of failure</strong>: if the catalogue is unavailable, no request can be served
+      at all. So it needs the highest availability configuration in the system, and the in-process cache is what
+      keeps you serving through a brief outage.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Tenant identity comes from the token, and nowhere else</div>
+    <p style="margin:0">The tenant id must be a claim in the <strong>validated JWT</strong>. Never a header, never a
+      query parameter, never a field in the request body.
+      <br><br>
+      If a client can supply its own tenant id, then changing one value reads another customer's data. That's not a
+      bug, it's an authorisation bypass with a trivial exploit — and it has happened to real products.
+      <br><br>
+      Two related rules that follow:
+      <br><br>
+      <strong>Tenant context must be scoped</strong>, resolved once per request into a scoped service. A static, a
+      singleton, or an <code>AsyncLocal</code> that leaks across an async boundary means one request can observe
+      another's tenant — which is intermittent, load-dependent, and the hardest version of this bug to find because
+      it presents identically to a caching problem.
+      <br><br>
+      <strong>Background work must carry the tenant explicitly</strong> in the message. A queue consumer has no
+      ambient HTTP context, so if tenant resolution depends on one, background jobs either fail or — much worse —
+      inherit whatever was last set.</p>
+  </div>
+
+  <h2 id="enforcement">Enforcing isolation structurally <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — correct by default, not by discipline" class="code-good"><code class="language-csharp">public sealed class AppDbContext(DbContextOptions o, ITenantContext tenant) : DbContext(o)
+{
+    protected override void OnModelCreating(ModelBuilder b)
+    {
+        foreach (var entity in b.Model.GetEntityTypes()
+                                .Where(e =&gt; typeof(ITenantOwned).IsAssignableFrom(e.ClrType)))
+        {
+            // CRITICAL: the filter reads tenant.TenantId at QUERY time.
+            // Capturing the value here instead would bake ONE tenant's id into
+            // the cached model and apply it to every tenant - a silent breach
+            // that passes every single-tenant test.
+            b.Entity(entity.ClrType).AddQueryFilter&lt;ITenantOwned&gt;(
+                e =&gt; e.TenantId == tenant.TenantId);
+        }
+    }
+
+    public override int SaveChanges()
+    {
+        // Stamp TenantId on insert so it can never be forgotten or forged
+        foreach (var e in ChangeTracker.Entries&lt;ITenantOwned&gt;()
+                                       .Where(e =&gt; e.State == EntityState.Added))
+        {
+            e.Entity.TenantId = tenant.TenantId;
+        }
+        return base.SaveChanges();
+    }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Layer</th><th>Enforcement</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Query</strong></td><td>EF Core global query filters, applied by the model</td></tr>
+        <tr><td><strong>Insert</strong></td><td><code>TenantId</code> stamped in <code>SaveChanges</code></td></tr>
+        <tr><td><strong>Cache</strong></td><td>A key-builder that always includes tenant from ambient context</td></tr>
+        <tr><td><strong>Blob storage</strong></td><td>Tenant as a path prefix; SAS scoped to that prefix</td></tr>
+        <tr><td><strong>Raw SQL</strong></td><td>Filters written explicitly; kept rare and reviewed</td></tr>
+        <tr><td><strong>CI</strong></td><td>Architecture test: <code>IgnoreQueryFilters</code> only in an allow-list</td></tr>
+        <tr><td><strong>Tests</strong></td><td>Write as tenant A, read as tenant B, assert empty</td></tr>
+        <tr><td><strong>Database</strong></td><td>Row-Level Security as a backstop, if the platform supports it</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The model-cache trap is the one that catches experienced teams</div>
+    <p style="margin:0">EF Core <strong>caches the compiled model</strong>. If a global query filter captures the
+      tenant id <em>by value</em> when the model is built, that one tenant's id is compiled into the filter and
+      applied to <strong>every</strong> subsequent request, for every tenant.
+      <br><br>
+      The consequence is severe and completely silent: either tenants see one specific tenant's data, or they see
+      nothing at all, depending on whose request happened to build the model first. It varies between deployments,
+      which makes it look like an infrastructure problem.
+      <br><br>
+      And it <strong>passes every single-tenant test</strong>, which is why it reaches production.
+      <br><br>
+      The fix is that the filter expression must <em>reference a scoped service</em> so the value is read at query
+      time — as in the code above. Worth also being aware that this makes the model cache key tenant-dependent in some
+      configurations, so it's worth measuring the model-building cost with many tenants.
+      <br><br>
+      The general lesson: <strong>anything cached at application level must not capture request-scoped
+      state.</strong> Same class of bug as a scoped service captured by a singleton, and it applies to compiled
+      queries and cached expressions too.</p>
+  </div>
+
+  <h2 id="fairness">Noisy neighbours <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Shared resource</th><th>Control</th></tr></thead>
+      <tbody>
+        <tr><td><strong>API requests</strong></td><td><strong>Per-tenant rate limit</strong>, distributed, keyed on the token claim</td></tr>
+        <tr><td><strong>Concurrency</strong></td><td>Per-tenant concurrency cap — a bulkhead</td></tr>
+        <tr><td><strong>Background work</strong></td><td>Per-tenant queues, or round-robin scheduling across tenants</td></tr>
+        <tr><td><strong>Database</strong></td><td>Query timeouts; heavy tenants moved to their own database</td></tr>
+        <tr><td><strong>Cache</strong></td><td>Per-tenant key prefixes; watch eviction</td></tr>
+        <tr><td><strong>Exports and reports</strong></td><td>Background jobs with per-tenant concurrency of one</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Per tenant, never global — and shared queues are the one people miss</div>
+    <p style="margin:0">A <em>global</em> rate limit makes noisy neighbours worse: if one tenant consumes 95% of the
+      allowance, everyone else is throttled <strong>because of someone else's behaviour</strong>. The limit has to be
+      per tenant, and distributed rather than per-instance — otherwise it multiplies as you scale out.
+      <br><br>
+      The control that's most often forgotten is the <strong>shared queue</strong>. If all tenants' background work
+      goes into one queue and a tenant submits 100,000 items, everyone else's work sits behind it. Their exports and
+      notifications are delayed by hours through no fault of their own, and nothing in the system reports an error.
+      <br><br>
+      The fix is either a queue per tenant — practical up to a few hundred — or a
+      <strong>scheduler that round-robins across tenants</strong> rather than processing strictly in arrival order.
+      That's fair scheduling, and it's the difference between a platform and a shared queue.
+      <br><br>
+      The framing worth stating: <strong>shared infrastructure defaults to first-come-first-served, which under load
+      means whoever generates the most load wins.</strong> Fairness has to be built deliberately; it is never the
+      default.</p>
+  </div>
+
+  <h2 id="onboarding">Onboarding and lifecycle <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="text — provisioning as a durable workflow, not a request"><code class="language-text">  POST /tenants  ->  202 Accepted, with a status URL
+                       |
+                       v
+             Durable orchestration (idempotent, resumable):
+                1. create the tenant row + catalogue entry  (Provisioning)
+                2. seed reference data
+                3. create the storage container / path prefix
+                4. create the identity provider group / app roles
+                5. invite the first administrator
+                6. mark Active
+                       |
+              any step fails -> retry that step; state is durable
+              still failing  -> mark Failed, alert, keep it inspectable
+
+  Deprovisioning: Active -> Suspended -> ScheduledForDeletion(+30d) -> Purged
+                            (read-only)   (recoverable)                (irreversible)</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Provisioning is a multi-step distributed operation, so treat it as one</div>
+    <p style="margin:0">Tenant creation touches several systems — your database, the catalogue, storage, the identity
+      provider, possibly the billing system. Any of them can fail, and the operation takes longer than a request
+      should.
+      <br><br>
+      So doing it inline in an HTTP request is wrong twice over: it times out, and a failure halfway leaves a
+      <strong>half-created tenant</strong> with no record of what succeeded. Then a retry either fails on the parts
+      that already exist or duplicates them.
+      <br><br>
+      <strong>Durable Functions or a saga</strong> gives you idempotent, resumable steps with the progress persisted —
+      so a retry resumes rather than restarts, and a permanent failure leaves an inspectable record rather than
+      orphaned resources.
+      <br><br>
+      An explicit <strong>status field</strong> matters too: a tenant in <code>Provisioning</code> must not be usable,
+      because a partially-created tenant that accepts logins produces very confusing failures.
+      <br><br>
+      And design <strong>deprovisioning at the same time</strong>, with a soft-delete window. Suspension should be
+      reversible; deletion should be delayed and then genuinely complete. Which raises the requirement most designs
+      forget: <strong>GDPR erasure means you must be able to prove a tenant's data is gone</strong> — including from
+      backups, logs, telemetry and any analytics store. That's much easier to answer with a dedicated database than
+      with rows scattered through a shared one, and it's a legitimate argument for offering dedicated infrastructure
+      to customers who ask about it.</p>
+  </div>
+
+  <h2 id="operations">Operability <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Need</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td><strong>"Is this one tenant or everyone?"</strong></td><td><strong>Tenant id on every telemetry item</strong>, via an initialiser</td></tr>
+        <tr><td>Per-tenant health</td><td>Requests, p95, errors grouped by tenant</td></tr>
+        <tr><td>Cost per tenant</td><td>Proportional attribution: requests, RU/DTU, storage, egress</td></tr>
+        <tr><td>Support investigation</td><td>Correlation id returned to the client</td></tr>
+        <tr><td>Staged rollout</td><td>Feature flags with tenant targeting</td></tr>
+        <tr><td>Migrations</td><td>Expand-and-contract; one shared database keeps this manageable</td></tr>
+        <tr><td>Impersonation for support</td><td><strong>Explicit, audited, time-boxed</strong> — never a shared credential</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — tenant enrichment is the single highest-value operational decision</div>
+    <p style="margin:0">The first question in every multi-tenant incident is <em>"is this one customer or
+      everyone?"</em>, and the answer changes everything you do next.
+      <br><br>
+      Without a tenant dimension on telemetry, it's unanswerable — you end up correlating support tickets against
+      timestamps. With it, it's a query.
+      <br><br>
+      It must be added <strong>before you need it</strong>, because you cannot retrospectively split by a dimension
+      you never recorded, and the first serious incident is exactly when you'll want six months of history by
+      tenant.
+      <br><br>
+      One important constraint: <strong>enrich with identifiers, never with data.</strong> A telemetry item containing
+      a customer's record is itself a leak, and telemetry is typically readable by more people than the database
+      is.
+      <br><br>
+      The same dimension then gives you cost attribution — which turns "is this customer profitable?" from a guess
+      into a number, and is how you discover that a tenant paying £200 a month costs £2,000 in RUs and egress.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Shared schema by default; dedicated database as a supported option from day one.</li>
+      <li>Database-per-tenant at scale is an operational problem, not just a cost one.</li>
+      <li>A tenant catalogue enables residency, migration, per-tenant config and mixed models.</li>
+      <li>The catalogue is a single point of failure — cache it hard.</li>
+      <li>Tenant id from the validated token only, in a scoped service.</li>
+      <li>Background jobs must carry tenant explicitly.</li>
+      <li>Global query filters must read tenant at query time, not capture it.</li>
+      <li>Enforce isolation structurally, and test cross-tenant reads.</li>
+      <li>Per-tenant rate limits and concurrency, distributed not per-instance.</li>
+      <li>Shared queues are the forgotten noisy-neighbour path — schedule fairly.</li>
+      <li>Provisioning is a durable workflow with an explicit status.</li>
+      <li>Design deprovisioning and GDPR erasure up front.</li>
+      <li>Tenant id on all telemetry — identifiers only, never data.</li>
+      <li>Attribute cost per tenant, including egress.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Design a multi-tenant SaaS platform. Start with the isolation model. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Before choosing, I'd want three numbers, because they decide it: <strong>how many tenants, what's the size
+          distribution, and does anyone need data residency or contractual isolation?</strong>"</p>
+        <p>"Assuming 500 growing to 5,000, a median tenant of 20 users with the largest at 5,000, and a few residency
+          requirements — I'd go with <strong>a shared database and a <code>TenantId</code> column for most tenants, and
+          support dedicated databases as a first-class option.</strong>"</p>
+        <p>"<strong>Why shared</strong>: at 5,000 tenants, database-per-tenant means 5,000 migrations per release,
+          5,000 backup configurations, 5,000 sets of monitoring. That's less a cost problem than an operational one — a
+          failed migration on tenant 3,847 is a ticket nobody notices for a week, and you can never be confident the
+          fleet is uniform."</p>
+        <p>"<strong>Why also support dedicated</strong>: the 250× size skew means the largest tenant may not fit
+          comfortably in the shared model, residency requires per-tenant placement, and enterprise customers will ask
+          for isolation as a contractual term. Supporting both from day one means each of those is a data migration
+          rather than a re-architecture — and you can quote a price instead of saying no."</p>
+        <p>"<strong>The mechanism that makes it possible is a tenant catalogue</strong> — a small lookup from tenant id
+          to connection string, storage account, region and tier, resolved per request and heavily cached. Without it
+          the connection string is a single config value and none of this is available at any price."</p>
+        <p>"That catalogue is a single point of failure though, so it needs the highest availability in the system and
+          an in-process cache so a brief outage doesn't stop everything."</p>
+        <p>"<strong>The honest cost of shared schema</strong> is that isolation depends on the code being correct. One
+          missing <code>WHERE TenantId</code> is a data breach. So the enforcement has to be structural, not a matter
+          of remembering."</p>
+        <p>"<strong>EF Core global query filters</strong> applied to every tenant-owned entity, so queries are
+          correct by default and bypassing requires explicitly calling <code>IgnoreQueryFilters</code>. Stamping
+          <code>TenantId</code> in <code>SaveChanges</code> so it can't be forgotten on insert. A cache key-builder
+          that always includes tenant. An architecture test asserting <code>IgnoreQueryFilters</code> appears only in
+          an allow-list. And a test that writes as tenant A and reads as tenant B expecting nothing."</p>
+        <p>"<strong>One trap I'd flag specifically</strong>, because it catches experienced teams: the query filter
+          must read the tenant id from a scoped service <em>at query time</em>. If it captures the value when the
+          model is built, EF Core's model cache bakes one tenant's id into the filter for everyone — and that passes
+          every single-tenant test while being a silent breach in production."</p>
+        <p>"<strong>Tenant identity comes from a claim in the validated token</strong>, never a header or body — a
+          client-supplied tenant id is an authorisation bypass with a trivial exploit. And the tenant context must be
+          scoped, because a static or singleton-captured value leaks across requests intermittently under load, which
+          is the hardest version of this to diagnose."</p>
+        <p>"<strong>On noisy neighbours</strong>, which is the defining operational problem of shared infrastructure:
+          per-tenant rate limits rather than global — a global limit means one tenant's usage throttles everyone
+          else — distributed rather than per-instance, plus per-tenant concurrency caps. And crucially, fair
+          scheduling on background work: a shared queue means one tenant's 100,000 items delay everyone's exports by
+          hours."</p>
+        <p>"<strong>Operationally</strong>, the highest-value single decision is <strong>tenant id on every telemetry
+          item</strong>. The first question in any incident is 'one customer or everyone?', and without that dimension
+          it's unanswerable. It has to be added before you need it, because you can't retrospectively split by
+          something you never recorded — and identifiers only, never data, since telemetry is readable by more people
+          than the database."</p>
+        <p>"<strong>Two things I'd design up front</strong> that are painful to retrofit. <strong>Provisioning as a
+          durable workflow</strong> rather than an HTTP request, because it touches several systems and a failure
+          halfway otherwise leaves a half-created tenant. And <strong>deprovisioning with GDPR erasure</strong> —
+          being able to prove a tenant's data is gone, including from backups, logs and telemetry. That's much easier
+          to answer for a dedicated database, which is a legitimate reason to offer one."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask for tenant count, skew and residency before deciding?</li>
+        <li>Do you weigh operational cost, not just infrastructure cost?</li>
+        <li>Do you support both models via a catalogue?</li>
+        <li>Is your isolation enforcement structural?</li>
+        <li>Do you know the model-cache filter trap?</li>
+        <li>Do you cover fairness including background work?</li>
+        <li>Do you raise telemetry enrichment and erasure?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> choosing an isolation model with no questions asked.</li>
+        <li><span class="redflag">Red flag:</span> relying on developers to remember the tenant filter.</li>
+        <li><span class="redflag">Red flag:</span> tenant id taken from a request header.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you move one tenant to a dedicated database with no downtime?</li>
+          <li>How do you prove a deleted tenant's data is really gone?</li>
+          <li>What breaks first as tenant count grows?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

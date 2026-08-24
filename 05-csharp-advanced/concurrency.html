@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concurrency &amp; Parallelism — C# Advanced</title>
+<meta name="description" content="Concurrency vs parallelism, thread safety, lock, SemaphoreSlim, Interlocked, concurrent collections, channels and the race conditions that cause real bugs.">
+<meta name="keywords" content="concurrency parallelism thread safety lock Monitor SemaphoreSlim Interlocked ConcurrentDictionary channels Parallel.ForEach race condition deadlock volatile atomic read modify write">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="05-csharp-advanced/concurrency.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Concurrency &amp; Parallelism</h1>
+    <p class="subtitle">Shared mutable state is where correctness goes to die. This page is about spotting
+      that in code review and choosing the cheapest tool that fixes it.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Concurrency</strong> = several things in progress. <strong>Parallelism</strong> = several
+        things executing at the same instant. Different problems.</li>
+      <li>The bug is almost always a <strong>read-modify-write</strong>: read a value, change it, write it
+        back — with a gap another thread can use.</li>
+      <li><code>lock</code> is the default tool. It's cheap when uncontended and only works
+        <strong>in-process</strong>.</li>
+      <li><code>Interlocked</code> for simple atomic counters — much cheaper than a lock.</li>
+      <li><code>SemaphoreSlim</code> when you need to limit concurrency, or need an
+        <strong>async-friendly</strong> lock. You cannot <code>await</code> inside <code>lock</code>.</li>
+      <li>Concurrent collections make individual operations safe, <strong>not</strong> your multi-step logic.</li>
+    </ul>
+  </div>
+
+  <h2 id="concurrency-vs-parallelism">Concurrency vs parallelism <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><strong>Concurrency</strong> is about <em>dealing with</em> many things at once — managing multiple
+      tasks that are all in flight.</p>
+    <p><strong>Parallelism</strong> is about <em>doing</em> many things at once — actually executing
+      simultaneously on multiple cores.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>Concurrency:</strong> one chef with four pans on the hob. They're all cooking, and the chef
+      moves between them. One person, four things in progress.</p>
+    <p><strong>Parallelism:</strong> four chefs, four pans. Genuinely simultaneous.</p>
+    <p>A single-core machine can be concurrent. It cannot be parallel.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Concurrency</th><th>Parallelism</th></tr></thead>
+      <tbody>
+        <tr><td>Goal</td><td>Don't block while waiting</td><td>Finish CPU work faster</td></tr>
+        <tr><td>For</td><td>I/O-bound work</td><td>CPU-bound work</td></tr>
+        <tr><td>Tool in C#</td><td><code>async</code>/<code>await</code>, <code>Task.WhenAll</code></td><td><code>Parallel.For</code>, PLINQ, <code>Task.Run</code></td></tr>
+        <tr><td>Needs multiple cores?</td><td>No</td><td>Yes, to help</td></tr>
+        <tr><td>Typical .NET web app</td><td><strong>This one</strong> — almost always</td><td>Rare</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>In a web API, you almost always want <strong>concurrency</strong> (async I/O), not parallelism.</p>
+    <p>The server is already running many requests in parallel. Adding <code>Parallel.ForEach</code> inside
+      a request usually just steals threads from other requests.</p>
+  </div>
+
+  <h2 id="race-conditions">The core problem: read-modify-write <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>Almost every thread-safety bug you will ever see has this shape.</p>
+
+  <pre data-label="csharp — looks atomic. Isn't." class="code-bad"><code class="language-csharp">private int _count;
+
+public void Increment()
+{
+    _count++;        // THREE operations, not one
+}</code></pre>
+
+  <p><code>_count++</code> compiles to: <strong>read</strong> the value, <strong>add</strong> one,
+    <strong>write</strong> it back. Two threads can interleave:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Thread A</th><th>Thread B</th><th><code>_count</code></th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>reads 5</td><td></td><td>5</td></tr>
+        <tr><td>2</td><td></td><td>reads 5</td><td>5</td></tr>
+        <tr><td>3</td><td>computes 6</td><td></td><td>5</td></tr>
+        <tr><td>4</td><td></td><td>computes 6</td><td>5</td></tr>
+        <tr><td>5</td><td>writes 6</td><td></td><td>6</td></tr>
+        <tr><td>6</td><td></td><td>writes 6</td><td><strong>6</strong> — should be 7</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Two increments, one counted. This is a <strong>lost update</strong>, and it's the same bug you get in a
+    database without a concurrency token — see
+    <a href="../10-sql/transactions.html">transactions &amp; concurrency</a>.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — spotting this in review</div>
+    <p style="margin:0">Look for any sequence that <strong>reads shared state, then acts on it</strong>:
+      <br><br>
+      <code>if (!dict.ContainsKey(k)) dict.Add(k, v);</code> — another thread can add between the check and
+      the add.
+      <br>
+      <code>if (_instance == null) _instance = new();</code> — two instances.
+      <br>
+      <code>balance = balance - amount;</code> — lost update.
+      <br><br>
+      The pattern to train yourself on is: <em>"is there a gap between the decision and the action?"</em></p>
+  </div>
+
+  <h2 id="lock">lock — the default tool <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the fix"><code class="language-csharp">private readonly object _gate = new();
+private int _count;
+
+public void Increment()
+{
+    lock (_gate)          // only one thread inside at a time
+    {
+        _count++;
+    }
+}</code></pre>
+
+  <p><code>lock</code> is syntax sugar over <code>Monitor.Enter</code>/<code>Exit</code> in a
+    <code>try/finally</code>, so the lock is always released even if the body throws.</p>
+
+  <h3 id="lock-rules">The rules that matter</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rule</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Lock on a <code>private readonly object</code></td><td>Nobody outside can lock on it, so nobody can deadlock you accidentally</td></tr>
+        <tr><td>Never lock on <code>this</code></td><td>External code can also lock on your instance</td></tr>
+        <tr><td>Never lock on a <code>string</code> or <code>typeof(X)</code></td><td>Interned strings and Type objects are shared process-wide</td></tr>
+        <tr><td>Keep the body tiny</td><td>Everything inside is serialised — it's your bottleneck</td></tr>
+        <tr><td>Never call out to unknown code inside a lock</td><td>It might take another lock, and you get a deadlock</td></tr>
+        <tr><td><strong>You cannot <code>await</code> inside <code>lock</code></strong></td><td>Compile error. A monitor is thread-affine and the continuation may run on another thread</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Modern detail <span class="pill pill-good">💡 Good to know</span></div>
+    <p style="margin:0">.NET 9 / C# 13 added a dedicated <code>System.Threading.Lock</code> type that
+      <code>lock</code> recognises and which is faster than locking on a plain <code>object</code>. If you're
+      on .NET 9+, prefer <code>private readonly Lock _gate = new();</code>.</p>
+  </div>
+
+  <h2 id="cheaper-options">Cheaper and better options <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Before reaching for a lock, check whether one of these fits — they're usually simpler and faster.</p>
+
+  <h3 id="interlocked">Interlocked — atomic operations without a lock</h3>
+
+  <pre data-label="csharp — a single CPU instruction, no lock" class="code-good"><code class="language-csharp">private int _count;
+
+public void Increment() =&gt; Interlocked.Increment(ref _count);
+
+// Also: Add, Exchange, CompareExchange, Read (for 64-bit on 32-bit platforms)</code></pre>
+
+  <p>Far cheaper than a lock for simple counters. <code>CompareExchange</code> also lets you build
+    lock-free update loops, though that gets subtle fast.</p>
+
+  <h3 id="immutability">Immutability — the option that needs no synchronisation at all</h3>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>If nothing can change, there's nothing to race on.</p>
+    <p>The cheapest concurrency fix is usually to <strong>remove the shared mutable state</strong>.</p>
+  </div>
+
+  <pre data-label="csharp — no locking needed anywhere" class="code-good"><code class="language-csharp">// An immutable record shared across threads is inherently safe to read.
+public sealed record PricingRules(decimal VatRate, decimal Discount);
+
+// Swap the whole thing atomically instead of mutating fields.
+private PricingRules _rules = new(0.20m, 0m);
+
+public void Update(PricingRules next) =&gt; Volatile.Write(ref _rules, next);
+public PricingRules Current =&gt; Volatile.Read(ref _rules);</code></pre>
+
+  <p>Reference assignment is atomic in .NET, so readers always see either the old object or the new one —
+    never a half-updated one. That's a genuinely useful pattern for configuration and rule sets.</p>
+
+  <h3 id="scoping">Just don't share it</h3>
+
+  <p>In ASP.NET Core, the simplest fix for most thread-safety questions is <strong>scoped
+    lifetime</strong> — each request gets its own instance, so there's no sharing to protect. Reach for
+    locking only when state genuinely must be shared, which is rarer than people assume.</p>
+
+  <h2 id="semaphoreslim">SemaphoreSlim — the async-friendly lock <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>You can't <code>await</code> inside a <code>lock</code>. <code>SemaphoreSlim</code> is the answer.</p>
+
+  <pre data-label="csharp — mutual exclusion that works with async" class="code-good"><code class="language-csharp">private readonly SemaphoreSlim _gate = new(1, 1);   // initial 1, max 1 = a mutex
+
+public async Task&lt;Config&gt; GetConfigAsync(CancellationToken ct)
+{
+    await _gate.WaitAsync(ct);
+    try
+    {
+        if (_cached is not null) return _cached;
+        _cached = await LoadFromDiskAsync(ct);    // await INSIDE the critical section
+        return _cached;
+    }
+    finally
+    {
+        _gate.Release();      // MUST be in finally, or one exception locks it forever
+    }
+}</code></pre>
+
+  <p>It also does the other job — <strong>limiting concurrency</strong>:</p>
+
+  <pre data-label="csharp — at most 5 concurrent calls to a rate-limited API" class="code-good"><code class="language-csharp">private readonly SemaphoreSlim _limit = new(5, 5);
+
+public async Task&lt;Result&gt; CallAsync(Request r, CancellationToken ct)
+{
+    await _limit.WaitAsync(ct);
+    try   { return await _api.SendAsync(r, ct); }
+    finally { _limit.Release(); }
+}</code></pre>
+
+  <p>That's the <a href="../19-architecture/resilience-patterns.html#bulkhead">bulkhead pattern</a> in a few
+    lines — one slow dependency can't consume all your threads.</p>
+
+  <div class="note danger">
+    <div class="note-title">Production trap</div>
+    <p style="margin:0"><code>Release()</code> <strong>must</strong> be in a <code>finally</code>. If an
+      exception escapes between <code>WaitAsync</code> and <code>Release</code>, that permit is gone
+      permanently. Do it once with a semaphore of 1 and every subsequent caller hangs forever — and it looks
+      like a deadlock with no obvious cause.</p>
+  </div>
+
+  <h2 id="concurrent-collections">Concurrent collections <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><code>ConcurrentDictionary&lt;K,V&gt;</code></td><td>Shared lookup/cache. The workhorse</td></tr>
+        <tr><td><code>ConcurrentQueue&lt;T&gt;</code></td><td>FIFO producer/consumer</td></tr>
+        <tr><td><code>ConcurrentBag&lt;T&gt;</code></td><td>Unordered collection, optimised for same-thread add/take</td></tr>
+        <tr><td><code>BlockingCollection&lt;T&gt;</code></td><td>Producer/consumer with a bounded capacity</td></tr>
+        <tr><td><code>Channel&lt;T&gt;</code></td><td><strong>Preferred</strong> for async producer/consumer</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — thread-safe operations, unsafe logic</div>
+    <p style="margin:0">This is the single most important thing to understand about concurrent collections:</p>
+    <pre data-label="csharp — each call is safe; the sequence is not" class="code-bad"><code class="language-csharp">if (!dict.ContainsKey(key))          // thread-safe call
+    dict.TryAdd(key, Expensive());   // thread-safe call
+// ...but another thread can add between the two. And Expensive() may run twice.</code></pre>
+    <pre data-label="csharp — one atomic operation" class="code-good"><code class="language-csharp">var value = dict.GetOrAdd(key, k =&gt; Expensive());</code></pre>
+    <p style="margin:0"><strong>Concurrent collections make individual operations atomic, not your
+      multi-step logic.</strong> Use the combined methods — <code>GetOrAdd</code>,
+      <code>AddOrUpdate</code>, <code>TryUpdate</code> — which exist precisely for this.
+      <br><br>
+      Even <code>GetOrAdd</code> has a caveat: the factory delegate <em>can</em> run more than once under
+      contention, though only one result is stored. If the factory is expensive or has side effects, wrap the
+      value in <code>Lazy&lt;T&gt;</code>.</p>
+  </div>
+
+  <h2 id="channels">Channels — the modern producer/consumer <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A <code>Channel&lt;T&gt;</code> is a thread-safe queue designed for <code>async</code> — producers
+      write, consumers <code>await</code> items, and it handles backpressure.</p>
+  </div>
+
+  <pre data-label="csharp — bounded channel with backpressure" class="code-good"><code class="language-csharp">// Bounded: if the consumer falls behind, writers WAIT rather than
+// letting the queue grow until you run out of memory.
+var channel = Channel.CreateBounded&lt;Order&gt;(new BoundedChannelOptions(1000)
+{
+    FullMode = BoundedChannelFullMode.Wait
+});
+
+// Producer
+await channel.Writer.WriteAsync(order, ct);
+
+// Consumer - typically in a BackgroundService
+await foreach (var order in channel.Reader.ReadAllAsync(ct))
+    await ProcessAsync(order, ct);</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Why bounded matters</span>
+    <p>An <strong>unbounded</strong> queue turns a slow consumer into an out-of-memory crash. The queue grows
+      until the process dies.</p>
+    <p>A <strong>bounded</strong> queue turns it into visible slowness instead — producers block, and you
+      find out early. Always prefer bounded, and monitor the depth.</p>
+  </div>
+
+  <h2 id="parallel">Parallel.ForEach and PLINQ <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — for CPU-bound work over a collection"><code class="language-csharp">Parallel.ForEach(images, img =&gt; Resize(img));      // CPU-bound: good fit
+
+// Cap it so you don't monopolise the machine
+Parallel.ForEach(images,
+    new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount / 2 },
+    img =&gt; Resize(img));</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Two things people get wrong</div>
+    <ul style="margin:8px 0 0">
+      <li><strong>Don't use <code>Parallel.ForEach</code> for I/O.</strong> It blocks a thread per item.
+        For async I/O use <code>Task.WhenAll</code>, or
+        <code>Parallel.ForEachAsync</code> (.NET 6+) which is the async-aware version.</li>
+      <li><strong>Don't use it inside a web request.</strong> The server is already handling requests in
+        parallel; grabbing all the cores for one request starves the others and makes overall throughput
+        worse.</li>
+    </ul>
+  </div>
+
+  <p>The body must also be thread-safe. Writing to a shared <code>List&lt;T&gt;</code> from inside
+    <code>Parallel.ForEach</code> will corrupt it — use a concurrent collection or aggregate per-thread and
+    combine at the end.</p>
+
+  <h2 id="choosing">Choosing the right tool</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Situation</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td>Waiting on I/O</td><td><code>async</code>/<code>await</code> — not threads</td></tr>
+        <tr><td>Several independent I/O calls</td><td><code>Task.WhenAll</code></td></tr>
+        <tr><td>A simple shared counter</td><td><code>Interlocked</code></td></tr>
+        <tr><td>Shared lookup or cache</td><td><code>ConcurrentDictionary.GetOrAdd</code></td></tr>
+        <tr><td>Short critical section, no <code>await</code></td><td><code>lock</code></td></tr>
+        <tr><td>Critical section containing <code>await</code></td><td><code>SemaphoreSlim(1,1)</code></td></tr>
+        <tr><td>Limit concurrent calls to a dependency</td><td><code>SemaphoreSlim(n,n)</code></td></tr>
+        <tr><td>Async producer/consumer pipeline</td><td><code>Channel&lt;T&gt;</code>, bounded</td></tr>
+        <tr><td>CPU-bound work over a collection</td><td><code>Parallel.ForEach</code> — outside a web request</td></tr>
+        <tr><td>Coordinating across multiple servers</td><td>A distributed lock — see <a href="../16-redis/distributed-primitives.html">Redis</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Concurrency (I/O, async) is what web apps need. Parallelism (CPU, cores) is rarer.</li>
+      <li>Nearly every bug is a read-modify-write with a gap. Train yourself to spot the gap.</li>
+      <li>Try immutability or scoped lifetime <em>before</em> locking — remove the sharing, remove the problem.</li>
+      <li><code>lock</code> on a private readonly object, tiny body, no calls out, no <code>await</code>.</li>
+      <li><code>Interlocked</code> for counters; <code>SemaphoreSlim</code> for async or for limiting.</li>
+      <li><code>Release()</code> in a <code>finally</code>, always.</li>
+      <li>Concurrent collections protect single operations, not your multi-step logic. Use
+        <code>GetOrAdd</code>.</li>
+      <li>Bounded channels turn a slow consumer into slowness, not an OOM crash.</li>
+      <li>Locks are in-process only. Multiple instances need a distributed lock.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>_count++</code> on a shared field</strong> and assuming it's atomic.</li>
+    <li><strong><code>ContainsKey</code> then <code>Add</code></strong> on a concurrent dictionary.</li>
+    <li><strong>Locking on <code>this</code>, a string, or a <code>Type</code></strong>.</li>
+    <li><strong>Calling out to unknown code inside a lock</strong> — a classic deadlock route.</li>
+    <li><strong><code>SemaphoreSlim.Release()</code> not in a <code>finally</code></strong>.</li>
+    <li><strong>Unbounded channels or queues</strong>, which convert slowness into an OOM crash.</li>
+    <li><strong><code>Parallel.ForEach</code> for I/O</strong>, or inside a web request.</li>
+    <li><strong>Sharing a <code>DbContext</code> across concurrent tasks</strong> — it isn't thread-safe.</li>
+    <li><strong>Assuming an in-process lock protects anything</strong> when the app runs on three instances.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What's the difference between concurrency and parallelism?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Concurrency is dealing with many things at once — several tasks in flight, and you manage the
+          switching between them. Parallelism is doing many things at the same instant, which needs multiple
+          cores."</p>
+        <p>"The analogy I use is a chef: one chef with four pans on the hob is concurrent — everything's in
+          progress and they move between them. Four chefs with four pans is parallel. A single-core machine
+          can be concurrent but never parallel."</p>
+        <p>"In C# they map to different tools. Concurrency is <code>async</code>/<code>await</code> and
+          <code>Task.WhenAll</code>, and it's for I/O — you're not using CPU, you're waiting. Parallelism is
+          <code>Parallel.For</code> or PLINQ, and it's for CPU-bound work you want to finish faster."</p>
+        <p>"For a typical web API, the answer is almost always concurrency. The requests are I/O-bound —
+          database, HTTP calls — so async lets one thread serve many requests. And the server is <em>already</em>
+          running requests in parallel, so using <code>Parallel.ForEach</code> inside a single request
+          usually just steals cores from other requests and makes overall throughput worse."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have a clear distinction, or use the words interchangeably?</li>
+        <li>Do you map them to the right C# tools and the right workload types?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>When would <code>Parallel.ForEach</code> be right?</li>
+          <li>Does async use extra threads?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Is this code thread-safe? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <pre data-label="csharp"><code class="language-csharp">private readonly Dictionary&lt;string, Customer&gt; _cache = new();
+
+public Customer Get(string id)
+{
+    if (!_cache.ContainsKey(id))
+        _cache[id] = LoadFromDb(id);
+    return _cache[id];
+}</code></pre>
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"No, and it's unsafe in two separate ways."</p>
+        <p>"First, the <strong>logic</strong> is a read-modify-write. Two threads can both find the key
+          missing, both call <code>LoadFromDb</code>, and both write. So you do the expensive load twice.
+          That's wasteful but not corrupting."</p>
+        <p>"Second, and much worse: <code>Dictionary&lt;K,V&gt;</code> is <strong>not thread-safe for
+          writes at all</strong>. Concurrent writes can corrupt its internal buckets. The symptom isn't a
+          clean exception — you can get an infinite loop inside the dictionary, or a
+          <code>NullReferenceException</code> from inside framework code, and it's very hard to trace back."</p>
+        <p>"The fix depends on what I need. If it's genuinely a cache, I'd use
+          <code>ConcurrentDictionary</code> with <code>GetOrAdd</code>, which makes the whole
+          check-and-add one atomic operation."</p>
+        <p>"There's a subtlety worth mentioning though: <code>GetOrAdd</code>'s factory can still run more
+          than once under contention — only one result gets stored. If <code>LoadFromDb</code> is expensive
+          or has side effects, I'd store <code>Lazy&lt;Customer&gt;</code> as the value so only one thread
+          actually executes the load."</p>
+        <p>"And honestly, in an ASP.NET Core app I'd first ask whether this needs to be shared at all. If
+          scoped-per-request works, there's no concurrency problem to solve. If it does need to be a real
+          cache, I'd use <code>IMemoryCache</code> — because a hand-rolled dictionary cache has no size
+          limit and no expiry, which is a memory leak waiting to happen."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you spot <em>both</em> problems — the logic race and the collection corruption?</li>
+        <li>Do you know <code>Dictionary</code> corrupts rather than throwing cleanly?</li>
+        <li>Bonus: the <code>GetOrAdd</code> factory caveat, and the unbounded-cache concern.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "wrap it in a <code>lock</code>" only — works, but misses
+          that there's a purpose-built type, and serialises every read.</li>
+        <li><span class="redflag">Red flag:</span> not knowing <code>Dictionary</code> can corrupt.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if you're running three instances of the app?</li>
+          <li>How would you add expiry?</li>
+          <li>Why is <code>Lazy&lt;T&gt;</code> the fix for the double-load?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why can't you <code>await</code> inside a <code>lock</code>, and what do you use instead?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It's a compile error, and the reason is that a monitor is <strong>thread-affine</strong> — the
+          thread that acquired it must be the thread that releases it."</p>
+        <p>"With <code>await</code>, the continuation after the await may run on a completely different
+          thread. So you'd have thread A holding the lock and thread B trying to release it, which the
+          monitor doesn't allow. Worse, thread A could return to the pool and pick up other work while still
+          nominally holding the lock — which is a recipe for deadlock."</p>
+        <p>"The replacement is <code>SemaphoreSlim</code> with a count of one. It isn't thread-affine, so it
+          works across an await, and it has <code>WaitAsync</code> so you're not blocking a thread while
+          waiting for the lock either."</p>
+        <p>"The critical detail is that <code>Release()</code> has to be in a <code>finally</code>. If an
+          exception escapes between the wait and the release, that permit is gone permanently — and with a
+          semaphore of one, every subsequent caller hangs forever. It presents as a deadlock with no obvious
+          cause, which is nasty to debug."</p>
+        <p>"I'd also step back and ask whether I need mutual exclusion at all. Often the async critical
+          section is guarding a lazy initialisation, and <code>Lazy&lt;Task&lt;T&gt;&gt;</code> or
+          <code>AsyncLazy</code> expresses that more clearly. And if it's cache population,
+          <code>IMemoryCache.GetOrCreateAsync</code> already handles it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <em>why</em>, not just that it's disallowed?</li>
+        <li>Do you know <code>SemaphoreSlim</code> and the <code>finally</code> requirement?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens if <code>Release</code> is called more times than <code>Wait</code>?</li>
+          <li>How would you implement an async-safe lazy initialiser?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>You need to ensure a job runs only once, but the app runs on three instances. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The first thing to say is that <code>lock</code> and <code>SemaphoreSlim</code> are
+          <strong>in-process only</strong>. They coordinate threads within one process, so with three
+          instances you get three independent locks and the job runs three times. That's the trap in this
+          question."</p>
+        <p>"So I need coordination through something all three instances can see. A few options, and I'd pick
+          based on how bad a double-run is."</p>
+        <p>"<strong>If a double-run is merely wasteful</strong> — say, regenerating a cache — the simplest
+          answer is a <strong>database row as a lease</strong>. Each instance tries a conditional update:
+          <code>UPDATE Jobs SET OwnerId = @me, ExpiresAt = @exp WHERE Name = @n AND (OwnerId IS NULL OR
+          ExpiresAt &lt; GETUTCDATE())</code>. Exactly one row gets updated; that instance wins. It's
+          transactional, needs no new infrastructure, and the expiry means a crashed instance doesn't block
+          forever."</p>
+        <p>"<strong>If I already have Redis</strong>, <code>SET key value NX PX 30000</code> is a one-liner
+          lock with a TTL. Fast, but I'd be honest that it's not a perfect lock — under network partitions or
+          GC pauses you can get two holders, which is the whole Redlock debate. Fine for 'avoid duplicate
+          work', not fine for 'must never happen twice'."</p>
+        <p>"<strong>If correctness genuinely matters</strong>, I'd stop relying on the lock and make the
+          <strong>work idempotent</strong> instead. Give the job a unique key for the run — a date, a
+          sequence — and enforce it with a unique constraint. Then a double-run is harmless: the second one
+          fails the insert and stops. That's much more robust than trying to build a perfect distributed
+          lock, and it's the answer I'd lead with for anything that moves money or sends messages."</p>
+        <p>"There's also the option of not solving it myself: a scheduler that guarantees single execution —
+          a Kubernetes CronJob, Azure Functions with a singleton trigger, or Hangfire/Quartz with a shared
+          store. If the platform already offers it, using it beats hand-rolling."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know in-process locks don't work across instances? That's the whole question.</li>
+        <li>Do you scale the solution to how bad a double-run actually is?</li>
+        <li>Do you reach for idempotency rather than a perfect lock?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "use a <code>lock</code>" — doesn't work across processes.</li>
+        <li><span class="redflag">Red flag:</span> "use a static flag" — same problem.</li>
+        <li><span class="redflag">Red flag:</span> claiming a Redis lock gives a hard guarantee.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens if the instance holding the lease crashes?</li>
+          <li>How do you handle the lease expiring mid-job?</li>
+          <li>What's the Redlock controversy about?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

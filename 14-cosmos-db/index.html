@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Cosmos DB — Overview</title>
+<meta name="description" content="What makes Cosmos DB different from other document databases, the two decisions that determine everything, and how this section is organised.">
+<meta name="keywords" content="Azure Cosmos DB overview request units RU partition key global distribution SLA APIs NoSQL Mongo API when to use">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="14-cosmos-db/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Azure Cosmos DB</h1>
+    <p class="subtitle">Two decisions determine whether a Cosmos project succeeds: the partition key and the
+      RU budget. Almost everything else is detail.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="what-makes-it-different">What makes it different <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Cosmos DB is a globally-distributed, horizontally-partitioned database where <strong>you pay for
+      throughput, not for queries</strong>.</p>
+    <p>Every operation costs a measured number of <strong>Request Units</strong>. You provision RU/s per second.
+      Exceed it and you get throttled — HTTP 429 — not a slow query.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The mental shift from SQL Server</span>
+    <p>In SQL Server, an inefficient query is <strong>slow</strong>.</p>
+    <p>In Cosmos DB, an inefficient query is <strong>expensive</strong> — and once you hit your provisioned
+      limit, it throttles everything else too.</p>
+    <p>So cost and performance are the same conversation here. A badly-designed query doesn't just perform
+      poorly, it shows up on the invoice and can take down unrelated features.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Cosmos DB</th><th>MongoDB / SQL Server</th></tr></thead>
+      <tbody>
+        <tr><td>Cost model</td><td><strong>Provisioned throughput (RU/s)</strong></td><td>Instance size</td></tr>
+        <tr><td>Over-limit behaviour</td><td><strong>HTTP 429, throttled</strong></td><td>Slower, queued</td></tr>
+        <tr><td>Partitioning</td><td><strong>Mandatory</strong>, from day one</td><td>Optional, added later</td></tr>
+        <tr><td>Consistency</td><td><strong>Five named levels</strong>, per request</td><td>Two or three options</td></tr>
+        <tr><td>Global distribution</td><td>A checkbox per region</td><td>Significant engineering</td></tr>
+        <tr><td>Indexing</td><td><strong>Everything indexed by default</strong></td><td>Nothing indexed by default</td></tr>
+        <tr><td>SLA</td><td>Latency, throughput, consistency <em>and</em> availability</td><td>Availability only</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the indexing default is backwards, deliberately</div>
+    <p style="margin:0">Every other database indexes nothing until you ask. Cosmos indexes
+      <strong>every property by default</strong>.
+      <br><br>
+      That's a sensible default for a system where you may not know the query patterns yet — reads are never
+      accidentally catastrophic. But it means <strong>writes cost more RU than they need to</strong>, because
+      every indexed path is maintained on every write.
+      <br><br>
+      So on a write-heavy container, tuning the indexing policy to exclude paths you never filter on is a
+      direct, measurable cost reduction. That's a Cosmos-specific optimisation with no equivalent elsewhere, and
+      a good thing to raise.</p>
+  </div>
+
+  <h2 id="two-decisions">The two decisions that matter <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Decision</th><th>Get it wrong and</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Partition key</strong></td>
+          <td>Hot partitions throttle while the rest idles, queries fan out across every partition, and a
+              single logical partition hits its 20 GB ceiling. <strong>Changing it means migrating the
+              container.</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Throughput model</strong></td>
+          <td>Either you over-provision and pay for idle capacity, or you under-provision and get throttled
+              under load</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The partition key is effectively permanent</div>
+    <p style="margin:0">You cannot change a container's partition key. The fix is creating a new container and
+      migrating every item — which means dual writes, a backfill, and a cutover.
+      <br><br>
+      MongoDB added <code>reshardCollection</code> in 5.0; Cosmos has no equivalent. So the partition key
+      genuinely is a design-time decision you have to get right, and it deserves proportionate attention up
+      front.
+      <br><br>
+      Covered on <a href="fundamentals.html#partition-key">the partitioning page</a>, which is the most
+      important page in this section.</p>
+  </div>
+
+  <h2 id="apis">The API choice <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>API</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>NoSQL</strong> (formerly SQL/Core)</td><td><strong>Default for new work.</strong> Native, gets features first, full change feed and SDK support</td></tr>
+        <tr><td><strong>MongoDB</strong></td><td>Migrating an existing Mongo app. Wire-protocol compatible, but a subset of Mongo's features</td></tr>
+        <tr><td><strong>Cassandra</strong></td><td>Migrating from Cassandra</td></tr>
+        <tr><td><strong>Table</strong></td><td>Migrating from Azure Table Storage</td></tr>
+        <tr><td><strong>Gremlin</strong></td><td>Graph workloads</td></tr>
+        <tr><td><strong>PostgreSQL</strong></td><td>Distributed Postgres (Citus). A genuinely different product under the same brand</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The Mongo API is a compatibility layer, not MongoDB</div>
+    <p style="margin:0">It speaks the MongoDB wire protocol, so existing drivers and tools connect. Underneath
+      it's Cosmos — so you get Cosmos partitioning, RU billing and consistency levels, not Mongo's.
+      <br><br>
+      Practical consequences: feature coverage lags real MongoDB, some aggregation stages and operators are
+      unsupported, and performance characteristics differ because the RU model is doing the work underneath.
+      <br><br>
+      <strong>It's a migration path, not a destination.</strong> For new development, use the NoSQL API — you
+      get the change feed, the full SDK, and features as they ship. Choosing the Mongo API for a greenfield
+      project is a decision worth questioning.</p>
+  </div>
+
+  <h2 id="when">When Cosmos is the right choice <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Good fit</th><th>Poor fit</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Global, multi-region with low latency everywhere</strong> — this is the genuine
+              differentiator</td>
+          <td><strong>Relational data with complex ad-hoc queries</strong> — use SQL</td>
+        </tr>
+        <tr>
+          <td><strong>Predictable, key-based access</strong> at very high scale</td>
+          <td><strong>Unknown or changing query patterns</strong> — the partition key locks you in</td>
+        </tr>
+        <tr>
+          <td><strong>Guaranteed single-digit-millisecond reads</strong> backed by an SLA</td>
+          <td><strong>Reporting and analytics</strong> — expensive per RU; use the analytical store or a
+              warehouse</td>
+        </tr>
+        <tr>
+          <td><strong>Serverless / event-driven</strong> — pairs naturally with Functions and the change
+              feed</td>
+          <td><strong>Cost-sensitive small workloads</strong> — a small SQL database or Postgres is
+              cheaper</td>
+        </tr>
+        <tr>
+          <td><strong>Spiky traffic</strong> with autoscale or serverless</td>
+          <td><strong>Heavy cross-partition aggregation</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the honest cost position</div>
+    <p style="margin:0">Cosmos is frequently more expensive than a relational database for the same workload,
+      and the difference is often large.
+      <br><br>
+      What you're paying for is <strong>global distribution, guaranteed latency and elastic scale</strong>. If
+      you need those, it's excellent value. If you have one region and moderate traffic, you're paying for
+      capabilities you aren't using — and Azure SQL or Postgres Flexible Server will cost a fraction.
+      <br><br>
+      "We chose Cosmos because it scales" is a weak answer. "We chose Cosmos because we serve users in four
+      regions and need sub-20ms reads in all of them, and we accept the RU cost for that" is a strong one.
+      <br><br>
+      The reverse is equally valid: recommending <em>against</em> Cosmos for a single-region CRUD application
+      is usually the correct senior call.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">Architecture &amp; Partitioning</a></td>
+          <td>Logical vs physical partitions, the 20 GB limit, choosing and synthesising partition keys,
+              hierarchical keys, hot partitions</td>
+        </tr>
+        <tr>
+          <td><a href="throughput-consistency.html">Throughput &amp; Consistency</a></td>
+          <td>RU/s and what consumes them, provisioned vs autoscale vs serverless, handling 429s, and the five
+              consistency levels</td>
+        </tr>
+        <tr>
+          <td><a href="queries-indexing.html">Indexing &amp; Query Execution</a></td>
+          <td>Indexing policy, point reads vs queries, cross-partition fan-out, pagination, and reading the RU
+              charge</td>
+        </tr>
+        <tr>
+          <td><a href="change-feed-global.html">Change Feed &amp; Global Distribution</a></td>
+          <td>Change feed processor and leases, multi-region writes, conflict resolution, failover</td>
+        </tr>
+        <tr>
+          <td><a href="modeling-cost.html">Modelling, Cost &amp; Comparisons</a></td>
+          <td>Denormalization strategy, cost control, and honest comparisons with MongoDB, DynamoDB and Azure
+              SQL</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="dotnet">The .NET side <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — client registration" class="code-good"><code class="language-csharp">// Singleton - the client owns connections and caches routing metadata
+builder.Services.AddSingleton(_ =&gt; new CosmosClient(
+    connectionString,
+    new CosmosClientOptions
+    {
+        // Direct mode over TCP: lower latency than Gateway. The default for the SDK.
+        ConnectionMode      = ConnectionMode.Direct,
+        ApplicationRegion   = Regions.WestEurope,   // read from the nearest region
+        // Let the SDK handle 429s; it respects the retry-after header
+        MaxRetryAttemptsOnRateLimitedRequests = 9,
+        MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.FromSeconds(30),
+        SerializerOptions   = new CosmosSerializationOptions
+        {
+            PropertyNamingPolicy = CosmosPropertyNamingPolicy.CamelCase
+        }
+    }));</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Detail</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>CosmosClient</code> as a <strong>singleton</strong></td><td>It caches partition routing metadata and pools connections. Per-request creation is slow and exhausts sockets</td></tr>
+        <tr><td><code>ConnectionMode.Direct</code></td><td>TCP straight to the partition. Gateway mode is HTTPS via a proxy — needed behind restrictive firewalls, slower</td></tr>
+        <tr><td><code>ApplicationRegion</code></td><td>Reads go to the nearest region. Getting this wrong means cross-continent latency on every read</td></tr>
+        <tr><td>SDK retry on 429</td><td>Built in and respects <code>retry-after</code>. <strong>Don't write your own</strong></td></tr>
+        <tr><td>Always check <code>RequestCharge</code></td><td>Every response carries its RU cost. This is your primary diagnostic</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Log the RU charge in development</div>
+    <pre data-label="csharp"><code class="language-csharp">var response = await container.ReadItemAsync&lt;Order&gt;(id, new PartitionKey(tenantId));
+logger.LogInformation("Read {Id} cost {RU} RU", id, response.RequestCharge);</code></pre>
+    <p style="margin:0">This is the Cosmos equivalent of
+      <a href="../11-ef-core/index.html#leaky">logging EF Core's SQL</a> — and arguably more important, because
+      RU charge is both the performance signal and the cost signal.
+      <br><br>
+      A point read is ~1 RU. If a lookup is costing 200 RU, it's doing a cross-partition query and you'd never
+      know from the response itself.</p>
+  </div>
+
+  <details class="qa">
+    <summary>Why would you choose Cosmos DB over Azure SQL? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd want a specific reason, because for a typical business application my default is still Azure
+          SQL — it's cheaper, the team probably knows it, and relational constraints do real work."</p>
+        <p>"The genuine reasons to pick Cosmos:"</p>
+        <p>"<strong>Multi-region with low latency everywhere.</strong> This is the real differentiator. Adding a
+          region is a checkbox, and reads are served locally with an SLA on latency. Doing that with Azure SQL
+          means geo-replication with a read-only secondary and considerably more engineering — and you don't get
+          multi-region <em>writes</em> at all."</p>
+        <p>"<strong>Guaranteed latency at scale.</strong> Cosmos has an SLA on latency, throughput and
+          consistency, not just availability. For a system where p99 read latency is a product requirement,
+          that's meaningful."</p>
+        <p>"<strong>Elastic, spiky throughput.</strong> Autoscale or serverless handles traffic that varies by
+          an order of magnitude without provisioning for peak."</p>
+        <p>"<strong>Predictable key-based access at very high volume</strong> — session stores, device state,
+          user profiles, event ingestion."</p>
+        <p>"Where I'd stay with Azure SQL: <strong>relational data with ad-hoc queries</strong>, because Cosmos
+          charges per RU and cross-partition aggregation is expensive. <strong>Multi-entity
+          invariants</strong> — 'total allocations must not exceed budget' is a constraint SQL enforces and
+          Cosmos can't. <strong>Reporting.</strong> And <strong>anything where the query patterns aren't settled
+          yet</strong>, because the partition key is effectively permanent — there's no resharding, so changing
+          it means migrating the container."</p>
+        <p>"On cost I'd be direct: <strong>Cosmos is usually more expensive</strong> for the same workload,
+          often substantially. You're paying for global distribution, guaranteed latency and elastic scale. If
+          you need those it's good value; if you're single-region with moderate traffic you're paying for
+          capabilities you aren't using."</p>
+        <p>"So 'we chose Cosmos because it scales' is a weak justification. 'We serve users in four regions and
+          need sub-20ms reads in all of them' is a real one. And honestly, recommending <em>against</em> Cosmos
+          for a single-region CRUD app is usually the right call — that's the answer I'd expect a senior
+          engineer to be comfortable giving."</p>
+        <p>"One thing worth adding: they're not mutually exclusive. A common shape is Azure SQL for
+          transactional core data and Cosmos for a globally-distributed read surface, session state or event
+          ingestion — kept in sync with the change feed."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know global distribution is the actual differentiator?</li>
+        <li>Are you honest about cost?</li>
+        <li>Do you know the partition key is permanent?</li>
+        <li>Would you recommend against it when appropriate?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "it's NoSQL so it scales better" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> "it's schemaless so we can move faster."</li>
+        <li><span class="redflag">Red flag:</span> no awareness of the cost model.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's a Request Unit?</li>
+          <li>How would you pick a partition key?</li>
+          <li>What happens when you exceed provisioned throughput?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section assumes <a href="../13-mongodb/fundamentals.html">document modelling</a>
+      from the MongoDB section — embedding versus referencing, unbounded growth, denormalization — because the
+      reasoning is the same and this section doesn't repeat it. It also builds on
+      <a href="../19-architecture/distributed-data.html">distributed data patterns</a> for the consistency and
+      conflict-resolution material.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

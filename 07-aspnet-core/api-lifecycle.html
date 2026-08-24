@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Versioning, OpenAPI &amp; Error Handling — ASP.NET Core</title>
+<meta name="description" content="API versioning strategies, OpenAPI documentation, global exception handling and ProblemDetails error responses that clients can actually use.">
+<meta name="keywords" content="api versioning url header media type OpenAPI Swagger ProblemDetails global exception handler IExceptionHandler UseExceptionHandler breaking change deprecation">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="07-aspnet-core/api-lifecycle.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Versioning, OpenAPI &amp; Error Handling</h1>
+    <p class="subtitle">The parts of an API that matter after it ships: how you change it without breaking
+      clients, and how you report failure usefully.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Adding</strong> an optional field is safe. <strong>Removing</strong> or renaming one is a
+        breaking change.</li>
+      <li>Version in the <strong>URL</strong> for public APIs — visible, cacheable, easy to route.</li>
+      <li>Every version you support is code you maintain. Version the <strong>endpoint</strong>, not the whole
+        API, where you can.</li>
+      <li><strong>One global exception handler</strong> — never try/catch in every action.</li>
+      <li><code>ProblemDetails</code> (RFC 7807) is the standard error shape. Use it rather than inventing
+        one.</li>
+      <li><strong>Never leak stack traces</strong> to clients. Return a correlation ID they can quote instead.</li>
+    </ul>
+  </div>
+
+  <h2 id="breaking-changes">What actually breaks a client <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A change is <strong>breaking</strong> if an existing client that worked yesterday stops working
+      today.</p>
+    <p>That's a lower bar than people assume — and it depends on how tolerant the client's deserializer is.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Change</th><th>Breaking?</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Add an optional response field</td><td>✅ Safe</td><td>Most deserializers ignore unknown fields</td></tr>
+        <tr><td>Add an optional request field</td><td>✅ Safe</td><td>Old clients just don't send it</td></tr>
+        <tr><td>Add a <strong>required</strong> request field</td><td>❌ Breaking</td><td>Old clients don't send it and now fail validation</td></tr>
+        <tr><td>Remove or rename a response field</td><td>❌ Breaking</td><td>Clients reading it get null or throw</td></tr>
+        <tr><td>Change a type (<code>int</code> → <code>string</code>)</td><td>❌ Breaking</td><td>Deserialization fails</td></tr>
+        <tr><td>Add an enum value</td><td>⚠️ <strong>Usually breaking</strong></td><td>Strict clients throw on an unknown value</td></tr>
+        <tr><td>Make validation stricter</td><td>❌ Breaking</td><td>Requests that worked now get 400</td></tr>
+        <tr><td>Change a status code</td><td>❌ Breaking</td><td>Clients branch on status</td></tr>
+        <tr><td>Change default sort order or pagination</td><td>⚠️ Subtly breaking</td><td>Clients relying on order silently get wrong results</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The enum one catches everyone</div>
+    <p style="margin:0">Adding <code>Refunded</code> to an <code>OrderStatus</code> enum feels additive. But a
+      client whose generated model is a strict enum will throw on a value it's never seen.
+      <br><br>
+      Two defences: serialise enums as <strong>strings</strong> so at least the value is self-describing, and
+      document that clients must tolerate unknown values. If you can't rely on that, adding an enum value is
+      a versioned change.</p>
+  </div>
+
+  <h2 id="versioning">Versioning strategies <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>Looks like</th><th>Pros</th><th>Cons</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>URL path</strong></td>
+          <td><code>/api/v2/orders</code></td>
+          <td>Visible, cacheable, trivial to route and test in a browser</td>
+          <td>Arguably not "RESTful" — the resource didn't change</td>
+        </tr>
+        <tr>
+          <td><strong>Query string</strong></td>
+          <td><code>/api/orders?api-version=2</code></td>
+          <td>Easy to add later; keeps one path</td>
+          <td>Easy to omit accidentally; messier caching</td>
+        </tr>
+        <tr>
+          <td><strong>Custom header</strong></td>
+          <td><code>X-Api-Version: 2</code></td>
+          <td>Clean URLs</td>
+          <td>Invisible; can't be tested from a browser address bar</td>
+        </tr>
+        <tr>
+          <td><strong>Media type</strong></td>
+          <td><code>Accept: application/vnd.acme.v2+json</code></td>
+          <td>Most technically correct — versions the representation</td>
+          <td>Awkward for clients; poor tooling support</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">What to actually pick</span>
+    <p><strong>URL path versioning</strong>, for anything with external consumers.</p>
+    <p>It loses a purity argument and wins on everything practical: you can see it in a log, share a URL that
+      works, and route it at a gateway without inspecting headers.</p>
+  </div>
+
+  <pre data-label="csharp — Asp.Versioning, URL segment"><code class="language-csharp">builder.Services.AddApiVersioning(options =&gt;
+{
+    options.DefaultApiVersion = new ApiVersion(1, 0);
+    options.AssumeDefaultVersionWhenUnspecified = true;
+    options.ReportApiVersions = true;      // advertises supported versions in a response header
+})
+.AddApiExplorer(options =&gt;
+{
+    options.GroupNameFormat = "'v'VVV";
+    options.SubstituteApiVersionInUrl = true;
+});</code></pre>
+
+  <pre data-label="csharp — versioning one endpoint, not the whole API" class="code-good"><code class="language-csharp">[ApiController]
+[Route("api/v{version:apiVersion}/orders")]
+public sealed class OrdersController : ControllerBase
+{
+    [HttpGet, MapToApiVersion("1.0")]
+    public async Task&lt;IActionResult&gt; GetV1() { /* old shape */ }
+
+    [HttpGet, MapToApiVersion("2.0")]
+    public async Task&lt;IActionResult&gt; GetV2() { /* new shape */ }
+
+    // Unversioned - shared by both, no duplication
+    [HttpDelete("{id:guid}")]
+    public async Task&lt;IActionResult&gt; Cancel(Guid id) { /* ... */ }
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the real cost of versioning</div>
+    <p style="margin:0">Every supported version is code you maintain, test and secure. Two versions doubles
+      your test matrix; a bug fix has to be applied to both.
+      <br><br>
+      So the strong answer isn't "here's how to add v2" — it's <strong>how to avoid needing one</strong>:
+      additive changes, tolerant readers, serialising enums as strings, and never removing a field until
+      telemetry shows nobody reads it.
+      <br><br>
+      And when you do version, have a <strong>deprecation plan from day one</strong>: announce it, measure who
+      still uses the old version, contact them, then remove it. A v1 that lives forever because nobody
+      measured usage is the actual failure.</p>
+  </div>
+
+  <h2 id="error-handling">Global exception handling <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — bad: try/catch in every action" class="code-bad"><code class="language-csharp">[HttpGet("{id:guid}")]
+public async Task&lt;IActionResult&gt; Get(Guid id)
+{
+    try
+    {
+        var order = await _repo.GetAsync(id);
+        return Ok(order);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Failed");
+        return StatusCode(500, ex.Message);      // and it leaks internals
+    }
+}</code></pre>
+
+  <p>Three problems: it's repeated in every action, it's inconsistent because each one is written slightly
+    differently, and <code>ex.Message</code> can expose connection strings, file paths or schema details.</p>
+
+  <pre data-label="csharp — one handler for the whole app (.NET 8+)" class="code-good"><code class="language-csharp">public sealed class GlobalExceptionHandler(
+    ILogger&lt;GlobalExceptionHandler&gt; log,
+    IProblemDetailsService problemDetails) : IExceptionHandler
+{
+    public async ValueTask&lt;bool&gt; TryHandleAsync(
+        HttpContext context, Exception exception, CancellationToken ct)
+    {
+        // The trace id is what the user quotes and what you search on
+        var traceId = context.TraceIdentifier;
+
+        log.LogError(exception, "Unhandled exception. TraceId {TraceId}", traceId);
+
+        var (status, title) = exception switch
+        {
+            NotFoundException      =&gt; (StatusCodes.Status404NotFound, "Resource not found"),
+            ValidationException    =&gt; (StatusCodes.Status400BadRequest, "Validation failed"),
+            ConcurrencyException   =&gt; (StatusCodes.Status409Conflict, "The resource was modified"),
+            UnauthorizedException  =&gt; (StatusCodes.Status403Forbidden, "Not permitted"),
+            _                      =&gt; (StatusCodes.Status500InternalServerError, "An error occurred")
+        };
+
+        context.Response.StatusCode = status;
+
+        return await problemDetails.TryWriteAsync(new ProblemDetailsContext
+        {
+            HttpContext = context,
+            ProblemDetails = new ProblemDetails
+            {
+                Status = status,
+                Title  = title,
+                // NOTE: no exception message, no stack trace
+                Extensions = { ["traceId"] = traceId }
+            }
+        });
+    }
+}
+
+// Program.cs
+builder.Services.AddExceptionHandler&lt;GlobalExceptionHandler&gt;();
+builder.Services.AddProblemDetails();
+
+app.UseExceptionHandler();      // FIRST in the pipeline</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — leaking internals in errors</div>
+    <p style="margin:0">Returning <code>ex.Message</code> or a stack trace to a client is an information
+      disclosure vulnerability. A <code>SqlException</code> message can contain a server name, a database
+      name and column names — enough to help someone attack you.
+      <br><br>
+      The pattern is: <strong>log everything, return almost nothing</strong>. Give the client a stable title
+      and a <code>traceId</code>. When they report a problem, that ID takes you straight to the full detail in
+      your logs.
+      <br><br>
+      And check your <code>Development</code> configuration isn't accidentally deployed — the developer
+      exception page is deliberately verbose and must never run in production.</p>
+  </div>
+
+  <h3 id="problem-details">Why ProblemDetails rather than a custom shape</h3>
+
+  <pre data-label="json — RFC 7807, a shape clients already understand"><code class="language-json">{
+  "type": "https://api.example.com/errors/insufficient-stock",
+  "title": "Insufficient stock",
+  "status": 409,
+  "detail": "SKU-1234 has 2 units available, 5 requested.",
+  "instance": "/api/v1/orders",
+  "traceId": "0HN7A2QK9M3PL:00000003"
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Field</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>type</code></td><td>A stable URI identifying the error <em>kind</em>. Clients branch on this, not on the message</td></tr>
+        <tr><td><code>title</code></td><td>Short human-readable summary. Stable per type</td></tr>
+        <tr><td><code>status</code></td><td>The HTTP status, repeated in the body</td></tr>
+        <tr><td><code>detail</code></td><td>Specifics for <em>this</em> occurrence — safe to show a user</td></tr>
+        <tr><td><code>traceId</code></td><td>Correlates to your logs. The single most useful extension</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The value of <code>type</code> is that it gives clients something stable to program against. If they
+    branch on <code>title</code> or <code>detail</code>, then improving your error wording becomes a breaking
+    change.</p>
+
+  <h3 id="expected-vs-exceptional">Don't use exceptions for expected outcomes</h3>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An exception should mean <em>something went wrong that we didn't plan for</em>.</p>
+    <p>"Payment declined" and "out of stock" are planned outcomes. They're results, not exceptions.</p>
+  </div>
+
+  <pre data-label="csharp — expected failures as a result type" class="code-good"><code class="language-csharp">public async Task&lt;Result&lt;Order&gt;&gt; PlaceAsync(CreateOrder cmd, CancellationToken ct)
+{
+    if (!await _stock.IsAvailableAsync(cmd.Sku, cmd.Quantity, ct))
+        return Result.Failure&lt;Order&gt;(OrderErrors.InsufficientStock);   // not a throw
+
+    // ...
+}</code></pre>
+
+  <p>Two reasons this matters. Exceptions are <strong>slow</strong> — throwing is orders of magnitude more
+    expensive than returning a value, and a declined-payment path can be high volume. And it keeps your
+    <strong>error metrics honest</strong>: if declines throw, your exception rate spikes during a normal busy
+    period and you can't tell real failures from business outcomes.</p>
+
+  <h2 id="openapi">OpenAPI <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — controllers need explicit attributes"><code class="language-csharp">[HttpGet("{id:guid}")]
+[ProducesResponseType&lt;OrderResponse&gt;(StatusCodes.Status200OK)]
+[ProducesResponseType(StatusCodes.Status404NotFound)]
+[ProducesResponseType&lt;ProblemDetails&gt;(StatusCodes.Status409Conflict)]
+public async Task&lt;IActionResult&gt; Get(Guid id, CancellationToken ct) { /* ... */ }</code></pre>
+
+  <pre data-label="csharp — minimal APIs infer it from the return type" class="code-good"><code class="language-csharp">app.MapGet("/api/orders/{id:guid}",
+    async Task&lt;Results&lt;Ok&lt;OrderResponse&gt;, NotFound&gt;&gt; (Guid id, IOrderRepository repo, CancellationToken ct)
+        =&gt; await repo.GetAsync(id, ct) is { } o
+            ? TypedResults.Ok(OrderResponse.From(o))
+            : TypedResults.NotFound());</code></pre>
+
+  <p>That's a genuine advantage of <code>TypedResults</code>: the possible responses are in the signature, so
+    the documentation can't drift from the code.</p>
+
+  <div class="note info">
+    <div class="note-title">Swashbuckle vs the built-in generator</div>
+    <p style="margin:0">.NET 9 ships a built-in OpenAPI document generator
+      (<code>AddOpenApi</code> / <code>MapOpenApi</code>), and the project templates no longer include
+      Swashbuckle by default.
+      <br><br>
+      The built-in generator produces the document; it doesn't include the Swagger UI. If you want the
+      interactive page you add a UI package separately. Worth verifying against current docs — this area is
+      actively changing.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Don't expose Swagger UI publicly in production</div>
+    <p style="margin:0">It documents every endpoint, parameter and model — a complete map of your attack
+      surface, and often an interactive client for it.
+      <br><br>
+      Either restrict it to non-production, or put it behind authentication. Publishing the OpenAPI
+      <em>document</em> to consumers is fine and useful; publishing an unauthenticated interactive console
+      usually isn't.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Additive changes are safe; removals, renames, type changes and stricter validation are not.</li>
+      <li>Adding an enum value is usually breaking. Serialise enums as strings.</li>
+      <li>URL path versioning wins on practicality. Version the endpoint, not the whole API.</li>
+      <li>Every version is maintenance. Have a deprecation plan before you create v2.</li>
+      <li>One global exception handler, registered first in the pipeline.</li>
+      <li>Log everything, return a title plus a <code>traceId</code>. Never a stack trace.</li>
+      <li>Use <code>ProblemDetails</code>, and give clients a stable <code>type</code> to branch on.</li>
+      <li>Expected business outcomes are results, not exceptions.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Returning <code>ex.Message</code> to clients</strong> — information disclosure.</li>
+    <li><strong>try/catch in every action</strong>, inconsistently.</li>
+    <li><strong>Exception handler registered late</strong>, so it misses earlier middleware.</li>
+    <li><strong>Throwing for expected outcomes</strong> like a declined payment — slow, and it pollutes error
+      metrics.</li>
+    <li><strong>Inventing a custom error shape</strong> instead of <code>ProblemDetails</code>.</li>
+    <li><strong>Clients branching on the error message</strong>, so rewording it breaks them.</li>
+    <li><strong>Creating v2 for an additive change</strong> that didn't need it.</li>
+    <li><strong>Supporting v1 forever</strong> because nobody measured who uses it.</li>
+    <li><strong>Public Swagger UI in production.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>How would you version a public API? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd use URL path versioning — <code>/api/v1/orders</code> — for anything with external consumers.
+          There's a purist argument that the resource didn't change so the URL shouldn't, and media-type
+          versioning is more technically correct. But path versioning wins on everything practical: it's
+          visible in logs, you can share a URL that works, you can route it at a gateway without inspecting
+          headers, and it caches cleanly."</p>
+        <p>"The more important part of the answer is <strong>avoiding versions in the first place</strong>,
+          because every version I support is code I maintain, test and secure. Two versions doubles the test
+          matrix and means every bug fix gets applied twice."</p>
+        <p>"So I'd design for additive change. New fields are optional. Enums serialise as strings and clients
+          are told to tolerate unknown values. I don't remove a response field until telemetry shows nobody
+          reads it. And I'd version the <strong>endpoint</strong> rather than the whole API where possible —
+          if only one response shape changed, only that endpoint needs a v2, and everything else stays
+          shared."</p>
+        <p>"When a breaking change is genuinely unavoidable, I'd have the deprecation plan before shipping
+          v2: announce it with a date, advertise supported versions in a response header, instrument usage
+          per version so I know who's still on v1, contact those consumers, then remove it. The failure mode
+          I've seen is a v1 that lives for five years because nobody ever measured whether it was still
+          used."</p>
+        <p>"One more thing I'd mention: for internal service-to-service APIs I'd push much harder on
+          <strong>not</strong> versioning at all, and instead using tolerant readers plus expand-and-contract
+          — add the new field, migrate consumers, then remove the old one. You control both sides, so you can
+          coordinate."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you pick a strategy and justify it against the alternatives?</li>
+        <li>Do you treat versioning as a cost to be avoided rather than a feature?</li>
+        <li>Do you have a deprecation plan, and do you measure usage?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> listing the four strategies with no recommendation.</li>
+        <li><span class="redflag">Red flag:</span> no mention of the maintenance cost or deprecation.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Which changes are breaking and which aren't?</li>
+          <li>Is adding an enum value breaking?</li>
+          <li>How would you find out who's still calling v1?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you handle errors in a Web API? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"One global exception handler rather than try/catch in every action. In .NET 8 that's
+          <code>IExceptionHandler</code> registered with <code>AddExceptionHandler</code>, and
+          <code>UseExceptionHandler</code> goes first in the pipeline so it wraps everything below it."</p>
+        <p>"The handler maps exception types to status codes — not found to 404, validation to 400,
+          concurrency conflict to 409, everything else to 500 — and returns <code>ProblemDetails</code>,
+          which is the RFC 7807 standard shape. I'd use that rather than inventing one, because clients and
+          tooling already understand it."</p>
+        <p>"The rule I'd emphasise is <strong>log everything, return almost nothing</strong>. Never send a
+          stack trace or the exception message to a client — a <code>SqlException</code> message can include
+          the server name, database name and column names, which is genuine information disclosure. Instead I
+          return a stable title and a <code>traceId</code>. When a user reports a problem they quote the ID
+          and it takes me straight to the full detail in the logs."</p>
+        <p>"I'd also give each error kind a stable <code>type</code> URI, so clients branch on that rather
+          than on the message text. Otherwise improving the wording of an error becomes a breaking change."</p>
+        <p>"And a design point: I wouldn't use exceptions for expected outcomes. A declined payment or an
+          out-of-stock item is a planned business result, so it returns a result object, not a throw. Two
+          reasons — throwing is expensive and those paths can be high volume, and it keeps error metrics
+          honest. If declines throw, my exception rate spikes on a busy day and I can't distinguish real
+          failures from normal business."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Global handler rather than scattered try/catch?</li>
+        <li>Do you know not to leak exception details, and why?</li>
+        <li>Do you know <code>ProblemDetails</code> and the value of a stable <code>type</code>?</li>
+        <li>Bonus: exceptions vs expected outcomes.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> returning <code>ex.Message</code> or the stack trace.</li>
+        <li><span class="redflag">Red flag:</span> try/catch in every controller action.</li>
+        <li><span class="redflag">Red flag:</span> always returning 500 regardless of cause.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where exactly in the pipeline does the handler go, and why there?</li>
+          <li>How does the client correlate an error with your logs?</li>
+          <li>400 or 422 for a business rule violation?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

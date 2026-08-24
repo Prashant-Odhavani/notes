@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Git In Depth — Git &amp; Source Control</title>
+<meta name="description" content="The object model behind the commands, merge versus rebase, branching workflows, review practice, and how to recover when something goes wrong.">
+<meta name="keywords" content="Git object model commits trees blobs refs HEAD merge rebase fast-forward squash cherry-pick reflog reset revert stash bisect rerere trunk based development GitFlow pull request review conventional commits force-with-lease submodules LFS worktree">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="27-git/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Git In Depth</h1>
+    <p class="subtitle">Almost every confusing Git situation becomes obvious once you know that commits are
+      immutable snapshots and branches are just labels pointing at one.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>A commit is a full snapshot</strong>, not a diff. Diffs are computed on demand.</li>
+      <li><strong>A branch is a movable pointer</strong> to one commit. That's the whole thing.</li>
+      <li><strong>Commits are immutable.</strong> Rebase and amend <em>create new ones</em>.</li>
+      <li><strong>Merge preserves history; rebase rewrites it.</strong></li>
+      <li><strong>Never rewrite shared history</strong> — unless everyone agrees.</li>
+      <li><strong><code>revert</code> for public branches, <code>reset</code> for local.</strong></li>
+      <li><strong>The reflog is your undo</strong> — nothing is really lost for about 90 days.</li>
+      <li><strong><code>--force-with-lease</code></strong>, never plain <code>--force</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="model">The object model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Four object types, and that's all there is</span>
+    <p><strong>Blob</strong> — the contents of a file. <strong>Tree</strong> — a directory listing, pointing at
+      blobs and other trees. <strong>Commit</strong> — a pointer to one tree, plus parents, author and message.
+      <strong>Tag</strong> — a named pointer, optionally annotated.</p>
+    <p>Every object is stored under the <strong>SHA-1 hash of its content</strong>. Identical content is stored
+      once, however many commits or branches contain it.</p>
+  </div>
+
+  <pre data-label="text — what a commit actually points at"><code class="language-text">  commit abc123
+    tree      d4e5f6            <- the ENTIRE directory state at this point
+    parent    789xyz            <- one parent; two if it is a merge commit
+    author    ...
+    message   "Add order validation"
+
+  tree d4e5f6
+    blob  aa11  Program.cs      <- unchanged files point at the SAME blob
+    tree  bb22  Services/          as the previous commit. Nothing is copied.
+    blob  cc33  README.md
+
+  A branch is a FILE containing one hash:
+    .git/refs/heads/main   ->  abc123
+
+  HEAD is a file containing a ref:
+    .git/HEAD              ->  ref: refs/heads/main</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — snapshots, not diffs, explains nearly everything</div>
+    <p style="margin:0">Most confusion about Git comes from imagining it stores changes. It doesn't — each commit
+      records the <strong>complete state of the tree</strong>, and unchanged files simply point at the same blob as
+      before. So there's no storage penalty.
+      <br><br>
+      Once you hold that, a lot of behaviour stops being mysterious:
+      <br><br>
+      <strong>Branching is instant</strong> because creating a branch writes a 41-byte file containing a hash.
+      Nothing is copied.
+      <br><br>
+      <strong>A diff is computed, not stored</strong> — which is why Git can show you the difference between any two
+      commits, however far apart, at the same cost.
+      <br><br>
+      <strong>Rebase can't move a commit</strong>, because a commit's hash is derived from its content
+      <em>including its parent</em>. Change the parent and it's a different commit with a different hash. So rebase
+      <strong>replays</strong> your changes as brand-new commits and abandons the originals — which is exactly why
+      rewriting shared history is disruptive, and why the old commits are still recoverable from the reflog.
+      <br><br>
+      <strong>Nothing is deleted immediately.</strong> Unreferenced objects sit there until garbage collection,
+      typically 90 days. That's the basis of every recovery below.
+      <br><br>
+      Being able to explain <em>why</em> rebase creates new commits — rather than just knowing it does — is the
+      difference between having memorised commands and understanding the tool.</p>
+  </div>
+
+  <h2 id="areas">The three areas <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Area</th><th>Is</th><th>Move into it with</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Working tree</strong></td><td>Your actual files</td><td>Editing</td></tr>
+        <tr><td><strong>Index (staging area)</strong></td><td><strong>The proposed next commit</strong></td><td><code>git add</code></td></tr>
+        <tr><td><strong>Repository</strong></td><td>Committed history</td><td><code>git commit</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The index is a feature, not an obstacle</div>
+    <p style="margin:0">People treat staging as a formality — <code>git add .</code> and move on. It's actually the
+      mechanism for making commits that are worth reading.
+      <br><br>
+      <strong><code>git add -p</code></strong> stages selected hunks within a file. So when you've fixed a bug and
+      also renamed a variable and also added a log line, you can commit them <em>separately</em> — which makes each
+      commit a single logical change that can be reviewed, reverted or cherry-picked on its own.
+      <br><br>
+      That matters later. A commit containing a bug fix mixed with unrelated refactoring can't be reverted cleanly,
+      and <code>git bisect</code> pointing at it tells you almost nothing.
+      <br><br>
+      It's also a good final review: staging hunk by hunk is the last chance to notice the debug line or the
+      commented-out block you left in.</p>
+  </div>
+
+  <h2 id="merge-rebase">Merge versus rebase <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — the same work, two shapes"><code class="language-text">  Starting point:
+        A---B---C  main
+             \
+              D---E  feature
+
+  MERGE (git checkout main; git merge feature)
+        A---B---C---M  main        M has TWO parents: C and E
+             \     /
+              D---E                D and E keep their original hashes
+
+  REBASE (git checkout feature; git rebase main)
+        A---B---C  main
+                 \
+                  D'--E'  feature   NEW commits. D and E still exist,
+                                    unreferenced, until gc.
+
+  SQUASH MERGE
+        A---B---C---S  main        S contains D+E as ONE commit.
+                                    feature's history is not in main at all.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Merge</th><th>Rebase</th><th>Squash</th></tr></thead>
+      <tbody>
+        <tr><td>History</td><td><strong>Preserved exactly</strong></td><td>Linearised, rewritten</td><td><strong>Collapsed to one commit</strong></td></tr>
+        <tr><td>Main branch shape</td><td>Branching, with merge commits</td><td><strong>Linear</strong></td><td>Linear</td></tr>
+        <tr><td>Conflicts</td><td>Resolved once</td><td><strong>Possibly once per commit</strong></td><td>Resolved once</td></tr>
+        <tr><td><code>bisect</code> usefulness</td><td>Good</td><td><strong>Best</strong></td><td>Coarse — one commit per feature</td></tr>
+        <tr><td>Safe on shared branches</td><td><strong>Yes</strong></td><td><strong>No</strong></td><td>Yes (done by the platform)</td></tr>
+        <tr><td>Reverting a feature</td><td>Revert the merge commit</td><td>Revert several commits</td><td><strong>Revert one commit</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the rule is about <em>where</em>, not which is better</div>
+    <p style="margin:0">This gets asked as though one is correct. The useful answer distinguishes the two places
+      they apply.
+      <br><br>
+      <strong>Rebase your own unpushed work</strong>, freely. Squash the "fix typo" and "actually fix it" commits,
+      reorder, reword. Nobody else has those commits, so rewriting them costs nothing and the result is a branch
+      that's pleasant to review.
+      <br><br>
+      <strong>Never rebase a branch other people have based work on.</strong> Their commits now reference parents
+      that no longer exist on the remote, so their next pull produces duplicated commits and conflicts that make no
+      sense. It's not that Git can't do it — it's that everyone else has to recover.
+      <br><br>
+      <strong>Rebase onto main rather than merging main into your feature branch</strong>, while the branch is
+      yours. Repeatedly merging main in produces a feature branch littered with merge commits that make the diff
+      hard to read, and it's the more common habit.
+      <br><br>
+      <strong>For integrating into main, the shape is a team decision</strong>, and all three are defensible: squash
+      for a tidy one-commit-per-feature history, rebase-and-merge for linear history with individual commits
+      preserved, merge commits for an exact record of what happened when.
+      <br><br>
+      What matters more than the choice is that it's <strong>consistent and enforced by the platform</strong> — set
+      the allowed merge method in the repository settings rather than relying on each person picking the right
+      button.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The squash trade-off nobody mentions until it bites</div>
+    <p style="margin:0">Squash merging gives a clean main branch, and it discards the individual commits. Which has
+      two consequences worth knowing in advance.
+      <br><br>
+      <strong><code>git bisect</code> gets coarser.</strong> When it identifies the bad commit, that commit is an
+      entire feature — possibly hundreds of lines — rather than the specific change. You've traded review
+      convenience for debugging precision.
+      <br><br>
+      <strong>Long-lived branches become painful.</strong> If a feature branch was squash-merged and someone
+      continues working on the original branch, Git can't tell the squashed commit contains that work, so the next
+      merge re-applies everything and conflicts heavily. The fix is to always branch fresh from main after a squash
+      merge, never continue on a merged branch.
+      <br><br>
+      Squash suits <strong>short-lived branches with small, focused changes</strong> — which is what you want anyway.
+      For long-running work with meaningful intermediate commits, rebase-and-merge preserves more useful
+      information.</p>
+  </div>
+
+  <h2 id="workflows">Branching workflows <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Workflow</th><th>Shape</th><th>Suits</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Trunk-based</strong></td>
+          <td>Short branches (hours to two days) merged to main; <strong>feature flags for incomplete work</strong></td>
+          <td><strong>Continuous delivery. The modern default</strong></td>
+        </tr>
+        <tr>
+          <td><strong>GitHub Flow</strong></td>
+          <td>Branch, pull request, merge, deploy from main</td>
+          <td>Web services; effectively trunk-based with pull requests</td>
+        </tr>
+        <tr>
+          <td><strong>GitFlow</strong></td>
+          <td><code>develop</code>, <code>release/*</code>, <code>hotfix/*</code>, <code>feature/*</code></td>
+          <td><strong>Versioned products with supported releases.</strong> Heavy for a web app</td>
+        </tr>
+        <tr>
+          <td>Release branches</td>
+          <td>Trunk-based plus a branch per release for patching</td>
+          <td>Products where old versions must be supported</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — long-lived branches are the actual problem</div>
+    <p style="margin:0">The argument for trunk-based development isn't aesthetic. It's that
+      <strong>merge difficulty grows with branch age and divergence</strong>, roughly non-linearly.
+      <br><br>
+      A two-week branch conflicts with everything that landed meanwhile. The person resolving those conflicts is
+      making judgement calls about code they may not have written, under pressure to finish — which is exactly when
+      logic gets silently broken. And a conflict resolved <em>syntactically</em> can still be semantically wrong,
+      which no test necessarily catches.
+      <br><br>
+      There's a subtler cost: <strong>a long branch means integration problems are discovered late</strong>. Two
+      people refactoring the same area in parallel find out at merge time rather than the same day.
+      <br><br>
+      So the goal is that branches live <strong>hours, not weeks</strong>, which requires two habits: breaking work
+      into small independently-mergeable pieces, and using <strong>feature flags</strong> so incomplete work can
+      merge safely while switched off.
+      <br><br>
+      That second point is what makes trunk-based work at all. Without flags, you either wait for the whole feature
+      or ship something half-finished. With them, <strong>merging and releasing become separate
+      decisions</strong> — which is the same decoupling that makes canary deployments possible.
+      <br><br>
+      <strong>GitFlow is not wrong</strong>, and it's a poor fit for a continuously-deployed service — all that
+      release-branch machinery exists to manage versioned releases you support in parallel. If you deploy main
+      several times a day, it's overhead. If you ship an on-premises product with three supported versions, it's the
+      right shape.</p>
+  </div>
+
+  <h2 id="commits">Commits and review <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="text — a commit message that earns its place"><code class="language-text">feat(orders): reject duplicate submissions within the idempotency window
+
+Orders submitted twice within 30 seconds were creating two records because
+the uniqueness check ran before the transaction, so two concurrent requests
+both passed it.
+
+Adds a unique index on (CustomerId, IdempotencyKey) and handles 2601 as a
+successful duplicate rather than an error, so the client sees the original
+order rather than a failure.
+
+The index is filtered on non-null IdempotencyKey so existing rows are
+unaffected and the migration is online.
+
+Refs: #2841</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Write the message for the person debugging this in a year</div>
+    <p style="margin:0">The diff already says <em>what</em> changed. The message's job is <strong>why</strong> — and
+      why is the part that can't be reconstructed later.
+      <br><br>
+      So: a subject line in the imperative under about 72 characters, then a blank line, then the reasoning. What
+      was wrong, why this approach, what was considered and rejected, anything surprising about the implementation.
+      <br><br>
+      That person in a year is usually you, looking at a line you don't understand and running
+      <code>git log -p</code> on it. A message saying "fix bug" leaves you reverse-engineering the intent from the
+      code.
+      <br><br>
+      <strong>Conventional Commits</strong> — the <code>feat:</code>, <code>fix:</code>, <code>chore:</code> prefixes
+      — are worth adopting mainly because tooling can generate changelogs and derive semantic versions from them. The
+      discipline of picking a type also nudges you toward one logical change per commit.
+      <br><br>
+      And reference the ticket, so the fuller discussion is one click away. Not <em>instead</em> of the explanation
+      — issue trackers get migrated and links rot, so the commit should stand alone.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Review practice</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Small pull requests</strong> — a few hundred lines</td><td><strong>Review quality collapses with size.</strong> Big ones get "LGTM"</td></tr>
+        <tr><td><strong>Describe the intent</strong>, not just the change</td><td>Reviewers need to judge the approach, not only the code</td></tr>
+        <tr><td><strong>Self-review first</strong></td><td>You'll catch the debug line before someone else does</td></tr>
+        <tr><td><strong>Automate the mechanical</strong></td><td>Formatting, analyzers, coverage. Humans review design</td></tr>
+        <tr><td><strong>Separate refactoring from behaviour change</strong></td><td>Otherwise the real change hides in the noise</td></tr>
+        <tr><td><strong>Draft pull requests for early feedback</strong></td><td>Direction problems are cheap to fix early</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The size of a pull request determines whether it gets reviewed</div>
+    <p style="margin:0">This is the single most actionable thing about code review. A 50-line change gets read
+      carefully. A 2,000-line change gets skimmed, and the reviewer comments on naming because that's all they can
+      meaningfully assess.
+      <br><br>
+      So a large pull request often receives <em>less</em> scrutiny than a small one — the opposite of what its risk
+      warrants.
+      <br><br>
+      Which makes "split this up" a legitimate and useful review comment, and one people are oddly reluctant to
+      give. The techniques: separate refactoring from behaviour change into different pull requests; land the
+      interface before the implementation; use feature flags so partial work can merge.
+      <br><br>
+      The related habit is <strong>mixing a rename or a reformat into a behavioural change</strong>. A 400-line diff
+      where 380 lines are automated formatting means the 20 that matter are effectively unreviewed. Separate commits
+      at minimum, separate pull requests ideally — and if your platform supports it, teach reviewers to hide
+      whitespace-only changes.</p>
+  </div>
+
+  <h2 id="recovery">Recovery <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="bash — the ones you'll actually need"><code class="language-bash"># THE UNDO BUTTON. Every position HEAD has held, for ~90 days.
+git reflog
+git reset --hard HEAD@{3}          # back to where you were three moves ago
+
+# Committed to the wrong branch
+git log --oneline -1               # note the hash
+git reset --hard HEAD~1            # remove it from here
+git checkout correct-branch
+git cherry-pick <hash>             # apply it there
+
+# Undo the last commit but KEEP the changes staged
+git reset --soft HEAD~1
+
+# Undo a commit that is already pushed - creates a NEW commit
+git revert <hash>                  # safe on shared branches
+git revert -m 1 <merge-hash>       # revert a merge: -m 1 keeps the main-line parent
+
+# Recover a deleted branch
+git reflog                         # find its tip
+git branch recovered <hash>
+
+# Recover a commit lost by a bad rebase
+git fsck --lost-found              # dangling commits, when reflog is not enough
+
+# Find which commit introduced a bug
+git bisect start
+git bisect bad                     # current is broken
+git bisect good v1.4.0             # this tag was fine
+# test, then: git bisect good | git bisect bad ... until it names the commit
+git bisect run dotnet test         # or let it drive itself
+
+# Who changed this line, ignoring formatting-only commits
+git blame -w -C --ignore-rev <formatting-commit> path/to/File.cs
+
+# Set aside work in progress
+git stash push -m "half-done validation" --include-untracked
+git stash list && git stash pop</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the reflog means almost nothing is ever lost</div>
+    <p style="margin:0">The reflog records <strong>every position HEAD has held</strong> in this repository — every
+      commit, checkout, reset, rebase and merge — for about 90 days by default.
+      <br><br>
+      So a "destroyed" branch, a bad <code>reset --hard</code>, or a rebase that mangled everything is recoverable:
+      find the hash the reflog remembers and point a branch at it. The commits were never deleted, just
+      unreferenced.
+      <br><br>
+      Knowing that changes how you work. It's what makes rebase and history editing reasonable rather than
+      terrifying — the worst case is finding a hash in the reflog.
+      <br><br>
+      Two limits to state honestly. It's <strong>local</strong>, so it can't recover something that only ever
+      existed on a machine you no longer have. And it only covers <strong>committed</strong> work — uncommitted
+      changes destroyed by <code>reset --hard</code> or <code>checkout --</code> are genuinely gone, which is the
+      strongest argument for committing early and often, even messily. You can always tidy the history
+      afterwards.
+      <br><br>
+      <code>git fsck --lost-found</code> is the deeper fallback, finding dangling objects the reflog doesn't
+      reference.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">reset versus revert, and why it matters on a shared branch</div>
+    <p style="margin:0"><strong><code>reset</code></strong> moves the branch pointer. History changes — commits
+      disappear from the branch. Fine locally; on a shared branch it means the next push is a force push and
+      everyone else's history diverges.
+      <br><br>
+      <strong><code>revert</code></strong> creates a <em>new</em> commit that undoes an earlier one. History grows
+      rather than changing, so nobody else is disturbed.
+      <br><br>
+      <strong>Local mistake → reset. Public mistake → revert.</strong> That's the whole rule.
+      <br><br>
+      Reverting a <em>merge</em> commit needs <code>-m 1</code>, which tells Git which parent is the mainline. Without
+      it, Git can't know which side you want to keep and refuses.
+      <br><br>
+      And when a force push is genuinely necessary — cleaning up your own feature branch — use
+      <strong><code>--force-with-lease</code></strong>. It refuses if the remote has moved since you last fetched,
+      so you can't silently destroy a colleague's push. Plain <code>--force</code> overwrites unconditionally, which
+      is how someone's afternoon disappears.
+      <br><br>
+      Better still, <strong>protect <code>main</code> at the platform level</strong>: no force pushes, no deletion,
+      required reviews and status checks. The reliable safeguards are the ones that don't depend on remembering
+      anything.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title"><code>bisect</code> is the most underused command in Git</div>
+    <p style="margin:0">"It worked in the last release and it's broken now" over hundreds of commits is a
+      <em>binary search</em> problem, and Git implements it for you. Twelve steps covers four thousand commits.
+      <br><br>
+      <code>git bisect run</code> makes it fully automatic: give it a command that exits non-zero on failure — a test,
+      a script, a build — and it walks the history unattended and names the commit.
+      <br><br>
+      That turns an afternoon of guessing into a coffee break, and it's especially good for performance regressions
+      and intermittent failures where reading diffs won't help.
+      <br><br>
+      The prerequisites are the argument for good commit hygiene: <strong>each commit needs to build and be
+      testable</strong>, and small focused commits make the answer precise. A bisect that lands on a 3,000-line
+      squashed merge tells you which feature, not which change — which is why the squash trade-off above is a real
+      one.</p>
+  </div>
+
+  <h2 id="advanced">Worth knowing exists <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Feature</th><th>Use for</th><th>Caveat</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>worktree</code></strong></td><td>Two branches checked out at once, in separate folders</td><td>Far better than stashing to switch context</td></tr>
+        <tr><td><strong><code>rerere</code></strong></td><td>Remembers conflict resolutions and reapplies them</td><td>Invaluable for repeated rebases of a long branch</td></tr>
+        <tr><td><code>bisect run</code></td><td>Automated regression hunting</td><td>Needs every commit to build</td></tr>
+        <tr><td><strong>Hooks</strong></td><td>Pre-commit formatting and secret scanning</td><td><strong>Local hooks aren't shared</strong> — CI must enforce too</td></tr>
+        <tr><td><strong>LFS</strong></td><td>Large binaries</td><td>Adds a server dependency; migrate deliberately</td></tr>
+        <tr><td>Submodules</td><td>Pinning another repository</td><td><strong>Awkward.</strong> Prefer a package</td></tr>
+        <tr><td>Sparse checkout / partial clone</td><td>Very large monorepos</td><td>Only needed at real scale</td></tr>
+        <tr><td><code>signed commits</code></td><td>Verifying authorship</td><td>Increasingly expected for regulated work</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Local hooks are a convenience, not a control</div>
+    <p style="margin:0">A pre-commit hook that formats code and scans for secrets is genuinely useful — it catches
+      problems before they leave your machine.
+      <br><br>
+      It is not a guarantee. Hooks live in <code>.git/hooks</code>, which <strong>isn't version-controlled</strong>,
+      so they're per-machine and per-developer. Anyone can skip one with <code>--no-verify</code>, and a new
+      contributor simply won't have them.
+      <br><br>
+      So the same check must exist in <strong>CI</strong>, where it can't be bypassed. Hooks give fast feedback; CI
+      provides the actual enforcement. Tools like Husky or a bootstrap script make hooks easier to distribute, and
+      they don't change this.
+      <br><br>
+      Same principle as everywhere in this part of the handbook: <strong>a control that depends on every individual
+      having configured something correctly isn't a control.</strong></p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A secret in history is compromised — rotate it</div>
+    <p style="margin:0">Committing a connection string and then committing its deletion achieves nothing. It remains
+      in every clone, every fork, every CI cache and every mirror.
+      <br><br>
+      So the response is always: <strong>rotate the credential immediately.</strong> History rewriting with
+      <code>git filter-repo</code> or BFG is cosmetic and comes second — and it forces every collaborator to
+      re-clone, so it isn't free.
+      <br><br>
+      Prevention is much cheaper: <strong>push protection and secret scanning</strong> in the platform, which blocks
+      the push rather than reporting it afterwards, plus <code>.gitignore</code> covering
+      <code>appsettings.*.local.json</code> and <code>.env</code>, and <code>dotnet user-secrets</code> for local
+      development.
+      <br><br>
+      Same conclusion as <a href="../24-azure/config-secrets.html">managed identity</a>: the strongest position is
+      having no secret to commit in the first place.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Commits are immutable content-addressed snapshots; branches are pointers.</li>
+      <li>Rebase can't move a commit — it replays it as a new one.</li>
+      <li>Unreferenced objects survive ~90 days, which is why recovery works.</li>
+      <li>Use <code>git add -p</code> so each commit is one logical change.</li>
+      <li>Rebase your own unpushed work; never rebase what others have based work on.</li>
+      <li>Squash suits short branches; it makes <code>bisect</code> coarser.</li>
+      <li>Never continue working on a squash-merged branch.</li>
+      <li>Trunk-based plus feature flags, because merge pain grows with branch age.</li>
+      <li>Commit messages explain <em>why</em>; the diff already shows what.</li>
+      <li>Pull request size determines whether it's genuinely reviewed.</li>
+      <li>Separate refactoring from behaviour change.</li>
+      <li>Reset for local mistakes, revert for public ones; <code>-m 1</code> to revert a merge.</li>
+      <li><code>--force-with-lease</code>, and protect <code>main</code> at the platform level.</li>
+      <li><code>bisect run</code> automates regression hunting.</li>
+      <li>Local hooks aren't enforcement — CI is.</li>
+      <li>A committed secret must be rotated, not deleted.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Rebasing a shared branch</strong>, forcing everyone else to recover.</li>
+    <li><strong>Plain <code>git push --force</code></strong> instead of <code>--force-with-lease</code>.</li>
+    <li><strong><code>reset --hard</code> on a pushed branch</strong> instead of <code>revert</code>.</li>
+    <li><strong>Repeatedly merging main into a feature branch</strong>, cluttering its history.</li>
+    <li><strong>Continuing to work on a squash-merged branch</strong>, then fighting the next merge.</li>
+    <li><strong>Enormous pull requests</strong> that receive less review than small ones.</li>
+    <li><strong>Refactoring mixed with behaviour change</strong> in one diff.</li>
+    <li><strong>"fix", "wip", "updates"</strong> as commit messages.</li>
+    <li><strong>Never using <code>bisect</code></strong>, and reading diffs by hand instead.</li>
+    <li><strong>Relying on local hooks</strong> with no CI equivalent.</li>
+    <li><strong>Deleting a committed secret without rotating it.</strong></li>
+    <li><strong><code>main</code> unprotected</strong>, so force pushes and deletions are possible.</li>
+    <li><strong>Long-lived branches</strong>, discovering integration problems weeks late.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Merge or rebase? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They do different things, so I'd answer by <em>where</em> rather than picking a winner."</p>
+        <p>"<strong>Merge</strong> creates a commit with two parents, preserving both histories exactly.
+          <strong>Rebase</strong> replays your commits on top of the target, producing linear history."</p>
+        <p>"The mechanical detail that matters: <strong>rebase doesn't move commits, it creates new ones.</strong> A
+          commit's hash is derived from its content <em>including its parent</em>, so changing the parent
+          necessarily produces a different commit. The originals still exist, unreferenced, until garbage
+          collection — which is why the reflog can recover them."</p>
+        <p>"That's the whole reason rebasing shared history is disruptive. It isn't that Git refuses; it's that
+          anyone who had the old commits now has history that diverges from the remote, and their next pull produces
+          duplicates and nonsensical conflicts."</p>
+        <p>"So my rules:"</p>
+        <p>"<strong>Rebase my own unpushed work freely.</strong> Squash the 'fix typo' commits, reorder, reword. No
+          one else has them, so it costs nothing and produces a branch that's pleasant to review."</p>
+        <p>"<strong>Rebase onto main rather than merging main into my branch</strong>, while the branch is mine.
+          Repeatedly merging main in leaves the feature branch full of merge commits that make the diff harder to
+          read — and that's the more common habit."</p>
+        <p>"<strong>Never rebase a branch someone else has based work on.</strong> If I absolutely must, it's a
+          conversation first, not a force push."</p>
+        <p>"<strong>For integrating into main</strong>, all three options are defensible and it's a team decision.
+          Squash gives one commit per feature and a very clean history. Rebase-and-merge keeps individual commits
+          with linear history. Merge commits keep an exact record of what happened when."</p>
+        <p>"I'd lean toward <strong>squash for short-lived branches</strong>, which is what trunk-based development
+          produces anyway. But I'd name the trade-off: <strong>squashing makes <code>git bisect</code>
+          coarser</strong>. When bisect finds the bad commit, it's an entire feature rather than a specific change.
+          You've traded debugging precision for a tidier log."</p>
+        <p>"And a practical gotcha with squash: <strong>never keep working on a squash-merged branch.</strong> Git
+          can't tell the squashed commit contains that work, so the next merge re-applies everything and conflicts
+          badly. Always branch fresh from main."</p>
+        <p>"One more thing on conflicts: <strong>rebase can make you resolve the same conflict repeatedly</strong>,
+          once per replayed commit, whereas a merge resolves it once. <code>git rerere</code> helps a lot here — it
+          remembers resolutions and reapplies them — and it's worth enabling if you rebase long branches."</p>
+        <p>"The part I'd emphasise: <strong>whatever the team picks, enforce it in the repository settings</strong>
+          rather than relying on people choosing the right button. Consistency matters more than which one."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know rebase creates new commits, and why?</li>
+        <li>Do you have the shared-history rule?</li>
+        <li>Do you prefer rebasing onto main over merging main in?</li>
+        <li>Can you name the squash trade-off?</li>
+        <li>Do you treat the integration strategy as a team decision to enforce?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "rebase is better, it's cleaner" with no caveats.</li>
+        <li><span class="redflag">Red flag:</span> not knowing why rebasing shared branches is a problem.</li>
+        <li><span class="redflag">Red flag:</span> thinking rebase modifies commits in place.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Someone rebased main and force-pushed. How do you recover?</li>
+          <li>How do you revert a squash-merged feature?</li>
+          <li>What does <code>rerere</code> do?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A colleague force-pushed to main and work is missing. Recover it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is recoverable, and the first thing I'd do is <strong>stop anyone else from pushing or
+          pulling</strong> — because the more people who fetch the rewritten main, the more local histories diverge
+          and the messier the cleanup."</p>
+        <p>"Then I'd find the commits. The good news is <strong>nothing is actually deleted</strong> — a force push
+          moves a pointer, and the old commits remain as unreferenced objects until garbage collection, roughly 90
+          days."</p>
+        <p>"<strong>The best source is someone's local clone.</strong> Anyone who had fetched main before the force
+          push has the old commits, and their <strong>reflog</strong> records where their
+          <code>origin/main</code> pointed. So <code>git reflog show origin/main</code> gives me the hash directly.
+          Even simpler, someone who hasn't fetched since still has the correct history on disk."</p>
+        <p>"<strong>On the server side</strong>, GitHub and Azure DevOps both keep this: GitHub's Events API records
+          the before-and-after SHAs of every push, and the Activity view shows force pushes with both hashes. So
+          even with no usable local clone I can get the old tip."</p>
+        <p>"Once I have the hash, recovery is straightforward: create a branch at it, verify the history is what I
+          expect, and restore main. I'd restore by <strong>merging the recovered commits</strong> rather than force
+          pushing again, because another force push compounds the divergence for everyone who has already
+          fetched."</p>
+        <p>"If the reflog isn't enough — say the rewrite happened locally and was garbage collected —
+          <code>git fsck --lost-found</code> finds dangling commits directly in the object database."</p>
+        <p>"Then <strong>everyone else has to reconcile.</strong> Anyone who pulled the rewritten main has divergent
+          history, and the clean fix is usually to reset their local main to the restored remote and rebase any local
+          work on top. That's worth communicating explicitly, because the default reaction is to
+          <code>git pull</code>, which creates a merge between the two histories and makes it worse."</p>
+        <p>"Then <strong>the more important part — why was this possible?</strong>"</p>
+        <p>"<strong>Branch protection on main</strong> should have prevented it outright: block force pushes, block
+          deletion, require a pull request, require review and status checks. That's a repository setting, and it
+          takes a minute."</p>
+        <p>"The reason I'd frame it that way is that this isn't a discipline problem to solve with a reminder. The
+          command is one keystroke from a legitimate one, and people run it by accident — often trying to fix their
+          own branch while on the wrong one. <strong>The fix is making it impossible, not asking people to be
+          careful.</strong>"</p>
+        <p>"I'd also establish <strong><code>--force-with-lease</code> as the team default</strong> — it refuses if
+          the remote has moved since your last fetch, so it can't silently overwrite someone else's push. It's
+          strictly better than plain <code>--force</code> for every legitimate use, and setting
+          <code>push.useForceIfIncludes</code> makes it the default behaviour."</p>
+        <p>"And I'd be careful about the tone of the follow-up. Someone force-pushing to main is usually a
+          <strong>missing guardrail</strong>, not carelessness — the repository allowed a destructive operation with
+          no confirmation. Treating it as a process failure rather than a personal one is both more accurate and more
+          likely to get the protection turned on."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know force push doesn't delete commits?</li>
+        <li>Do you know to look in reflogs and the platform's push history?</li>
+        <li>Do you restore by merging rather than another force push?</li>
+        <li>Do you address everyone else's divergent history?</li>
+        <li>Do you fix it with branch protection rather than a reminder?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "the work is gone."</li>
+        <li><span class="redflag">Red flag:</span> re-cloning and losing local work.</li>
+        <li><span class="redflag">Red flag:</span> no prevention afterwards.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if nobody has a clone with the old commits?</li>
+          <li>How do you get everyone's local main back in sync?</li>
+          <li>Which branch protection rules would you enable first?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A bug appeared somewhere in the last 300 commits. Find it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong><code>git bisect</code></strong>, which turns this into a binary search — about eight or nine
+          steps for 300 commits rather than reading 300 diffs."</p>
+        <p>"The prerequisite is <strong>a reliable way to tell good from bad</strong>, and I'd get that first. A
+          failing test is ideal. A script that exits non-zero, or even manual steps I can perform consistently,
+          works. Without a dependable check, bisect gives a confident wrong answer, because one mislabelled step
+          sends it down the wrong half."</p>
+        <p>"So: <code>git bisect start</code>, mark the current commit <code>bad</code>, mark a known-good commit or
+          tag <code>good</code>. Git checks out the midpoint, I test, mark it, and it converges."</p>
+        <p>"If I can automate the check, <strong><code>git bisect run dotnet test --filter FullyQualifiedName~TheTest</code></strong>
+          does the whole thing unattended. That's the version worth remembering — it's the difference between an
+          afternoon and a coffee break, and it's especially good for performance regressions where reading diffs
+          wouldn't help at all."</p>
+        <p>"A few practical points."</p>
+        <p>"<strong>Commits that don't build.</strong> If the midpoint won't compile I can't test it, so
+          <code>git bisect skip</code> excludes it and Git works around the gap. If <em>many</em> commits don't
+          build, bisect gets unreliable — which is an argument for the discipline of every commit building."</p>
+        <p>"<strong>Intermittent bugs.</strong> Bisect assumes a deterministic answer. For a flaky failure I'd run
+          the check enough times per step to be confident, or find a more deterministic reproduction first —
+          otherwise a single false 'good' invalidates everything after it."</p>
+        <p>"<strong>Squashed history.</strong> If features were squash-merged, bisect lands on a whole feature rather
+          than a specific change. Still a big narrowing, and then I can bisect <em>within</em> that feature's original
+          branch if it still exists. This is the concrete cost of squash merging, and it's worth knowing before you
+          need it."</p>
+        <p>"<strong>The bug might not be in our code.</strong> If bisect points at a commit that only bumps a package
+          version, that's the answer — a dependency changed behaviour. Worth expecting, since it's easy to assume the
+          culprit must be application logic."</p>
+        <p>"Once I have the commit, <strong><code>git show</code></strong> and I'm usually looking at a small diff
+          with a message explaining the intent — which is where good commit hygiene pays off. A focused commit gives
+          me the change and the reasoning together."</p>
+        <p>"Alternatives if bisect isn't practical: <strong><code>git log -S 'someString'</code></strong> finds
+          commits that added or removed a specific string, and <strong><code>git log -L</code></strong> follows the
+          history of a specific function or line range. Both are much faster when I already suspect a particular
+          area."</p>
+        <p>"And <code>git blame -w -C</code> with <code>--ignore-rev</code> for formatting commits, so blame shows
+          the last <em>meaningful</em> change rather than whoever reformatted the file."</p>
+        <p>"Afterwards I'd <strong>keep the reproduction as a regression test</strong>. That's the part that stops
+          this recurring, and it's the actual deliverable — finding the commit is only half the job."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you reach for <code>bisect</code> rather than reading diffs?</li>
+        <li>Do you establish a reliable good/bad test first?</li>
+        <li>Do you know <code>bisect run</code>?</li>
+        <li>Do you handle non-building commits and flaky tests?</li>
+        <li>Do you know <code>log -S</code> and <code>log -L</code>?</li>
+        <li>Do you add a regression test at the end?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> reading the log manually looking for suspicious commits.</li>
+        <li><span class="redflag">Red flag:</span> not knowing bisect exists.</li>
+        <li><span class="redflag">Red flag:</span> bisecting a flaky failure without addressing determinism.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if half the commits don't compile?</li>
+          <li>How would you bisect a performance regression?</li>
+          <li>What does <code>git log -S</code> do that <code>grep</code> doesn't?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

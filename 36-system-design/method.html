@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to Run a Design Interview — System Design Exercises</title>
+<meta name="description" content="A time-boxed structure for a 45-minute design interview: requirements, scope, estimation, data model, architecture, failure, operability — and what is actually scored.">
+<meta name="keywords" content="system design interview method structure requirements functional non-functional estimation back of envelope data model API design failure modes operability trade-offs scoring rubric time boxing">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/method.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>How to Run a Design Interview</h1>
+    <p class="subtitle">Structure is most of the score. A well-organised design with one gap beats a brilliant idea
+      delivered as a stream of consciousness.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Requirements first, always.</strong> Ten minutes, not two.</li>
+      <li><strong>Write down what you're excluding.</strong> Scope control is a scored skill.</li>
+      <li><strong>Estimate to size decisions</strong>, not to show arithmetic.</li>
+      <li><strong>Data model before architecture.</strong> The data drives the boxes.</li>
+      <li><strong>Name a trade-off on every significant choice.</strong></li>
+      <li><strong>Volunteer the failure modes.</strong> Don't wait to be asked.</li>
+      <li><strong>Finish with operability</strong> — monitoring, deployment, what you'd alert on.</li>
+      <li><strong>Say the reasoning out loud.</strong> Silent thinking scores nothing.</li>
+    </ul>
+  </div>
+
+  <h2 id="timebox">A 45-minute structure <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — rough minutes, adjust to the interviewer"><code class="language-text">0-8    REQUIREMENTS      Ask. Write them down. Confirm scope and exclusions.
+                         Get the non-functional numbers: scale, latency, consistency.
+
+8-12   ESTIMATION        Only what sizes a decision. Reads/sec, writes/sec, data volume,
+                         growth. Say what each number implies.
+
+12-18  DATA MODEL        Entities, relationships, access patterns, store choice.
+                         This is where most of the real design happens.
+
+18-20  API SURFACE       The three or four operations that matter. Sync vs async.
+
+20-32  ARCHITECTURE      Components and flows. Walk ONE request end to end.
+                         Then the write path. Name a trade-off per choice.
+
+32-40  FAILURE + SCALE   What breaks first. What happens when X is down.
+                         Where the bottleneck moves. Volunteer this.
+
+40-45  OPERABILITY       Monitoring, alerts, deployment, migrations.
+                         Then: "what I'd do differently with more time."</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Draw the boxes, but not first</div>
+    <p style="margin:0">The instinct is to start drawing an architecture diagram, because that's what a design looks
+      like. It's the wrong order: the boxes are a <em>consequence</em> of the requirements and the data model, so
+      drawing them first means you've decided before you know anything.
+      <br><br>
+      A candidate who draws an API gateway, three services, a queue and a cache in the first two minutes has produced
+      a generic diagram that would fit any question. Interviewers see it constantly and it signals pattern-matching
+      rather than reasoning.
+      <br><br>
+      Better: agree the requirements, work out what data you're storing and how it's accessed, and let the components
+      fall out of that. <strong>Then</strong> draw, and the diagram is defensible because every box exists for a
+      stated reason.
+      <br><br>
+      When you do draw, keep it simple and walk a request through it. <strong>Tracing one concrete operation end to
+      end</strong> — what receives it, what validates it, what persists it, what responds — is far more convincing
+      than a diagram with more boxes.</p>
+  </div>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Ask about</th><th>Because it changes</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Who uses this, and to do what?</strong></td><td>Everything. Start here</td></tr>
+        <tr><td><strong>How many users, and how active?</strong></td><td>Whether scale is even a concern</td></tr>
+        <tr><td><strong>Read-heavy or write-heavy?</strong></td><td>Caching, replicas, store choice</td></tr>
+        <tr><td><strong>What must be strongly consistent?</strong></td><td><strong>Usually the pivotal question</strong></td></tr>
+        <tr><td><strong>What latency is acceptable?</strong></td><td>Synchronous versus asynchronous</td></tr>
+        <tr><td><strong>What happens if we lose an hour of data?</strong></td><td>Durability and backup design</td></tr>
+        <tr><td><strong>Multi-tenant? Multi-region? Regulated?</strong></td><td>Each adds a whole dimension</td></tr>
+        <tr><td><strong>What's explicitly out of scope?</strong></td><td>Lets you go deep instead of wide</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the consistency question is usually the pivotal one</div>
+    <p style="margin:0">If you only ask a few questions, make one of them <strong>"what has to be strongly consistent,
+      and what can be eventually consistent?"</strong>
+      <br><br>
+      It determines more of the design than scale does. Strong consistency on a specific invariant means a single
+      writer, a transaction, or an atomic conditional write — and constrains how you partition and replicate.
+      Tolerating eventual consistency opens up queues, read replicas, caching, CQRS and independent services.
+      <br><br>
+      And the answer is almost never uniform across a system. In a booking platform, <em>seat allocation</em> must be
+      strongly consistent — double-booking is unacceptable — while the search index can be seconds stale and nobody
+      minds. Recognising that <strong>different parts of one system get different guarantees</strong> is a strong
+      signal on its own, and it lets you spend strong consistency only where it's needed.
+      <br><br>
+      The related question worth asking: <strong>"what's the cost of being wrong here?"</strong> A stale product
+      description costs nothing. A stale stock level oversells. A stale permission check is a security incident. That
+      framing gets you to the right guarantee quickly and shows you're reasoning about consequences rather than
+      applying a default.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Write down the exclusions, explicitly</div>
+    <p style="margin:0">"I'm going to assume authentication is handled by an existing identity provider and not design
+      it. I'll cover reporting only briefly. I'm treating the payment provider as a black box."
+      <br><br>
+      Saying that does three useful things. It <strong>demonstrates scope control</strong>, which is a scored skill —
+      shipping anything real requires deciding what not to build. It lets you go <strong>deep on what matters</strong>
+      instead of shallow on everything, and depth is what distinguishes answers. And it gives the interviewer a chance
+      to redirect: <em>"actually, I'd like you to cover the reporting side."</em>
+      <br><br>
+      That last point matters more than it seems. The interviewer usually has a specific area they want to probe, and
+      stating your plan lets them steer you there rather than waiting while you spend twenty minutes elsewhere.
+      <br><br>
+      The failure mode is trying to cover everything: authentication, reporting, admin, mobile, analytics — each for
+      ninety seconds. That reads as inability to prioritise, and there's nothing for the interviewer to dig into.</p>
+  </div>
+
+  <h2 id="estimation">Estimation <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="text — numbers worth having in your head"><code class="language-text">  1 million users, 10% daily active, 20 actions each
+    = 2,000,000 actions/day
+    / 86,400                        ~ 23 writes/sec average
+    x 5 for peak                    ~ 120 writes/sec peak
+    Reads typically 10-100x writes  ~ 1,000-10,000 reads/sec
+
+  IMPLICATIONS - this is the part that scores:
+    ~120 writes/sec        a single well-indexed SQL database handles this easily
+    ~10,000 reads/sec      needs caching, or read replicas
+    2 KB per record        2M/day = 4 GB/day = ~1.5 TB/year -> retention policy needed
+    Peak 5x average        autoscaling, or provision for peak
+
+  Useful anchors:
+    A tuned relational DB      thousands of simple reads/sec, hundreds of writes/sec
+    Redis                      ~100k ops/sec per node
+    One App Service instance   hundreds of concurrent requests, if async throughout
+    Cosmos DB                  1 RU ~= a 1 KB point read; a write ~5x a read</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Estimate to reach a conclusion, then stop</div>
+    <p style="margin:0">Estimation is a means, not a display. The mark isn't for the arithmetic — it's for
+      <strong>saying what the number implies</strong>.
+      <br><br>
+      "About 120 writes a second at peak — that's comfortable for a single well-indexed SQL database, so I don't need
+      to shard and I'll design for a single primary" is the useful form. It has converted a number into a
+      <em>decision</em> and closed off a whole branch of complexity.
+      <br><br>
+      "Roughly 10,000 reads a second, which is beyond what I'd want to hit the database directly, so caching is
+      load-bearing rather than an optimisation" is the same move on the read side, and it tells you where to spend the
+      rest of your time.
+      <br><br>
+      Two habits. <strong>Round aggressively</strong> — 86,400 seconds is 100,000, a million users is a million; the
+      order of magnitude is what decides architecture, and precision wastes time. And <strong>state your assumptions
+      as you go</strong>, so a wrong assumption gets corrected rather than invalidating everything after it.
+      <br><br>
+      And be ready to say <strong>when the numbers make scale a non-issue</strong>. Plenty of real systems serve a few
+      hundred requests a second, and a candidate who designs a globally-distributed event-sourced platform for that
+      has misread the problem. Recognising that the boring answer is sufficient is a genuine senior signal.</p>
+  </div>
+
+  <h2 id="data-model">Data model before architecture <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Decide</th><th>Which determines</th></tr></thead>
+      <tbody>
+        <tr><td><strong>The entities and their relationships</strong></td><td>Whether relational or document fits</td></tr>
+        <tr><td><strong>The access patterns</strong></td><td>Indexes, partition keys, denormalisation</td></tr>
+        <tr><td><strong>What must be transactional together</strong></td><td><strong>Service boundaries</strong></td></tr>
+        <tr><td><strong>The partition or shard key</strong></td><td>Scale ceiling, and it's usually irreversible</td></tr>
+        <tr><td><strong>Growth and retention</strong></td><td>Whether it degrades in two years</td></tr>
+        <tr><td><strong>What's read together</strong></td><td>Denormalisation and caching</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — "what must be transactional together" defines the services</div>
+    <p style="margin:0">This is the most useful question in the whole exercise, and most candidates never ask it.
+      <br><br>
+      If two pieces of data must change atomically, they should almost certainly live in <strong>one database owned by
+      one service</strong>. Splitting them across services means you've replaced a transaction with a saga —
+      compensation logic, eventual consistency, and a whole class of partial-failure states — for no benefit.
+      <br><br>
+      So transactional boundaries are a much better guide to service boundaries than either organisational structure
+      or nouns in the requirements. Working outward from "what has to be consistent" produces boundaries that hold;
+      working from "we have orders, customers and products, so three services" produces boundaries that need
+      distributed transactions to function.
+      <br><br>
+      It's also how you justify <em>not</em> splitting. "Inventory and orders must be consistent when a purchase is
+      confirmed, so I'd keep them in one service rather than run a saga for the core flow" is a strong answer, and
+      it's the opposite of what a candidate reaching for microservices would say.
+      <br><br>
+      The related irreversible decision is the <strong>partition key</strong>. In Cosmos DB and DynamoDB it can't be
+      changed without a migration, and it sets both the scale ceiling and which queries are cheap. Naming it
+      explicitly — and saying what you'd need to know to choose it, particularly the size distribution — is a strong
+      signal.</p>
+  </div>
+
+  <h2 id="trade-offs">Trade-offs <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Instead of</th><th>Say</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>"I'd use a queue here."</td>
+          <td>"A queue here, so a spike grows a backlog instead of timing out. The cost is that the caller gets a 202 and needs a way to check status."</td>
+        </tr>
+        <tr>
+          <td>"I'd cache this."</td>
+          <td>"Cache this for five minutes. Stale prices for five minutes are acceptable; stale stock levels wouldn't be, so I'd invalidate those on write."</td>
+        </tr>
+        <tr>
+          <td>"Cosmos DB."</td>
+          <td>"Cosmos, partitioned by tenant — but I'd want the largest tenant's volume first, because a very large one hits per-partition limits and adding RUs doesn't help."</td>
+        </tr>
+        <tr>
+          <td>"Microservices."</td>
+          <td>"A modular monolith first. Independent deployability is the one real benefit and we don't need it yet; I'd enforce module boundaries so splitting later is mechanical."</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Every choice has a cost — name it before you're asked</div>
+    <p style="margin:0">A design presented as a series of obviously-correct decisions reads as inexperience, because
+      real designs are compromises. Interviewers probe precisely to find out whether you know what you gave up.
+      <br><br>
+      So volunteer it. The pattern is: <strong>choice, reason, cost, and when you'd choose differently.</strong> That
+      last clause is the strongest part — <em>"if writes grew past a few thousand a second I'd revisit this"</em>
+      shows you know the boundary of your own decision.
+      <br><br>
+      It also makes the conversation collaborative rather than adversarial. If you've already named the weakness, the
+      interviewer engages with your reasoning instead of hunting for a gap — and you've set the agenda.
+      <br><br>
+      Two costs worth naming habitually because candidates rarely do: <strong>operational complexity</strong> — every
+      component is something to monitor, deploy, patch and debug at 3am — and <strong>the cost of being
+      wrong</strong>, which is what irreversibility means. A partition key choice and a caching TTL are not equally
+      serious mistakes, and treating them the same misses something important.</p>
+  </div>
+
+  <h2 id="failure">Failure modes <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Ask yourself</th><th>Good answers involve</th></tr></thead>
+      <tbody>
+        <tr><td><strong>What breaks first under load?</strong></td><td>A specific component, and why</td></tr>
+        <tr><td><strong>What if the database is unavailable?</strong></td><td>Degraded read-only, queued writes, or honest failure</td></tr>
+        <tr><td><strong>What if a dependency is slow, not down?</strong></td><td><strong>Timeouts, breaker, bulkhead</strong> — slow is worse than dead</td></tr>
+        <tr><td><strong>What if a message is delivered twice?</strong></td><td>Idempotency, and where it's enforced</td></tr>
+        <tr><td><strong>What if a step fails halfway?</strong></td><td>Retry, compensate, or park for a human</td></tr>
+        <tr><td><strong>What if one tenant behaves badly?</strong></td><td>Per-tenant quotas, not global</td></tr>
+        <tr><td><strong>What if we need to change the schema?</strong></td><td>Expand and contract, both versions running</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Volunteering failure modes is the clearest experience signal available</div>
+    <p style="margin:0">A candidate who designs a happy path and waits to be asked about failure looks like someone
+      who has built systems but not <em>run</em> them. A candidate who says
+      <em>"the risk here is that the payment provider succeeds and our write fails, so..."</em> has obviously been on
+      call.
+      <br><br>
+      The four that come up most often across every design, worth having ready:
+      <br><br>
+      <strong>Duplicate delivery.</strong> At-least-once is the norm, so any operation with a real-world side effect
+      needs an idempotency mechanism — enforced by a database constraint, not an application-level check, because
+      check-then-act is itself a race.
+      <br><br>
+      <strong>A slow dependency.</strong> Worse than a dead one, because it exhausts your threads and takes down
+      endpoints that don't even use it. Timeout, then circuit breaker, then bulkhead.
+      <br><br>
+      <strong>Partial failure in a multi-step operation.</strong> Prefer retry over compensation, keep irreversible
+      steps last, and be clear that compensation is a new business action rather than a rollback.
+      <br><br>
+      <strong>Schema change with zero downtime.</strong> Both versions run simultaneously during any rolling
+      deployment, so expand-and-contract across separate releases. This one is very often unasked and very often the
+      thing that actually bites in production.</p>
+  </div>
+
+  <h2 id="operability">Operability <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cover</th><th>Specifically</th></tr></thead>
+      <tbody>
+        <tr><td><strong>What you'd alert on</strong></td><td>User-visible symptoms, and a business metric that stopped</td></tr>
+        <tr><td><strong>How you'd debug it</strong></td><td>Correlation ids returned to clients; trace by operation id</td></tr>
+        <tr><td><strong>Dimensions on telemetry</strong></td><td><strong>Tenant id</strong>, so "one customer or everyone?" is answerable</td></tr>
+        <tr><td><strong>Deployment</strong></td><td>Slots or rolling, with backward-compatible migrations</td></tr>
+        <tr><td><strong>Rollback</strong></td><td>How, and how long it takes</td></tr>
+        <tr><td><strong>Cost</strong></td><td>Roughly what this runs at, and the largest line item</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the best alert is a business metric that stopped</div>
+    <p style="margin:0">Most candidates who mention monitoring say "we'd monitor CPU and memory and set up alerts."
+      That's a non-answer.
+      <br><br>
+      Technical alerts detect <em>known</em> failure modes. The most valuable alert detects the unknown ones:
+      <strong>"no orders completed in the last hour."</strong> That single alert catches a broken payment integration,
+      a failed deployment, a full disk, an expired certificate, a misconfigured DNS record — including causes you
+      never anticipated and have no specific alert for.
+      <br><br>
+      Mentioning that is a strong differentiator because it's rare, and because it shows you're thinking about
+      <em>outcomes</em> rather than components.
+      <br><br>
+      Two supporting points. <strong>Alert on symptoms users feel</strong> — error rate, p95 latency, availability
+      checks — rather than on every exception, because an alert nobody reads is worse than none. And
+      <strong>return a correlation id in every response</strong>, so a support conversation starts with an identifier
+      that retrieves the full distributed trace rather than a timestamp and a guess.
+      <br><br>
+      Finishing on operability leaves the interviewer with the impression that you'd own this system after it
+      shipped, which is exactly the question behind a senior interview.</p>
+  </div>
+
+  <h2 id="scoring">What's actually being scored <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Scores well</th><th>Scores badly</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Clarifying before designing</strong></td><td>Designing immediately</td></tr>
+        <tr><td><strong>Named trade-offs</strong></td><td>Presenting choices as obvious</td></tr>
+        <tr><td><strong>Volunteered failure modes</strong></td><td>A happy path only</td></tr>
+        <tr><td><strong>"That's a good point, I'd change X"</strong></td><td>Defending a weak choice</td></tr>
+        <tr><td><strong>Simplest thing that meets the need</strong></td><td>Complexity for its own sake</td></tr>
+        <tr><td><strong>Concrete specifics</strong> — this key, this metric</td><td>Vague hand-waving</td></tr>
+        <tr><td><strong>Thinking out loud</strong></td><td>Long silences, then a conclusion</td></tr>
+        <tr><td><strong>"I don't know, here's how I'd find out"</strong></td><td>Bluffing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Changing your mind when challenged is a positive signal</div>
+    <p style="margin:0">Interviewers push on decisions. Sometimes to test conviction, often because they've spotted a
+      genuine problem.
+      <br><br>
+      The strong response is to <strong>engage with the substance</strong>: <em>"you're right that a single writer
+      limits throughput. If we needed more than a few thousand writes a second I'd partition by region — I chose the
+      simpler option because the requirement was a few hundred."</em>
+      <br><br>
+      That shows you know the boundary of your own decision. <strong>Defending a choice you now see is wrong is the
+      worse outcome</strong>, because it suggests you'd do the same on a real team — and it's the behaviour that makes
+      someone hard to work with.
+      <br><br>
+      Equally, <strong>"I don't know"</strong> followed by how you'd find out is a good answer. Nobody knows every
+      service's limits. "I'd check the documented per-partition throughput before committing to this key" is honest
+      and demonstrates method. Inventing a number is the thing that damages credibility, because the interviewer
+      usually knows the real one.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Requirements for the first eight minutes; write down the exclusions.</li>
+      <li>"What must be strongly consistent?" is usually the pivotal question.</li>
+      <li>Different parts of one system deserve different guarantees.</li>
+      <li>Estimate to reach a decision, then stop; round aggressively.</li>
+      <li>Say when the numbers make scale a non-issue.</li>
+      <li>Data model before architecture; the boxes follow from it.</li>
+      <li>"What must be transactional together?" defines service boundaries.</li>
+      <li>Name the partition key and what you'd need to choose it.</li>
+      <li>Choice, reason, cost, and when you'd choose differently.</li>
+      <li>Volunteer failure modes — duplicates, slow dependencies, partial failure, schema change.</li>
+      <li>Finish on operability; the best alert is a stopped business metric.</li>
+      <li>Return a correlation id, and put tenant id on telemetry.</li>
+      <li>Change your mind when challenged; say "I don't know" with a method.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Drawing boxes before asking anything.</strong></li>
+    <li><strong>No stated scope</strong>, so the answer is shallow everywhere.</li>
+    <li><strong>Estimation as arithmetic</strong> with no implication drawn.</li>
+    <li><strong>Designing for scale that isn't required.</strong></li>
+    <li><strong>Microservices by default.</strong></li>
+    <li><strong>Splitting data that must be transactional.</strong></li>
+    <li><strong>No partition key decision</strong>, or one chosen without asking about distribution.</li>
+    <li><strong>Presenting every choice as obvious.</strong></li>
+    <li><strong>Happy path only</strong>, waiting to be asked about failure.</li>
+    <li><strong>"We'd monitor CPU and memory"</strong> as the operability answer.</li>
+    <li><strong>No mention of deployment or migrations.</strong></li>
+    <li><strong>Silent thinking</strong>, then a conclusion with no visible reasoning.</li>
+    <li><strong>Defending a choice</strong> after being shown it's wrong.</li>
+    <li><strong>Inventing a number</strong> rather than saying you'd check.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How would you approach a system design question you've never seen before? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd follow the same structure regardless of the domain, because the structure is what makes an unfamiliar
+          problem tractable — and it's also most of what's being assessed."</p>
+        <p>"<strong>First, requirements — and I'd spend real time here</strong>, seven or eight minutes of
+          forty-five. Who uses it and for what, how many users and how active, read-heavy or write-heavy, and the two
+          questions that matter most: <strong>what has to be strongly consistent</strong>, and <strong>what latency
+          is acceptable</strong>."</p>
+        <p>"The consistency question determines more of the design than scale does. Strong consistency on a specific
+          invariant means a single writer, a transaction or an atomic conditional write. Tolerating eventual
+          consistency opens up queues, replicas, caching and independent services."</p>
+        <p>"And the answer is almost never uniform. In a booking system, seat allocation must be strongly consistent
+          while search results can be seconds stale — so I'd spend strong consistency only where the cost of being
+          wrong justifies it."</p>
+        <p>"<strong>Then I'd state my scope explicitly:</strong> what I'm covering and what I'm treating as out of
+          scope. That demonstrates prioritisation, lets me go deep rather than shallow, and gives the interviewer a
+          chance to redirect me to whatever they actually want to probe."</p>
+        <p>"<strong>Then estimation</strong>, but only enough to size decisions. The mark isn't for the arithmetic —
+          it's for the implication. '120 writes a second at peak, which a single well-indexed SQL database handles
+          easily, so I won't shard' converts a number into a decision and closes off a branch of complexity. I'd
+          round aggressively, because the order of magnitude is what decides architecture."</p>
+        <p>"I'd also be willing to say when the numbers make scale a non-issue, because designing a
+          globally-distributed platform for four hundred requests a second is misreading the problem."</p>
+        <p>"<strong>Then the data model, before any architecture diagram.</strong> Entities, access patterns, and
+          specifically <strong>what must be transactional together</strong> — because that defines service boundaries
+          far better than nouns in the requirements do. If two things must change atomically, they belong in one
+          database owned by one service; splitting them means replacing a transaction with a saga for no benefit."</p>
+        <p>"I'd name the partition key explicitly and say what I'd need to know to choose it — particularly the size
+          distribution, since a very skewed one creates a hot partition that capacity can't fix. In Cosmos or DynamoDB
+          that choice is irreversible, so it deserves stating as such."</p>
+        <p>"<strong>Only then the components</strong>, and I'd walk one concrete request end to end rather than
+          drawing a generic diagram. Tracing an actual operation — what receives it, validates it, persists it,
+          responds — is much more convincing than a picture with more boxes. And I'd name a trade-off on every
+          significant choice: the reason, the cost, and when I'd choose differently."</p>
+        <p>"<strong>Then failure modes, volunteered rather than waiting to be asked.</strong> What breaks first under
+          load. What happens when a dependency is <em>slow</em> rather than down, which is worse because it exhausts
+          threads and takes out unrelated endpoints. What happens on duplicate delivery, since at-least-once is the
+          norm. What happens if a multi-step operation fails halfway."</p>
+        <p>"<strong>And I'd finish on operability</strong>, because that's what a senior interview is really asking:
+          would you own this after it shipped? What I'd alert on — user-visible symptoms plus a business metric that
+          stopped, which catches failures nobody anticipated. Correlation ids returned to clients. Tenant id on
+          telemetry so 'one customer or everyone?' is answerable. How deployment and schema migration work with both
+          versions running."</p>
+        <p>"Two things I'd hold to throughout. <strong>Think out loud</strong>, because silent reasoning scores
+          nothing. And <strong>change my mind when shown a genuine problem</strong> — engaging with the substance is a
+          much better signal than defending a choice I can see is wrong."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you have a repeatable structure?</li>
+        <li>Do you prioritise requirements and consistency over diagrams?</li>
+        <li>Do you use estimation to reach decisions?</li>
+        <li>Do you derive boundaries from transactional needs?</li>
+        <li>Do you volunteer failure modes and operability?</li>
+        <li>Do you think out loud and stay open to correction?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> starting with an architecture diagram.</li>
+        <li><span class="redflag">Red flag:</span> no requirements-gathering phase.</li>
+        <li><span class="redflag">Red flag:</span> the same architecture for every question.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the interviewer keeps adding requirements?</li>
+          <li>How do you handle a domain you know nothing about?</li>
+          <li>How long would you spend on requirements in a 30-minute interview?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

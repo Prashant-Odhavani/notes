@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modelling, Cost &amp; Comparisons — Cosmos DB</title>
+<meta name="description" content="Denormalization strategy, single-container design, cost control levers, and honest comparisons with MongoDB, DynamoDB and Azure SQL.">
+<meta name="keywords" content="Cosmos DB data modelling denormalization single container design type discriminator reference data cost optimization RU budget Cosmos vs MongoDB vs DynamoDB vs Azure SQL comparison capacity planning">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="14-cosmos-db/modeling-cost.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Modelling, Cost &amp; Comparisons</h1>
+    <p class="subtitle">How to shape data for the RU model, how to keep the bill under control, and when
+      something else is the better choice.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Model for the access pattern</strong>, same as any document store — but here the cost is
+        measured, so the incentive is sharper.</li>
+      <li><strong>Denormalize aggressively.</strong> There are no cross-container joins at all.</li>
+      <li><strong>Single-container design</strong> with a type discriminator is a legitimate and common
+        pattern.</li>
+      <li><strong>Keep documents small.</strong> RU scales with size on reads and writes.</li>
+      <li><strong>2 MB item limit</strong>, 20 GB per logical partition. Both hard.</li>
+      <li><strong>Cost control = fewer RU per operation</strong>, not a smaller RU/s number.</li>
+      <li><strong>Cosmos is usually more expensive</strong> than the alternatives. Know when it's worth it.</li>
+    </ul>
+  </div>
+
+  <h2 id="modelling">Modelling for the RU model <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The one rule</span>
+    <p>Shape documents so that <strong>your most frequent operation is a point read</strong> — partition key
+      plus id, ~1 RU.</p>
+    <p>Everything else is a compromise away from that.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Decision</th><th>Guidance</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Embed</strong></td><td>Bounded, owned, read together. Same rules as <a href="../13-mongodb/fundamentals.html#embed-vs-reference">MongoDB</a></td></tr>
+        <tr><td><strong>Reference</strong></td><td>Unbounded or independently queried — but remember there's no join, so plan how you'll resolve it</td></tr>
+        <tr><td><strong>Denormalize</strong></td><td><strong>More aggressively than in MongoDB</strong>, because <code>$lookup</code> has no equivalent</td></tr>
+        <tr><td><strong>Duplicate documents</strong></td><td>Storing the same data twice under different partition keys is a legitimate technique</td></tr>
+        <tr><td><strong>Keep items small</strong></td><td>RU scales with bytes. A 100 KB read is ~10 RU, not 1</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — duplicating a document under two partition keys</div>
+    <p style="margin:0">In a relational database, storing the same row twice is a bug. Here it can be the correct
+      design.
+      <br><br>
+      Suppose messages need to be read <em>by conversation</em> and <em>by recipient</em>. One partition key
+      can't serve both — whichever you choose, the other access path is a cross-partition fan-out that gets
+      worse as you grow.
+      <br><br>
+      So you write the message twice: once partitioned by <code>conversationId</code>, once by
+      <code>recipientId</code>. Both reads are single-partition. The write costs 2× RU, and the
+      <a href="change-feed-global.html#change-feed">change feed</a> can maintain the second copy so the
+      application only writes once.
+      <br><br>
+      <strong>The reasoning: reads are usually far more frequent than writes, so paying double on write to make
+      every read cheap is normally the right trade.</strong> Being able to justify deliberate duplication —
+      rather than treating it as something to avoid — is a genuine senior signal in any RU-billed or
+      access-pattern-driven store.</p>
+  </div>
+
+  <h2 id="single-container">Single-container design <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="json — several entity types in one container" class="code-good"><code class="language-json">// Partition key: /tenantId. All of a tenant's data in one logical partition.
+{ "id": "cust-1",          "tenantId": "acme", "type": "customer",
+  "name": "A. Patel", "email": "a.patel@example.com" }
+
+{ "id": "order-1041",      "tenantId": "acme", "type": "order",
+  "customerId": "cust-1", "total": 88.99, "status": "shipped" }
+
+{ "id": "order-1041-line-1", "tenantId": "acme", "type": "orderLine",
+  "orderId": "order-1041", "sku": "KB-01", "qty": 1 }</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Gains</th><th>Costs</th></tr></thead>
+      <tbody>
+        <tr><td><strong>One query can return several types</strong> for a tenant — no joins needed</td><td>Every query needs a <code>type</code> filter</td></tr>
+        <tr><td><strong>Cheaper</strong> — one throughput allocation instead of N</td><td>One indexing policy for all types, so it's a compromise</td></tr>
+        <tr><td>Transactional batch across types in one partition</td><td>Mixed document shapes make the container harder to reason about</td></tr>
+        <tr><td>Fewer containers to operate</td><td>The 20 GB limit now covers <em>all</em> of a tenant's data</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">When single-container is right</div>
+    <p style="margin:0"><strong>Use it</strong> when entity types share a partition key and are read together —
+      a tenant's customers, orders and settings on one screen. It's also how you get a
+      <strong>transactional batch</strong> across types, since those are scoped to a single logical
+      partition.
+      <br><br>
+      <strong>Don't</strong> when types have genuinely different partition keys, very different indexing needs,
+      or wildly different volumes — putting a high-volume telemetry stream in the same container as low-volume
+      reference data means one indexing policy and one throughput allocation serving two incompatible
+      workloads.
+      <br><br>
+      Watch the 20 GB implication: with <code>/tenantId</code> as the key, <em>everything</em> for a tenant
+      shares that budget. A <a href="fundamentals.html#hierarchical">hierarchical key</a> is usually the answer
+      if that's a risk.</p>
+  </div>
+
+  <h2 id="transactional-batch">Transactional batch <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — atomic, but only within one logical partition" class="code-good"><code class="language-csharp">var batch = container.CreateTransactionalBatch(new PartitionKey(tenantId));
+
+batch.CreateItem(order);
+foreach (var line in lines) batch.CreateItem(line);
+batch.PatchItem(customer.Id, new[]
+{
+    PatchOperation.Increment("/orderCount", 1)
+});
+
+var response = await batch.ExecuteAsync();
+if (!response.IsSuccessStatusCode)
+{
+    // The whole batch failed. Inspect per-operation results to find out why.
+}</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Transactional batch is atomic within one logical partition only.</strong></p>
+    <p>There is no cross-partition transaction in Cosmos — none, at any consistency level. So the partition key
+      isn't just a performance decision, it's your <strong>transaction boundary</strong>.</p>
+    <p>That's a stronger constraint than MongoDB, which does have multi-document transactions across shards
+      (slowly). If two things must change atomically in Cosmos, they must share a partition key — or you need a
+      <a href="../19-architecture/distributed-data.html#saga">saga</a>.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Batch limits</div>
+    <p style="margin:0">100 operations, 2 MB total. Beyond that you need multiple batches — which means you've
+      lost atomicity across them, so design the unit of work to fit.
+      <br><br>
+      Also worth knowing: batch is atomic but <em>not</em> isolated from concurrent readers in the way a
+      relational transaction is. It's a single-partition atomic operation, not a general transaction
+      mechanism.</p>
+  </div>
+
+  <h2 id="reference-data">Reference data <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Embed a copy in each document</strong></td><td>Small, rarely changes — a currency code, a country name</td></tr>
+        <tr><td><strong>Duplicate into every partition</strong></td><td>Needed alongside partition data; keeps reads single-partition</td></tr>
+        <tr><td><strong>Separate container + application cache</strong></td><td>Larger reference sets read frequently. Cache in memory, refresh periodically</td></tr>
+        <tr><td><strong>Integrated cache</strong></td><td>Hot reads at 0 RU without application caching</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The pragmatic answer for lookup data</div>
+    <p style="margin:0">A container of a few hundred reference items read on every request is a waste of RU no
+      matter how it's indexed.
+      <br><br>
+      <strong>Load it into memory at startup and refresh on a timer</strong>, or subscribe to its change feed
+      to invalidate. That's zero RU per request and the data is typically stale by seconds at most, which for
+      reference data is irrelevant.
+      <br><br>
+      Reaching for in-process caching before RU optimisation is often the bigger win, and it's easy to
+      overlook when you're focused on the database.</p>
+  </div>
+
+  <h2 id="cost">Cost control <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The framing that matters</span>
+    <p><strong>Cost control in Cosmos means reducing RU <em>per operation</em>, not provisioning a smaller
+      number.</strong></p>
+    <p>Provisioning less than you need just moves the problem to throttling. The real lever is making each
+      operation cheaper — then the same workload needs less throughput.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lever</th><th>Impact</th><th>Effort</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Point reads instead of queries</strong></td><td>1 RU vs 3–5+</td><td>Low</td></tr>
+        <tr><td><strong>Partition key in every query</strong></td><td>Avoids × partition count</td><td>Low</td></tr>
+        <tr><td><strong>Tune the indexing policy</strong></td><td>Directly cuts write RU</td><td>Low</td></tr>
+        <tr><td><strong>Project fields, not <code>SELECT *</code></strong></td><td>RU scales with bytes</td><td>Low</td></tr>
+        <tr><td><strong>TTL instead of delete jobs</strong></td><td>Uses spare RU — free</td><td>Low</td></tr>
+        <tr><td><strong>Autoscale below ~66% utilisation</strong></td><td>Stops paying for idle headroom</td><td>Low</td></tr>
+        <tr><td><strong>Reserved capacity</strong> (1 or 3 years)</td><td>Substantial discount on steady load</td><td>Low — a commitment, not a change</td></tr>
+        <tr><td><strong>Integrated cache</strong></td><td>Repeat reads at 0 RU</td><td>Medium</td></tr>
+        <tr><td><strong>Analytical store for reporting</strong></td><td>Removes analytics from RU entirely</td><td>Medium</td></tr>
+        <tr><td><strong>Change-feed-maintained read models</strong></td><td>Expensive query → 1 RU read</td><td>High</td></tr>
+        <tr><td><strong>Fix the partition key</strong></td><td>Ends hot-partition throttling</td><td>High — container migration</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — reserved capacity is the forgotten lever</div>
+    <p style="margin:0">Everyone reaches for query tuning. <strong>Reserved capacity</strong> — committing to a
+      baseline RU/s for one or three years — is a discount you get for signing a form, with no engineering
+      work and no risk to correctness.
+      <br><br>
+      For a production workload with a predictable floor, that's usually the largest single saving available
+      and the cheapest to obtain. You can still autoscale above the reserved baseline.
+      <br><br>
+      Mentioning it shows you think about cost as an engineering <em>and</em> commercial problem, which is
+      exactly the framing a senior role expects.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Where the bill usually comes from</div>
+    <p style="margin:0">In my experience the unexpected costs are, in order: <strong>cross-partition
+      queries</strong> that were fine at launch and got worse as partitions split; <strong>default indexing
+      policies</strong> on write-heavy containers with large documents; <strong>analytics running against the
+      transactional container</strong>; and <strong>over-provisioned autoscale maximums</strong>, where the 10%
+      floor means you never pay less than a tenth of a number someone picked optimistically.
+      <br><br>
+      All four are invisible without logging <code>RequestCharge</code> — which is why that's the first thing to
+      instrument.</p>
+  </div>
+
+  <h2 id="comparisons">Honest comparisons <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th></th><th>Cosmos DB</th><th>MongoDB (Atlas)</th><th>DynamoDB</th><th>Azure SQL</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Cost model</td>
+          <td><strong>RU/s provisioned</strong></td>
+          <td>Instance size</td>
+          <td><strong>RCU/WCU or on-demand</strong></td>
+          <td>vCore / DTU</td>
+        </tr>
+        <tr>
+          <td>Over-limit</td>
+          <td><strong>429 throttle</strong></td>
+          <td>Slower</td>
+          <td><strong>Throttle</strong></td>
+          <td>Slower</td>
+        </tr>
+        <tr>
+          <td>Global writes</td>
+          <td><strong>Yes, native</strong></td>
+          <td>Global clusters</td>
+          <td>Global tables</td>
+          <td>No</td>
+        </tr>
+        <tr>
+          <td>Consistency options</td>
+          <td><strong>Five levels</strong></td>
+          <td>Write/read concerns</td>
+          <td>Eventual or strong</td>
+          <td>Isolation levels</td>
+        </tr>
+        <tr>
+          <td>Query flexibility</td>
+          <td>SQL-like, no cross-doc joins</td>
+          <td><strong>Aggregation pipeline, <code>$lookup</code></strong></td>
+          <td><strong>Weakest</strong> — key access plus GSIs</td>
+          <td><strong>Full SQL</strong></td>
+        </tr>
+        <tr>
+          <td>Secondary access paths</td>
+          <td>Any indexed field, but cross-partition</td>
+          <td>Any indexed field</td>
+          <td><strong>Must define GSIs</strong></td>
+          <td>Any indexed column</td>
+        </tr>
+        <tr>
+          <td>Cross-partition transactions</td>
+          <td><strong>None</strong></td>
+          <td>Yes (slow)</td>
+          <td>Yes (limited)</td>
+          <td>Yes</td>
+        </tr>
+        <tr>
+          <td>Change stream</td>
+          <td><strong>Change feed</strong></td>
+          <td>Change streams</td>
+          <td>DynamoDB Streams</td>
+          <td>CDC / change tracking</td>
+        </tr>
+        <tr>
+          <td>Typical cost</td>
+          <td><strong>Highest</strong></td>
+          <td>Moderate</td>
+          <td>Low at small scale</td>
+          <td><strong>Lowest</strong> for one region</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Choose</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Cosmos DB</strong></td><td>Multi-region, latency SLA matters, Azure-native, spiky load</td></tr>
+        <tr><td><strong>MongoDB</strong></td><td>Richer queries needed, cloud-portable, team knows Mongo</td></tr>
+        <tr><td><strong>DynamoDB</strong></td><td>AWS-native, extreme scale, access patterns fully known</td></tr>
+        <tr><td><strong>Azure SQL</strong></td><td>Relational data, ad-hoc queries, one region, cost-sensitive</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the sharpest distinction between Cosmos and Mongo</div>
+    <p style="margin:0">People treat them as interchangeable document stores. Two differences matter in
+      practice.
+      <br><br>
+      <strong>Cosmos has no cross-partition transactions at all.</strong> MongoDB does, since 4.2 for sharded
+      clusters — slow, but available. So in Cosmos the partition key <em>is</em> your transaction boundary, and
+      that's a much harder constraint on modelling. Anything that must change atomically has to share a
+      partition key.
+      <br><br>
+      <strong>Cosmos has no cross-document join.</strong> MongoDB's <code>$lookup</code> is inefficient but it
+      exists, so you can defer a modelling decision. In Cosmos there's no fallback, so denormalization isn't an
+      optimisation — it's the only option, and the design has to be right earlier.
+      <br><br>
+      That's why "Cosmos requires knowing your access patterns up front, more than Mongo does" is the accurate
+      framing, and it explains why the partition key decision carries so much weight.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Shape data so the most frequent operation is a ~1 RU point read.</li>
+      <li>Denormalize more aggressively than in MongoDB — there's no join fallback.</li>
+      <li>Duplicating a document under two partition keys is a legitimate design, maintained by the change
+        feed.</li>
+      <li>Single-container with a type discriminator is common and needs a <code>type</code> filter
+        everywhere.</li>
+      <li>Transactional batch is atomic within one logical partition — that's your transaction boundary.</li>
+      <li>There are no cross-partition transactions at all.</li>
+      <li>Cache reference data in the application; RU per request for lookups is waste.</li>
+      <li>Cost control means fewer RU per operation, not a smaller provisioned number.</li>
+      <li>Reserved capacity is the largest zero-effort saving on steady load.</li>
+      <li>Cosmos is usually the most expensive option — justify it with global distribution and latency.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Normalising as in SQL</strong>, then discovering there are no joins.</li>
+    <li><strong>Refusing to duplicate data</strong>, so a key access path is a permanent fan-out.</li>
+    <li><strong>Expecting cross-partition transactions.</strong></li>
+    <li><strong>Single-container design without a <code>type</code> filter</strong> on every query.</li>
+    <li><strong>Large documents</strong>, paying RU on size for every read and write.</li>
+    <li><strong>Reference lookups per request</strong> instead of an in-process cache.</li>
+    <li><strong>Provisioning less RU/s as a cost fix</strong>, converting cost into throttling.</li>
+    <li><strong>Never considering reserved capacity.</strong></li>
+    <li><strong>Choosing Cosmos for a single-region CRUD app.</strong></li>
+    <li><strong>Assuming Cosmos and MongoDB are interchangeable.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Messages must be read by conversation and by recipient. How do you model that? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is the classic two-access-path problem, and in Cosmos it can't be solved with indexing —
+          because a secondary index still doesn't tell the router which partition to go to. So the answer is
+          <strong>storing the message twice</strong>."</p>
+        <p>"One copy partitioned by <code>conversationId</code>, one by <code>recipientId</code>. Both reads
+          become single-partition. If I picked only one key, the other access path would be a cross-partition
+          fan-out — and crucially that would <em>get worse over time</em> as data grows and Cosmos splits into
+          more physical partitions, with nothing in the code changing."</p>
+        <p>"I know duplicating data sounds wrong coming from a relational background. Here it's the correct
+          design, and the justification is the read/write ratio: <strong>messages are read far more often than
+          they're written</strong>. Paying 2× RU on write to make every read 1 RU is a good trade when reads
+          outnumber writes by an order of magnitude — which for messaging they do."</p>
+        <p>"For keeping the copies consistent, I wouldn't have the application write both. I'd write the
+          canonical copy — partitioned by <code>conversationId</code>, since that's the primary access path —
+          and use the <strong>change feed</strong> to maintain the recipient-partitioned copy. That way there's
+          one write from the application's perspective, no dual-write problem, and if the projection falls
+          behind it catches up rather than diverging permanently."</p>
+        <p>"The change feed handler must be idempotent, which an upsert naturally is."</p>
+        <p>"Two design details I'd get right."</p>
+        <p>"<strong>The second copy can be a projection, not a full copy.</strong> The recipient view probably
+          needs sender, preview text, timestamp and read status — not the full body. So it can be much smaller,
+          which reduces both the storage and the RU cost of maintaining it. Only duplicate the fields that view
+          needs."</p>
+        <p>"<strong>Deletes need handling.</strong> The change feed doesn't surface deletes by default, so a
+          deleted message would persist in the recipient copy forever. Soft delete with a short TTL: the update
+          appears in the feed so the projection can remove its copy, and TTL cleans up the original for free."</p>
+        <p>"I'd also consider the alternative: <strong>a single copy with a synthetic composite key</strong>,
+          if one access path is much rarer. If reading by recipient is only used for a notifications screen
+          loaded occasionally, a cross-partition query there might be acceptable and simpler than maintaining a
+          projection. I'd want the actual call rates before committing to the duplication — it's real
+          complexity, and worth it only if both paths are genuinely hot."</p>
+        <p>"And I'd note this is a case where <strong>DynamoDB would be more ergonomic</strong> — a Global
+          Secondary Index does exactly this duplication for you, managed by the platform. In Cosmos you build
+          it yourself with the change feed. Same pattern, more code."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Are you comfortable duplicating data deliberately?</li>
+        <li>Do you justify it with the read/write ratio?</li>
+        <li>Do you use the change feed rather than dual writes?</li>
+        <li>Do you handle deletes?</li>
+        <li>Do you check whether both paths are actually hot?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add a secondary index" — it doesn't solve partition
+          routing.</li>
+        <li><span class="redflag">Red flag:</span> accepting a cross-partition query on a hot path.</li>
+        <li><span class="redflag">Red flag:</span> dual writes from the application.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if a message is edited?</li>
+          <li>How would you detect the projection drifting?</li>
+          <li>How does DynamoDB's GSI differ from this?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your Cosmos bill tripled in three months with no traffic increase. Investigate. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"No traffic increase but tripled cost points at something that scales with <em>data volume</em> rather
+          than request volume — and there's a specific mechanism for that in Cosmos."</p>
+        <p>"My leading hypothesis: <strong>cross-partition queries getting more expensive as partitions
+          split</strong>. A cross-partition query costs roughly base × partition count. At launch with one
+          physical partition it's indistinguishable from a targeted query. As data grows Cosmos splits — one
+          partition becomes three, becomes eight — and that same unchanged query now costs eight times more and
+          its latency is the slowest partition's. Nothing in the code changed, the traffic didn't change, and
+          the bill tripled. That's exactly this signature."</p>
+        <p>"To confirm I'd log <code>RequestCharge</code> per operation type and compare against whatever
+          baseline exists, and check the physical partition count over time in the metrics."</p>
+        <p>"Other candidates, in the order I'd check them."</p>
+        <p>"<strong>Autoscale maximum raised and never lowered.</strong> The floor is 10% of the maximum, so if
+          someone bumped the max to 50,000 RU/s during an incident, the account now never bills below 5,000 RU/s
+          even overnight. That's a very common cause and trivial to fix."</p>
+        <p>"<strong>Document size growth.</strong> RU scales with bytes. If documents are accumulating an array
+          — an audit trail, an event history — then every read and write of them costs proportionally more over
+          time. And with the default indexing policy, every property of every array element is indexed, so write
+          cost grows too. That's two multipliers from one modelling problem."</p>
+        <p>"<strong>Data volume with no TTL.</strong> If nothing expires, storage grows and queries scan more.
+          Adding TTL is cheap because expiry uses leftover RU rather than provisioned throughput."</p>
+        <p>"<strong>A new consumer nobody counted.</strong> A change feed processor, a reporting job, a
+          dashboard, a data export — all consume RU from the same container budget. Worth checking what was
+          deployed in that window."</p>
+        <p>"<strong>Multi-region or consistency changes.</strong> Adding a region multiplies cost. Enabling
+          multi-region writes roughly doubles RU. Someone moving the account default to Strong doubles read RU.
+          Any of those could have been a well-intentioned change with an unexamined bill impact."</p>
+        <p>"How I'd actually work it: <strong>Azure Cost Analysis broken down by container</strong> to see
+          <em>where</em> the increase is, then <code>RequestCharge</code> logging on that container's operations
+          to see <em>which</em> operations. Cost Analysis first, because it narrows the search from an account to
+          a container in minutes."</p>
+        <p>"Then the fixes, cheapest first: lower the autoscale maximum if that's it; add the partition key to
+          queries that can have it; tune the indexing policy; add TTL. If a genuinely cross-partition query is
+          on a hot path, build a change-feed-maintained read model so it becomes a 1 RU point read."</p>
+        <p>"And I'd put <strong>monitoring in place</strong> so this doesn't recur silently — a budget alert on
+          the account, plus tracking RU per operation type as a metric. The reason it went unnoticed for three
+          months is that nothing was watching, and in Cosmos cost and performance are the same signal: the same
+          query that tripled the bill is also on its way to throttling other features with 429s."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know cross-partition cost grows with partition count?</li>
+        <li>Do you know the autoscale 10% floor?</li>
+        <li>Do you connect document growth to both read and write cost?</li>
+        <li>Do you start from Cost Analysis rather than guessing?</li>
+        <li>Do you add monitoring so it doesn't recur?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "reduce the provisioned RU/s" — converts cost into
+          throttling.</li>
+        <li><span class="redflag">Red flag:</span> no systematic diagnosis.</li>
+        <li><span class="redflag">Red flag:</span> not knowing cost can rise with data volume alone.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you attribute cost per tenant?</li>
+          <li>What would you alert on?</li>
+          <li>How do you migrate a container to a new partition key?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

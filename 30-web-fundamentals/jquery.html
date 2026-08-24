@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jQuery &amp; Legacy Front Ends — Web Fundamentals</title>
+<meta name="description" content="The jQuery API you'll meet in older .NET codebases, the modern equivalents, why it faded, and how to modernise a legacy front end incrementally.">
+<meta name="keywords" content="jQuery legacy front end modern equivalent querySelector fetch classList jQuery to vanilla migration strangler ASP.NET MVC Razor unobtrusive validation Web Forms UpdatePanel incremental modernization">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="30-web-fundamentals/jquery.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>jQuery &amp; Legacy Front Ends</h1>
+    <p class="subtitle">A large amount of working .NET software has a jQuery front end. Being able to work in
+      it — and modernise it without a rewrite — is a genuinely useful skill.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>jQuery solved problems that no longer exist</strong> — mainly browser inconsistency and a
+        hostile DOM API.</li>
+      <li><strong>Nearly every jQuery method now has a native equivalent</strong>, often with the same
+        ergonomics.</li>
+      <li><strong>It faded because the DOM API improved and because it doesn't scale to application
+        state.</strong></li>
+      <li><strong>Don't rewrite a working jQuery app</strong> without a business reason.</li>
+      <li><strong>Modernise incrementally</strong> — island by island, not big-bang.</li>
+      <li><strong>ASP.NET MVC's unobtrusive validation depends on jQuery</strong>, which is why it lingers.</li>
+      <li><strong>jQuery is still maintained.</strong> "Legacy" doesn't mean unsupported.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-it-existed">What jQuery solved <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>In 2006, the same JavaScript behaved differently in every browser, and the native DOM API was verbose and
+      inconsistent.</p>
+    <p>jQuery gave you one API that worked everywhere, plus CSS selectors for finding elements — which the DOM
+      didn't have.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Problem in 2006</th><th>Status now</th></tr></thead>
+      <tbody>
+        <tr><td>Every browser had different event handling and quirks</td><td><strong>Solved</strong> — standards convergence and evergreen browsers</td></tr>
+        <tr><td>No way to query by CSS selector</td><td><strong>Solved</strong> — <code>querySelectorAll</code></td></tr>
+        <tr><td><code>XMLHttpRequest</code> was painful and inconsistent</td><td><strong>Solved</strong> — <code>fetch</code></td></tr>
+        <tr><td>Class manipulation meant string surgery on <code>className</code></td><td><strong>Solved</strong> — <code>classList</code></td></tr>
+        <tr><td>Animation required manual timers</td><td><strong>Solved</strong> — CSS transitions and animations</td></tr>
+        <tr><td>No chaining or collection operations</td><td>Partly — the native API is still more verbose</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">jQuery didn't fail — it succeeded and was absorbed</div>
+    <p style="margin:0">Many of jQuery's ideas went into the platform. <code>querySelectorAll</code> exists
+      because jQuery demonstrated that CSS selectors were the right query API.
+      <br><br>
+      So the honest framing is that jQuery <strong>won the argument</strong> and then became unnecessary. That's
+      a better answer than "it's outdated", and it's a more accurate reading of the history.
+      <br><br>
+      It's also still actively maintained — version 4 is in development. "Legacy" here means "not what you'd
+      choose for something new", not "abandoned".</p>
+  </div>
+
+  <h2 id="translation">The translation table <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>jQuery</th><th>Native equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>$('.item')</code></td><td><code>document.querySelectorAll('.item')</code></td></tr>
+        <tr><td><code>$('#id')</code></td><td><code>document.getElementById('id')</code></td></tr>
+        <tr><td><code>$(el).addClass('x')</code></td><td><code>el.classList.add('x')</code></td></tr>
+        <tr><td><code>$(el).toggleClass('x')</code></td><td><code>el.classList.toggle('x')</code></td></tr>
+        <tr><td><code>$(el).attr('href')</code></td><td><code>el.getAttribute('href')</code></td></tr>
+        <tr><td><code>$(el).html(s)</code></td><td><code>el.innerHTML = s</code> — <strong>XSS risk</strong></td></tr>
+        <tr><td><code>$(el).text(s)</code></td><td><code>el.textContent = s</code> — safe</td></tr>
+        <tr><td><code>$(el).on('click', fn)</code></td><td><code>el.addEventListener('click', fn)</code></td></tr>
+        <tr><td><code>$(document).ready(fn)</code></td><td><code>document.addEventListener('DOMContentLoaded', fn)</code>, or just <code>defer</code></td></tr>
+        <tr><td><code>$.ajax({...})</code></td><td><code>fetch(url, {...})</code></td></tr>
+        <tr><td><code>$(el).closest('.x')</code></td><td><code>el.closest('.x')</code></td></tr>
+        <tr><td><code>$(el).find('.x')</code></td><td><code>el.querySelectorAll('.x')</code></td></tr>
+        <tr><td><code>$(el).fadeIn()</code></td><td>A CSS transition on <code>opacity</code></td></tr>
+        <tr><td><code>$.each(arr, fn)</code></td><td><code>arr.forEach(fn)</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="javascript — the same task, both ways"><code class="language-javascript">// jQuery
+$('#save').on('click', function () {
+  $.ajax({ url: '/api/orders', method: 'POST', data: { id: 1 } })
+    .done(function (res) { $('#status').text('Saved').addClass('ok'); })
+    .fail(function ()    { $('#status').text('Failed').addClass('error'); });
+});
+
+// Native
+document.querySelector('#save').addEventListener('click', async () =&gt; {
+  const status = document.querySelector('#status');
+  try {
+    const res = await fetch('/api/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 1 })
+    });
+    if (!res.ok) throw new Error(res.statusText);   // fetch does NOT throw on 4xx/5xx
+    status.textContent = 'Saved';
+    status.classList.add('ok');
+  } catch {
+    status.textContent = 'Failed';
+    status.classList.add('error');
+  }
+});</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">The <code>fetch</code> difference that causes real bugs</div>
+    <p style="margin:0"><strong><code>fetch</code> does not reject on HTTP error statuses.</strong> A 404 or a
+      500 resolves successfully — the promise only rejects on a <em>network</em> failure.
+      <br><br>
+      <code>$.ajax</code> called <code>.fail()</code> for a 500. Code translated mechanically from jQuery
+      therefore treats server errors as success, and you get "Saved" displayed after a failed request.
+      <br><br>
+      <strong>You must check <code>response.ok</code> explicitly.</strong> This is the most common mistake in
+      jQuery-to-fetch migrations, and it fails silently in exactly the direction you don't want.
+      <br><br>
+      Also: <code>fetch</code> doesn't send cookies cross-origin unless you set
+      <code>credentials: 'include'</code>, where <code>$.ajax</code> had different defaults. That's the second
+      migration surprise.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The two things native code is still more verbose about</div>
+    <p style="margin:0"><strong>Collection operations.</strong> <code>$('.item').addClass('x')</code> operates on
+      every match. Natively you need
+      <code>document.querySelectorAll('.item').forEach(el =&gt; el.classList.add('x'))</code>. Note that
+      <code>querySelectorAll</code> returns a <code>NodeList</code>, which has <code>forEach</code> but not
+      <code>map</code> or <code>filter</code> — use <code>Array.from()</code> for those.
+      <br><br>
+      <strong>Event delegation.</strong> jQuery's <code>$(parent).on('click', '.child', fn)</code> handles
+      dynamically-added children elegantly. Natively you attach to the parent and check
+      <code>event.target.closest('.child')</code> yourself. Slightly more code, same behaviour.
+      <br><br>
+      A twelve-line helper covers both, which is why "we replaced jQuery with a small utility file" is a common
+      and reasonable migration outcome.</p>
+  </div>
+
+  <h2 id="why-it-faded">Why it faded <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The real reason — not bundle size</span>
+    <p><strong>jQuery manipulates the DOM. Modern frameworks derive the DOM from state.</strong></p>
+    <p>That's an architectural difference, not a syntax preference. In jQuery, <em>the DOM is the state</em> — to
+      know whether a checkbox is ticked you inspect the checkbox.</p>
+    <p>Once an interface has enough interacting pieces, keeping the DOM consistent by hand becomes the dominant
+      source of bugs. Frameworks make state the single source of truth and render from it.</p>
+  </div>
+
+  <pre data-label="javascript — where jQuery stops scaling" class="code-bad"><code class="language-javascript">// Every interaction must remember to update every dependent piece of UI
+$('#qty').on('change', function () {
+  const qty = +$(this).val();
+  $('#lineTotal').text(qty * price);           // update the line
+  $('#cartTotal').text(recalcCart());          // update the cart
+  $('#checkout').prop('disabled', qty === 0);  // update the button
+  $('#stockWarning').toggle(qty &gt; stock);      // update the warning
+  // Miss one of these and the UI is inconsistent, silently.
+  // Now add a second place that can change quantity.
+});</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">Why the framework version is different</span>
+    <p>In React or Angular you change <code>quantity</code> and every derived piece of UI updates because it was
+      <em>declared</em> as a function of state.</p>
+    <p>There's no list of things to remember to update, so there's no possibility of forgetting one. The bug class
+      disappears rather than being managed.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Contributing factor</th><th>Weight</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Imperative DOM updates don't scale</strong> to complex state</td><td><strong>The main one</strong></td></tr>
+        <tr><td>Native APIs caught up, removing the compatibility need</td><td>High</td></tr>
+        <tr><td>Component models enable reuse; jQuery plugins didn't compose</td><td>High</td></tr>
+        <tr><td>Frameworks brought routing, forms, testing, tooling</td><td>Medium</td></tr>
+        <tr><td>Bundle size</td><td><strong>Low</strong> — ~30KB gzipped is not the problem</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — bundle size is the weak argument</div>
+    <p style="margin:0">"jQuery is 30KB" is the reason people cite and the least important one. A React plus
+      router plus state library bundle is considerably larger.
+      <br><br>
+      The real argument is <strong>architectural</strong>: imperative DOM manipulation means the number of update
+      paths grows with the square of the number of interacting elements, and every one is a place to forget
+      something.
+      <br><br>
+      Leading with bundle size in an interview suggests you've absorbed the conclusion without the reasoning.
+      Leading with "the DOM as state doesn't scale" shows you understand why the industry moved.</p>
+  </div>
+
+  <h2 id="should-you-migrate">Should you migrate? <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Migrate when</th><th>Leave it when</th></tr></thead>
+      <tbody>
+        <tr><td>The UI is genuinely complex and bugs cluster in DOM synchronisation</td><td>It works, it's stable, and it's rarely changed</td></tr>
+        <tr><td>Active development, and the team is slowed down</td><td>The application is being retired</td></tr>
+        <tr><td>You need component reuse across many screens</td><td>The interaction is simple — forms, a few toggles</td></tr>
+        <tr><td>Hiring: fewer people want to work on it</td><td>No capacity, and no compelling driver</td></tr>
+        <tr><td>You're already rewriting the pages for other reasons</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">"Rewrite it in React" is usually the wrong answer</div>
+    <p style="margin:0">A jQuery front end that works represents years of accumulated business rules, edge cases
+      and bug fixes. A rewrite discards all of it and reintroduces the bugs — while delivering no new
+      functionality for months.
+      <br><br>
+      This is the same reasoning as
+      <a href="../09-dotnet-framework/index.html#migration">.NET Framework migration</a>: the honest question is
+      whether there's a business reason, not whether the technology is current.
+      <br><br>
+      Being willing to say <strong>"I wouldn't migrate this"</strong> is a strong signal, provided you can also
+      describe how you <em>would</em> do it if the reason existed.</p>
+  </div>
+
+  <h3 id="incremental">How to modernise incrementally</h3>
+
+  <ol class="steps">
+    <li><strong>Stop adding new jQuery.</strong> New features use the modern approach. The old code isn't the
+      problem; growth of it is.</li>
+    <li><strong>Remove jQuery-dependent plugins</strong> where a native or small alternative exists — date
+      pickers, modals, tooltips. Usually the largest chunk of the dependency.</li>
+    <li><strong>Replace jQuery calls with native equivalents</strong> in files you're touching anyway. Not as a
+      dedicated project.</li>
+    <li><strong>Introduce components as islands.</strong> Mount a React or Angular component into one
+      <code>div</code> on an existing page. The rest of the page stays as it is.</li>
+    <li><strong>Convert page by page</strong>, highest-value first.</li>
+    <li><strong>Drop jQuery</strong> when nothing references it.</li>
+  </ol>
+
+  <pre data-label="javascript — an island inside a Razor page" class="code-good"><code class="language-javascript">// The existing page keeps working. One div becomes a modern component.
+// _Layout.cshtml still loads jQuery for everything else.
+
+import { createRoot } from 'react-dom/client';
+import { OrderGrid } from './OrderGrid';
+
+const host = document.getElementById('order-grid-root');
+if (host) {
+  createRoot(host).render(
+    &lt;OrderGrid customerId={host.dataset.customerId} /&gt;
+  );
+}
+// Data passed in via data-* attributes rendered by Razor -
+// so the server still owns auth and initial state.</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The islands approach is the pragmatic answer</div>
+    <p style="margin:0">This is the <a href="../19-architecture/integration-patterns.html#strangler">strangler
+      pattern</a> applied to a front end. Each island is independently shippable, independently revertible, and
+      the application keeps working throughout.
+      <br><br>
+      The one thing to plan deliberately: <strong>how the island gets its data and communicates back</strong>.
+      Passing initial state via <code>data-</code> attributes rendered by Razor works well and keeps the server
+      authoritative. Custom events, or a small shared store, handle communication out.
+      <br><br>
+      What to avoid is having jQuery and the framework both manipulating the same DOM subtree — they will fight,
+      because the framework assumes it owns its tree and will overwrite external changes on the next render.
+      <strong>Draw a clear boundary per element.</strong></p>
+  </div>
+
+  <h2 id="dotnet-legacy">The .NET-specific legacy you'll meet <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Thing</th><th>What to know</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Unobtrusive validation</strong></td>
+          <td>ASP.NET MVC emits <code>data-val-*</code> attributes read by
+              <code>jquery.validate.unobtrusive.js</code>. <strong>Removing jQuery breaks client-side validation
+              on every form</strong> — often the single reason it's still there</td>
+        </tr>
+        <tr>
+          <td><strong>Razor partial + AJAX</strong></td>
+          <td>The classic pattern: fetch an HTML fragment and inject it. Works fine; note
+              <code>innerHTML</code> is an XSS surface if any of it is user data</td>
+        </tr>
+        <tr>
+          <td><strong>Bundling and minification</strong></td>
+          <td><code>System.Web.Optimization</code> in older projects; a real bundler in modern ones</td>
+        </tr>
+        <tr>
+          <td><strong>Web Forms <code>UpdatePanel</code></strong></td>
+          <td>Partial postbacks with full ViewState. Very hard to modernise in place — usually a page-level
+              rewrite</td>
+        </tr>
+        <tr>
+          <td><strong>Bootstrap 3/4</strong></td>
+          <td>Its JavaScript components depend on jQuery. Bootstrap 5 removed that dependency</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The validation dependency is the practical blocker</div>
+    <p style="margin:0">If you remove jQuery from an MVC application, every <code>[Required]</code> and
+      <code>[EmailAddress]</code> attribute stops producing client-side feedback. The server still validates —
+      so it's not a security problem — but the user experience regresses badly, and it happens on every form at
+      once.
+      <br><br>
+      Options: keep jQuery just for validation until forms are migrated; replace it with a native validation
+      approach reading the same <code>data-val-*</code> attributes; or migrate forms to a framework with its own
+      validation.
+      <br><br>
+      Knowing this specific coupling is a good practical signal for a .NET role, because it's the reason jQuery
+      persists in so many otherwise-modern codebases.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>jQuery solved browser inconsistency and a poor DOM API — both largely gone.</li>
+      <li>Nearly every method has a native equivalent; collections and delegation are the verbose ones.</li>
+      <li><code>fetch</code> doesn't reject on 4xx/5xx — check <code>response.ok</code>.</li>
+      <li>It faded because imperative DOM updates don't scale, not because of bundle size.</li>
+      <li>Don't rewrite a working jQuery app without a business reason.</li>
+      <li>Modernise as islands: stop adding, replace plugins, convert page by page.</li>
+      <li>Never let jQuery and a framework manage the same DOM subtree.</li>
+      <li>MVC unobtrusive validation depends on jQuery — plan for that specifically.</li>
+      <li>jQuery is still maintained; "legacy" means "not for new work".</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Translating <code>$.ajax</code> to <code>fetch</code></strong> without checking
+      <code>response.ok</code>.</li>
+    <li><strong>Proposing a full rewrite</strong> with no business justification.</li>
+    <li><strong>jQuery and a framework fighting</strong> over the same elements.</li>
+    <li><strong>Removing jQuery</strong> and silently breaking MVC client validation.</li>
+    <li><strong><code>innerHTML</code> with user data</strong> — an XSS hole.</li>
+    <li><strong>Citing bundle size</strong> as the main reason to move on.</li>
+    <li><strong>A big-bang migration</strong> instead of islands.</li>
+    <li><strong>Treating <code>NodeList</code> as an array</strong> — no <code>map</code> or
+      <code>filter</code>.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>You inherit a large jQuery + ASP.NET MVC application. How would you modernise the front end? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My first question is <strong>whether we should</strong>, and I'd want a business reason rather than
+          'jQuery is old'. A working jQuery front end encodes years of business rules and edge-case fixes. A
+          rewrite discards that, reintroduces the bugs, and delivers nothing new for months."</p>
+        <p>"Reasons I'd accept: the UI is genuinely complex and bugs cluster in DOM synchronisation; it's under
+          active development and the team is slowed down; we need component reuse across many screens; or
+          hiring is getting hard. Reasons I wouldn't: it's stable and rarely changed, or it's being retired
+          within a year or two."</p>
+        <p>"Assuming there's a reason, I'd do it <strong>incrementally as islands</strong> — never big-bang."</p>
+        <p>"<strong>First, stop the bleeding.</strong> New features are built the modern way. The existing jQuery
+          isn't the problem; more of it is."</p>
+        <p>"<strong>Then remove jQuery-dependent plugins</strong> — date pickers, modals, tooltips, carousels.
+          These are usually the bulk of the coupling and often have native or small standalone replacements.
+          Bootstrap 3 or 4 will be in here too, and its JavaScript needs jQuery; Bootstrap 5 dropped that."</p>
+        <p>"<strong>Then islands.</strong> Mount a component into a single <code>div</code> on an existing Razor
+          page, passing initial state through <code>data-</code> attributes so the server still owns auth and
+          initial data. The rest of the page carries on unchanged. Each island is independently shippable and
+          revertible, so we're delivering value throughout rather than going dark."</p>
+        <p>"<strong>Then page by page</strong>, highest-value first, and drop jQuery when nothing references
+          it."</p>
+        <p>"Three things I'd flag specifically for a .NET codebase."</p>
+        <p>"<strong>Unobtrusive validation is the real blocker.</strong> MVC emits <code>data-val-*</code>
+          attributes consumed by jQuery Validate. Remove jQuery and client-side validation silently stops on
+          every form at once. The server still validates so it isn't a security issue, but the UX regresses
+          badly. So I'd plan for that explicitly — keep jQuery for validation until forms migrate, or replace it
+          with something reading the same attributes."</p>
+        <p>"<strong>Never let jQuery and the framework manage the same DOM subtree.</strong> The framework
+          assumes it owns its tree and will overwrite outside changes on the next render, producing bugs that
+          look random. One clear owner per element."</p>
+        <p>"<strong>Check for Web Forms.</strong> If any of this is <code>UpdatePanel</code> with ViewState,
+          that's a different and much harder problem — partial postbacks don't coexist with client-side
+          components, so those pages need a genuine rewrite rather than incremental work."</p>
+        <p>"On <strong>framework choice</strong>, I'd weight team familiarity heavily. If the team knows Angular,
+          Angular — the migration is hard enough without also learning a new framework. For islands specifically,
+          React mounts into an existing page slightly more easily, and Angular Elements works too."</p>
+        <p>"And I'd ask about <strong>SEO and server rendering</strong> before committing. If these are public
+          pages currently server-rendered by Razor, moving to client-rendered islands could hurt
+          discoverability. Islands are actually good here — the page stays server-rendered and only the
+          interactive parts are client-side — but that needs to be a deliberate choice rather than a
+          side effect."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you question whether migration is justified?</li>
+        <li>Do you propose incremental islands rather than a rewrite?</li>
+        <li>Do you know the unobtrusive-validation coupling?</li>
+        <li>Do you know jQuery and a framework can't share a subtree?</li>
+        <li>Do you weight team familiarity and SEO?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "rewrite it in React" with no assessment.</li>
+        <li><span class="redflag">Red flag:</span> citing bundle size as the driver.</li>
+        <li><span class="redflag">Red flag:</span> no awareness of what breaks when jQuery is removed.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does an island get its data and report back?</li>
+          <li>How would you handle client validation during the transition?</li>
+          <li>How do you decide which page to convert first?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>.NET Framework &amp; Legacy Modernization</title>
+<meta name="description" content=".NET Framework internals, IIS and the ASP.NET pipeline, WCF, how it differs from modern .NET, and how to actually migrate a legacy application.">
+<meta name="keywords" content=".NET Framework CLR AppDomain GAC IIS application pool web.config Global.asax ASP.NET MVC Web API WCF gRPC migration strangler fig upgrade assistant .NET Standard">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="09-dotnet-framework/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>.NET Framework &amp; Legacy Modernization</h1>
+    <p class="subtitle">Most .NET jobs involve some legacy. This is what's different about it, and how to
+      migrate without a two-year rewrite that never ships.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-good">💡 Good to know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>.NET Framework is Windows-only and no longer gets new features</strong> — 4.8 is the last
+        version. It's supported, not evolving.</li>
+      <li><strong>No built-in DI, no built-in configuration binding, no built-in logging.</strong> That's the
+        biggest day-to-day difference.</li>
+      <li><strong>IIS hosts it, not Kestrel.</strong> Application pools, recycling and
+        <code>web.config</code> instead of a self-hosted process.</li>
+      <li><strong><code>HttpContext.Current</code></strong> is a static ambient value — convenient, and the
+        source of many async bugs.</li>
+      <li><strong>WCF has no modern .NET equivalent.</strong> gRPC replaces most of it; that's usually the
+        biggest migration blocker.</li>
+      <li><strong>Migrate incrementally</strong> with the strangler pattern. A big-bang rewrite is the
+        classic failure.</li>
+    </ul>
+  </div>
+
+  <h2 id="why-this-matters">Why this page exists <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A very large amount of working, revenue-generating .NET code runs on .NET Framework.</p>
+    <p>Interviewers ask about it because they probably have some — and they want to know whether you can work
+      in it and whether you have a realistic view of migrating it.</p>
+  </div>
+
+  <p>The two questions that actually come up:</p>
+
+  <ol class="steps">
+    <li><strong>"What's the difference between .NET Framework and .NET?"</strong> — a knowledge check.</li>
+    <li><strong>"How would you migrate this application?"</strong> — a judgement check, and the more
+      important one.</li>
+  </ol>
+
+  <h2 id="framework-vs-modern">.NET Framework vs modern .NET <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>.NET Framework (4.8)</th><th>Modern .NET (8/9)</th></tr></thead>
+      <tbody>
+        <tr><td>Platforms</td><td><strong>Windows only</strong></td><td>Windows, Linux, macOS</td></tr>
+        <tr><td>Future</td><td>Security fixes only — no new features</td><td>Annual releases</td></tr>
+        <tr><td>Installation</td><td>Machine-wide, one version</td><td>Side-by-side, or self-contained</td></tr>
+        <tr><td>Web host</td><td>IIS + <code>System.Web</code></td><td>Kestrel, self-hosted</td></tr>
+        <tr><td>Dependency injection</td><td><strong>Not built in</strong> — Autofac, Unity, Ninject</td><td>Built in</td></tr>
+        <tr><td>Configuration</td><td><code>web.config</code> / <code>app.config</code> XML</td><td>Layered providers, typed options</td></tr>
+        <tr><td>Logging</td><td>Third party (log4net, NLog)</td><td><code>ILogger&lt;T&gt;</code> built in</td></tr>
+        <tr><td>Containers</td><td>Possible but heavy (Windows images)</td><td>First-class, small Linux images</td></tr>
+        <tr><td>Performance</td><td>Slower — older JIT, older GC</td><td>Substantially faster</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The one-line version</span>
+    <p>.NET Framework is <strong>Windows-only and feature-frozen</strong>. Modern .NET is
+      <strong>cross-platform and actively developed</strong>.</p>
+    <p>Everything else — DI, configuration, logging, hosting — follows from modern .NET being a redesign
+      rather than an update.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The naming history, briefly</div>
+    <p style="margin:0">.NET Framework 1.0–4.8 → .NET Core 1.0–3.1 → <strong>.NET 5</strong> onwards.
+      <br><br>
+      "Core" was dropped at 5 to signal that it was now <em>the</em> .NET, and the version skipped 4 to avoid
+      confusion with Framework 4.x. So ".NET 8" is the successor to .NET Core, not to .NET Framework 4.8 —
+      they're different lineages that were merged.</p>
+  </div>
+
+  <h2 id="clr-concepts">Framework-specific runtime concepts <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concept</th><th>What it was for</th><th>In modern .NET</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>AppDomain</strong></td>
+          <td>An isolation boundary inside a process — load assemblies, unload them, sandbox code</td>
+          <td><strong>Gone.</strong> Use separate processes, or <code>AssemblyLoadContext</code> for
+              collectible loading</td>
+        </tr>
+        <tr>
+          <td><strong>GAC</strong> (Global Assembly Cache)</td>
+          <td>Machine-wide shared assemblies, versioned and signed</td>
+          <td><strong>Gone.</strong> Dependencies are per-application via NuGet</td>
+        </tr>
+        <tr>
+          <td><strong>Binding redirects</strong></td>
+          <td><code>web.config</code> entries resolving version conflicts</td>
+          <td><strong>Gone.</strong> The SDK resolves a single version at build time</td>
+        </tr>
+        <tr>
+          <td><strong>Machine-wide install</strong></td>
+          <td>One Framework version per machine, shared by all apps</td>
+          <td>Side-by-side runtimes, or self-contained deployment</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">Why these disappeared</span>
+    <p>They all solved the same problem: <strong>many applications sharing one machine-wide runtime</strong>.</p>
+    <p>Modern .NET made deployment self-contained and side-by-side instead, so the problems those features
+      solved no longer exist. GAC and binding redirects were symptoms of shared installation.</p>
+  </div>
+
+  <h2 id="iis">IIS and the ASP.NET pipeline <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concept</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Application pool</strong></td><td>The worker process (<code>w3wp.exe</code>) hosting your app. Isolation and resource limits live here</td></tr>
+        <tr><td><strong>Recycling</strong></td><td>IIS restarts the pool periodically, or on memory limits — which silently masked memory leaks for years</td></tr>
+        <tr><td><strong>Idle timeout</strong></td><td>The pool shuts down after inactivity. First request afterwards is slow (cold start)</td></tr>
+        <tr><td><strong><code>Global.asax</code></strong></td><td>Application and session lifecycle events — <code>Application_Start</code>, <code>Session_Start</code></td></tr>
+        <tr><td><strong><code>HttpModule</code> / <code>HttpHandler</code></strong></td><td>The pipeline extension points — the ancestors of middleware</td></tr>
+        <tr><td><strong><code>web.config</code></strong></td><td>Configuration <em>and</em> IIS settings in one XML file</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two Framework behaviours that surprise people coming from modern .NET</div>
+    <ul style="margin:8px 0 0">
+      <li><strong>Pool recycling hides leaks.</strong> If IIS restarts the process every 29 hours, a slow
+        memory leak never becomes visible. Move that app to a container with no recycling and the leak
+        surfaces immediately — which is why "it was fine before we migrated" sometimes means "the leak was
+        always there".</li>
+      <li><strong>In-process session state is normal.</strong> Framework apps commonly use
+        <code>Session</code>, which requires sticky sessions and breaks when you scale out. That's often the
+        real blocker to horizontal scaling, and it has to be addressed during migration.</li>
+    </ul>
+  </div>
+
+  <h3 id="httpcontext-current"><code>HttpContext.Current</code> — the async trap <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <pre data-label="csharp — works, until it doesn't" class="code-bad"><code class="language-csharp">public async Task&lt;ActionResult&gt; Index()
+{
+    var user = HttpContext.Current.User;          // fine
+
+    await SomeServiceAsync();                      // continuation may resume elsewhere
+
+    var again = HttpContext.Current.User;          // may be NULL
+}</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">Why it breaks</span>
+    <p><code>HttpContext.Current</code> is a <strong>static, ambient</strong> value flowed through the
+      synchronisation context.</p>
+    <p>After an <code>await</code>, if the context isn't restored — or you used
+      <code>ConfigureAwait(false)</code>, or spawned a <code>Task.Run</code> — the ambient value is gone.</p>
+  </div>
+
+  <p>This is why ASP.NET Core removed it in favour of injecting <code>IHttpContextAccessor</code>. It's also
+    why <code>ConfigureAwait(false)</code> is dangerous in Framework web code but harmless in ASP.NET Core —
+    there's nothing ambient to lose.</p>
+
+  <div class="note tip">
+    <div class="note-title">The migration-friendly habit</div>
+    <p style="margin:0">Even in Framework code, capture what you need from the context <strong>at the start of
+      the request</strong> and pass it explicitly. Don't reach for <code>HttpContext.Current</code> deep in a
+      service.
+      <br><br>
+      That removes a class of async bug immediately, and it's exactly the refactoring migration would require
+      anyway — so it's work you'd have to do regardless.</p>
+  </div>
+
+  <h2 id="wcf">WCF — the real migration blocker <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>WCF was a framework for building services over many transports — HTTP, TCP, named pipes, MSMQ — with
+      configurable security, transactions and reliable messaging.</p>
+    <p><strong>There is no equivalent in modern .NET.</strong> Nothing covers that whole surface.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What you used WCF for</th><th>Modern replacement</th></tr></thead>
+      <tbody>
+        <tr><td>Binary RPC between .NET services</td><td><strong>gRPC</strong> — contract-first, fast, streaming</td></tr>
+        <tr><td>SOAP endpoints for external consumers</td><td><strong>CoreWCF</strong> (community port), or expose REST alongside</td></tr>
+        <tr><td>HTTP services</td><td>ASP.NET Core Web API</td></tr>
+        <tr><td>MSMQ-based reliable messaging</td><td>A real broker — Service Bus, RabbitMQ</td></tr>
+        <tr><td>Distributed transactions (MSDTC)</td><td>No equivalent. Use <a href="../19-architecture/distributed-data.html#saga">sagas</a></td></tr>
+        <tr><td><code>netTcpBinding</code> duplex callbacks</td><td>gRPC bidirectional streaming, or SignalR</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The two that have no answer</div>
+    <p style="margin:0"><strong>MSDTC distributed transactions.</strong> If the app relies on a two-phase
+      commit across a database and a queue, there is no port. You have to redesign it around eventual
+      consistency — which is a domain-modelling change, not a technical migration. That's often the thing
+      that makes a WCF migration a multi-quarter project rather than a sprint.
+      <br><br>
+      <strong>WS-* security</strong> and complex SOAP interop. If an external partner requires it, CoreWCF is
+      the option, but you're accepting a community-maintained dependency for something Microsoft doesn't ship.</p>
+  </div>
+
+  <h2 id="migration">How to actually migrate <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Never do a big-bang rewrite.</strong></p>
+    <p>You get a long period with no delivery, ending in one enormous risky cutover — and you have to catch
+      up with every change made to the legacy system while you were building.</p>
+  </div>
+
+  <h3 id="migration-order">A realistic sequence</h3>
+
+  <ol class="steps">
+    <li><strong>Inventory and assess.</strong> Run the .NET Upgrade Assistant / API portability analyser.
+      Find what has no modern equivalent — WCF, MSMQ, <code>System.Drawing</code> on Linux, Windows-specific
+      APIs, MSDTC. Those determine whether this is a three-month or two-year project.</li>
+    <li><strong>Fix the migration blockers in place, on Framework.</strong> Remove
+      <code>HttpContext.Current</code> from services. Replace in-process session with a distributed store.
+      Introduce a DI container. Move config out of <code>web.config</code>. All of this can ship
+      incrementally, on the old platform, with no cutover risk.</li>
+    <li><strong>Extract shared logic to <code>netstandard2.0</code></strong> so both the old and new app can
+      reference it. That's the one legitimate remaining use for .NET Standard.</li>
+    <li><strong>Put a reverse proxy in front.</strong> YARP or nginx. Everything still routes to the legacy
+      app — nothing has changed functionally, and that's the point.</li>
+    <li><strong>Move one route at a time.</strong> Build the endpoint in a new ASP.NET Core app, route just
+      that path to it, verify, and keep going. Each step is independently shippable and revertible.</li>
+    <li><strong>Delete the legacy app</strong> when nothing routes to it.</li>
+  </ol>
+
+  <p>That's the <a href="../19-architecture/integration-patterns.html#strangler">strangler fig pattern</a>.
+    Steps 2 and 3 are the ones teams skip, and they're the ones that make the rest low-risk.</p>
+
+  <div class="note danger">
+    <div class="note-title">The hard part nobody puts in the plan</div>
+    <p style="margin:0"><strong>Shared data.</strong> While both apps run, they need the same data. So you're
+      either dual-writing, syncing, or letting the new app read the old database directly.
+      <br><br>
+      That decision determines whether the migration takes six months or three years — far more than the code
+      does. Address it explicitly in the plan rather than discovering it in month four.
+      <br><br>
+      Authentication is the second one: sessions or auth cookies have to be valid across both apps during the
+      transition, which usually means moving to a shared token-based scheme <em>before</em> you start routing
+      traffic.</p>
+  </div>
+
+  <h3 id="migration-worth-it">Is it even worth migrating?</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Migrate when</th><th>Leave it when</th></tr></thead>
+      <tbody>
+        <tr><td>You need Linux or containers for cost or deployment</td><td>It's stable, rarely changed, and Windows hosting is fine</td></tr>
+        <tr><td>Performance genuinely matters — modern .NET is much faster</td><td>The app is being retired within a year or two</td></tr>
+        <tr><td>Active development, and the missing features slow the team down</td><td>The team has no capacity and no compelling driver</td></tr>
+        <tr><td>Hiring — fewer people want to work on Framework</td><td>The blockers (WCF, MSDTC) exceed the benefit</td></tr>
+        <tr><td>You need modern libraries that dropped Framework support</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Being willing to say <strong>"don't migrate this one"</strong>.
+      <br><br>
+      .NET Framework 4.8 is a supported component of Windows and receives security updates. A stable app
+      nobody is changing has no urgent technical reason to move. Migrating it consumes months of capacity for
+      no user-visible benefit.
+      <br><br>
+      Interviewers notice the difference between "modernise everything" and "here's how I'd decide which
+      applications justify it".</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>.NET Framework: Windows-only, feature-frozen at 4.8, still supported.</li>
+      <li>No built-in DI, config binding or logging — that's the biggest daily difference.</li>
+      <li>AppDomains, GAC and binding redirects existed because the runtime was machine-wide. Self-contained
+        deployment removed the need.</li>
+      <li>IIS pool recycling masks memory leaks; in-process session blocks scale-out.</li>
+      <li><code>HttpContext.Current</code> is ambient and breaks across <code>await</code>. Capture early,
+        pass explicitly.</li>
+      <li>WCF has no full replacement. gRPC covers RPC; MSDTC and WS-* are the real blockers.</li>
+      <li>Migrate with a strangler: fix blockers in place first, then route path by path.</li>
+      <li>Shared data and shared auth decide the timeline, not the code.</li>
+      <li>Sometimes the right answer is not to migrate.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Big-bang rewrite</strong> — no delivery for a year, one risky cutover, and a moving target.</li>
+    <li><strong>Not auditing for blockers first</strong>, then discovering WCF or MSDTC in month three.</li>
+    <li><strong>Ignoring the shared-data problem</strong> until both apps are live.</li>
+    <li><strong>Migrating the code but keeping in-process session</strong>, so you still can't scale out.</li>
+    <li><strong>Assuming pool recycling was hiding nothing</strong> — leaks appear after migration.</li>
+    <li><strong><code>ConfigureAwait(false)</code> in Framework web code</strong>, losing
+      <code>HttpContext.Current</code>.</li>
+    <li><strong>Targeting <code>netstandard2.0</code> for new projects</strong> that have no Framework
+      consumers.</li>
+    <li><strong>Migrating an app that's being retired anyway.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>What's the difference between .NET Framework and .NET? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The headline is that .NET Framework is Windows-only and feature-frozen — 4.8 is the last version,
+          getting security updates but no new features. Modern .NET is cross-platform and on an annual release
+          cadence."</p>
+        <p>"But the differences that matter day to day are architectural, because modern .NET was a redesign
+          rather than an update."</p>
+        <p>"Framework has <strong>no built-in dependency injection</strong>, so every project picks Autofac or
+          Unity or Ninject and they're all wired differently. No built-in configuration binding — it's
+          <code>web.config</code> XML and <code>ConfigurationManager.AppSettings</code>. No built-in logging
+          abstraction. Modern .NET has all three in the box, which is why codebases look far more consistent."</p>
+        <p>"Hosting is different too. Framework runs in IIS with <code>System.Web</code>, so you get
+          application pools, recycling and <code>HttpContext.Current</code>. Modern .NET is a self-hosted
+          process with Kestrel, which is what makes containers straightforward."</p>
+        <p>"Deployment is the other big one. Framework is installed machine-wide, one version, shared by every
+          app — which is why the GAC and binding redirects existed. Modern .NET is side-by-side or entirely
+          self-contained, so those problems just disappeared."</p>
+        <p>"And performance is a genuine difference, not a marketing claim — newer JIT, better GC, and a lot
+          of allocation removed from the BCL."</p>
+        <p>"One naming point that trips people up: .NET 5 followed .NET Core 3.1, skipping 4 to avoid
+          confusion with Framework 4.x. So .NET 8 is the successor to .NET Core, not to Framework 4.8 — two
+          lineages that got merged."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the practical differences, or just "one is cross-platform"?</li>
+        <li>Do you know why the GAC and binding redirects existed?</li>
+        <li>Do you know the naming history?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happened to AppDomains?</li>
+          <li>What's .NET Standard for now?</li>
+          <li>Why is <code>ConfigureAwait(false)</code> more dangerous in Framework?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>You've inherited a large .NET Framework application. How would you approach modernising it? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My first question would be <strong>whether to migrate at all</strong>, and I'd want a business
+          reason before committing capacity. Framework 4.8 is still supported and getting security updates. If
+          the app is stable, rarely changed, and Windows hosting isn't a problem, migrating consumes months
+          for no user-visible benefit."</p>
+        <p>"Good reasons to do it: we need Linux or containers for cost, performance genuinely matters,
+          it's under active development and the missing features are slowing us down, or we need libraries
+          that have dropped Framework support."</p>
+        <p>"Assuming there's a reason, I'd start with an <strong>assessment</strong> — the Upgrade Assistant
+          and portability analyser — specifically hunting for things with <em>no</em> modern equivalent. WCF,
+          MSMQ, MSDTC distributed transactions, Windows-specific APIs. Those determine whether this is three
+          months or two years, and I'd want that answer before promising a timeline."</p>
+        <p>"Then, and this is the part teams skip: <strong>fix the blockers in place, on Framework</strong>.
+          Remove <code>HttpContext.Current</code> from service layers and pass context explicitly. Replace
+          in-process session with a distributed store. Introduce a DI container. Move configuration out of
+          <code>web.config</code>. Every one of those ships incrementally on the old platform with no cutover
+          risk — and they're all work the migration would require anyway."</p>
+        <p>"Then extract the shared domain logic into a <code>netstandard2.0</code> library so both apps can
+          reference it. That's the one remaining legitimate use for .NET Standard."</p>
+        <p>"Then a <strong>strangler</strong>: reverse proxy in front, everything still routing to legacy, and
+          move one route at a time to a new ASP.NET Core app. Each step is shippable and revertible, and we're
+          delivering value throughout rather than going dark for a year."</p>
+        <p>"The two things I'd put in the plan explicitly because they're what actually determine the
+          timeline: <strong>shared data</strong> — while both apps run they need the same data, so we're
+          dual-writing or the new app reads the old database — and <strong>shared authentication</strong>,
+          because sessions or auth cookies have to be valid across both. I'd sort auth out before routing any
+          traffic."</p>
+        <p>"What I'd refuse to do is a big-bang rewrite. You get a long period with no delivery, one enormous
+          cutover, and you spend the whole time chasing changes being made to the system you're replacing."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you question whether migration is justified?</li>
+        <li>Do you assess blockers before committing?</li>
+        <li>Do you know you can do preparatory work <em>on Framework</em>?</li>
+        <li>Do you raise shared data and auth — the things that actually blow up timelines?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "rewrite it in .NET 9" with no assessment.</li>
+        <li><span class="redflag">Red flag:</span> no mention of how the two systems coexist.</li>
+        <li><span class="redflag">Red flag:</span> assuming migration is always the right call.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What would you do about a WCF service with duplex callbacks?</li>
+          <li>How do you handle the shared database during transition?</li>
+          <li>How would you convince the business to fund this?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>async / await — C# Advanced</title>
+<meta name="description" content="async/await explained simply: what it actually does, the state machine, why .Result deadlocks, ValueTask, cancellation and the mistakes that cause production incidents.">
+<meta name="keywords" content="async await csharp state machine SynchronizationContext deadlock ConfigureAwait Task.Run ValueTask CancellationToken async void thread pool starvation WhenAll interview">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="05-csharp-advanced/async-await.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>async / await</h1>
+    <p class="subtitle">The most misunderstood feature in C#, and one of the most commonly asked. Start by
+      unlearning "async makes it run on another thread".</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><code>async</code> is about <strong>not holding a thread while waiting</strong>. It creates no
+        threads.</li>
+      <li>It makes your app handle <strong>more concurrent requests</strong>. It does not make any single
+        request faster.</li>
+      <li>The compiler rewrites an <code>async</code> method into a <strong>state machine</strong> — the
+        same mechanism as <code>yield return</code>.</li>
+      <li><strong>Never</strong> use <code>.Result</code> or <code>.Wait()</code> on an async call. That's
+        the classic deadlock.</li>
+      <li><code>async void</code> is only ever correct for event handlers. Exceptions in it crash the
+        process.</li>
+      <li>Pass a <code>CancellationToken</code> everywhere. An abandoned request should stop doing work.</li>
+    </ul>
+  </div>
+
+  <h2 id="what-it-does">What async actually does <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>When your code waits for something external — a database, an HTTP call, a file — the thread would
+      normally sit there doing nothing.</p>
+    <p><code>async/await</code> lets the thread <strong>go and do something else</strong>, and come back
+      when the result arrives.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>Synchronous:</strong> a waiter takes your order, walks to the kitchen, and <em>stands there
+      watching the chef</em> until the food is ready. One waiter, one table at a time.</p>
+    <p><strong>Async:</strong> the waiter takes your order, hands it to the kitchen, and serves other
+      tables. When the food is ready, they bring it. Same waiter, twenty tables.</p>
+    <p>Notice: the food doesn't cook any faster. You just need far fewer waiters.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><code>async</code> improves <strong>scalability</strong>, not <strong>speed</strong>.</p>
+    <p>A single request takes exactly as long. But the server can handle far more of them at once, because
+      threads aren't parked waiting on I/O.</p>
+  </div>
+
+  <h3 id="why-it-matters">Why this matters concretely</h3>
+
+  <p>A web server has a limited thread pool. If every request blocks a thread for 200ms waiting on the
+    database:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Synchronous</th><th>Async</th></tr></thead>
+      <tbody>
+        <tr><td>Thread held during the DB call</td><td>Yes — the whole 200ms</td><td>No — released back to the pool</td></tr>
+        <tr><td>Concurrent requests with 100 threads</td><td>~100</td><td>Thousands</td></tr>
+        <tr><td>Behaviour under load spike</td><td>Thread pool exhausts, requests queue, latency explodes</td><td>Degrades gracefully</td></tr>
+        <tr><td>Latency of one request</td><td>200ms</td><td>200ms — identical</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>That last row is the one people miss. Async is not a performance optimisation for the individual user.
+    It's a capacity optimisation for the server.</p>
+
+  <h2 id="state-machine">How the compiler makes it work <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <p>An <code>async</code> method isn't executed the way you wrote it. The compiler rewrites it into a
+    <strong>state machine</strong> — a class that remembers where it paused.</p>
+
+  <pre data-label="csharp — what you write"><code class="language-csharp">public async Task&lt;int&gt; GetTotalAsync(int orderId)
+{
+    var order = await _db.FindAsync(orderId);      // pause point 1
+    var tax   = await _tax.CalculateAsync(order);  // pause point 2
+    return order.Subtotal + tax;
+}</code></pre>
+
+  <p>Conceptually, the compiler turns that into something like:</p>
+
+  <pre data-label="text — the shape of the generated machine" class="code-good"><code class="language-text" data-nohl>class GetTotalAsyncStateMachine
+{
+    int    _state;          // where did we pause? -1 = not started
+    Order  _order;          // locals become FIELDS, so they survive the pause
+    int    _tax;
+    TaskAwaiter&lt;Order&gt; _awaiter;
+
+    void MoveNext()
+    {
+        switch (_state)
+        {
+            case -1:  start the DB call; if not finished, save state and RETURN
+            case 0:   _order = result of DB call; start the tax call; RETURN
+            case 1:   _tax = result; set the Task's result; done
+        }
+    }
+}</code></pre>
+
+  <p>Three consequences worth knowing:</p>
+
+  <ol class="steps">
+    <li><strong>Locals become fields.</strong> They have to survive across the pause, so they move onto the
+      state machine object — which means they're on the heap, not the stack.</li>
+    <li><strong>The method returns early.</strong> At the first incomplete <code>await</code>, control
+      returns to the caller. The rest runs later, when the awaited thing completes.</li>
+    <li><strong>It's the same machinery as <code>yield return</code></strong>. If iterators made sense to
+      you, async is the same idea with a callback instead of a caller pulling.</li>
+  </ol>
+
+  <div class="note info">
+    <div class="note-title">Why <code>async</code> methods allocate</div>
+    <p style="margin:0">That state machine is an object. So is the <code>Task</code>. In a hot path called
+      millions of times, that adds up — which is exactly what <a href="#valuetask"><code>ValueTask</code></a>
+      exists to address.
+      <br><br>
+      Note the optimisation though: if an <code>async</code> method completes <strong>synchronously</strong>
+      (everything it awaits was already finished), the state machine can stay on the stack and no heap
+      allocation happens. That's why <code>ValueTask</code> helps most on cache-hit style methods.</p>
+  </div>
+
+  <h2 id="deadlock">Why <code>.Result</code> deadlocks <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>This is the single most asked async question, because it caused real outages in a whole generation of
+    ASP.NET applications.</p>
+
+  <pre data-label="csharp — this hangs forever in classic ASP.NET / WPF" class="code-bad"><code class="language-csharp">// A synchronous method calling async code
+public string GetName(int id)
+{
+    return GetNameAsync(id).Result;      // DEADLOCK
+}
+
+private async Task&lt;string&gt; GetNameAsync(int id)
+{
+    var customer = await _db.FindAsync(id);
+    return customer.Name;                 // needs the original context to resume
+}</code></pre>
+
+  <h3 id="deadlock-mechanism">The mechanism, step by step</h3>
+
+  <ol class="steps">
+    <li><code>GetName</code> calls <code>GetNameAsync</code>, then <code>.Result</code> <strong>blocks the
+      current thread</strong> waiting for the task.</li>
+    <li>Inside, <code>await _db.FindAsync(id)</code> captures the <strong>synchronisation context</strong> —
+      a promise to resume on that same original thread.</li>
+    <li>The database call completes. The continuation needs the original thread to run on.</li>
+    <li>But that thread is <strong>blocked</strong> at step 1, waiting for the task to finish.</li>
+    <li>The task can't finish until the continuation runs. The continuation can't run until the thread is
+      free. <strong>Deadlock.</strong></li>
+  </ol>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>You're holding the only door key, standing in the doorway waiting for a delivery. The courier needs
+      to get through the door to hand it to you.</p>
+    <p>Neither of you can move. Nothing errors — you just both wait forever.</p>
+  </div>
+
+  <pre data-label="csharp — the fix is async all the way up" class="code-good"><code class="language-csharp">public async Task&lt;string&gt; GetNameAsync(int id)
+{
+    var customer = await _db.FindAsync(id);
+    return customer.Name;
+}
+// The caller awaits too, and so on up to the framework entry point.</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Important nuance for modern .NET</div>
+    <p style="margin:0"><strong>ASP.NET Core has no synchronisation context.</strong> So this specific
+      deadlock does <em>not</em> happen there.
+      <br><br>
+      But <code>.Result</code> is still wrong in ASP.NET Core, for a different reason: it blocks a thread
+      pool thread. Do it under load and you get <strong>thread pool starvation</strong> — the pool injects
+      new threads slowly (roughly one or two per second), so requests queue and latency climbs sharply.
+      <br><br>
+      So the rule is the same, the failure mode differs: <strong>classic ASP.NET/WPF → deadlock.
+      ASP.NET Core → starvation.</strong> Knowing that distinction is a strong senior answer.</p>
+  </div>
+
+  <h3 id="configureawait"><code>ConfigureAwait(false)</code></h3>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>ConfigureAwait(false)</code> says: <em>"I don't need to resume on the original context — any
+      thread pool thread will do."</em></p>
+  </div>
+
+  <p>That avoids the deadlock and skips the cost of marshalling back to a specific thread.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Where</th><th>Use it?</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Library code</td><td><strong>Yes, always</strong></td><td>You don't know your caller's context; don't take a dependency on it</td></tr>
+        <tr><td>ASP.NET Core app code</td><td>Not needed</td><td>There's no synchronisation context to capture</td></tr>
+        <tr><td>WPF / WinForms UI code</td><td><strong>No</strong> — after the await you need the UI thread</td><td>Touching a control from a pool thread throws</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="common-mistakes-async">The mistakes that cause incidents <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <h3 id="async-void"><code>async void</code></h3>
+
+  <pre data-label="csharp — an unobservable crash" class="code-bad"><code class="language-csharp">public async void ProcessOrder(Order order)     // async VOID
+{
+    await _service.SubmitAsync(order);          // if this throws...
+}</code></pre>
+
+  <p>Three problems, all serious:</p>
+
+  <ul>
+    <li><strong>You can't await it.</strong> The caller has no way to know when it finished.</li>
+    <li><strong>You can't catch its exceptions.</strong> There's no <code>Task</code> to carry them, so the
+      exception is raised on the synchronisation context — which usually means it <strong>crashes the
+      process</strong>.</li>
+    <li><strong>Fire and forget by accident.</strong> Callers assume it completed when it hasn't.</li>
+  </ul>
+
+  <p><strong>The only legitimate use is an event handler</strong>, because the delegate signature returns
+    void. Even then, wrap the whole body in a try/catch.</p>
+
+  <h3 id="sequential-awaits">Awaiting sequentially when you could parallelise</h3>
+
+  <pre data-label="csharp — 300ms: three calls one after another" class="code-bad"><code class="language-csharp">var customer = await _customers.GetAsync(id);      // 100ms
+var orders   = await _orders.GetAsync(id);         // 100ms
+var invoices = await _invoices.GetAsync(id);       // 100ms</code></pre>
+
+  <pre data-label="csharp — ~100ms: all three in flight together" class="code-good"><code class="language-csharp">var customerTask = _customers.GetAsync(id);        // started, not awaited
+var ordersTask   = _orders.GetAsync(id);
+var invoicesTask = _invoices.GetAsync(id);
+
+await Task.WhenAll(customerTask, ordersTask, invoicesTask);
+
+var customer = await customerTask;                 // already complete</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Two caveats on <code>WhenAll</code></div>
+    <ul style="margin:8px 0 0">
+      <li>Only do this when the calls are <strong>genuinely independent</strong>. If the second needs the
+        first's result, sequential is correct.</li>
+      <li><strong>Never share a <code>DbContext</code> across concurrent tasks.</strong> It isn't
+        thread-safe, and you'll get a "second operation started on this context" exception. Each concurrent
+        operation needs its own scope.</li>
+      <li>If several tasks throw, <code>await Task.WhenAll(...)</code> rethrows only the <em>first</em>
+        exception. Inspect <code>task.Exception</code> if you need all of them.</li>
+    </ul>
+  </div>
+
+  <h3 id="async-over-sync">Fake async</h3>
+
+  <pre data-label="csharp — this is worse than being synchronous" class="code-bad"><code class="language-csharp">public Task&lt;int&gt; ComputeAsync(int[] data) =&gt;
+    Task.Run(() =&gt; Compute(data));     // CPU work pushed to a pool thread</code></pre>
+
+  <p>In a web app this is counterproductive. You haven't freed a thread — you've moved the work to a
+    <em>different</em> pool thread and added scheduling overhead. The request thread is still waiting.</p>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><code>async</code> is for <strong>I/O-bound</strong> work — waiting on something external.</p>
+    <p><code>Task.Run</code> is for <strong>CPU-bound</strong> work, and in a web app it usually doesn't
+      help at all. It's for keeping a <em>desktop UI</em> responsive.</p>
+  </div>
+
+  <h2 id="valuetask">Task vs ValueTask <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>Task</code> is a class — every one is a heap allocation.</p>
+    <p><code>ValueTask</code> is a struct — if the result is already available, there's no allocation at all.</p>
+  </div>
+
+  <pre data-label="csharp — the case ValueTask is built for"><code class="language-csharp">// Usually a cache hit -&gt; returns synchronously -&gt; no Task allocated
+public ValueTask&lt;Customer&gt; GetAsync(int id)
+{
+    if (_cache.TryGetValue(id, out var cached))
+        return new ValueTask&lt;Customer&gt;(cached);      // zero allocation
+
+    return new ValueTask&lt;Customer&gt;(LoadFromDbAsync(id));
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — ValueTask has rules</div>
+    <p style="margin:0">A <code>ValueTask</code> may only be consumed <strong>once</strong>. You must not:</p>
+    <ul style="margin:8px 0 0">
+      <li>await it twice</li>
+      <li>call <code>.Result</code> before it completes</li>
+      <li>store it and await it later</li>
+      <li>pass it to <code>Task.WhenAll</code></li>
+    </ul>
+    <p style="margin:8px 0 0">Break those and you get undefined behaviour, not a clean exception. If you
+      need any of that, call <code>.AsTask()</code> once and use the <code>Task</code>.
+      <br><br>
+      <strong>So: use <code>Task</code> by default.</strong> Reach for <code>ValueTask</code> only in a hot
+      path that usually completes synchronously — and only with a benchmark showing it helps.</p>
+  </div>
+
+  <h2 id="cancellation">Cancellation <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A <code>CancellationToken</code> is a way of saying <em>"stop, nobody needs this any more"</em>.</p>
+    <p>If the user closed the browser, continuing to query the database is pure waste.</p>
+  </div>
+
+  <pre data-label="csharp — pass it all the way down" class="code-good"><code class="language-csharp">[HttpGet]
+public async Task&lt;IActionResult&gt; Search(string term, CancellationToken ct)
+{
+    // ASP.NET Core supplies ct and cancels it when the client disconnects
+    var results = await _repo.SearchAsync(term, ct);
+    return Ok(results);
+}
+
+public async Task&lt;List&lt;Order&gt;&gt; SearchAsync(string term, CancellationToken ct) =&gt;
+    await _db.Orders
+        .Where(o =&gt; o.Reference.Contains(term))
+        .ToListAsync(ct);                        // the DB command is cancelled too</code></pre>
+
+  <p>For long CPU loops, check it yourself:</p>
+
+  <pre data-label="csharp — cooperative cancellation in a loop"><code class="language-csharp">foreach (var row in millionRows)
+{
+    ct.ThrowIfCancellationRequested();     // throws OperationCanceledException
+    Process(row);
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Best practice</div>
+    <p style="margin:0">Accept a <code>CancellationToken</code> in every async method you write, and pass it
+      down. Defaulting it (<code>CancellationToken ct = default</code>) keeps callers happy.
+      <br><br>
+      And don't catch <code>OperationCanceledException</code> and log it as an error — cancellation is
+      normal. Logging it as an error means every user who navigates away generates a false alarm.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>async releases threads while waiting. It creates no threads and makes nothing faster.</li>
+      <li>It buys scalability: more concurrent requests on the same thread pool.</li>
+      <li>The compiler builds a state machine; locals become heap fields.</li>
+      <li><code>.Result</code>/<code>.Wait()</code> → deadlock in classic ASP.NET, thread pool starvation in
+        ASP.NET Core. Wrong either way.</li>
+      <li><code>ConfigureAwait(false)</code> in libraries; unnecessary in ASP.NET Core; harmful in UI code.</li>
+      <li><code>async void</code> only for event handlers — exceptions crash the process.</li>
+      <li><code>Task.WhenAll</code> for independent calls, but never share a <code>DbContext</code>.</li>
+      <li><code>ValueTask</code> only for hot paths that usually complete synchronously, and it's
+        single-consume.</li>
+      <li>Thread a <code>CancellationToken</code> through everything.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>.Result</code> or <code>.Wait()</code></strong> to bridge sync and async code.</li>
+    <li><strong><code>async void</code></strong> anywhere except an event handler.</li>
+    <li><strong>Sequential awaits</strong> on independent calls, tripling latency for no reason.</li>
+    <li><strong>Sharing a <code>DbContext</code> across <code>Task.WhenAll</code></strong> — it isn't
+      thread-safe.</li>
+    <li><strong><code>Task.Run</code> around synchronous code</strong> in a web app, calling it "async".</li>
+    <li><strong>Not passing <code>CancellationToken</code></strong>, so abandoned work keeps running.</li>
+    <li><strong>Logging <code>OperationCanceledException</code> as an error</strong> — creates alert noise.</li>
+    <li><strong><code>async</code> with no <code>await</code> inside</strong> — generates a warning and a
+      pointless state machine.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What does <code>async</code>/<code>await</code> actually do? Does it create a thread? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"No, it doesn't create a thread — that's the most common misconception. What it does is let the
+          current thread be released while you're waiting for something external."</p>
+        <p>"Concretely: when I <code>await</code> a database call, the thread doesn't sit there. It goes
+          back to the thread pool and serves other requests. When the database responds, a continuation is
+          scheduled and the rest of my method runs — possibly on a different thread."</p>
+        <p>"The important framing is that this is about <strong>scalability, not speed</strong>. A single
+          request takes exactly as long either way. But if each request spends 200ms waiting on I/O, a
+          synchronous app with 100 threads handles about 100 concurrent requests, while an async one handles
+          thousands with the same pool."</p>
+        <p>"Mechanically, the compiler rewrites the method into a state machine — the same machinery as
+          <code>yield return</code>. Locals become fields on that state machine so they survive across the
+          pause point, which is also why async methods allocate."</p>
+        <p>"And the corollary: if the work is CPU-bound rather than I/O-bound, async doesn't help at all.
+          There's nothing to wait for. <code>Task.Run</code> moves it to another pool thread, which is
+          useful for keeping a desktop UI responsive but pointless in a web app — you've just moved the
+          work sideways."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it isn't about threads? This is the discriminating question.</li>
+        <li>Do you say scalability rather than speed?</li>
+        <li>Bonus: the state machine, and the I/O vs CPU distinction.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "it runs the code on a background thread."</li>
+        <li><span class="redflag">Red flag:</span> "it makes the code faster."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the difference between async and multithreading?</li>
+          <li>When would <code>Task.Run</code> be the right call?</li>
+          <li>What does the compiler generate?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Why does <code>.Result</code> deadlock, and is that still true in ASP.NET Core? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"In classic ASP.NET or a WPF app, it deadlocks because of the synchronisation context."</p>
+        <p>"The sequence is: I call <code>.Result</code>, which blocks the current thread waiting for the
+          task. Inside the async method, the <code>await</code> captured the synchronisation context — a
+          promise to resume on that same thread. When the I/O completes, the continuation needs that thread.
+          But the thread is blocked waiting for the task, and the task can't complete until the continuation
+          runs. Both sides wait forever."</p>
+        <p>"In <strong>ASP.NET Core there is no synchronisation context</strong>, so that specific deadlock
+          doesn't happen. Continuations just run on any thread pool thread."</p>
+        <p>"But <code>.Result</code> is still wrong there, for a different reason:
+          <strong>thread pool starvation</strong>. Every blocked call ties up a pool thread doing nothing.
+          The pool only injects new threads slowly — roughly one or two a second — so under load you get a
+          queue of requests waiting for threads, and latency climbs badly. It looks like the app has
+          suddenly become slow with no obvious cause, which makes it nasty to diagnose."</p>
+        <p>"So the failure mode differs by platform but the rule is the same: async all the way up. If I'm
+          genuinely stuck at a boundary I can't make async — a legacy interface, a constructor — I'd rather
+          restructure than block. If I truly can't, <code>GetAwaiter().GetResult()</code> at least preserves
+          the original exception instead of wrapping it in <code>AggregateException</code>, but it's still a
+          smell I'd want to remove."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you explain the deadlock mechanism, not just recite the rule?</li>
+        <li>Do you know ASP.NET Core changed this — and that it's <em>still</em> wrong?</li>
+        <li>Do you know thread pool starvation as a named failure mode?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "never use <code>.Result</code>" with no reason.</li>
+        <li><span class="redflag">Red flag:</span> claiming it still deadlocks in ASP.NET Core.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does <code>ConfigureAwait(false)</code> do, and where should you use it?</li>
+          <li>How would you detect thread pool starvation in production?</li>
+          <li>How do you call async code from a constructor?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What's wrong with <code>async void</code>?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Three things, and the exception one is the serious one."</p>
+        <p>"First, you can't await it. The caller has no handle on it, so it has no way of knowing when the
+          work finished — or whether it finished at all. That turns into fire-and-forget by accident."</p>
+        <p>"Second, and worst: <strong>exceptions can't be caught</strong>. With
+          <code>async Task</code>, an exception is captured on the returned task and rethrown when you
+          await it. With <code>async void</code> there's no task to put it on, so it gets raised on the
+          synchronisation context — which typically means it takes the process down. A try/catch around the
+          call site does nothing, because the method returned at the first await."</p>
+        <p>"Third, you can't compose it — no <code>WhenAll</code>, no timeout, no cancellation coordination."</p>
+        <p>"The one legitimate use is an event handler, because the delegate signature requires void. Even
+          then I'd wrap the entire body in a try/catch so nothing escapes."</p>
+        <p>"If I genuinely want fire-and-forget — say, logging telemetry where I don't care about the result
+          — I'd still return <code>Task</code> and handle it deliberately: either await it, or attach a
+          continuation that logs failures. Silent failure is the thing to avoid."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the exception behaviour specifically?</li>
+        <li>Do you know the event-handler exception to the rule?</li>
+        <li>Do you have a safe fire-and-forget pattern?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you do fire-and-forget safely in ASP.NET Core?</li>
+          <li>What happens to an exception in a <code>Task</code> nobody ever awaits?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Your API's latency jumps from 50ms to 8 seconds under load, with low CPU. What's happening? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Low CPU with high latency points strongly at <strong>thread pool starvation</strong> — requests
+          are queuing for threads rather than doing work. If it were a genuine CPU bottleneck, CPU would be
+          pinned."</p>
+        <p>"The classic cause is blocking calls on async code somewhere in the request path —
+          <code>.Result</code>, <code>.Wait()</code>, or a synchronous I/O call. Each one parks a pool thread
+          doing nothing. The pool grows, but only by about one or two threads per second, so a traffic spike
+          outruns it and requests sit in the queue."</p>
+        <p>"To confirm it, I'd look at the <code>ThreadPool</code> metrics — queue length and thread count.
+          A climbing queue length with flat CPU is the signature. In .NET the
+          <code>ThreadPool.ThreadCount</code> and <code>ThreadPool.QueueLength</code> counters show this
+          directly, and a dump would show most threads sitting in a wait."</p>
+        <p>"The immediate mitigation, if I need the site up now, is to raise the minimum thread count so the
+          pool doesn't have to grow gradually. That's a sticking plaster — it hides the problem rather than
+          fixing it, and I'd say so."</p>
+        <p>"The real fix is to find and remove the blocking calls. I'd grep for <code>.Result</code>,
+          <code>.Wait()</code> and <code>GetAwaiter().GetResult()</code>, and look for synchronous I/O —
+          <code>File.ReadAllText</code>, a sync HTTP client, sync EF methods. Then make that path async all
+          the way up. I'd also add an analyser to fail the build on new blocking calls, so it doesn't come
+          back."</p>
+        <p>"Two other things I'd rule out, because they look similar: a slow downstream dependency causing
+          requests to pile up — where the fix is timeouts and a circuit breaker rather than async — and
+          connection pool exhaustion on the database, which also shows as waiting with low CPU. All three
+          are 'waiting on a limited resource', so I'd check which resource before acting."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you read "high latency + low CPU" as a waiting problem?</li>
+        <li>Do you know thread pool growth is slow, and why that matters?</li>
+        <li>Do you separate mitigation from fix, and consider alternative causes?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add more servers" without diagnosing.</li>
+        <li><span class="redflag">Red flag:</span> raising the thread pool minimum and calling it fixed.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you find the blocking call in a large codebase?</li>
+          <li>How is this different from connection pool exhaustion?</li>
+          <li>What would you monitor to catch it before customers do?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

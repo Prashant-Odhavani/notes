@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture &amp; Fundamentals — Kafka</title>
+<meta name="description" content="Topics, partitions and offsets; replication and in-sync replicas; how producers and consumers actually work; consumer groups.">
+<meta name="keywords" content="Kafka topic partition offset broker leader follower replication ISR acks producer consumer group rebalance commit offset sequential disk zero copy KRaft ZooKeeper">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="22-kafka/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Architecture &amp; Fundamentals</h1>
+    <p class="subtitle">Partitions are the unit of everything — parallelism, ordering and scaling all follow from
+      them.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>A topic is split into partitions.</strong> A partition is an ordered, append-only log.</li>
+      <li><strong>Ordering is guaranteed within a partition only</strong> — never across a topic.</li>
+      <li><strong>Same key → same partition</strong>, which is how you get ordering where it matters.</li>
+      <li><strong>Partition count caps consumer parallelism.</strong> Extra consumers sit idle.</li>
+      <li><strong>Offsets are per consumer group</strong>, so groups are independent.</li>
+      <li><strong><code>acks=all</code> plus <code>min.insync.replicas=2</code></strong> is the durable
+        configuration.</li>
+      <li><strong>Committing an offset acknowledges everything before it.</strong></li>
+    </ul>
+  </div>
+
+  <h2 id="topics-partitions">Topics, partitions and offsets <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — a topic is a set of independent ordered logs"><code class="language-text">  Topic: orders
+
+  Partition 0:  [0][1][2][3][4][5]           <- append only, ordered
+  Partition 1:  [0][1][2][3]
+  Partition 2:  [0][1][2][3][4][5][6][7]
+
+  - Each partition is an independent ordered log on disk
+  - An offset is a position WITHIN a partition, not across the topic
+  - Ordering exists inside a partition; there is NO topic-wide order
+  - Partitions can live on different brokers - that's how it scales</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concept</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Topic</strong></td><td>A named stream. Purely logical — a grouping of partitions</td></tr>
+        <tr><td><strong>Partition</strong></td><td><strong>The real unit.</strong> An ordered, immutable, append-only log</td></tr>
+        <tr><td><strong>Offset</strong></td><td>A monotonically increasing position within one partition</td></tr>
+        <tr><td><strong>Broker</strong></td><td>A server hosting partitions</td></tr>
+        <tr><td><strong>Leader</strong></td><td>The replica handling all reads and writes for a partition</td></tr>
+        <tr><td><strong>Follower</strong></td><td>A replica copying from the leader, ready to take over</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>The partition is the unit of parallelism, ordering and scale — all three.</strong></p>
+    <p>Ordering exists within a partition. Consumer parallelism is capped by partition count. Distribution across
+      brokers is per partition.</p>
+    <p>Which means the <strong>partition count decision</strong> constrains everything downstream, and it's the
+      one you can't easily undo.</p>
+  </div>
+
+  <h2 id="keys">Partition keys <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the key determines the partition" class="code-good"><code class="language-csharp">await producer.ProduceAsync("orders", new Message&lt;string, string&gt;
+{
+    Key   = order.CustomerId.ToString(),   // hash(key) % partitionCount
+    Value = JsonSerializer.Serialize(evt)
+});
+
+// Same key -> same partition -> ordered relative to each other.
+// Null key -> round-robin (or sticky batching) -> NO ordering guarantee.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key choice</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Entity id</strong> — customer, order, device</td><td><strong>Ordering per entity, parallelism across entities.</strong> Usually right</td></tr>
+        <tr><td><strong>Null</strong></td><td>Even distribution, no ordering at all</td></tr>
+        <tr><td><strong>A constant</strong></td><td>One partition — total ordering and zero parallelism</td></tr>
+        <tr><td><strong>Low-cardinality value</strong> — status, region</td><td><strong>Hot partitions.</strong> Uneven load, and consumers idle</td></tr>
+        <tr><td><strong>A dominant entity</strong></td><td>One partition receives most traffic and becomes the bottleneck</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Adding partitions breaks ordering for existing keys</div>
+    <p style="margin:0">Partition assignment is <code>hash(key) % partitionCount</code>. Change the count and the
+      modulo changes — so a key that mapped to partition 2 may now map to partition 5.
+      <br><br>
+      The consequence: <strong>that key's older messages are in the old partition and its new messages are in a
+      different one.</strong> Two consumers process them concurrently, and the ordering guarantee you were relying
+      on silently no longer holds — for historical data as well as new.
+      <br><br>
+      And you <strong>cannot reduce</strong> partition count at all.
+      <br><br>
+      So partition count is effectively a design-time decision. The usual advice is to over-provision — more
+      partitions than you currently need, since they're relatively cheap — but not excessively, because each one
+      costs file handles, memory and rebalance time.
+      <br><br>
+      This is the Kafka equivalent of
+      <a href="../14-cosmos-db/fundamentals.html#partition-key">Cosmos's immutable partition key</a>: the
+      decision you must get right up front.</p>
+  </div>
+
+  <h2 id="consumer-groups">Consumer groups <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The mechanism</span>
+    <p>Consumers with the same <code>group.id</code> form a group, and Kafka assigns <strong>each partition to
+      exactly one consumer in that group</strong>. So the group collectively processes everything, once.</p>
+    <p>A <em>different</em> group gets its own assignment and its own offsets — so it reads everything
+      independently, unaffected by the first group.</p>
+  </div>
+
+  <pre data-label="text — one group scales, two groups are independent"><code class="language-text">  Topic: orders (4 partitions)
+
+  Group "fulfilment" (2 consumers)      Group "analytics" (1 consumer)
+    Consumer A -> P0, P1                  Consumer X -> P0, P1, P2, P3
+    Consumer B -> P2, P3
+
+  Both groups receive EVERY message. Within a group, each partition
+  goes to one consumer. The groups' offsets are completely separate.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Consumers in group</th><th>Result (4 partitions)</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Handles all 4 partitions</td></tr>
+        <tr><td>2</td><td>2 partitions each</td></tr>
+        <tr><td>4</td><td>1 each — maximum parallelism</td></tr>
+        <tr><td><strong>6</strong></td><td><strong>4 working, 2 permanently idle</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Partition count is a hard ceiling on consumer parallelism</div>
+    <p style="margin:0">A partition is only ever assigned to <strong>one</strong> consumer per group — that's what
+      preserves ordering. So consumers beyond the partition count do nothing at all.
+      <br><br>
+      This catches teams during an incident: the queue is backing up, they scale the consumer deployment from 4 to
+      12 pods, and throughput doesn't change. The extra 8 are idle, and now rebalances are slower.
+      <br><br>
+      <strong>To increase consumer parallelism you must add partitions</strong> — which breaks key ordering, as
+      above. That's the bind, and it's why partition sizing deserves real thought before launch.
+      <br><br>
+      If the bottleneck is per-message processing time rather than partition count, the better fix is often to
+      make the consumer faster or to process within a partition concurrently where ordering permits.</p>
+  </div>
+
+  <h2 id="offsets">Offset management <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — manual commit, which is what you usually want" class="code-good"><code class="language-csharp">var config = new ConsumerConfig
+{
+    BootstrapServers = brokers,
+    GroupId = "fulfilment",
+    EnableAutoCommit = false,                       // commit deliberately
+    AutoOffsetReset = AutoOffsetReset.Earliest      // new group starts at the beginning
+};
+
+using var consumer = new ConsumerBuilder&lt;string, string&gt;(config).Build();
+consumer.Subscribe("orders");
+
+while (!ct.IsCancellationRequested)
+{
+    var result = consumer.Consume(ct);
+    if (result is null) continue;
+
+    await HandleAsync(result.Message, ct);   // process FIRST
+
+    consumer.StoreOffset(result);            // then record progress
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>Semantics</th><th>Risk</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Auto-commit</strong> (periodic)</td>
+          <td>Convenient</td>
+          <td><strong>Can commit before processing completes</strong> — message loss on crash</td>
+        </tr>
+        <tr>
+          <td><strong>Commit after processing</strong></td>
+          <td><strong>At-least-once</strong></td>
+          <td>Duplicate on crash between processing and commit. <strong>The usual choice</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Commit before processing</strong></td>
+          <td>At-most-once</td>
+          <td>Message loss on crash. Rarely what you want</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Committing an offset acknowledges everything before it</div>
+    <p style="margin:0">An offset is a <em>position</em>, not a per-message flag. Committing offset 100 says "I
+      have processed everything up to 100" — so it implicitly acknowledges 0–99 whether or not they succeeded.
+      <br><br>
+      That has two consequences people trip over.
+      <br><br>
+      <strong>You cannot acknowledge out of order.</strong> If you process messages concurrently within a
+      partition and message 98 fails while 99 and 100 succeed, committing 100 loses 98 permanently. So concurrent
+      processing within a partition requires tracking the lowest un-processed offset and committing only up to
+      there.
+      <br><br>
+      <strong>Auto-commit can lose messages.</strong> It commits on a timer based on what's been <em>fetched</em>,
+      not what's been processed. So a crash after the commit but before processing means those messages are gone —
+      the consumer restarts past them. That's why <code>EnableAutoCommit = false</code> is the default choice for
+      anything that matters.</p>
+  </div>
+
+  <h2 id="replication">Replication and durability <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">How it works</span>
+    <p>Each partition has a <strong>leader</strong> and some <strong>followers</strong>. All reads and writes go
+      to the leader; followers copy from it.</p>
+    <p>Followers that are caught up form the <strong>in-sync replica set</strong> (ISR). If the leader fails, a
+      new leader is elected from the ISR — so only in-sync replicas can be promoted, which is what prevents data
+      loss.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th><code>acks</code></th><th>Producer waits for</th><th>Durability</th></tr></thead>
+      <tbody>
+        <tr><td><code>0</code></td><td>Nothing — fire and forget</td><td><strong>Messages can vanish.</strong> Metrics only</td></tr>
+        <tr><td><code>1</code></td><td>The leader only</td><td>Lost if the leader fails before followers copy it</td></tr>
+        <tr><td><strong><code>all</code></strong></td><td><strong>All in-sync replicas</strong></td><td><strong>Durable. The correct choice for real data</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — the durable producer configuration" class="code-good"><code class="language-csharp">var config = new ProducerConfig
+{
+    BootstrapServers = brokers,
+    Acks = Acks.All,                    // wait for all in-sync replicas
+    EnableIdempotence = true,           // no duplicates from producer retries
+    MessageSendMaxRetries = int.MaxValue,
+    MaxInFlight = 5                     // required to be <= 5 for idempotence
+};
+// Broker side: min.insync.replicas = 2 with replication.factor = 3</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — <code>acks=all</code> alone is not durable</div>
+    <p style="margin:0">This is the configuration mistake that looks correct. <code>acks=all</code> means "wait
+      for all <em>in-sync</em> replicas" — and if replicas have fallen behind, the ISR can shrink to
+      <strong>just the leader</strong>.
+      <br><br>
+      At that point <code>acks=all</code> means acknowledgement from one broker, and losing that broker loses the
+      data. You've configured durability and got none.
+      <br><br>
+      The fix is the broker-side setting <strong><code>min.insync.replicas=2</code></strong> with
+      <code>replication.factor=3</code>. Then if the ISR shrinks below 2, the producer receives an error rather
+      than a false acknowledgement — so you <strong>fail loudly instead of silently losing data</strong>.
+      <br><br>
+      The trade-off is explicit: with replication factor 3 and min ISR 2, you tolerate one broker failure and
+      remain available; two failures make the partition unwritable. That's choosing consistency over availability
+      deliberately, which is the correct choice for data you can't lose.
+      <br><br>
+      Knowing that <code>acks=all</code> needs <code>min.insync.replicas</code> to mean anything is one of the
+      better Kafka signals — it's a genuine production trap.</p>
+  </div>
+
+  <h2 id="why-fast">Why Kafka is fast <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Technique</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Sequential disk writes</strong></td><td>Append-only means no seeking. Sequential disk throughput is far higher than random — and competitive with random memory access</td></tr>
+        <tr><td><strong>OS page cache</strong></td><td>Kafka doesn't cache in the JVM heap; it relies on the OS. Recent data is served from memory without Kafka managing it</td></tr>
+        <tr><td><strong>Zero-copy</strong></td><td><code>sendfile</code> moves data from page cache to socket without passing through user space</td></tr>
+        <tr><td><strong>Batching</strong></td><td>Producers and consumers work in batches, amortising per-message overhead</td></tr>
+        <tr><td><strong>No per-message state</strong></td><td>The broker tracks nothing per message — just an offset per consumer group</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The insight worth stating</div>
+    <p style="margin:0">Kafka is fast because it <strong>does less</strong>, not because it's cleverer.
+      <br><br>
+      A queue must track per-message state — delivered, acknowledged, deferred, dead-lettered — which means random
+      access and bookkeeping. Kafka appends to a file and stores one integer per consumer group.
+      <br><br>
+      So the performance advantage and the missing features are <strong>the same design decision</strong>. You
+      can't have per-message dead-lettering <em>and</em> the throughput of an append-only log.
+      <br><br>
+      That framing is much stronger than reciting "zero-copy and sequential I/O", because it explains the
+      trade-off rather than just the optimisation.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">ZooKeeper is gone</div>
+    <p style="margin:0">Kafka historically needed a ZooKeeper cluster for metadata and controller election — a
+      second distributed system to operate, and a common source of problems.
+      <br><br>
+      <strong>KRaft mode</strong> replaced it: Kafka manages its own metadata using a Raft quorum among the
+      brokers. ZooKeeper support was removed entirely in Kafka 4.0.
+      <br><br>
+      Worth knowing because older material assumes ZooKeeper, and "you also need to run ZooKeeper" is no longer a
+      valid objection to Kafka. It also means faster failover and a much larger practical partition limit.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The partition is the unit of ordering, parallelism and distribution.</li>
+      <li>Ordering exists within a partition only — never across a topic.</li>
+      <li>Same key means same partition; a null key means no ordering.</li>
+      <li>Adding partitions changes key-to-partition mapping and breaks existing ordering. You can't
+        reduce them.</li>
+      <li>Partition count is a hard ceiling on consumer parallelism — extra consumers idle.</li>
+      <li>Consumer groups are independent; each tracks its own offsets.</li>
+      <li>Committing an offset acknowledges everything before it, so you can't acknowledge out of order.</li>
+      <li>Auto-commit can lose messages — commit after processing.</li>
+      <li><code>acks=all</code> is meaningless without <code>min.insync.replicas=2</code>.</li>
+      <li>Kafka is fast because it does less — which is why it lacks per-message operations.</li>
+      <li>KRaft removed the ZooKeeper dependency.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Expecting topic-wide ordering.</strong></li>
+    <li><strong>A null key</strong> when ordering was required.</li>
+    <li><strong>A low-cardinality key</strong>, creating hot partitions.</li>
+    <li><strong>Adding partitions</strong> without realising ordering breaks.</li>
+    <li><strong>Scaling consumers past the partition count</strong> and expecting more throughput.</li>
+    <li><strong>Auto-commit enabled</strong> on a consumer that must not lose messages.</li>
+    <li><strong>Committing before processing.</strong></li>
+    <li><strong>Concurrent processing within a partition</strong> then committing the highest offset.</li>
+    <li><strong><code>acks=1</code></strong> for data that matters.</li>
+    <li><strong><code>acks=all</code> without <code>min.insync.replicas</code>.</strong></li>
+    <li><strong>Too many partitions</strong>, slowing rebalances and consuming resources.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Explain partitions, consumer groups and how they interact. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A topic is a logical name; the <strong>partition is the real unit</strong>. Each partition is an
+          ordered, immutable, append-only log, and partitions can live on different brokers — which is how Kafka
+          scales."</p>
+        <p>"The critical consequence: <strong>ordering is guaranteed within a partition and nowhere else.</strong>
+          There is no topic-wide ordering, ever. So if you need messages for one customer processed in order, they
+          must go to the same partition — which you achieve by using the customer id as the
+          <strong>key</strong>, since Kafka assigns partitions by hashing the key."</p>
+        <p>"That gives you ordering per entity and parallelism across entities, which is usually exactly what you
+          want."</p>
+        <p>"A <strong>consumer group</strong> is a set of consumers sharing a <code>group.id</code>. Kafka assigns
+          each partition to <strong>exactly one consumer in the group</strong> — that's what preserves ordering.
+          The group collectively processes everything once."</p>
+        <p>"Different groups are completely independent: each gets its own partition assignment and its own
+          offsets. So a fulfilment group and an analytics group both receive every message and neither affects the
+          other. That's how Kafka supports many independent readers of the same stream, which a queue can't."</p>
+        <p>"Two consequences that matter practically."</p>
+        <p>"<strong>Partition count is a hard ceiling on consumer parallelism.</strong> With four partitions, a
+          fifth consumer in the group does nothing at all. This catches teams during incidents: the lag is
+          growing, they scale from 4 pods to 12, and throughput doesn't move — eight are idle and rebalances are
+          now slower."</p>
+        <p>"<strong>And you can't simply add partitions to fix that</strong>, because partition assignment is
+          <code>hash(key) % partitionCount</code>. Change the count and a key that mapped to partition 2 may now
+          map to partition 5 — so that key's old messages are in one partition and its new ones in another, being
+          processed concurrently. The ordering guarantee silently stops holding. And you can't reduce partitions at
+          all."</p>
+        <p>"So partition count is effectively a design-time decision. I'd over-provision moderately — more than
+          currently needed, since partitions are fairly cheap — but not wildly, because each costs file handles,
+          memory and rebalance time."</p>
+        <p>"On <strong>offsets</strong>, the thing to know is that an offset is a <em>position</em>, not a
+          per-message acknowledgement. Committing offset 100 means 'everything up to 100 is done' — so it
+          implicitly acknowledges 0 to 99 whether they succeeded or not. That's why you can't acknowledge out of
+          order, and why processing concurrently within a partition requires tracking the lowest un-processed
+          offset rather than just committing the highest one you finished."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know ordering is per-partition only?</li>
+        <li>Do you know the key determines the partition?</li>
+        <li>Do you know partition count caps parallelism?</li>
+        <li>Do you know adding partitions breaks ordering?</li>
+        <li>Do you know offsets are positions, not per-message flags?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens during a rebalance?</li>
+          <li>How would you increase throughput without adding partitions?</li>
+          <li>How do you choose a partition key?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How do you make sure a message is never lost? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"There are three places a message can be lost — producing, in the broker, and consuming — and each
+          needs its own configuration. Getting one right and missing another is the usual failure."</p>
+        <p>"<strong>Producer side:</strong> <code>acks=all</code>, so the producer waits for all in-sync replicas
+          rather than just the leader. With <code>acks=1</code> a message acknowledged by the leader is lost if
+          that leader fails before followers copy it."</p>
+        <p>"I'd also set <code>enable.idempotence=true</code>, which prevents producer retries creating duplicates
+          — the broker deduplicates using a producer id and sequence number. And unbounded retries, so a transient
+          broker problem doesn't drop the message."</p>
+        <p>"<strong>But here's the trap</strong>, and it's the important part: <strong><code>acks=all</code> alone
+          is not durable.</strong> It means 'all <em>in-sync</em> replicas' — and if followers fall behind, the ISR
+          can shrink to just the leader. At that point <code>acks=all</code> is acknowledgement from one broker,
+          and losing it loses the data. You've configured durability and got none."</p>
+        <p>"So the broker needs <strong><code>min.insync.replicas=2</code></strong> with
+          <code>replication.factor=3</code>. Then if the ISR drops below 2, the producer gets an <em>error</em>
+          instead of a false acknowledgement — you fail loudly rather than losing data silently."</p>
+        <p>"That's an explicit availability trade: with factor 3 and min ISR 2 you survive one broker failure and
+          stay writable; two failures make the partition unwritable. For data you can't lose, that's the right
+          choice."</p>
+        <p>"I'd also disable <strong>unclean leader election</strong>, which would otherwise let an out-of-sync
+          replica become leader — trading data loss for availability."</p>
+        <p>"<strong>Consumer side:</strong> <code>enable.auto.commit=false</code> and commit
+          <em>after</em> processing. Auto-commit runs on a timer against what's been <em>fetched</em>, so a crash
+          after the commit but before processing means those messages are gone — the consumer restarts past
+          them."</p>
+        <p>"Committing after processing gives at-least-once, so <strong>the consumer must be idempotent</strong>
+          because a crash between processing and commit means redelivery. That's unavoidable, so I'd handle it with
+          a dedupe key rather than pretend it won't happen."</p>
+        <p>"<strong>And the piece outside Kafka:</strong> if the message originates from a database change, the
+          <strong>outbox pattern</strong>. Writing to the database and producing to Kafka aren't atomic — if the
+          produce fails after the commit, the data changed and nothing downstream knows. Writing the event into the
+          same transaction and relaying it afterwards is the only reliable answer."</p>
+        <p>"So the full chain is: outbox for atomicity with the database; <code>acks=all</code> plus
+          <code>min.insync.replicas</code> plus idempotence for producing; replication for broker durability; and
+          manual commit after processing with idempotent handling for consuming. Missing any one of those leaves a
+          hole, and the <code>min.insync.replicas</code> one is the hole people don't know they have."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you cover all three loss points?</li>
+        <li>Do you know <code>acks=all</code> needs <code>min.insync.replicas</code>?</li>
+        <li>Do you know auto-commit can lose messages?</li>
+        <li>Do you require idempotent consumers?</li>
+        <li>Do you connect it to the outbox?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "<code>acks=all</code>" as the complete answer.</li>
+        <li><span class="redflag">Red flag:</span> no mention of the consumer side.</li>
+        <li><span class="redflag">Red flag:</span> claiming exactly-once without idempotency.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's unclean leader election and why disable it?</li>
+          <li>How does the idempotent producer actually work?</li>
+          <li>What's the latency cost of <code>acks=all</code>?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

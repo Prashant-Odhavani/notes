@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>High-Scale Booking System — System Design Exercises</title>
+<meta name="description" content="A worked design centred on preventing double-booking under concurrency: holds with expiry, atomic allocation, search versus truth, and overbooking policy.">
+<meta name="keywords" content="booking system design double booking prevention optimistic concurrency pessimistic locking seat hold expiry inventory allocation atomic conditional update search index eventual consistency overbooking waitlist idempotency">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/booking.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>High-Scale Booking System</h1>
+    <p class="subtitle">One invariant matters absolutely: never sell the same thing twice. Everything else in the
+      design can be eventually consistent.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Assumed answer</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>What's being booked?</td><td><strong>Specific inventory</strong> — a seat, a room, a slot</td><td>Allocation must be exact, not a count</td></tr>
+        <tr><td>Is double-booking ever acceptable?</td><td><strong>Never</strong></td><td>This invariant drives the whole design</td></tr>
+        <tr><td>Contention?</td><td><strong>Extreme and bursty</strong> — a popular event opens and thousands compete</td><td>The hot path is a small set of rows</td></tr>
+        <tr><td>Search freshness?</td><td>Seconds of staleness acceptable</td><td><strong>Search can be a separate, eventually consistent store</strong></td></tr>
+        <tr><td>Does payment happen before confirmation?</td><td>Yes — hold, pay, confirm</td><td>Needs a hold with expiry</td></tr>
+        <tr><td>Scale?</td><td>Steady state modest; peaks of thousands/sec on one event</td><td>The peak is concentrated, not distributed</td></tr>
+        <tr><td>Out of scope</td><td>Pricing engine, payment provider internals, notifications</td><td>Focus on allocation correctness</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — split the system by consistency requirement immediately</div>
+    <p style="margin:0">The most useful early observation is that <strong>this system has two halves with completely
+      different needs</strong>.
+      <br><br>
+      <strong>Browsing and search</strong> — "what's available for these dates?" — is read-heavy, high volume, and
+      <em>tolerates staleness</em>. If the page says twelve seats left and there are actually eleven, nothing bad
+      happens; the booking attempt will simply be re-validated.
+      <br><br>
+      <strong>Allocation</strong> — "this specific seat is now mine" — is low volume, extremely contended, and requires
+      <em>absolute</em> consistency. Selling one seat twice is unacceptable in a way that being slightly wrong about
+      availability isn't.
+      <br><br>
+      Recognising that lets you use the right tool for each: a denormalised, cached, replicated read model for search,
+      and a small strongly-consistent transactional core for allocation.
+      <br><br>
+      Which also fixes the scale problem. The high-volume traffic goes to the part that can be replicated and cached
+      arbitrarily; only the genuinely contended operation touches the strongly-consistent store — and there are far
+      fewer of those.
+      <br><br>
+      The mistake is treating the whole system as needing one guarantee. Making search strongly consistent is
+      expensive and pointless; making allocation eventually consistent sells the same seat twice.</p>
+  </div>
+
+  <h2 id="architecture">Shape <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — two paths, two consistency models"><code class="language-text">  BROWSE / SEARCH  (high volume, stale is fine)
+    client -> CDN -> API -> Redis cache -> read model (replica or search index)
+                                             ^
+                                             | change feed / outbox projection
+                                             |  (seconds behind, and that is fine)
+  ALLOCATE  (low volume, absolutely consistent)
+    client -> API -> SQL, single primary
+                       |
+                       +-- Holds     (SeatId, UserId, ExpiresAt)   short-lived
+                       +-- Bookings  (confirmed)
+                       +-- unique constraint / conditional update = the real guard
+
+  Payment happens between hold and confirm.
+  Hold expiry releases inventory if payment never completes.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Component</th><th>Choice</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Allocation store</strong></td><td><strong>Azure SQL, single primary</strong></td><td>Transactions and unique constraints are exactly what's needed</td></tr>
+        <tr><td>Search / availability</td><td>Read replica, or a projected read model in Cosmos/search</td><td>Read-heavy, staleness acceptable</td></tr>
+        <tr><td>Availability cache</td><td>Redis, short TTL</td><td>Absorbs the browse volume</td></tr>
+        <tr><td>Holds</td><td>Rows in SQL, or Redis with TTL — see below</td><td>Trade-off worth discussing</td></tr>
+        <tr><td>Payment</td><td>External provider, with idempotency keys</td><td>Never re-charge on retry</td></tr>
+        <tr><td>Expiry sweeping</td><td>A job, plus expiry checked on read</td><td><strong>Never rely on the job alone</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Relational is the right choice here, and that's worth saying confidently</div>
+    <p style="margin:0">The instinct in a design interview is to reach for something distributed. For allocation,
+      <strong>a single-primary relational database is the correct answer</strong>, and being able to justify that is a
+      stronger signal than proposing something more elaborate.
+      <br><br>
+      The reason: the invariant you must enforce is <em>uniqueness of an allocation</em>, and a relational database
+      enforces that natively with a unique constraint or a conditional update — atomically, correctly, with no
+      coordination logic to write and get wrong.
+      <br><br>
+      The volumes support it too. Even a very popular event releasing 50,000 seats over a few minutes is a few hundred
+      allocations a second — well within a single well-indexed database's capability. The <em>browse</em> traffic is
+      the large number, and that's handled by caching and replicas which scale independently.
+      <br><br>
+      Where you'd reconsider: allocation genuinely exceeding a single primary's write throughput, or a hard
+      multi-region write requirement. Then you partition by event or venue — which works because
+      <strong>allocations never span events</strong>, so each partition is independently consistent. That's a natural
+      shard key, and worth mentioning as the path if the numbers demanded it.</p>
+  </div>
+
+  <h2 id="allocation">Preventing double-booking <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="sql — the atomic claim, which is the heart of the design" class="code-good"><code class="language-sql">-- WRONG: check-then-act. Two requests both see Available and both proceed.
+-- SELECT Status FROM Seats WHERE SeatId = @seatId;   -- 'Available'
+-- IF available: UPDATE Seats SET Status = 'Held' WHERE SeatId = @seatId;
+
+-- RIGHT: one atomic statement. The database decides the winner.
+UPDATE Seats
+SET    Status    = 'Held',
+       HeldBy    = @userId,
+       HoldToken = @holdToken,
+       ExpiresAt = DATEADD(minute, 10, SYSUTCDATETIME())
+WHERE  SeatId    = @seatId
+  AND (Status    = 'Available'
+       OR (Status = 'Held' AND ExpiresAt &lt; SYSUTCDATETIME()));   -- reclaim an expired hold
+
+-- @@ROWCOUNT = 1 -> this caller won the seat
+-- @@ROWCOUNT = 0 -> someone else holds it. Return 409, suggest alternatives.</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Check-then-act is the bug, and the atomic conditional write is the answer</div>
+    <p style="margin:0">The naive implementation reads the status, decides, then writes. Under contention two requests
+      both read <code>Available</code>, both decide to proceed, and both write — so the seat is sold twice.
+      <br><br>
+      The window is milliseconds, which is why it survives testing and fails on the day tickets go on sale. It
+      <em>looks</em> impossible until thousands of people click at once.
+      <br><br>
+      The fix is a <strong>single conditional statement</strong> where the condition and the write are one atomic
+      operation. Exactly one caller gets <code>@@ROWCOUNT = 1</code>; everyone else gets zero and is told the seat is
+      gone.
+      <br><br>
+      That's the same primitive as DynamoDB condition expressions, a Cosmos <code>_etag</code> check, Redis
+      <code>SET NX</code>, and EF Core's <code>rowversion</code>. <strong>Every store gives you one atomic conditional
+      write, and every correct allocation scheme is built on it.</strong> Recognising it as one idea rather than five
+      APIs is what the question is testing.
+      <br><br>
+      Note the <code>OR (Status = 'Held' AND ExpiresAt &lt; now)</code> clause: it reclaims an expired hold
+      <em>in the same atomic operation</em>, so a stale hold never blocks a sale and there's no dependency on a
+      cleanup job having run. That detail is what makes the design robust rather than merely correct in
+      theory.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Behaviour under contention</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Conditional UPDATE</strong></td><td>One winner, others get zero rows immediately</td><td><strong>Preferred — no locks held, no waiting</strong></td></tr>
+        <tr><td>Unique constraint on (SeatId, active)</td><td>One insert wins, others get a duplicate-key error</td><td>Also correct; handle 2627/2601 as "taken"</td></tr>
+        <tr><td><code>UPDLOCK</code> pessimistic lock</td><td>Others <strong>wait</strong>, then find it taken</td><td>Correct and worse — queueing under load</td></tr>
+        <tr><td>Optimistic concurrency (<code>rowversion</code>)</td><td>Loser gets a concurrency exception</td><td>Fine, but a retry loop under heavy contention</td></tr>
+        <tr><td>Distributed lock in Redis</td><td>Depends on Redis for correctness</td><td><strong>Unnecessary — the database already does this</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Don't add a distributed lock to something the database already guarantees</div>
+    <p style="margin:0">Reaching for a Redis distributed lock here is a common instinct and it's a downgrade. It adds a
+      dependency, introduces lock-expiry edge cases, and — critically — <strong>a lock in Redis cannot guarantee
+      anything about a write to SQL</strong>. If the lock expires mid-operation, two callers proceed and the invariant
+      is broken with no error.
+      <br><br>
+      The database's own conditional write is <em>stronger</em>, because the condition and the effect are the same
+      operation. There's no window.
+      <br><br>
+      The principle worth stating: <strong>enforce an invariant in the store that owns the data.</strong> A lock
+      elsewhere is advisory; a constraint in the database is absolute.
+      <br><br>
+      Pessimistic locking with <code>UPDLOCK</code> is correct but behaves worse: under contention callers
+      <em>queue</em>, so latency climbs and connections are held. The conditional update lets losers fail immediately,
+      which is the better user experience — "that seat just went, here are three others" beats a five-second wait
+      followed by the same news.</p>
+  </div>
+
+  <h2 id="holds">Holds and expiry <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Decision</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Holds live in SQL, not only Redis</strong></td><td>A hold <em>is</em> inventory state; it must be as durable as the booking</td></tr>
+        <tr><td><strong>Expiry checked on read, not only swept</strong></td><td>Correct even if the sweeper is down</td></tr>
+        <tr><td><strong>A sweeper job as well</strong></td><td>Keeps availability counts and the read model accurate</td></tr>
+        <tr><td><strong>Hold token returned to the client</strong></td><td>Confirming requires proving you hold it</td></tr>
+        <tr><td><strong>10 minutes, and tell the user</strong></td><td>Long enough to pay, short enough not to strand inventory</td></tr>
+        <tr><td>Extend on activity, with a cap</td><td>Avoids losing a hold mid-payment; cap prevents indefinite holding</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — expiry must be enforced on read, not by a job</div>
+    <p style="margin:0">The obvious implementation is a background job that clears expired holds every minute. That's
+      useful and it must not be the <em>only</em> mechanism, because if the job stops — a deployment, a crash, a
+      misconfigured schedule — <strong>inventory is silently stranded</strong> and seats that should be on sale
+      aren't.
+      <br><br>
+      Which is a bad failure: nothing errors, revenue is quietly lost, and the symptom is "customers say it's sold out
+      but we have seats."
+      <br><br>
+      So the allocation statement itself treats an expired hold as available — the
+      <code>OR (Status = 'Held' AND ExpiresAt &lt; now)</code> clause. Then <strong>correctness never depends on the
+      job having run</strong>; the job becomes an optimisation that keeps counts tidy rather than a correctness
+      requirement.
+      <br><br>
+      That's a generally useful pattern: <strong>make the read path self-correcting so background cleanup is
+      optional.</strong> The same reasoning applies to TTL-based caches, soft-deleted rows, and anything with an
+      expiry — if a stopped job can cause incorrect behaviour, the design has a hidden dependency.
+      <br><br>
+      On storing holds in Redis: tempting, because a TTL handles expiry for free. But a hold is real inventory state,
+      and Redis is not as durable as your database — losing it means holds vanish and seats are double-sold. Redis is
+      fine as a <em>cache</em> of availability; the truth belongs with the bookings.</p>
+  </div>
+
+  <h2 id="search">Search and availability <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="note tip">
+    <div class="note-title">Availability shown to users is a hint, not a promise</div>
+    <p style="margin:0">The read model is seconds behind, so a user may see a seat that's just been taken. That's
+      acceptable — as long as the design makes it explicit that <strong>the only authoritative check is the allocation
+      attempt itself</strong>.
+      <br><br>
+      So the flow is: browse against the cached read model, then attempt to allocate, and handle failure gracefully.
+      A 409 on the allocation isn't an error condition to avoid; it's the normal outcome under contention and the UI
+      should present it as such — "that seat just went, here are alternatives" — rather than as a system failure.
+      <br><br>
+      Two consequences worth naming. <strong>Don't try to make the read model strongly consistent</strong>; you'd
+      serialise all reads through the primary and lose the ability to cache, for a guarantee that's still stale by the
+      time the user clicks.
+      <br><br>
+      And <strong>project the read model from the write side</strong> — via change feed, or an outbox — rather than
+      dual-writing. Dual-writing means the two can diverge permanently with nothing to reconcile them.
+      <br><br>
+      For a high-demand release, add a <strong>queue or waiting room</strong> in front: admit users at a controlled
+      rate rather than letting 100,000 people hit allocation simultaneously. That converts a thundering herd into an
+      orderly queue, and it's how ticketing platforms handle onsales.</p>
+  </div>
+
+  <h2 id="payment">Payment and the confirm step <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — the sequence, and where it can fail"><code class="language-text">1  POST /holds        atomic claim -> hold token, expires in 10 min
+2  POST /payments     idempotency key = hold token. Provider charges.
+3  POST /bookings     confirm: hold token + payment reference
+                        conditional update Held -> Booked, only if token matches
+                        AND not expired
+4  publish BookingConfirmed (via outbox) -> email, read model update
+
+FAILURE CASES THAT MATTER:
+  paid, then confirm fails      -> retry confirm; hold may have expired
+                                   -> compensate: refund, or honour and reconcile
+  hold expired during payment   -> extend on payment start, cap the extension
+  duplicate confirm             -> idempotent: second attempt returns the same booking
+  duplicate payment attempt     -> idempotency key means the provider charges once</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">"Paid but not confirmed" is the case that decides whether this design is sound</div>
+    <p style="margin:0">The dangerous window is between a successful charge and a successful booking record. The
+      customer has been debited and holds nothing.
+      <br><br>
+      Every mitigation matters here:
+      <br><br>
+      <strong>Use the hold token as the payment idempotency key.</strong> Then a retried payment cannot double-charge,
+      because the provider recognises the key and returns the original result.
+      <br><br>
+      <strong>Extend the hold when payment starts</strong>, with a cap. Otherwise a slow payment page means the hold
+      expires, the seat is resold, and the charge succeeds against nothing — the worst possible ordering.
+      <br><br>
+      <strong>Make confirmation idempotent.</strong> A retry with the same hold token and payment reference returns the
+      existing booking rather than creating a second one or failing.
+      <br><br>
+      <strong>Record payment intent before charging</strong>, so a charge that succeeds while your process dies is
+      recoverable — you have a record saying "we were about to charge for this hold" and can reconcile against the
+      provider.
+      <br><br>
+      <strong>Have a reconciliation job</strong> comparing provider transactions against bookings, and a documented
+      decision for mismatches: refund, or honour the booking and fix it manually. Which one depends on the business,
+      and <em>having decided in advance</em> is the point — because at 2am someone will otherwise guess.
+      <br><br>
+      The honest framing: <strong>you cannot make a charge and a database write atomic across two systems.</strong>
+      What you can do is make every step idempotent, record intent before acting, and reconcile — so the window is
+      detectable and recoverable rather than silent.</p>
+  </div>
+
+  <h2 id="overbooking">Overbooking, if the business wants it <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="note info">
+    <div class="note-title">Overbooking is a business policy, and it changes the invariant</div>
+    <p style="margin:0">Airlines and hotels deliberately sell more than they have, because a predictable percentage of
+      customers don't turn up. If that's a requirement, the invariant changes from
+      <em>"never sell the same unit twice"</em> to <em>"never exceed capacity × an overbooking factor"</em>.
+      <br><br>
+      That's a different design: allocation becomes a <strong>counter with a limit</strong> rather than allocation of
+      specific units — <code>UPDATE Inventory SET Sold = Sold + 1 WHERE Sold &lt; Capacity * @factor</code>, which is
+      still one atomic conditional write.
+      <br><br>
+      And it needs the business process around it: a <strong>waitlist</strong>, a documented compensation policy, and
+      a way to prioritise who gets bumped.
+      <br><br>
+      Worth raising because it demonstrates that <strong>you understand which requirements are technical and which
+      are commercial.</strong> "Never double-book" sounds absolute and is actually a business decision — and asking
+      whether it's genuinely absolute is a good question. For a cinema seat, yes. For a hotel room, often not.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Split by consistency requirement: search can be stale, allocation cannot.</li>
+      <li>A single-primary relational database is the right choice for allocation.</li>
+      <li>Partition by event or venue if writes ever exceed one primary — allocations never span events.</li>
+      <li>Check-then-act is the bug; one atomic conditional write is the fix.</li>
+      <li>Reclaim expired holds in the same statement, so correctness doesn't need a job.</li>
+      <li>Don't add a distributed lock to something the database already guarantees.</li>
+      <li>Losers should fail fast with alternatives, not queue behind a lock.</li>
+      <li>Holds are inventory state — durable, not Redis-only.</li>
+      <li>Availability shown to users is a hint; the allocation attempt is the truth.</li>
+      <li>Project the read model from the write side; never dual-write.</li>
+      <li>A waiting room converts a thundering herd into an orderly queue.</li>
+      <li>Hold token as the payment idempotency key; extend the hold when payment starts.</li>
+      <li>Record intent before charging, make confirm idempotent, and reconcile.</li>
+      <li>Ask whether "never double-book" is absolute — overbooking may be policy.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Design a booking system that can never double-book. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The first thing I'd establish is that <strong>this system has two halves with different consistency
+          requirements</strong>, and treating them the same is the main design mistake."</p>
+        <p>"<strong>Browsing and search</strong> is high volume and tolerates staleness — if the page says twelve seats
+          and there are eleven, nothing bad happens. <strong>Allocation</strong> is low volume, extremely contended,
+          and requires absolute consistency."</p>
+        <p>"So: a cached, replicated read model for search, and a small strongly-consistent transactional core for
+          allocation. That also solves the scale problem, because the high-volume traffic never touches the
+          strongly-consistent store."</p>
+        <p>"<strong>For allocation I'd use a single-primary relational database</strong>, and I'd defend that
+          deliberately rather than reaching for something distributed. The invariant I need is uniqueness of an
+          allocation, and a relational database enforces that natively — atomically, with no coordination code to get
+          wrong. Even a big onsale releasing 50,000 seats over minutes is a few hundred allocations a second, which is
+          comfortable."</p>
+        <p>"<strong>The core of the design is an atomic conditional write.</strong> The bug I'd specifically avoid is
+          check-then-act: reading the status, deciding, then writing. Under contention two requests both read
+          Available, both proceed, and the seat sells twice. The window is milliseconds, which is exactly why it
+          survives testing and fails when tickets go on sale."</p>
+        <p>"So instead, one statement: <code>UPDATE Seats SET Status='Held', HeldBy=@user WHERE SeatId=@id AND
+          Status='Available'</code>. Exactly one caller gets a row count of 1; everyone else gets zero and is told the
+          seat is gone. The condition and the write are the same operation, so there's no window."</p>
+        <p>"I'd add <code>OR (Status='Held' AND ExpiresAt &lt; now)</code> to that condition, which reclaims an
+          expired hold in the same atomic operation. That matters because it means <strong>correctness never depends
+          on a cleanup job having run</strong> — if the sweeper stops, inventory isn't silently stranded."</p>
+        <p>"That last point generalises: make the read path self-correcting so background cleanup is an optimisation
+          rather than a correctness requirement."</p>
+        <p>"<strong>Holds with expiry</strong>, because payment happens between selecting and confirming. Ten minutes,
+          shown to the user, extended when payment starts with a cap. And holds live in the database, not only in
+          Redis — a hold is real inventory state, and if Redis loses it the seat gets double-sold."</p>
+        <p>"<strong>What I'd explicitly not do is add a distributed lock.</strong> It's the common instinct and it's a
+          downgrade: it adds a dependency, and a lock in Redis cannot guarantee anything about a write to SQL — if it
+          expires mid-operation, two callers proceed and the invariant breaks with no error. The database's own
+          conditional write is stronger. Enforce the invariant in the store that owns the data."</p>
+        <p>"<strong>The failure case I'd raise unprompted</strong> is 'paid but not confirmed'. The customer is
+          debited and holds nothing. So: the hold token is the payment idempotency key, so a retry can't double-charge;
+          payment intent is recorded before charging, so a crash mid-charge is recoverable; confirmation is idempotent;
+          and there's a reconciliation job comparing provider transactions against bookings, with a
+          <em>pre-decided</em> policy for mismatches — refund or honour. Deciding that in advance is the point,
+          because otherwise someone guesses at 2am."</p>
+        <p>"I'd be honest that <strong>you cannot make a charge and a database write atomic across two
+          systems</strong>. What you can do is make every step idempotent and reconcile, so the window is detectable
+          rather than silent."</p>
+        <p>"<strong>For a high-demand onsale</strong>, a waiting room in front — admitting users at a controlled rate
+          rather than letting 100,000 people hit allocation at once. And the UI should treat a 409 as a normal
+          outcome, not an error: 'that seat just went, here are three others'."</p>
+        <p>"One question I'd ask back: <strong>is 'never double-book' genuinely absolute?</strong> For a cinema seat,
+          yes. For a hotel room, overbooking is often deliberate policy — and that changes the invariant to a counter
+          with a limit rather than allocation of specific units. Worth confirming rather than assuming."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you separate search from allocation by consistency need?</li>
+        <li>Do you identify check-then-act as the bug?</li>
+        <li>Do you use one atomic conditional write?</li>
+        <li>Do you make expiry self-correcting rather than job-dependent?</li>
+        <li>Do you reject the distributed lock, with a reason?</li>
+        <li>Do you volunteer the paid-but-not-confirmed case?</li>
+        <li>Do you question whether the invariant is truly absolute?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a Redis distributed lock as the primary mechanism.</li>
+        <li><span class="redflag">Red flag:</span> read-then-write with no atomicity.</li>
+        <li><span class="redflag">Red flag:</span> no holds, so payment happens with nothing reserved.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if allocation exceeds one database's write throughput?</li>
+          <li>How do you handle a payment that succeeded but whose response was lost?</li>
+          <li>How would you support booking a group of adjacent seats atomically?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

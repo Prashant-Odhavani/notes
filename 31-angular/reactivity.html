@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RxJS, Signals &amp; Change Detection — Angular</title>
+<meta name="description" content="How change detection actually works, OnPush, Zone.js, signals versus observables, the RxJS operators worth knowing, and subscription cleanup.">
+<meta name="keywords" content="Angular change detection Zone.js OnPush markForCheck signals computed effect toSignal RxJS observable subject BehaviorSubject switchMap mergeMap concatMap exhaustMap takeUntilDestroyed async pipe memory leak zoneless trackBy">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="31-angular/reactivity.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>RxJS, Signals &amp; Change Detection</h1>
+    <p class="subtitle">The most important page in this section. Nearly every Angular interview question and
+      performance problem lives here.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Zone.js patches async APIs</strong> so Angular knows when something might have changed.</li>
+      <li><strong>Default strategy checks the whole tree</strong> on every async event.</li>
+      <li><strong><code>OnPush</code> checks only when</strong> an input changes by reference, an event fires
+        inside, or an async pipe emits.</li>
+      <li><strong>Never call a method from a template binding</strong> — it runs every cycle.</li>
+      <li><strong>Signals for state, observables for streams.</strong> That's the dividing line.</li>
+      <li><strong><code>computed()</code> recalculates only when dependencies change.</strong></li>
+      <li><strong>Every subscription needs cleanup</strong> — async pipe or
+        <code>takeUntilDestroyed</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="change-detection">How change detection works <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Angular doesn't know when your data changes. So instead it re-checks bindings <strong>after anything
+      happens that might have changed something</strong>, and updates the DOM where a bound value differs.</p>
+    <p><strong>Zone.js</strong> is how it knows something happened. It patches the browser's async APIs —
+      <code>setTimeout</code>, <code>addEventListener</code>, <code>fetch</code>, promises — so Angular is
+      notified when any of them completes.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A proofreader who can't be told which page changed. Every time anyone touches the manuscript, they re-read
+      <strong>the entire document</strong> looking for differences.</p>
+    <p>Correct, and expensive. <code>OnPush</code> is telling them "only re-read chapters whose cover sheet has
+      been stamped".</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Step</th><th>What happens</th></tr></thead>
+      <tbody>
+        <tr><td>1. An async event fires</td><td>Click, HTTP response, timer, keystroke — anything Zone.js patched</td></tr>
+        <tr><td>2. Zone notifies Angular</td><td>The microtask queue drains, then Angular is told the zone is stable</td></tr>
+        <tr><td>3. Change detection runs</td><td>Walks the component tree <strong>from the root</strong>, top to bottom</td></tr>
+        <tr><td>4. Bindings are compared</td><td>Each binding's current value against its previous value</td></tr>
+        <tr><td>5. DOM is updated</td><td>Only where a value actually differs</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The connection to the event loop</div>
+    <p style="margin:0">Change detection runs when the <strong>microtask queue has drained</strong> — so it's
+      scheduled off the back of the <a href="../30-web-fundamentals/javascript.html#event-loop">event loop</a>
+      mechanics, not on a timer.
+      <br><br>
+      That's why an <code>await</code> inside a component triggers a cycle when it resumes: the continuation is a
+      microtask, Zone.js sees it complete, and Angular checks.
+      <br><br>
+      It's also why work outside Angular's zone — via <code>runOutsideAngular</code> — doesn't trigger change
+      detection at all. Useful for high-frequency things like mouse-move handlers or animation frames that
+      shouldn't cause a full check on every event.</p>
+  </div>
+
+  <h3 id="onpush"><code>OnPush</code> — what actually triggers it</h3>
+
+  <pre data-label="typescript"><code class="language-typescript">@Component({
+  selector: 'app-order-row',
+  changeDetection: ChangeDetectionStrategy.OnPush,   // opt in
+  template: `{{ order.reference }} - {{ order.total | currency }}`
+})
+export class OrderRowComponent {
+  @Input() order!: Order;
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>An <code>OnPush</code> component re-checks when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>An <code>@Input()</code> changes by reference</strong> — a new object, not a mutated one</td></tr>
+        <tr><td>An event handler fires <strong>inside</strong> the component or its template</td></tr>
+        <tr><td>An observable bound with the <strong>async pipe</strong> emits</td></tr>
+        <tr><td>A <strong>signal</strong> read in its template changes</td></tr>
+        <tr><td>You call <code>markForCheck()</code> explicitly</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The mutation trap — why <code>OnPush</code> "doesn't work"</div>
+    <pre data-label="typescript — the view never updates" class="code-bad"><code class="language-typescript">// Parent component
+addItem(item: Item) {
+  this.items.push(item);        // SAME array reference
+}
+// An OnPush child bound to [items]="items" sees no change.
+// The reference is identical, so Angular skips it entirely.</code></pre>
+    <pre data-label="typescript — a new reference" class="code-good"><code class="language-typescript">addItem(item: Item) {
+  this.items = [...this.items, item];    // NEW array reference
+}</code></pre>
+    <p style="margin:0"><code>OnPush</code> compares inputs by reference, so <strong>mutating an object or array
+      in place is invisible to it</strong>. The data is correct, the view is stale, and nothing errors.
+      <br><br>
+      This is the single most common <code>OnPush</code> complaint, and it's not a bug — it's the contract.
+      <code>OnPush</code> requires that you treat inputs as immutable.
+      <br><br>
+      Which is a good discipline anyway: immutable updates make change tracking predictable and are the same
+      reasoning behind React's state rules. If a codebase mutates state freely, adopting <code>OnPush</code>
+      means fixing that first.</p>
+  </div>
+
+  <h3 id="template-methods">Never call methods from templates <span class="pill pill-must">🔥 Must know</span></h3>
+
+  <pre data-label="html — runs on every change detection cycle" class="code-bad"><code class="language-html">&lt;div *ngFor="let item of getFilteredItems()"&gt;{{ item.name }}&lt;/div&gt;
+&lt;span&gt;{{ calculateTotal() }}&lt;/span&gt;
+&lt;span&gt;{{ formatDate(item.created) }}&lt;/span&gt;</code></pre>
+
+  <pre data-label="typescript — a computed signal recalculates only when inputs change" class="code-good"><code class="language-typescript">export class OrderListComponent {
+  readonly items  = signal&lt;Item[]&gt;([]);
+  readonly filter = signal('');
+
+  // Recomputes ONLY when items() or filter() actually change
+  readonly filteredItems = computed(() =&gt;
+    this.items().filter(i =&gt; i.name.includes(this.filter())));
+
+  readonly total = computed(() =&gt;
+    this.filteredItems().reduce((sum, i) =&gt; sum + i.price, 0));
+}</code></pre>
+
+  <pre data-label="html — reading a signal is cheap" class="code-good"><code class="language-html">@for (item of filteredItems(); track item.id) {
+  &lt;div&gt;{{ item.name }}&lt;/div&gt;
+}
+&lt;span&gt;{{ total() }}&lt;/span&gt;</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Angular cannot know whether a method's return value changed, so it must call it every
+      cycle.</strong></p>
+    <p>A computed signal is <em>memoised</em> — it tracks its dependencies and only recalculates when one of
+      them actually changes. Reading it afterwards is just returning a cached value.</p>
+    <p>Before signals, the equivalents were a precomputed field updated when data changed, or a
+      <code>pure</code> pipe (which Angular caches by argument). Both still work; computed signals are
+      clearer.</p>
+  </div>
+
+  <h2 id="signals">Signals <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="typescript — the three primitives"><code class="language-typescript">// writable state
+const count = signal(0);
+count.set(5);
+count.update(n =&gt; n + 1);
+console.log(count());              // read by calling it
+
+// derived state - memoised, recomputes lazily
+const doubled = computed(() =&gt; count() * 2);
+
+// side effects - runs when dependencies change
+effect(() =&gt; {
+  console.log('count is now', count());   // dependencies tracked automatically
+});</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Signal</th><th>Observable</th></tr></thead>
+      <tbody>
+        <tr><td>Represents</td><td><strong>A value that changes</strong></td><td><strong>A stream of events over time</strong></td></tr>
+        <tr><td>Always has a value</td><td>Yes</td><td>No — may not have emitted</td></tr>
+        <tr><td>Read</td><td>Synchronously, by calling it</td><td>Requires subscription</td></tr>
+        <tr><td>Cleanup needed</td><td><strong>No</strong></td><td><strong>Yes</strong></td></tr>
+        <tr><td>Dependency tracking</td><td><strong>Automatic</strong></td><td>Manual composition</td></tr>
+        <tr><td>Operators</td><td>Few</td><td><strong>Very many</strong></td></tr>
+        <tr><td>Async work</td><td>Not its job</td><td><strong>Its strength</strong></td></tr>
+        <tr><td>Change detection</td><td><strong>Fine-grained</strong></td><td>Component-level</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The dividing line</span>
+    <p><strong>Signals for state. Observables for events and async.</strong></p>
+    <p>"What is the current filter value?" — a signal. It always has a value and you read it synchronously.</p>
+    <p>"Every keystroke, debounced, cancelling the previous request" — an observable. That's a stream with
+      timing.</p>
+    <p>They interoperate: <code>toSignal()</code> converts an observable to a signal,
+      <code>toObservable()</code> goes the other way. So you don't have to pick one for the whole
+      application.</p>
+  </div>
+
+  <pre data-label="typescript — the two worlds together" class="code-good"><code class="language-typescript">export class OrderSearchComponent {
+  private readonly http = inject(HttpClient);
+
+  readonly query = signal('');
+
+  // Signal -> observable -> HTTP stream -> back to a signal.
+  // toSignal handles subscription AND cleanup automatically.
+  readonly results = toSignal(
+    toObservable(this.query).pipe(
+      debounceTime(300),
+      distinctUntilChanged(),
+      switchMap(q =&gt; q ? this.http.get&lt;Order[]&gt;(`/api/orders?q=${q}`) : of([]))
+    ),
+    { initialValue: [] }
+  );
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Why this pattern is the modern default</div>
+    <p style="margin:0">The debouncing and request cancellation genuinely need RxJS — signals have no equivalent
+      to <code>switchMap</code>, and shouldn't.
+      <br><br>
+      But the <em>result</em> is state, so exposing it as a signal means the template reads
+      <code>results()</code> with no async pipe, no subscription, and <strong>no cleanup code</strong>.
+      <code>toSignal</code> unsubscribes when the component is destroyed.
+      <br><br>
+      That combination — RxJS for the async pipeline, signals at the boundary — removes the most common source of
+      Angular memory leaks while keeping the operators where they're needed.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title"><code>effect()</code> is not for deriving values</div>
+    <p style="margin:0">A common misuse is using <code>effect()</code> to compute one signal from another by
+      calling <code>set()</code> inside it. That works, and it's wrong — it creates a second source of truth
+      that can drift, and Angular actively discourages writing to signals in effects.
+      <br><br>
+      <strong><code>computed()</code> is for deriving. <code>effect()</code> is for side effects</strong> —
+      logging, analytics, syncing to <code>localStorage</code>, imperatively calling a non-Angular library.
+      <br><br>
+      If you find yourself setting a signal inside an effect, the answer is almost always a
+      <code>computed</code>. This is the same distinction as React's "don't use an effect to compute derived
+      state".</p>
+  </div>
+
+  <h2 id="rxjs">The RxJS you actually need <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Operator</th><th>Does</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><code>map</code></td><td>Transform each value</td><td>Reshaping a response</td></tr>
+        <tr><td><code>filter</code></td><td>Drop values</td><td>Ignoring irrelevant emissions</td></tr>
+        <tr><td><code>tap</code></td><td>Side effect, passes through</td><td>Logging, without altering the stream</td></tr>
+        <tr><td><code>debounceTime</code></td><td>Wait for quiet</td><td><strong>Search-as-you-type</strong></td></tr>
+        <tr><td><code>distinctUntilChanged</code></td><td>Skip repeats</td><td>Avoiding duplicate requests</td></tr>
+        <tr><td><strong><code>switchMap</code></strong></td><td><strong>Cancel the previous inner stream</strong></td><td><strong>Search, navigation — the usual choice</strong></td></tr>
+        <tr><td><code>mergeMap</code></td><td>Run all concurrently</td><td>Independent parallel work</td></tr>
+        <tr><td><code>concatMap</code></td><td>Queue, one at a time, in order</td><td>Ordered writes</td></tr>
+        <tr><td><code>exhaustMap</code></td><td>Ignore new while one is running</td><td><strong>Preventing double form submits</strong></td></tr>
+        <tr><td><code>combineLatest</code></td><td>Latest from each source</td><td>Several filters driving one query</td></tr>
+        <tr><td><code>catchError</code></td><td>Handle and substitute</td><td>Error recovery</td></tr>
+        <tr><td><code>shareReplay</code></td><td>Multicast and replay</td><td>Sharing one HTTP call between subscribers</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the four flattening operators</div>
+    <p style="margin:0">This is the RxJS question most likely to come up, because choosing wrong causes real
+      bugs rather than just inefficiency.
+      <br><br>
+      <strong><code>switchMap</code></strong> — cancels the previous inner observable. For a type-ahead search
+      that's exactly right: you don't want the response for "ab" arriving after the response for "abc" and
+      overwriting it. That's a genuine race condition, not a performance concern.
+      <br><br>
+      <strong><code>mergeMap</code></strong> — everything runs concurrently, results arrive in completion order.
+      Fine for independent operations; <em>wrong</em> for search, because out-of-order responses corrupt state.
+      <br><br>
+      <strong><code>concatMap</code></strong> — strictly sequential and ordered. Use when order matters, like a
+      queue of writes that must apply in sequence.
+      <br><br>
+      <strong><code>exhaustMap</code></strong> — ignores new emissions while one is in flight. The correct answer
+      for a submit button: rapid clicks produce one request, not five. Most people reach for a disabled flag
+      instead; <code>exhaustMap</code> is the declarative version.
+      <br><br>
+      Being able to name <em>which bug each one prevents</em> is what distinguishes real usage from memorising a
+      list.</p>
+  </div>
+
+  <h2 id="cleanup">Subscription cleanup <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="typescript — leaks on every component instance" class="code-bad"><code class="language-typescript">export class DashboardComponent implements OnInit {
+  ngOnInit() {
+    this.service.updates$.subscribe(data =&gt; this.data = data);
+    // Never unsubscribed. The subject holds a reference to this component
+    // forever - so the component, its DOM and its captured scope all leak.
+    // And the callback keeps running after the component is destroyed.
+  }
+}</code></pre>
+
+  <pre data-label="typescript — the async pipe: no subscription code at all" class="code-good"><code class="language-typescript">// Component
+readonly data$ = this.service.updates$;
+
+// Template - Angular subscribes AND unsubscribes for you
+// {{ data$ | async }}   or   @if (data$ | async; as data) { ... }</code></pre>
+
+  <pre data-label="typescript — when you must subscribe imperatively" class="code-good"><code class="language-typescript">export class DashboardComponent {
+  private readonly service = inject(DataService);
+
+  constructor() {
+    this.service.updates$
+      .pipe(takeUntilDestroyed())      // Angular 16+; ties to the injection context
+      .subscribe(data =&gt; this.handle(data));
+  }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Async pipe</strong></td><td><strong>Best.</strong> No subscription code, cleanup guaranteed</td></tr>
+        <tr><td><strong><code>toSignal()</code></strong></td><td><strong>Best</strong> for state-shaped data. Same automatic cleanup</td></tr>
+        <tr><td><code>takeUntilDestroyed()</code></td><td>Right when you genuinely need imperative code</td></tr>
+        <tr><td><code>takeUntil(destroy$)</code> + <code>ngOnDestroy</code></td><td>The pre-16 pattern. Verbose but correct</td></tr>
+        <tr><td>Manual <code>Subscription</code> and <code>unsubscribe()</code></td><td>Works; easy to forget one</td></tr>
+        <tr><td><strong>Nothing</strong></td><td><strong>A memory leak</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Which observables genuinely need cleanup</div>
+    <p style="margin:0"><code>HttpClient</code> observables <strong>complete</strong> after one emission, so they
+      self-unsubscribe. Not subscribing to those is a leak in principle and harmless in practice.
+      <br><br>
+      The ones that leak are those that <strong>never complete</strong>: subjects, <code>interval</code>,
+      <code>fromEvent</code>, router events, form <code>valueChanges</code>, and anything from a long-lived
+      service. Those hold a reference to your callback — and therefore your component — indefinitely.
+      <br><br>
+      <code>valueChanges</code> is the one people miss most, because it looks local to the component.
+      <br><br>
+      The safe habit: <strong>treat every subscription as needing cleanup</strong> rather than reasoning about
+      which ones don't. Same discipline as disposing every <code>IDisposable</code>.</p>
+  </div>
+
+  <h2 id="zoneless">Zoneless Angular <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What changes</span>
+    <p>Zone.js patches every async API to detect that <em>something</em> happened, then Angular checks the tree
+      to find out <em>what</em>.</p>
+    <p>With signals, Angular is told precisely what changed — so the patching becomes unnecessary. Zoneless mode
+      removes Zone.js entirely and relies on signals and explicit notification.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Benefit</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Smaller bundle</strong></td><td>Zone.js is roughly 35KB</td></tr>
+        <tr><td><strong>Less work per event</strong></td><td>No tree walk to find what changed</td></tr>
+        <tr><td><strong>Cleaner stack traces</strong></td><td>Zone.js wraps async calls and obscures them</td></tr>
+        <tr><td><strong>Better interop</strong></td><td>Third-party async code no longer triggers spurious cycles</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">What zoneless requires of your code</div>
+    <p style="margin:0">Any state the template depends on must be a <strong>signal</strong>, or you must call
+      <code>markForCheck()</code>. Mutating a plain field and expecting the view to update no longer works —
+      nothing is watching.
+      <br><br>
+      So a codebase built on plain properties and default change detection can't simply switch it on. The
+      migration is: adopt <code>OnPush</code> broadly, move template-bound state to signals, then go
+      zoneless.
+      <br><br>
+      Stable from v20, and the direction Angular is clearly heading. For an interview, knowing it exists and
+      what it demands is enough unless the role is Angular-focused.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Zone.js patches async APIs so Angular knows to check; change detection walks from the root.</li>
+      <li><code>OnPush</code> checks on reference-changed inputs, internal events, async pipe emissions and
+        signal changes.</li>
+      <li>Mutating an input in place is invisible to <code>OnPush</code> — treat inputs as immutable.</li>
+      <li>Never call a method from a template binding; use a computed signal.</li>
+      <li>Signals for state, observables for streams; <code>toSignal</code>/<code>toObservable</code>
+        bridge them.</li>
+      <li><code>computed()</code> derives, <code>effect()</code> is for side effects only.</li>
+      <li><code>switchMap</code> for search, <code>exhaustMap</code> for submits, <code>concatMap</code> for
+        ordered writes.</li>
+      <li>Async pipe or <code>toSignal</code> first; <code>takeUntilDestroyed</code> when imperative.</li>
+      <li>Observables that never complete are the ones that leak — <code>valueChanges</code> especially.</li>
+      <li>Zoneless requires signals or explicit <code>markForCheck</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Method calls in template bindings.</strong></li>
+    <li><strong>Mutating arrays or objects</strong> passed to <code>OnPush</code> children.</li>
+    <li><strong>Subscribing without cleanup.</strong></li>
+    <li><strong><code>mergeMap</code> for a search</strong>, letting stale responses overwrite fresh ones.</li>
+    <li><strong>Nested subscriptions</strong> instead of a flattening operator.</li>
+    <li><strong>Using <code>effect()</code> to derive state</strong> rather than <code>computed()</code>.</li>
+    <li><strong>Manual subscription where the async pipe would do.</strong></li>
+    <li><strong>Missing <code>trackBy</code> / <code>track</code></strong>, recreating every DOM node.</li>
+    <li><strong>Calling <code>detectChanges()</code> to force updates</strong> instead of fixing the cause.</li>
+    <li><strong>High-frequency handlers inside the zone</strong> — mouse move, scroll, animation frames.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Explain change detection and <code>OnPush</code>. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Angular has no way to know when your data changes — there's no proxy or setter interception on plain
+          properties. So instead it re-checks bindings after anything happens that <em>might</em> have changed
+          something."</p>
+        <p>"<strong>Zone.js</strong> is how it knows something happened. It monkey-patches the browser's async
+          APIs — <code>setTimeout</code>, <code>addEventListener</code>, promises, XHR — so when any of them
+          completes, Angular is notified and runs change detection."</p>
+        <p>"With the <strong>default strategy</strong>, that check walks the entire component tree from the root,
+          comparing every binding's current value to its previous value, and updates the DOM where they differ.
+          So on a large application, every click and every HTTP response checks everything."</p>
+        <p>"<strong><code>OnPush</code></strong> narrows that. An <code>OnPush</code> component is only checked
+          when one of four things happens: an <code>@Input()</code> changes <em>by reference</em>, an event
+          handler fires inside the component or its template, an observable bound with the async pipe emits, or
+          a signal read in its template changes. Otherwise Angular skips the component and its subtree
+          entirely."</p>
+        <p>"The critical consequence — and the reason people say <code>OnPush</code> is broken — is
+          <strong>reference comparison</strong>. If a parent does <code>this.items.push(newItem)</code>, the
+          array reference hasn't changed, so an <code>OnPush</code> child bound to it sees nothing. The data is
+          right, the view is stale, and there's no error."</p>
+        <p>"That's not a bug, it's the contract: <code>OnPush</code> requires you to treat inputs as immutable
+          and replace rather than mutate — <code>this.items = [...this.items, newItem]</code>. Which is good
+          discipline regardless, and it's the same reasoning as React's state rules."</p>
+        <p>"So adopting <code>OnPush</code> in an existing codebase means auditing for in-place mutation first.
+          Turning it on without that produces stale views in hard-to-predict places."</p>
+        <p>"Worth adding where this is heading: <strong>signals make the whole model unnecessary</strong>. A
+          signal tells Angular exactly what changed, so it can update precisely what depends on it rather than
+          checking a tree. That's what enables zoneless change detection — Zone.js exists only to detect that
+          <em>something</em> happened, and with signals that's no longer needed."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know Zone.js is the detection mechanism?</li>
+        <li>Can you list what triggers an <code>OnPush</code> check?</li>
+        <li>Do you know the mutation trap and why it's a contract, not a bug?</li>
+        <li>Do you know where signals fit?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "<code>OnPush</code> makes it faster" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> not knowing mutation breaks it.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you force an update under <code>OnPush</code>?</li>
+          <li>What's <code>markForCheck</code> vs <code>detectChanges</code>?</li>
+          <li>How do signals change this?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary><code>switchMap</code>, <code>mergeMap</code>, <code>concatMap</code>, <code>exhaustMap</code> — when do you use each? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"All four flatten an observable of observables. They differ in what they do with a new emission while
+          a previous inner observable is still running — and I'd frame each by the bug it prevents, because
+          that's what makes the choice obvious."</p>
+        <p>"<strong><code>switchMap</code> cancels the previous one.</strong> That's what you want for a
+          type-ahead search. If the user types 'a', 'ab', 'abc', you fire three requests, and without
+          cancellation the response for 'a' can arrive <em>after</em> the response for 'abc' and overwrite the
+          results with stale data. That's a genuine race condition, not just wasted bandwidth.
+          <code>switchMap</code> cancels the in-flight request so only the latest can land. Same reasoning for
+          route parameter changes."</p>
+        <p>"<strong><code>mergeMap</code> runs everything concurrently</strong> and results arrive in whatever
+          order they complete. Right for independent operations — uploading several files, firing off analytics
+          events. Wrong for search, for exactly the ordering reason above."</p>
+        <p>"<strong><code>concatMap</code> queues them strictly in order</strong>, waiting for each to complete
+          before starting the next. Use it when order matters — a sequence of writes that must apply in
+          sequence, or operations where the second depends on the first having landed. Slower by design."</p>
+        <p>"<strong><code>exhaustMap</code> ignores new emissions while one is in flight.</strong> This is the
+          right answer for a submit button: if the user clicks five times rapidly, you want one request, not
+          five. Most people solve that with a <code>disabled</code> flag and a boolean — <code>exhaustMap</code>
+          is the declarative version and it can't get out of sync."</p>
+        <p>"The way I keep them straight: <strong>switch cancels, merge parallelises, concat queues, exhaust
+          ignores.</strong>"</p>
+        <p>"And the related mistake worth mentioning: <strong>nested subscriptions</strong>. Subscribing inside a
+          subscribe callback is what these operators exist to replace. Nesting means you can't cancel the inner
+          one, error handling doesn't compose, and cleanup becomes manual — so it reintroduces every problem the
+          operators solve."</p>
+        <p>"If I'm unsure in a review, the question I ask is: <em>what should happen if this fires again before
+          the last one finished?</em> The answer names the operator."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <code>switchMap</code> prevents a race, not just waste?</li>
+        <li>Do you know <code>exhaustMap</code> for double-submit?</li>
+        <li>Do you recognise nested subscribes as the anti-pattern?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens to the cancelled HTTP request?</li>
+          <li>How would you retry a failed request?</li>
+          <li>Where does <code>shareReplay</code> fit?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Signals or RxJS — how do you decide? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"They solve different problems, so mostly it isn't a choice — <strong>signals for state, observables
+          for streams and async</strong>."</p>
+        <p>"A <strong>signal</strong> is a value that changes. It always has a current value, you read it
+          synchronously by calling it, dependencies are tracked automatically, and there's no cleanup. 'What's
+          the current filter?' or 'is the panel open?' — signal."</p>
+        <p>"An <strong>observable</strong> is a stream of events over time. It may not have emitted yet, it needs
+          subscription and cleanup, and it has a large operator library for timing and coordination. 'Every
+          keystroke, debounced 300ms, cancelling the previous request' — that's inherently a stream and signals
+          have no equivalent to <code>debounceTime</code> or <code>switchMap</code>, deliberately."</p>
+        <p>"So in practice they compose, and the pattern I'd reach for is <strong>RxJS for the async pipeline,
+          signals at the boundary</strong>. Take a query signal, convert with <code>toObservable</code>, debounce
+          and <code>switchMap</code> the HTTP call, then <code>toSignal</code> the result back."</p>
+        <p>"The payoff is concrete: the template reads <code>results()</code> with no async pipe and no
+          subscription, and <code>toSignal</code> handles unsubscription on destroy. That eliminates the most
+          common source of Angular memory leaks while keeping the operators where they're genuinely needed."</p>
+        <p>"Where signals are a clear improvement: <strong>component state and derived values</strong>. A
+          <code>computed</code> is memoised, so the template-method performance problem disappears — and it
+          reads synchronously, so no <code>| async</code> and no <code>BehaviorSubject</code> plumbing for what
+          is really just a value."</p>
+        <p>"Where I'd stay with RxJS: anything with <strong>timing, cancellation, retries, or coordination
+          between streams</strong>. And the <code>HttpClient</code> returns observables, so the data layer is
+          naturally RxJS whatever you do at the component boundary."</p>
+        <p>"One misuse worth calling out: using <code>effect()</code> to derive one signal from another by
+          calling <code>set()</code> inside it. That creates a second source of truth that can drift, and Angular
+          discourages writing to signals in effects. <strong><code>computed()</code> derives;
+          <code>effect()</code> is for genuine side effects</strong> — logging, localStorage, calling into a
+          non-Angular library. Same distinction as React's 'don't use an effect to compute derived state'."</p>
+        <p>"On migration: I wouldn't rewrite working RxJS code. I'd use signals for new component state and for
+          places where a <code>BehaviorSubject</code> was only ever standing in for a value, and leave
+          established streams alone. The two interoperate specifically so this can be incremental."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know they're complementary rather than competing?</li>
+        <li>Can you name what signals can't do?</li>
+        <li>Do you know the <code>toSignal</code> boundary pattern and why it helps?</li>
+        <li>Do you know <code>computed</code> vs <code>effect</code>?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "signals replace RxJS."</li>
+        <li><span class="redflag">Red flag:</span> no awareness of the cleanup benefit.</li>
+        <li><span class="redflag">Red flag:</span> proposing a full rewrite to signals.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does <code>toSignal</code> handle errors?</li>
+          <li>What's the equivalent of <code>debounceTime</code> for signals?</li>
+          <li>How do signals enable zoneless change detection?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

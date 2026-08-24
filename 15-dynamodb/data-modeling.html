@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Single-Table Design — DynamoDB</title>
+<meta name="description" content="The access-pattern-first design process, overloaded keys, hierarchies, adjacency lists, and when a single table is the wrong choice.">
+<meta name="keywords" content="DynamoDB single table design access patterns overloaded keys generic PK SK entity prefix hierarchy adjacency list many to many GSI overloading write sharding composite sort key one to many">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="15-dynamodb/data-modeling.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Single-Table Design</h1>
+    <p class="subtitle">The technique DynamoDB is known for. Genuinely powerful, frequently misapplied, and it
+      starts with a list rather than a diagram.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Start with a written list of access patterns.</strong> Not an entity diagram.</li>
+      <li><strong>Generic key names</strong> — <code>PK</code>, <code>SK</code> — because they hold different
+        things per item type.</li>
+      <li><strong>Prefix key values with the entity type</strong>: <code>USER#123</code>,
+        <code>ORDER#1041</code>.</li>
+      <li><strong>The goal is one query per screen</strong>, returning several entity types together.</li>
+      <li><strong>Hierarchies go in the sort key</strong>, queried with <code>begins_with</code>.</li>
+      <li><strong>Adjacency lists</strong> handle many-to-many.</li>
+      <li><strong>Single-table isn't always right.</strong> Knowing when to use several tables matters.</li>
+    </ul>
+  </div>
+
+  <h2 id="why">Why one table <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>DynamoDB has no joins. So if a screen needs a user, their orders and their addresses, a table-per-entity
+      layout means three round trips.</p>
+    <p>Put them in <strong>one table sharing a partition key</strong>, and one query returns all three — because
+      they're physically adjacent, sorted by the sort key.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Table-per-entity is filing by document type: all invoices in one cabinet, all customers in another. To
+      assemble a customer's file you visit several cabinets.</p>
+    <p>Single-table is filing by customer: one folder per customer containing their details, their invoices and
+      their addresses, in order. One trip.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Benefit</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><strong>One query per screen</strong></td><td>Several entity types returned together — the main point</td></tr>
+        <tr><td><strong>Fewer round trips</strong></td><td>Latency is dominated by round trips, not by data volume</td></tr>
+        <tr><td><strong>Cheaper</strong></td><td>One table's capacity, and one query's overhead instead of N</td></tr>
+        <tr><td><strong>Transactional writes</strong></td><td>Related items can be written atomically</td></tr>
+        <tr><td><strong>Less to operate</strong></td><td>One table to monitor, back up, and configure</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="process">The design process <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <ol class="steps">
+    <li><strong>List every access pattern in writing.</strong> "Get a user by id." "List a user's orders, newest
+      first." "Get an order with its line items." Be exhaustive — this is the step that determines everything.</li>
+    <li><strong>Note the cardinality and direction</strong> of each relationship, and how often each pattern
+      runs.</li>
+    <li><strong>Design the primary key</strong> to serve the most frequent patterns.</li>
+    <li><strong>Add GSIs</strong> for patterns the primary key can't serve.</li>
+    <li><strong>Write out the resulting item shapes</strong> in a table and check every pattern against it.</li>
+    <li><strong>Verify no pattern needs a scan.</strong> If one does, go back to step 3.</li>
+  </ol>
+
+  <div class="note danger">
+    <div class="note-title">Step 1 is the whole thing</div>
+    <p style="margin:0">Everyone wants to skip to the key design. Every DynamoDB failure I've seen traces back
+      to an access pattern nobody wrote down.
+      <br><br>
+      The reason it matters so much more here than elsewhere: in Postgres, a missed query means adding an index.
+      In DynamoDB it can mean a table migration — because the primary key can't be changed and a new GSI may
+      not have the data it needs in the right shape.
+      <br><br>
+      <strong>The written list is the design artefact.</strong> It should be in the repository, and it should be
+      updated when a new pattern is added — because that's the moment to check whether the table still
+      supports it.</p>
+  </div>
+
+  <h2 id="keys">Overloaded keys <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — one table, several entity types"><code class="language-text">PK                  SK                        Other attributes
+------------------- ------------------------- ----------------------------------
+USER#123            PROFILE                   name, email, createdAt
+USER#123            ADDRESS#home              line1, city, postcode
+USER#123            ADDRESS#work              line1, city, postcode
+USER#123            ORDER#2024-06-01#1041     total, status
+USER#123            ORDER#2024-05-14#0987     total, status
+ORDER#1041          METADATA                  userId, total, status, placedAt
+ORDER#1041          LINE#001                  sku, qty, unitPrice
+ORDER#1041          LINE#002                  sku, qty, unitPrice
+PRODUCT#KB-01       METADATA                  name, price, stock</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Access pattern</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>Get a user's profile</td><td><code>PK = USER#123, SK = PROFILE</code> — a single item read</td></tr>
+        <tr><td>Get everything about a user</td><td><code>PK = USER#123</code> — profile, addresses and orders in one query</td></tr>
+        <tr><td>List a user's addresses only</td><td><code>PK = USER#123, begins_with(SK, "ADDRESS#")</code></td></tr>
+        <tr><td>A user's orders, newest first</td><td><code>begins_with(SK, "ORDER#")</code>, <code>ScanIndexForward = false</code></td></tr>
+        <tr><td>A user's orders in June</td><td><code>begins_with(SK, "ORDER#2024-06")</code></td></tr>
+        <tr><td>Get an order with its lines</td><td><code>PK = ORDER#1041</code> — metadata and all lines in one query</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The two conventions that make this work</span>
+    <p><strong>1. Generic key names.</strong> <code>PK</code> and <code>SK</code>, not
+      <code>userId</code> and <code>orderDate</code> — because they hold different things depending on the item
+      type.</p>
+    <p><strong>2. Type-prefixed values.</strong> <code>USER#123</code> rather than <code>123</code>, so the key
+      space is unambiguous and <code>begins_with</code> can filter by type.</p>
+    <p>The <code>#</code> is conventional and any delimiter works, as long as it can't appear in an id.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Why <code>METADATA</code> as a sort key</div>
+    <p style="margin:0">An entity's own attributes need a sort key value, and it should <strong>sort before its
+      children</strong> so a single query returns the parent first.
+      <br><br>
+      <code>METADATA</code>, <code>#META</code>, or just <code>A</code> — whatever sorts early. Some people use
+      the entity type itself (<code>ORDER#1041</code> / <code>ORDER#1041</code>) so the item is
+      self-describing.
+      <br><br>
+      Practical benefit: querying <code>PK = ORDER#1041</code> with <code>Limit = 1</code> gets just the order
+      header cheaply, and without the limit you get the header plus every line in one call.</p>
+  </div>
+
+  <h2 id="hierarchies">Hierarchies in the sort key <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="text — location hierarchy, one key"><code class="language-text">PK              SK
+--------------- --------------------------------------
+STORE           COUNTRY#UK#REGION#SE#CITY#LONDON#S#001
+STORE           COUNTRY#UK#REGION#SE#CITY#LONDON#S#002
+STORE           COUNTRY#UK#REGION#NW#CITY#MANCH#S#010
+STORE           COUNTRY#IE#REGION#L#CITY#DUBLIN#S#020
+
+Queries, all with begins_with on SK:
+  All UK stores          -> "COUNTRY#UK"
+  All South East stores  -> "COUNTRY#UK#REGION#SE"
+  All London stores      -> "COUNTRY#UK#REGION#SE#CITY#LONDON"</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — one key serves every level</div>
+    <p style="margin:0">A composite sort key encoding a hierarchy from broadest to narrowest gives you a query
+      at <strong>every level of granularity</strong> with a single index. In a relational database that's
+      several indexes or a recursive CTE.
+      <br><br>
+      The constraint is the same as any prefix: <strong>you can only query left to right</strong>. "All stores
+      in cities called London, in any country" doesn't work — city isn't a prefix. That's the trade, and it's
+      why the ordering of levels has to match how you'll query.
+      <br><br>
+      Being able to explain both the capability and the left-to-right constraint is what distinguishes
+      understanding it from having read about it.</p>
+  </div>
+
+  <h2 id="adjacency">Adjacency lists for many-to-many <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="text — students and courses"><code class="language-text">PK                SK                Attributes
+----------------- ----------------- --------------------
+STUDENT#s1        STUDENT#s1        name, email          (the entity itself)
+COURSE#c1         COURSE#c1         title, credits       (the entity itself)
+STUDENT#s1        COURSE#c1         enrolledAt, grade    (the relationship)
+STUDENT#s1        COURSE#c2         enrolledAt, grade
+STUDENT#s2        COURSE#c1         enrolledAt, grade
+
+Primary key:  PK = STUDENT#s1  -> that student's courses
+GSI (SK, PK): PK = COURSE#c1   -> that course's students</code></pre>
+
+  <div class="simple">
+    <span class="sm-label">How the inverted GSI works</span>
+    <p>The relationship item is stored once, with the student as <code>PK</code> and the course as
+      <code>SK</code>.</p>
+    <p>A GSI with the keys <strong>swapped</strong> — <code>SK</code> as partition key, <code>PK</code> as sort
+      key — lets you query the relationship from the other direction. Same item, both directions, one extra
+      index.</p>
+    <p>That inverted GSI is a standard part of the single-table toolkit, and it usually serves several reverse
+      lookups at once rather than just one.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Denormalize onto the relationship item</div>
+    <p style="margin:0">Querying a student's courses returns relationship items with course <em>ids</em>. Getting
+      the course titles means a second <code>BatchGetItem</code> — the N+1 problem again.
+      <br><br>
+      So copy the fields the screen displays — <code>courseTitle</code>, <code>credits</code> — onto the
+      relationship item. One query renders the page.
+      <br><br>
+      That's the <a href="../13-mongodb/fundamentals.html#extended-reference">extended reference pattern</a>,
+      and here it's not optional in the way it is in MongoDB, because there's no <code>$lookup</code> fallback at
+      all. Keep the duplicated fields to ones that rarely change, and use
+      <a href="operations.html#streams">Streams</a> to update them when they do.</p>
+  </div>
+
+  <h2 id="gsi-overloading">GSI overloading <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="text — one GSI, several access patterns"><code class="language-text">Items carry generic GSI keys whose meaning depends on the item type:
+
+PK            SK          GSI1PK             GSI1SK
+------------- ----------- ------------------ ------------------
+USER#123      PROFILE     EMAIL#a@x.com      USER#123
+ORDER#1041    METADATA    STATUS#pending     2024-06-01#1041
+PRODUCT#KB-01 METADATA    CATEGORY#input     KB-01
+
+One GSI on (GSI1PK, GSI1SK) serves:
+  - look up a user by email
+  - list pending orders by date
+  - list products in a category</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why overload rather than add indexes</div>
+    <p style="margin:0">Each GSI is a <strong>full maintained copy</strong> of the projected attributes, with its
+      own capacity, and every base-table write propagates to every index. So five GSIs means five copies to
+      write.
+      <br><br>
+      Overloading one GSI to serve several unrelated patterns keeps that cost down. It works because different
+      item types simply put different things in <code>GSI1PK</code>, and each query knows which prefix it's
+      looking for.
+      <br><br>
+      Combined with the <strong>sparse index</strong> property — items that don't set <code>GSI1PK</code> aren't
+      in the index at all — one GSI can cover a surprising number of patterns.
+      <br><br>
+      The honest cost: <strong>readability</strong>. A table where <code>GSI1PK</code> means four different
+      things is hard for a newcomer to reason about, and impossible to understand without the access-pattern
+      document. That's a real maintenance burden and the main argument for restraint.</p>
+  </div>
+
+  <h2 id="write-sharding">Write sharding for hot partitions <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <pre data-label="text — spreading a hot key"><code class="language-text">Problem: PK = "COUNTER#global" takes all writes -> one partition, 1,000 WCU cap
+
+Solution: add a deterministic or random suffix
+  COUNTER#global#0 .. COUNTER#global#9      -> 10 partitions, 10,000 WCU
+
+Reading the total: query all 10 and sum in the application.</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Suffix strategy</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Random</strong> (0–N)</td><td>Even spread; reads must query all N shards</td></tr>
+        <tr><td><strong>Deterministic</strong> — <code>hash(id) % N</code></td><td>Even spread, and <strong>a single item is still directly addressable</strong></td></tr>
+        <tr><td><strong>Time-based</strong> — an hour bucket</td><td>Natural for time-series; reads target a window</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Prefer deterministic suffixes</div>
+    <p style="margin:0">A random suffix means you can no longer compute an item's key from its identity — so a
+      point read becomes a query across all N shards, and you've traded a cheap read for a fan-out.
+      <br><br>
+      Deriving the suffix from a hash of the item's own id keeps single-item reads direct while still spreading
+      writes. Same reasoning as
+      <a href="../14-cosmos-db/fundamentals.html#synthetic">Cosmos synthetic keys</a>.
+      <br><br>
+      Random is only right when you genuinely never read a single item — a pure aggregate counter, where every
+      read sums all shards anyway.</p>
+  </div>
+
+  <h2 id="when-not">When single-table is the wrong choice <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Use several tables when</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Entities are genuinely unrelated</strong></td>
+          <td>No query ever needs them together, so co-locating buys nothing</td>
+        </tr>
+        <tr>
+          <td><strong>Very different access volumes</strong></td>
+          <td>High-volume telemetry alongside low-volume config means one capacity setting serving two
+              incompatible workloads</td>
+        </tr>
+        <tr>
+          <td><strong>Different lifecycles</strong></td>
+          <td>One needs TTL expiry, another must be retained for seven years</td>
+        </tr>
+        <tr>
+          <td><strong>Different backup or compliance needs</strong></td>
+          <td>Table-level, so mixing forces the strictest policy on everything</td>
+        </tr>
+        <tr>
+          <td><strong>Separate services own the data</strong></td>
+          <td>A shared table is a shared database — the coupling microservices exist to avoid</td>
+        </tr>
+        <tr>
+          <td><strong>The team is new to DynamoDB</strong></td>
+          <td>A bad single-table design is worse than a straightforward multi-table one</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — being willing to say no to it</div>
+    <p style="margin:0">Single-table design is treated as the correct DynamoDB answer, and it's a
+      <strong>technique with a purpose</strong>: eliminating round trips for entities read together. If nothing
+      is read together, it delivers complexity and no benefit.
+      <br><br>
+      The strongest argument against it is the one people don't make: <strong>it optimises for access patterns
+      you know today and makes changing them harder.</strong> A table where four entity types share overloaded
+      keys is difficult to evolve, and impossible to understand without the design document.
+      <br><br>
+      So my position: use it where entities are genuinely accessed together and the patterns are stable. Use
+      separate tables where they aren't. And if the team is new to DynamoDB, a clear multi-table design that
+      works beats a clever single-table design nobody can safely change.
+      <br><br>
+      Saying that is a stronger signal than demonstrating the pattern, because the pattern is well documented
+      and the judgement isn't.</p>
+  </div>
+
+  <h2 id="migration">Adding an access pattern later <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Situation</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>The data is there, keyed wrong</strong></td>
+          <td><strong>Add a GSI.</strong> Online, backfilled automatically, no downtime</td>
+        </tr>
+        <tr>
+          <td><strong>Need a new attribute in the key</strong></td>
+          <td>Backfill the attribute onto existing items, then add a GSI on it</td>
+        </tr>
+        <tr>
+          <td><strong>The primary key itself is wrong</strong></td>
+          <td><strong>New table plus migration.</strong> The expensive case</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Adding a GSI is easier than people expect</div>
+    <p style="margin:0">A new GSI is created and backfilled <strong>online</strong> — the table stays available
+      throughout. It consumes write capacity during the backfill, so on-demand mode or temporarily raised
+      capacity avoids throttling live traffic.
+      <br><br>
+      So "we need a new access pattern" is often a GSI, not a migration. The genuinely expensive case is when
+      the <em>primary key</em> is wrong, because that can't be changed — that's a new table, dual writes, a
+      backfill, and a cutover.
+      <br><br>
+      Which is why step 3 of the design process deserves the most scrutiny: GSIs are recoverable, the primary
+      key isn't.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Write the access patterns down first. That list is the design artefact.</li>
+      <li>Generic key names with type-prefixed values.</li>
+      <li>A sort key prefix scheme gives you per-type and per-range queries from one key.</li>
+      <li>Hierarchies encode broadest-to-narrowest, queried left to right only.</li>
+      <li>Adjacency lists plus an inverted GSI handle many-to-many.</li>
+      <li>Denormalize display fields onto relationship items — there's no join fallback.</li>
+      <li>Overload one GSI across item types rather than adding many.</li>
+      <li>Deterministic shard suffixes keep point reads possible.</li>
+      <li>Separate tables when entities aren't read together, or have different volumes or lifecycles.</li>
+      <li>New GSIs are online and cheap; a wrong primary key means a table migration.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Designing from an entity diagram</strong> instead of access patterns.</li>
+    <li><strong>Not writing the access patterns down</strong>, so nobody can check a change against them.</li>
+    <li><strong>Meaningful key names</strong> like <code>userId</code> in a multi-entity table.</li>
+    <li><strong>No type prefixes</strong>, making the key space ambiguous.</li>
+    <li><strong>Non-sortable sort keys</strong> — unpadded numbers, non-ISO dates.</li>
+    <li><strong>A GSI per access pattern</strong> instead of overloading.</li>
+    <li><strong>Random shard suffixes</strong>, destroying point reads.</li>
+    <li><strong>Not denormalizing display fields</strong>, causing N+1 batch gets.</li>
+    <li><strong>Single-table for unrelated entities</strong>, all cost and no benefit.</li>
+    <li><strong>A shared table across services</strong>, recreating the shared-database problem.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Design a DynamoDB table for an e-commerce system. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by asking for the <strong>access patterns</strong>, because in DynamoDB you can't design
+          the table without them — the key structure <em>is</em> the query capability, and there's no planner to
+          compensate. If I designed from an entity diagram I'd build something that can't answer the
+          questions."</p>
+        <p>"Let me assume a reasonable set: get a user's profile; list a user's orders newest first; get an order
+          with its line items; look up a user by email; list products in a category; find pending orders for
+          fulfilment."</p>
+        <p>"<strong>Primary key:</strong> generic <code>PK</code> and <code>SK</code>, with type-prefixed
+          values."</p>
+        <p>"A user's profile is <code>PK = USER#123, SK = PROFILE</code>. Their orders are
+          <code>PK = USER#123, SK = ORDER#2024-06-01#1041</code>. So querying
+          <code>PK = USER#123</code> with <code>begins_with(SK, "ORDER#")</code> and
+          <code>ScanIndexForward = false</code> gives their orders newest first — and because the date is in the
+          sort key, I also get 'orders in June' for free with a longer prefix. Querying
+          <code>PK = USER#123</code> with no sort condition returns the profile <em>and</em> the orders in one
+          call."</p>
+        <p>"Order detail is a separate partition: <code>PK = ORDER#1041</code> with
+          <code>SK = METADATA</code> for the header and <code>SK = LINE#001</code> onwards for the items. One
+          query returns the order and every line — which is the main thing single-table design buys you, since
+          there's no join."</p>
+        <p>"That means the order is stored in two places — as a summary item under the user, and as a full
+          record under its own partition. That's deliberate duplication, and it's correct here: the list view
+          needs a few fields, the detail view needs everything, and both should be single queries."</p>
+        <p>"<strong>For the remaining patterns I'd use one overloaded GSI</strong> rather than three separate
+          ones, because each GSI is a full maintained copy with its own capacity and every write propagates to
+          all of them."</p>
+        <p>"So items carry generic <code>GSI1PK</code>/<code>GSI1SK</code> whose meaning depends on type. The
+          user profile sets <code>GSI1PK = EMAIL#a@x.com</code> for email lookup. Products set
+          <code>GSI1PK = CATEGORY#input</code>. That one index serves both."</p>
+        <p>"<strong>Pending orders I'd do as a sparse index</strong>, because that's the trap in this question. A
+          GSI on <code>status</code> would be a hot partition — five distinct values means every pending order
+          in one partition, capped at 1,000 WCU, and since a GSI shares the write path, throttling there
+          throttles base-table writes. Instead I'd write a <code>pendingSince</code> attribute only while the
+          order is pending and remove it when the status changes. Items without the attribute aren't in the
+          index, so it contains just the working set and shrinks automatically as orders are fulfilled."</p>
+        <p>"For that index's partition key I'd use a date bucket rather than a constant, so it spreads across
+          partitions while a fulfilment worker can still target recent days."</p>
+        <p>"<strong>Denormalization I'd be explicit about.</strong> The order summary under the user carries
+          the total and status so the list renders from one query. Line items carry the product name and price
+          <em>as at purchase time</em> — which isn't really denormalization, it's a
+          <a href="../10-sql/fundamentals.html#denormalization">historical snapshot</a>: an invoice must show
+          what was charged then, not today's price. Joining to the current product would be a genuine bug."</p>
+        <p>"<strong>Projections:</strong> <code>INCLUDE</code> with just the attributes each query needs, not
+          <code>ALL</code> — <code>ALL</code> duplicates the whole table and doubles write cost."</p>
+        <p>"Two things I'd flag. <strong>Reporting and analytics don't belong here</strong> — no aggregation, no
+          joins — so I'd stream to S3 or a warehouse via DynamoDB Streams for that. And I'd keep the access
+          pattern list in the repository, so when someone adds a feature there's a defined place to check
+          whether the table still supports it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask for access patterns before designing?</li>
+        <li>Do you use generic keys with type prefixes?</li>
+        <li>Do you get several entity types from one query?</li>
+        <li>Do you overload a GSI rather than adding several?</li>
+        <li>Do you catch the status hot-partition trap and use a sparse index?</li>
+        <li>Do you distinguish snapshot data from denormalization?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> a table per entity, with joins done in application code.</li>
+        <li><span class="redflag">Red flag:</span> a GSI on <code>status</code>.</li>
+        <li><span class="redflag">Red flag:</span> designing before asking what the queries are.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you handle "all orders across all users last month"?</li>
+          <li>How do you keep the duplicated order summary in sync?</li>
+          <li>What if a new access pattern appears after launch?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Is single-table design always the right approach? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"No, and I think it's over-applied — largely because it's the impressive-sounding answer."</p>
+        <p>"It's a technique with a specific purpose: <strong>eliminating round trips for entities that are read
+          together</strong>. DynamoDB has no joins, so if a screen needs a user plus their orders plus their
+          addresses, co-locating them under one partition key turns three queries into one. That's a real and
+          significant win."</p>
+        <p>"But the benefit is entirely conditional on <em>being read together</em>. If the entities are never
+          queried in the same request, putting them in one table delivers the complexity and none of the
+          benefit."</p>
+        <p>"Where I'd use separate tables:"</p>
+        <p>"<strong>Genuinely unrelated entities.</strong> No query needs them together, so nothing is
+          gained."</p>
+        <p>"<strong>Very different access volumes.</strong> High-volume telemetry alongside low-volume
+          configuration means one capacity configuration serving two incompatible workloads, and a traffic spike
+          in one throttles the other."</p>
+        <p>"<strong>Different lifecycles.</strong> TTL is table-level. If one entity type should expire after 30
+          days and another must be retained for seven years, that's awkward in one table. Same for backup and
+          compliance settings."</p>
+        <p>"<strong>Separate services owning the data.</strong> A shared table is a shared database — exactly
+          the coupling microservices exist to avoid. Two services with overloaded keys in one table can't deploy
+          or evolve independently."</p>
+        <p>"<strong>And team familiarity.</strong> A poorly-executed single-table design is considerably worse
+          than a straightforward multi-table one — scans everywhere because the keys don't fit, and nobody
+          confident enough to change it. A clear design that works beats a clever one nobody can safely
+          modify."</p>
+        <p>"The argument against it that I think is underweighted: <strong>it optimises for the access patterns
+          you know today, and makes changing them harder.</strong> Overloaded keys mean the table's meaning
+          lives in a design document rather than in the schema. Six months later, a new engineer looking at
+          <code>GSI1PK</code> holding four different kinds of value has no way to understand it from the data
+          alone. That's a real maintenance cost, and it's rarely mentioned alongside the performance
+          benefit."</p>
+        <p>"So my position: single-table where entities are genuinely accessed together and the patterns are
+          stable. Separate tables otherwise. And if the access patterns aren't settled yet, that's an argument
+          against DynamoDB entirely rather than an argument about table count."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know what problem it actually solves?</li>
+        <li>Can you name concrete cases against it?</li>
+        <li>Do you raise the maintainability cost?</li>
+        <li>Do you connect it to service boundaries?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "yes, it's the DynamoDB way."</li>
+        <li><span class="redflag">Red flag:</span> "no, it's too complex" with no analysis.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you document a single-table design?</li>
+          <li>What if two services need the same data?</li>
+          <li>How do you handle different TTL requirements?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

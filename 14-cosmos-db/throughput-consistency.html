@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Throughput &amp; Consistency — Cosmos DB</title>
+<meta name="description" content="Request Units and what consumes them, provisioned vs autoscale vs serverless, handling 429s, and the five consistency levels.">
+<meta name="keywords" content="Cosmos DB request units RU/s provisioned autoscale serverless throttling 429 retry after consistency levels strong bounded staleness session consistent prefix eventual session token">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="14-cosmos-db/throughput-consistency.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Throughput &amp; Consistency</h1>
+    <p class="subtitle">RU/s is the currency of Cosmos DB. Consistency is the one dial no other mainstream
+      database exposes this explicitly.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>1 RU</strong> ≈ a point read of a 1 KB item. Writes cost roughly 5× a read of the same
+        item.</li>
+      <li><strong>Exceeding provisioned RU/s gives HTTP 429</strong>, with a <code>retry-after</code> header.</li>
+      <li><strong>The SDK retries 429s automatically.</strong> Don't write your own retry.</li>
+      <li><strong>Provisioned</strong> for steady load, <strong>autoscale</strong> for spiky,
+        <strong>serverless</strong> for intermittent and small.</li>
+      <li><strong>Autoscale costs 1.5× per RU</strong> but scales 10:1, so it wins when utilisation is
+        under ~66%.</li>
+      <li><strong>Five consistency levels.</strong> <strong>Session</strong> is the default and usually
+        correct.</li>
+      <li><strong>Stronger consistency costs more RU on reads</strong> — consistency is billed.</li>
+    </ul>
+  </div>
+
+  <h2 id="ru">Request Units <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>An RU is a normalised unit of work covering CPU, memory and IOPS together. Every operation has a
+      measured RU cost, and you provision RU <em>per second</em>.</p>
+    <p>The reference point: <strong>a point read of a 1 KB item costs 1 RU</strong>. Everything else is
+      relative to that.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Operation</th><th>Typical cost</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Point read</strong> (pk + id), 1 KB</td><td><strong>1 RU</strong></td><td>The cheapest possible read. Always prefer this</td></tr>
+        <tr><td>Point read, 100 KB</td><td>~10 RU</td><td>Scales with item size</td></tr>
+        <tr><td><strong>Create / replace</strong>, 1 KB</td><td><strong>~5 RU</strong></td><td>Writes maintain every indexed path</td></tr>
+        <tr><td>Delete</td><td>~5 RU</td><td>Index maintenance again</td></tr>
+        <tr><td><strong>Patch</strong> (partial update)</td><td>~5 RU, often less</td><td>Cheaper than replace on large items</td></tr>
+        <tr><td>Single-partition query, 100 results</td><td>~10–50 RU</td><td>Depends on results and index use</td></tr>
+        <tr><td><strong>Cross-partition query</strong></td><td><strong>Multiplies by partition count</strong></td><td>The main source of unexpected cost</td></tr>
+        <tr><td><code>COUNT(*)</code> across partitions</td><td>Can be hundreds or thousands</td><td>Scans everything</td></tr>
+        <tr><td>Stored procedure</td><td>Sum of its operations, plus overhead</td><td>Rarely worth it</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The mental model</span>
+    <p><strong>Writes cost about 5× reads, because every indexed path is maintained.</strong></p>
+    <p>Which gives a Cosmos-specific optimisation with no equivalent elsewhere: <strong>excluding paths from the
+      indexing policy directly reduces write cost.</strong> On a write-heavy container that's often the single
+      biggest saving available.</p>
+    <p>Covered on the <a href="queries-indexing.html#policy">indexing page</a>.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Every response tells you what it cost</div>
+    <pre data-label="csharp"><code class="language-csharp">var response = await container.ReadItemAsync&lt;Order&gt;(id, new PartitionKey(tenantId));
+logger.LogInformation("{RU} RU", response.RequestCharge);
+
+// Queries: accumulate across pages, since each page is charged
+double total = 0;
+using var iterator = container.GetItemQueryIterator&lt;Order&gt;(query);
+while (iterator.HasMoreResults)
+{
+    var page = await iterator.ReadNextAsync();
+    total += page.RequestCharge;
+}</code></pre>
+    <p style="margin:0"><code>RequestCharge</code> is the single most useful diagnostic in Cosmos. A lookup you
+      expected to be 1 RU costing 200 RU means it's a cross-partition query — and nothing else in the response
+      tells you that.
+      <br><br>
+      Note the query case: <strong>each page is charged separately</strong>, so a single logical query returning
+      1,000 items across 10 pages has 10 charges to add up. Measuring only the first page understates the cost
+      badly.</p>
+  </div>
+
+  <h2 id="throughput-models">Provisioned, autoscale, or serverless <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Provisioned</th><th>Autoscale</th><th>Serverless</th></tr></thead>
+      <tbody>
+        <tr><td>You set</td><td>A fixed RU/s</td><td>A <strong>maximum</strong> RU/s</td><td>Nothing</td></tr>
+        <tr><td>Scales</td><td>Only when you change it</td><td>Between 10% and 100% of max, automatically</td><td>Per request</td></tr>
+        <tr><td>Billing</td><td>The provisioned amount, always</td><td>Highest RU/s used per hour</td><td>Per RU consumed</td></tr>
+        <tr><td>Cost per RU</td><td>Baseline</td><td><strong>1.5×</strong></td><td>Higher still</td></tr>
+        <tr><td>Minimum</td><td>400 RU/s</td><td>1,000 RU/s max (so 100 floor)</td><td>None</td></tr>
+        <tr><td>Ceiling</td><td>Very high</td><td>Very high</td><td><strong>5,000 RU/s, 1 TB</strong></td></tr>
+        <tr><td>Multi-region</td><td>Yes</td><td>Yes</td><td><strong>Single region only</strong></td></tr>
+        <tr><td>Best for</td><td><strong>Steady, predictable load</strong></td><td><strong>Spiky or unknown load</strong></td><td>Dev/test, intermittent workloads</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the autoscale break-even</div>
+    <p style="margin:0">Autoscale costs <strong>1.5× per RU</strong> but scales down to 10% of the maximum. So
+      the arithmetic:
+      <br><br>
+      If average utilisation is <strong>below about 66%</strong>, autoscale is cheaper — you're paying 1.5× for
+      the RU you use, but you're not paying for idle headroom. Above that, provisioned wins because the 1.5×
+      premium exceeds what you'd save.
+      <br><br>
+      So the question isn't "is autoscale better?", it's <strong>"what's our average utilisation against
+      peak?"</strong> A workload at a steady 80% should be provisioned. One that idles overnight and spikes
+      during business hours should be autoscale.
+      <br><br>
+      Being able to state that break-even is a strong signal, because most people treat autoscale as either
+      obviously good or obviously more expensive.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two limits that catch people</div>
+    <p style="margin:0"><strong>Autoscale's floor is 10% of the maximum.</strong> Set the max to 20,000 RU/s and
+      you never pay less than 2,000 RU/s, even at 3am with zero traffic. So an unnecessarily high maximum has a
+      real, permanent cost.
+      <br><br>
+      <strong>Serverless is capped at 5,000 RU/s and one region.</strong> Excellent for dev/test and genuinely
+      intermittent workloads, and it cannot be your production database if you need multi-region — which is the
+      main reason to use Cosmos at all. Migrating from serverless to provisioned means a new account, not a
+      setting change.</p>
+  </div>
+
+  <h2 id="throttling">Throttling and 429s <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What actually happens</span>
+    <p>Exceed your RU/s and Cosmos returns <strong>HTTP 429 Too Many Requests</strong> with a
+      <code>x-ms-retry-after-ms</code> header telling you exactly how long to wait.</p>
+    <p>It's not an error condition in the usual sense — it's flow control. A small number of 429s is normal and
+      means you're using the capacity you paid for.</p>
+  </div>
+
+  <pre data-label="csharp — the SDK already handles this" class="code-good"><code class="language-csharp">new CosmosClientOptions
+{
+    // The SDK retries automatically, honouring retry-after
+    MaxRetryAttemptsOnRateLimitedRequests = 9,
+    MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.FromSeconds(30)
+}
+
+// Only if you need to react to exhausted retries
+try { await container.CreateItemAsync(item, new PartitionKey(pk)); }
+catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests)
+{
+    // All retries used. Shed load, queue it, or surface backpressure.
+    logger.LogWarning("Throttled after retries, retry-after {Ms}ms", ex.RetryAfter?.TotalMilliseconds);
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Don't write your own retry loop</div>
+    <p style="margin:0">The SDK's retry respects the <code>retry-after</code> value the service supplies, which
+      is calculated from actual capacity. A hand-rolled exponential backoff either waits too long (adding
+      latency) or too little (adding load to a service that's already telling you to slow down).
+      <br><br>
+      Worse, a custom retry on top of the SDK's gives you <strong>multiplicative retries</strong> — 9 SDK
+      attempts × 3 of yours is 27 requests for one logical operation, which turns a brief throttle into
+      <a href="../08-http-web-apis/reliability.html#retries">retry amplification</a>.
+      <br><br>
+      Configure the SDK's limits and let it do the work.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Persistent 429s mean</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Genuinely under-provisioned</strong></td><td>Raise RU/s, or switch to autoscale</td></tr>
+        <tr><td><strong>A hot partition</strong></td><td>Fix the <a href="fundamentals.html#hot-partitions">partition key</a>. More RU/s won't help</td></tr>
+        <tr><td><strong>Expensive queries</strong></td><td>Cross-partition fan-out, or missing index coverage</td></tr>
+        <tr><td><strong>A bulk job competing with live traffic</strong></td><td>Throttle the job, or run it against a separate container</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The diagnostic that distinguishes them</div>
+    <p style="margin:0"><strong>429s while overall RU consumption is low</strong> means a hot partition, not
+      under-provisioning. Check <em>Normalized RU Consumption</em> per partition key range — if one is at 100%
+      and the rest are near zero, adding throughput is money wasted.
+      <br><br>
+      <strong>429s with overall consumption near 100%</strong> means you're genuinely at capacity, and either
+      the queries are too expensive or you need more RU/s.
+      <br><br>
+      Same symptom, opposite fixes. Getting this wrong is how teams end up paying for 10× the throughput they
+      need while still being throttled.</p>
+  </div>
+
+  <h2 id="consistency">The five consistency levels <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>Guarantee</th><th>Read RU</th><th>Latency</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Strong</strong></td>
+          <td>Always the latest committed write. Linearizable</td>
+          <td><strong>2×</strong></td>
+          <td>Highest — waits for a quorum</td>
+        </tr>
+        <tr>
+          <td><strong>Bounded staleness</strong></td>
+          <td>At most K versions or T seconds behind</td>
+          <td><strong>2×</strong></td>
+          <td>High</td>
+        </tr>
+        <tr>
+          <td><strong>Session</strong> <em>(default)</em></td>
+          <td><strong>Read-your-own-writes</strong> within a session</td>
+          <td><strong>1×</strong></td>
+          <td>Low</td>
+        </tr>
+        <tr>
+          <td><strong>Consistent prefix</strong></td>
+          <td>Never see writes out of order; may be behind</td>
+          <td>1×</td>
+          <td>Low</td>
+        </tr>
+        <tr>
+          <td><strong>Eventual</strong></td>
+          <td>No ordering guarantee at all</td>
+          <td>1×</td>
+          <td>Lowest</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Session is the default, and it's the right answer for most applications.</strong></p>
+    <p>It gives read-your-own-writes — the guarantee users actually notice — at eventual-consistency cost and
+      latency. That's the combination that matters: users care that <em>their</em> change appears, not that
+      someone else's does instantly.</p>
+    <p>And note <strong>Strong and Bounded staleness cost 2× RU on reads</strong>. Consistency is literally
+      billed here, which is unusual and worth knowing.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p><strong>Strong</strong> — everyone reads from the single master copy. Correct, and there's a queue.</p>
+    <p><strong>Session</strong> — you always see your own edits immediately; other people's may take a moment
+      to reach you.</p>
+    <p><strong>Consistent prefix</strong> — you may be reading an older revision, but never a scrambled one:
+      you'll never see chapter 3 before chapter 2.</p>
+    <p><strong>Eventual</strong> — you get whichever copy is nearest, in whatever state it's in.</p>
+  </div>
+
+  <h3 id="session-tokens">How Session consistency works <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <div class="simple">
+    <span class="sm-label">The mechanism</span>
+    <p>Every write returns a <strong>session token</strong>. The SDK sends it with subsequent reads, and a
+      replica that hasn't caught up to that token <em>waits</em> rather than returning stale data.</p>
+    <p>The token is held by the <code>CosmosClient</code> instance — which is why the client must be a
+      singleton, and why session consistency silently breaks across process boundaries.</p>
+  </div>
+
+  <pre data-label="csharp — passing the token across services" class="code-good"><code class="language-csharp">// Service A writes and captures the token
+var response = await container.CreateItemAsync(order, new PartitionKey(tenantId));
+string token = response.Headers.Session;
+
+// Pass it to service B (header, message property, whatever the transport is)
+// Service B supplies it, so its read is guaranteed to see the write
+var read = await container.ReadItemAsync&lt;Order&gt;(
+    order.Id, new PartitionKey(tenantId),
+    new ItemRequestOptions { SessionToken = token });</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">The distributed read-your-own-writes gap</div>
+    <p style="margin:0">Session consistency is scoped to a <strong>client instance</strong>. So:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>A new <code>CosmosClient</code> per request</strong> means a new session each time — no
+        read-your-own-writes at all, and this is invisible until it isn't.</li>
+      <li><strong>Two services</strong> have separate sessions. Service A writes, service B reads, and B can
+        miss it.</li>
+      <li><strong>Scaled-out instances</strong> behind a load balancer have separate sessions. The write hits
+        instance 1 and the follow-up read hits instance 3, which never saw the token.</li>
+    </ul>
+    <p style="margin:8px 0 0">The fix is to <strong>propagate the session token</strong> explicitly, as above.
+      That's the answer to "how do you guarantee read-your-own-writes across services?" — and most people don't
+      know the token can be passed around, so they reach for Strong consistency instead and pay 2× RU plus
+      latency for something Session already provides.</p>
+  </div>
+
+  <h3 id="choosing-consistency">Choosing a level</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Requirement</th><th>Level</th></tr></thead>
+      <tbody>
+        <tr><td>General application data</td><td><strong>Session</strong></td></tr>
+        <tr><td>Financial balances, stock counts, anything you act on irreversibly</td><td><strong>Strong</strong> — but note it constrains multi-region writes</td></tr>
+        <tr><td>Dashboards, analytics, feeds</td><td><strong>Eventual</strong> — cheapest and fastest</td></tr>
+        <tr><td>Event or audit ordering matters, freshness doesn't</td><td><strong>Consistent prefix</strong></td></tr>
+        <tr><td>"No more than 5 seconds stale", with a guarantee</td><td><strong>Bounded staleness</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the multi-region constraint on Strong</div>
+    <p style="margin:0"><strong>Strong consistency requires a write quorum across regions</strong>, so every
+      write pays inter-region latency — potentially hundreds of milliseconds for geographically distant
+      regions.
+      <br><br>
+      And it's <strong>incompatible with multi-region writes</strong>. You can have globally-distributed writes
+      or Strong consistency, not both. That's not a Cosmos limitation so much as CAP arithmetic — you cannot
+      have linearizability and independent regional write acceptance simultaneously.
+      <br><br>
+      So "we'll use Strong to be safe" quietly gives up the main reason you chose Cosmos. The better answer is
+      Session globally, with Strong scoped to the specific operations that genuinely need it — the level is
+      configurable <strong>per request</strong>, downwards from the account default.
+      <br><br>
+      Note the direction: a request can weaken consistency below the account default, never strengthen it. So
+      the account default should be the strongest level any operation needs.</p>
+  </div>
+
+  <h2 id="cost-control">Controlling cost <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Lever</th><th>Typical impact</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Point reads instead of queries</strong></td><td>1 RU vs 10–1000. The largest single win</td></tr>
+        <tr><td><strong>Exclude unqueried paths from the index</strong></td><td>Directly reduces write RU</td></tr>
+        <tr><td><strong>Avoid cross-partition queries</strong></td><td>Multiplies by partition count</td></tr>
+        <tr><td><strong>Smaller items</strong></td><td>RU scales with size on both reads and writes</td></tr>
+        <tr><td><strong>Patch instead of replace</strong></td><td>Meaningful on large items</td></tr>
+        <tr><td><strong>TTL instead of delete jobs</strong></td><td>TTL uses spare RU — effectively free</td></tr>
+        <tr><td><strong>Autoscale when utilisation is under ~66%</strong></td><td>Stops paying for idle headroom</td></tr>
+        <tr><td><strong>Eventual consistency where acceptable</strong></td><td>Halves read RU vs Strong</td></tr>
+        <tr><td><strong>Integrated cache</strong></td><td>Repeated point reads become 0 RU</td></tr>
+        <tr><td><strong>Analytical store for reporting</strong></td><td>Removes analytics from the RU budget entirely</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">The analytical store is the answer to "reporting is eating our RU"</div>
+    <p style="margin:0"><strong>Azure Synapse Link</strong> maintains a column-oriented copy of your data,
+      updated automatically from the change feed, billed on storage and scan — <strong>not RU</strong>.
+      <br><br>
+      So analytical queries stop competing with your transactional workload for throughput, which is otherwise
+      one of the most common causes of production throttling.
+      <br><br>
+      It's a checkbox per container plus a small storage cost, and it's the structurally correct answer rather
+      than trying to make aggregations cheap in RU. Same reasoning as
+      <a href="../10-sql/scaling-operations.html#scaling-reads">keeping reporting off the OLTP primary</a>.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>1 RU = a 1 KB point read. Writes ≈ 5× because every indexed path is maintained.</li>
+      <li>Log <code>RequestCharge</code> — and accumulate it across query pages.</li>
+      <li>429 is flow control with a <code>retry-after</code>. Let the SDK retry; never stack your own.</li>
+      <li>429s at low overall utilisation mean a hot partition, not under-provisioning.</li>
+      <li>Autoscale is cheaper below ~66% average utilisation; its floor is 10% of max.</li>
+      <li>Serverless caps at 5,000 RU/s and one region.</li>
+      <li>Session is the default and gives read-your-own-writes at eventual-consistency cost.</li>
+      <li>Session is scoped to a client instance — propagate the token across services.</li>
+      <li>Strong and Bounded staleness cost 2× read RU.</li>
+      <li>Strong is incompatible with multi-region writes.</li>
+      <li>Consistency can be weakened per request, never strengthened.</li>
+      <li>Analytical store removes reporting from the RU budget.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Custom retry logic on top of the SDK's</strong>, causing retry amplification.</li>
+    <li><strong>Adding RU/s to fix a hot partition.</strong></li>
+    <li><strong>Never logging <code>RequestCharge</code></strong>, so cost is invisible until the invoice.</li>
+    <li><strong>Measuring only the first page</strong> of a query's RU cost.</li>
+    <li><strong>Strong consistency "to be safe"</strong>, doubling read cost and blocking multi-region
+      writes.</li>
+    <li><strong>A <code>CosmosClient</code> per request</strong>, silently losing session consistency.</li>
+    <li><strong>Assuming session consistency spans services.</strong></li>
+    <li><strong>An unnecessarily high autoscale maximum</strong>, so the 10% floor is expensive.</li>
+    <li><strong>Serverless for production</strong>, then discovering the region and RU caps.</li>
+    <li><strong>Analytics against the transactional container.</strong></li>
+    <li><strong>Explicit delete jobs</strong> where TTL is free.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What happens when you exceed provisioned throughput? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Cosmos returns <strong>HTTP 429</strong> with an <code>x-ms-retry-after-ms</code> header saying
+          exactly how long to wait. That's the key difference from a relational database — you don't get a slow
+          query, you get a rejected request."</p>
+        <p>"It's worth framing 429 as <strong>flow control rather than an error</strong>. A small number of them
+          is normal and means you're actually using the capacity you're paying for. Zero 429s ever probably means
+          you're over-provisioned."</p>
+        <p>"The <strong>SDK retries automatically</strong>, honouring the retry-after value, so most 429s never
+          surface to application code. I'd configure
+          <code>MaxRetryAttemptsOnRateLimitedRequests</code> and the wait time, and specifically
+          <strong>not write my own retry</strong> — the service tells you how long to wait based on real
+          capacity, which a generic exponential backoff can't know. And a custom retry layered on the SDK's
+          gives multiplicative attempts: nine SDK retries times three of mine is 27 requests for one operation,
+          which turns a brief throttle into retry amplification."</p>
+        <p>"If 429s are <em>persistent</em>, that's a real problem, and the diagnosis splits two ways."</p>
+        <p>"<strong>If overall RU consumption is near 100%</strong>, I'm genuinely at capacity — so either the
+          queries are too expensive or I need more throughput."</p>
+        <p>"<strong>If overall consumption is low but I'm still throttled</strong>, that's a
+          <strong>hot partition</strong>. Provisioned RU/s are divided evenly across physical partitions, so
+          with 30,000 RU/s across three partitions each gets 10,000. One hot partition-key value throttles at
+          10,000 while 20,000 sits unused. <strong>Adding RU/s does not help</strong> — it adds capacity to
+          partitions that weren't busy. I'd check Normalized RU Consumption per partition key range to confirm,
+          because overall averages hide it entirely."</p>
+        <p>"Getting that distinction wrong is how teams end up paying for ten times the throughput they need
+          and still being throttled."</p>
+        <p>"Other common causes: expensive cross-partition queries, or a bulk import competing with live
+          traffic — for that I'd throttle the job or run it against a separate container so it can't starve user
+          requests."</p>
+        <p>"And on handling exhausted retries in the application: at that point I'd shed load or apply
+          backpressure rather than failing the user request outright — queue the write if it can be
+          asynchronous, or return a clear 503 with a retry-after of my own so callers behave sensibly."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's 429 with a retry-after, not a slowdown?</li>
+        <li>Do you know the SDK handles it and yours shouldn't?</li>
+        <li>Can you distinguish under-provisioning from a hot partition?</li>
+        <li>Do you know adding RU/s doesn't fix a hot partition?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you find the hot partition?</li>
+          <li>Provisioned or autoscale for a spiky workload?</li>
+          <li>How do you stop a bulk job throttling live traffic?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Which consistency level would you choose, and why? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>Session as the account default</strong>, and I'd weaken or strengthen specific operations
+          from there. That's usually the right answer and I'd explain why rather than just naming it."</p>
+        <p>"Session gives <strong>read-your-own-writes</strong>, which is the guarantee users actually notice.
+          Someone updates their profile and immediately sees the new value. They genuinely don't care whether
+          another user's change from 200ms ago has propagated. And it costs the same read RU as Eventual —
+          <strong>1×, whereas Strong and Bounded staleness are 2×</strong>. So you get the guarantee that
+          matters at the cheaper price point."</p>
+        <p>"The mechanism is worth knowing because it has a sharp edge: every write returns a <strong>session
+          token</strong>, and the SDK sends it with subsequent reads so a replica that hasn't caught up
+          <em>waits</em> rather than returning stale data. But that token lives on the
+          <code>CosmosClient</code> instance."</p>
+        <p>"Which means session consistency <strong>silently breaks in three situations</strong>. If you create
+          a client per request, there's no shared session at all. If two services are involved, service A writes
+          and service B can miss it. And if you're scaled out, the write hits instance 1 while the follow-up
+          read hits instance 3, which never saw the token."</p>
+        <p>"The fix most people don't know: <strong>you can propagate the session token explicitly</strong> —
+          capture it from the write response, pass it in a header or a message property, and supply it via
+          <code>ItemRequestOptions.SessionToken</code> on the read. That gives cross-service
+          read-your-own-writes without upgrading consistency. A lot of teams reach for Strong instead and pay
+          double RU plus latency for something Session already provides."</p>
+        <p>"Where I'd go <strong>stronger</strong>: operations I act on irreversibly. A balance check before a
+          transfer, a stock count before dispatch. There I'd use Strong on that specific read, because acting on
+          stale data has real consequences."</p>
+        <p>"But I'd flag the cost properly: <strong>Strong requires a write quorum across regions</strong>, so
+          every write pays inter-region latency — and it's <strong>incompatible with multi-region
+          writes</strong> entirely. That's CAP arithmetic, not a Cosmos quirk. So 'we'll use Strong to be safe'
+          quietly gives up the main reason you chose Cosmos in the first place."</p>
+        <p>"Where I'd go <strong>weaker</strong>: dashboards, analytics, activity feeds, search results —
+          Eventual, cheapest and lowest latency. And <strong>Consistent prefix</strong> for anything where
+          ordering matters but freshness doesn't, like an audit trail: you may be a little behind, but you'll
+          never see events out of order."</p>
+        <p>"<strong>Bounded staleness</strong> I'd use when there's an actual stated requirement — 'no more than
+          five seconds stale' — because it's the only level that gives you a guarantee you can put in a
+          contract."</p>
+        <p>"One directional detail: consistency can be <strong>weakened per request but never
+          strengthened</strong> above the account default. So the account default has to be the strongest level
+          any operation needs, and everything else relaxes from there. That's the opposite of what people assume
+          and it affects how you set the default."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you default to Session and know why it's the right trade?</li>
+        <li>Do you know Strong and Bounded cost 2× read RU?</li>
+        <li>Do you know session tokens are per client, and can be propagated?</li>
+        <li>Do you know Strong blocks multi-region writes?</li>
+        <li>Do you know consistency can only be weakened per request?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "Strong, to be safe" with no cost awareness.</li>
+        <li><span class="redflag">Red flag:</span> "Eventual, it's a NoSQL database."</li>
+        <li><span class="redflag">Red flag:</span> not knowing Session is the default.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you get read-your-own-writes across two services?</li>
+          <li>What breaks if you enable multi-region writes?</li>
+          <li>How does Bounded staleness differ from Eventual in practice?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

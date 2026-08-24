@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OOP Fundamentals — Object-Oriented Programming</title>
+<meta name="description" content="Encapsulation, abstraction, inheritance and polymorphism explained simply, with C# examples: virtual vs new, abstract class vs interface, overloading vs overriding, virtual dispatch.">
+<meta name="keywords" content="encapsulation abstraction inheritance polymorphism csharp virtual override new keyword abstract class vs interface method overloading overriding virtual dispatch constructor sealed invariants">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="02-oop/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>OOP Fundamentals</h1>
+    <p class="subtitle">The four pillars, explained the way you'd want a senior engineer to explain them —
+      plus the C# details interviewers always follow up with.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Encapsulation</strong> = the object protects its own rules. Public setters give that away.</li>
+      <li><strong>Abstraction</strong> = hide what changes, expose what stays the same.</li>
+      <li><strong>Inheritance</strong> = "can be used instead of". Not "shares code with".</li>
+      <li><strong>Polymorphism</strong> = same call, different behaviour, decided at runtime.</li>
+      <li><code>virtual</code>+<code>override</code> picks the method by the <em>object's</em> type.
+        <code>new</code> picks it by the <em>variable's</em> type — almost always a bug.</li>
+      <li>Overloading = compile time, different parameters. Overriding = runtime, same signature.</li>
+      <li>Never call a virtual method from a constructor. The override runs before the subclass is ready.</li>
+    </ul>
+  </div>
+
+  <h2 id="classes-objects">Classes and objects <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="oneline"><b>One line:</b> a class is the blueprint, an object is one thing built from it.</div>
+
+  <p>In C#, classes are reference types. A variable holds a reference to the object, not the object itself.</p>
+
+  <pre data-label="csharp — two variables, one object"><code class="language-csharp">var a = new Order();
+var b = a;              // b points at the SAME order
+b.Status = OrderStatus.Paid;
+
+Console.WriteLine(a.Status);   // Paid - because a and b are the same object</code></pre>
+
+  <p>That single fact causes a lot of real bugs: shared state, accidental mutation, and surprises around
+    equality. The details are in <a href="../01-csharp-fundamentals/type-system.html">the C# type system</a>.</p>
+
+  <p>The design question that actually matters is not "what fields does this hold?" It is:</p>
+
+  <blockquote>What rules is this class responsible for keeping true?</blockquote>
+
+  <p>If the answer is "none", you've built a data structure. That's fine — just don't call it a domain model.</p>
+
+  <h2 id="encapsulation">Encapsulation <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>The object <strong>protects its own rules</strong>. Nobody outside can put it into a state that
+      shouldn't exist.</p>
+    <p>It's about protecting rules — not about typing <code>private</code> in front of fields.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A cash machine. You can withdraw and check your balance, but you can't reach in and set the balance
+      to £1,000,000.</p>
+    <p>The machine exposes <em>operations</em>, not <em>fields</em>. That's the whole idea.</p>
+  </div>
+
+  <h3 id="enc-bad">Start with the broken version</h3>
+
+  <pre data-label="csharp — bad: looks encapsulated, protects nothing" class="code-bad"><code class="language-csharp">public class Order
+{
+    public List&lt;OrderLine&gt; Lines { get; set; } = new();
+    public decimal Total { get; set; }
+    public OrderStatus Status { get; set; }
+    public DateTime? ShippedAt { get; set; }
+}</code></pre>
+
+  <p>Every field is behind a property, so it <em>looks</em> fine. Now watch what any caller can do:</p>
+
+  <pre data-label="csharp — three bugs that nothing prevents" class="code-bad"><code class="language-csharp">order.Lines.Add(new OrderLine(sku, qty));   // Total is now wrong
+order.Status = OrderStatus.Shipped;         // but ShippedAt is still null
+order.Total  = -50;                         // a negative total is allowed</code></pre>
+
+  <p>The rules exist — total must match the lines, a shipped order must have a shipped date — but the class
+    doesn't own them. So every caller has to remember them. Three callers will, the fourth won't, and that's
+    your production bug.</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Exposing a <code>List&lt;T&gt;</code> property. Even with a <em>private setter</em>,
+      the caller can still call <code>.Add()</code> and <code>.Remove()</code>. This is the encapsulation
+      leak people miss most often in C#.</p>
+  </div>
+
+  <h3 id="enc-good">The fixed version</h3>
+
+  <pre data-label="csharp — the class owns its rules" class="code-good"><code class="language-csharp">public sealed class Order
+{
+    private readonly List&lt;OrderLine&gt; _lines = [];
+
+    public OrderStatus Status { get; private set; } = OrderStatus.Draft;
+    public DateTime? ShippedAt { get; private set; }
+
+    public IReadOnlyList&lt;OrderLine&gt; Lines =&gt; _lines;   // read-only view
+    public decimal Total =&gt; _lines.Sum(l =&gt; l.LineTotal); // derived, can't drift
+
+    public void AddLine(string sku, int quantity, decimal unitPrice)
+    {
+        if (Status != OrderStatus.Draft)
+            throw new InvalidOperationException("Lines can only be added to a draft order.");
+        if (quantity &lt;= 0)
+            throw new ArgumentOutOfRangeException(nameof(quantity));
+
+        _lines.Add(new OrderLine(sku, quantity, unitPrice));
+    }
+
+    public void Ship(DateTime shippedAtUtc)
+    {
+        if (Status != OrderStatus.Paid)
+            throw new InvalidOperationException($"Cannot ship an order in state {Status}.");
+
+        Status = OrderStatus.Shipped;
+        ShippedAt = shippedAtUtc;      // both change together, or neither does
+    }
+}</code></pre>
+
+  <p>What changed:</p>
+
+  <ul>
+    <li><code>Total</code> is <strong>calculated</strong>, so it can never disagree with the lines.</li>
+    <li><code>Ship()</code> sets status and date <strong>together</strong>, so "shipped with no date" is impossible.</li>
+    <li>Illegal transitions throw instead of quietly corrupting data.</li>
+    <li>Callers can read the lines but not modify them.</li>
+  </ul>
+
+  <p>Notice this isn't more code overall. It's the same validation that would otherwise be copy-pasted
+    across services — moved to the one place that can't be bypassed.</p>
+
+  <div class="say-it">
+    <span class="s-label">How I'd explain this in an interview</span>
+    <p>"Encapsulation means the object owns the rules about its own state, so no caller can break them.
+      The access modifiers are just the mechanism."</p>
+    <p>"The example I use is an Order with a public setter on Total and Status. It looks encapsulated
+      because everything is a property, but the rule 'total equals the sum of the lines' isn't enforced
+      anywhere — so every service has to remember it, and eventually one forgets."</p>
+    <p>"The fix is to expose operations instead of state. <code>AddLine</code> keeps the total right,
+      <code>Ship</code> sets the status and timestamp together. And in C# I'd watch for the list leak —
+      returning <code>List&lt;T&gt;</code> lets callers mutate it even if the setter is private."</p>
+  </div>
+
+  <h2 id="abstraction">Abstraction <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Hide what's likely to <strong>change</strong>. Expose what <strong>won't</strong>.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A car's pedals. "Accelerate" and "brake" haven't changed in a century — but what's behind them went
+      from petrol engine to electric motor without you relearning how to drive.</p>
+    <p>The pedals are the abstraction. The engine is the implementation.</p>
+  </div>
+
+  <p>So the test for a good abstraction is simple: <strong>can the implementation change without callers
+    changing?</strong></p>
+
+  <pre data-label="csharp — leaky vs honest" class="code-bad"><code class="language-csharp">// Leaky: the caller now knows we use SQL, and knows about offsets and readers.
+public interface ICustomerSqlRepository
+{
+    SqlDataReader ExecuteCustomerQuery(string whereClause, int offset, int fetch);
+}</code></pre>
+
+  <pre data-label="csharp — expresses intent, not mechanism" class="code-good"><code class="language-csharp">public interface ICustomerRepository
+{
+    Task&lt;Customer?&gt; FindAsync(CustomerId id, CancellationToken ct);
+    Task&lt;IReadOnlyList&lt;Customer&gt;&gt; SearchAsync(CustomerSearch criteria, CancellationToken ct);
+}</code></pre>
+
+  <p>The second one isn't better because it uses an interface — the first one does too. It's better because
+    it hides a decision that might change (SQL) and exposes a concept that won't (finding a customer).</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Creating an interface that mirrors one class method-for-method. That abstracts
+      nothing. You've added a file and an indirection, and the "flexibility" is imaginary.</p>
+  </div>
+
+  <h2 id="inheritance">Inheritance <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Inheritance means <strong>"can be used instead of"</strong>.</p>
+    <p>It does <em>not</em> mean "is a kind of", and it definitely doesn't mean "shares some code with".</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A debit card inherits from "payment card" because anywhere a payment card is accepted, a debit card
+      works. That's a safe substitution.</p>
+    <p>A gift card <em>looks</em> like a payment card — same shape, same magnetic stripe — but it can't be
+      used for a hotel deposit. If you modelled it as a payment card, every deposit flow would break.</p>
+  </div>
+
+  <p>So when you inherit, you're making a promise: anywhere the base type works, the derived type works too.
+    Break that promise and correct code starts failing.</p>
+
+  <p>Here's the classic example of how it goes wrong.</p>
+
+  <pre data-label="csharp — a square is a rectangle... until it isn't" class="code-bad"><code class="language-csharp">public class Rectangle
+{
+    public virtual int Width  { get; set; }
+    public virtual int Height { get; set; }
+    public int Area =&gt; Width * Height;
+}
+
+public class Square : Rectangle
+{
+    public override int Width  { set { base.Width = base.Height = value; } }
+    public override int Height { set { base.Width = base.Height = value; } }
+}</code></pre>
+
+  <pre data-label="csharp — correct code that now breaks" class="code-bad"><code class="language-csharp">void Stretch(Rectangle r)
+{
+    r.Width = 10;
+    r.Height = 4;
+    Debug.Assert(r.Area == 40);   // fails for Square: area is 16
+}</code></pre>
+
+  <p>Nothing here is a compile error. The <em>design</em> is wrong. <code>Rectangle</code> implicitly
+    promises that width and height are independent. <code>Square</code> breaks that promise.</p>
+
+  <p>This generalises well beyond shapes. <strong>The warning signs that inheritance is wrong:</strong></p>
+
+  <ul>
+    <li>A subclass throws from a method it inherited.</li>
+    <li>A subclass makes a rule stricter than the base.</li>
+    <li>Call sites need <code>if (x is SomeSubclass)</code> checks.</li>
+  </ul>
+
+  <h3 id="when-inherit">When to inherit vs when to compose</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Use inheritance when…</th><th>Use composition when…</th></tr></thead>
+      <tbody>
+        <tr><td>The subtype really can replace the base everywhere</td><td>You just want to reuse some code</td></tr>
+        <tr><td>You want polymorphic dispatch across a fixed family</td><td>The relationship is "has-a" or "uses-a"</td></tr>
+        <tr><td>A framework demands it (<code>ControllerBase</code>, <code>DbContext</code>, <code>Exception</code>)</td><td>Behaviour needs to vary at runtime, not per type</td></tr>
+        <tr><td>Template Method — base owns the steps, subclass fills them in</td><td>You have two or more independent things that vary</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Worked examples of composition are on the <a href="advanced.html#composition">advanced OOP page</a>.</p>
+
+  <h3 id="abstract-vs-interface">Abstract class vs interface <span class="pill pill-must">🔥 Must know</span></h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Abstract class</th><th>Interface</th></tr></thead>
+      <tbody>
+        <tr><td>How many can you have?</td><td>One base class</td><td>As many as you like</td></tr>
+        <tr><td>Can hold state (fields)?</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Constructor?</td><td>Yes</td><td>No</td></tr>
+        <tr><td>Adding a member later</td><td>Safe — you provide the implementation</td><td>Breaks every implementer (unless you add a default implementation)</td></tr>
+        <tr><td>Models</td><td>"is-a", with shared mechanics</td><td>"can-do" — a capability</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>How to choose, in plain terms:</strong></p>
+
+  <ul>
+    <li>If two completely unrelated types might want this → <strong>interface</strong>.
+      (<code>IDisposable</code>, <code>IValidatable</code>, <code>IPaymentGateway</code>.)</li>
+    <li>If there's real shared code <em>and</em> shared state, and the types form a family →
+      <strong>abstract class</strong>. Example: a message handler base that owns retry bookkeeping while
+      each subclass implements only the handling.</li>
+    <li>Often you use both: an interface for the contract, an abstract base for convenience.</li>
+  </ul>
+
+  <div class="note info">
+    <div class="note-title">Default interface methods (C# 8+) <span class="pill pill-good">💡 Good to know</span></div>
+    <p style="margin:0">They exist so library authors can add a method to a published interface without
+      breaking everyone. They are <em>not</em> a replacement for abstract classes — there's still no state,
+      and the resolution rules get subtle fast. Use them for evolving an interface, not as a default design tool.</p>
+  </div>
+
+  <h2 id="polymorphism">Polymorphism <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>You call the <strong>same method</strong> and get <strong>different behaviour</strong>, decided by
+      what the object actually is at runtime.</p>
+    <p>The caller doesn't need to know which concrete class it got.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>You press "print" in an application. The same click sends a job to a laser printer, an inkjet, or a
+      PDF writer — and the application has no idea which.</p>
+    <p>It just calls <code>Print()</code>. Each printer knows how to do its own version.</p>
+  </div>
+
+  <p>Two kinds get mixed up in interviews. Being precise here is an easy win.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Overloading</th><th>Overriding</th></tr></thead>
+      <tbody>
+        <tr><td>What differs</td><td>The parameters</td><td>Nothing — same signature</td></tr>
+        <tr><td>Decided</td><td>At compile time</td><td>At run time</td></tr>
+        <tr><td>Based on</td><td>The argument types you passed</td><td>The actual type of the object</td></tr>
+        <tr><td>Keywords</td><td>None</td><td><code>virtual</code> + <code>override</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="virtual-new">virtual / override / new — the classic trap <span class="lvl lvl-i">🟡 Intermediate</span></h3>
+
+  <pre data-label="csharp — same object, different answers"><code class="language-csharp">public class Notifier
+{
+    public virtual string Send() =&gt; "base-virtual";
+    public          string Log()  =&gt; "base-plain";
+}
+
+public class EmailNotifier : Notifier
+{
+    public override string Send() =&gt; "email-override";
+    public new      string Log()  =&gt; "email-new";      // hides, does not override
+}</code></pre>
+
+  <pre data-label="csharp — what actually runs"><code class="language-csharp">Notifier n = new EmailNotifier();
+
+n.Send();                     // "email-override"  <- object's type wins
+n.Log();                      // "base-plain"      <- variable's type wins
+((EmailNotifier)n).Log();     // "email-new"       <- different variable type, different result</code></pre>
+
+  <p>Read that last block twice. With <code>new</code>, the behaviour depends on <strong>how the variable is
+    declared</strong>, not on what the object actually is.</p>
+
+  <p>That's why it's dangerous. Two call sites can look identical and behave differently, and nothing in the
+    code looks wrong.</p>
+
+  <div class="note warn">
+    <div class="note-title">Common mistake</div>
+    <p style="margin:0">Seeing <code>new</code> on a method in a code review and letting it through.
+      Default assumption: it's a mistake. Either the base method should have been <code>virtual</code>,
+      or the derived method should have a different name.</p>
+  </div>
+
+  <h3 id="dispatch">How the runtime actually picks the method <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <p>Here's the mechanism, step by step:</p>
+
+  <ol class="steps">
+    <li>Every object on the heap has a pointer to its type's <strong>method table</strong>.</li>
+    <li>A <strong>non-virtual</strong> call compiles to a direct call — the target is known at compile time.</li>
+    <li>A <strong>virtual</strong> call loads the method table from the object and calls through the slot for
+      that method. So the object's real type decides.</li>
+    <li>An <strong>interface</strong> call needs one more lookup, because the runtime has to map the
+      interface slot to the concrete type's implementation.</li>
+  </ol>
+
+  <p>Two consequences worth knowing:</p>
+
+  <ul>
+    <li><strong>Inlining.</strong> The JIT can't inline a call whose target it can't prove. Modern .NET does
+      <em>guarded devirtualization</em> — it speculatively inlines the type it sees most often and adds a
+      type check that falls back if a different type shows up.</li>
+    <li><strong><code>sealed</code> helps.</strong> If a class or override is sealed, the JIT can prove
+      there's no further override and skip the indirection entirely. That's why hot framework types are
+      often sealed.</li>
+  </ul>
+
+  <div class="note info">
+    <div class="note-title">Keep this in proportion</div>
+    <p style="margin:0">For normal application code this performance difference is unmeasurable. The real
+      reasons to seal a class are design reasons: you didn't design it for inheritance, and sealing means you
+      can change internals later without breaking someone's override.</p>
+  </div>
+
+  <h3 id="ctor-virtual">Never call a virtual method from a constructor <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <pre data-label="csharp — looks harmless, throws NullReferenceException" class="code-bad"><code class="language-csharp">public abstract class Repository
+{
+    protected Repository()
+    {
+        Configure();          // virtual call during BASE construction
+    }
+    protected virtual void Configure() { }
+}
+
+public sealed class SqlRepository : Repository
+{
+    private readonly string _connection = "Server=...";
+
+    protected override void Configure()
+    {
+        Console.WriteLine(_connection.Length);   // _connection is still null here
+    }
+}</code></pre>
+
+  <p>Why? Construction order in C# is:</p>
+
+  <ol class="steps">
+    <li>Derived field initialisers run.</li>
+    <li>Base constructor runs. ← your virtual call happens here, and it dispatches to the <em>derived</em> override</li>
+    <li>Derived constructor body runs.</li>
+  </ol>
+
+  <p>So the override executes while the object is only half-built. In this example
+    <code>_connection</code> hasn't been assigned yet.</p>
+
+  <p><strong>The rule:</strong> don't call virtual members from constructors. If subclasses need to
+    contribute to setup, pass the values in as constructor parameters, or use an explicit init method
+    the caller runs after construction.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Encapsulation is about invariants. Ask "what can a caller break?" not "are my fields private?"</li>
+      <li>A read-only collection property is still mutable if the items themselves are mutable.</li>
+      <li>Inheritance is a promise of substitutability. If a subclass throws or restricts, the design is wrong.</li>
+      <li>Interface = capability, many allowed. Abstract class = family with shared state, one allowed.</li>
+      <li><code>new</code> makes behaviour depend on the variable's declared type. Treat it as a bug.</li>
+      <li><code>sealed</code> lets the JIT devirtualize — but seal for design reasons, not performance.</li>
+      <li>Virtual calls in constructors run against a half-initialised object.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Public setters everywhere</strong>, then enforcing the rules in services. The object can't
+      defend itself.</li>
+    <li><strong>Exposing <code>List&lt;T&gt;</code></strong> and thinking a private setter protects it.</li>
+    <li><strong>Deep hierarchies</strong> (4+ levels). To understand one method you open five files.</li>
+    <li><strong>Inheriting to reuse one helper method.</strong> Composition or a static method does it
+      without the substitutability promise.</li>
+    <li><strong>Method hiding with <code>new</code></strong>, giving behaviour that depends on the variable type.</li>
+    <li><strong>Interfaces that exist only to be mocked</strong>, mirroring one class exactly.</li>
+    <li><strong>Anaemic entities</strong> — properties only, all behaviour in <code>XManager</code> classes.</li>
+  </ul>
+
+  <h2 id="best-practices">Best practices</h2>
+  <ul>
+    <li>Expose behaviour, not state. If two fields must change together, that's one method.</li>
+    <li>Make concrete classes <code>sealed</code> by default. Open them for inheritance deliberately.</li>
+    <li>Construct objects valid — required data in the constructor, no half-built states.</li>
+    <li>Use <code>record</code> with <code>init</code> for value-like types.</li>
+    <li>Keep hierarchies shallow. Two levels is usually plenty.</li>
+    <li>Name types after the domain (<code>PricingPolicy</code>), not after patterns
+      (<code>PricingStrategyImpl</code>).</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>Explain encapsulation, and show me where it's commonly violated.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Encapsulation means the object owns its own state and the rules that keep it valid. Access
+          modifiers are just how you do it — the point is that no caller can put the object into a state
+          that shouldn't exist."</p>
+        <p>"The violation I see most is a class that looks encapsulated because everything is a property,
+          but every property has a public setter. Take an Order with a settable Total and Status. Now the
+          rule 'total equals the sum of the lines' lives nowhere. Every service has to re-implement it, and
+          one of them won't."</p>
+        <p>"The fix is to expose operations. <code>AddLine</code> keeps the total consistent.
+          <code>Ship</code> sets the status and the timestamp together and rejects the transition if the
+          order isn't paid."</p>
+        <p>"There's a subtler C# one too: if you expose a <code>List&lt;T&gt;</code>, a private setter
+          doesn't help — callers can still add and remove. It needs to be
+          <code>IReadOnlyList&lt;T&gt;</code> over a private backing list."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the purpose, or just the syntax?</li>
+        <li>Have you hit the mutable-collection leak in real code?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "make fields private and add getters and setters." That's
+          a data bag, not encapsulation.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you encapsulate an entity that EF Core has to materialise?</li>
+          <li>Does encapsulation conflict with serialization?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Abstract class or interface — how do you choose?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My default is an interface. It keeps the type substitutable, allows multiple implementations,
+          and doesn't use up the single base-class slot."</p>
+        <p>"I go to an abstract class when there's real shared implementation <em>and</em> shared state.
+          For example a message handler base that owns the retry counting and logging, while each subclass
+          only implements the actual handling."</p>
+        <p>"The way I think about it: an interface is a capability — something unrelated types might have,
+          like <code>IDisposable</code>. An abstract class is membership in a family that shares mechanics."</p>
+        <p>"There's also a versioning angle that matters for shared libraries. Adding a member to an
+          abstract class is fine because you provide the implementation. Adding one to an interface breaks
+          every implementer — which is exactly why default interface methods were added in C# 8. In practice
+          I often use both: an interface for the contract, plus an abstract base with the common
+          implementation."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you give selection criteria, not just a feature comparison?</li>
+        <li>Do you know the versioning implication? That's the practical difference in library design.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What are default interface methods actually for?</li>
+          <li>Can an abstract class implement an interface without implementing its members?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What's the difference between <code>virtual</code>/<code>override</code> and <code>new</code>?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<code>virtual</code> plus <code>override</code> is real polymorphism. The method is picked at
+          runtime based on the actual type of the object, so a base-typed variable holding a derived
+          instance calls the derived version."</p>
+        <p>"<code>new</code> is method hiding. It declares a separate method that happens to share a name,
+          and the call is resolved at compile time from the variable's declared type."</p>
+        <p>"So with <code>new</code>, the same object behaves differently depending on how the variable is
+          declared. A <code>Notifier</code> variable holding an <code>EmailNotifier</code> calls the base
+          method; cast it to <code>EmailNotifier</code> and you get the derived one. Two call sites that
+          look identical, two different results."</p>
+        <p>"The only case I'd accept it is deriving from a base class I don't control that exposes a
+          non-virtual member. In a review, if I see <code>new</code>, I assume it's a mistake until
+          someone explains otherwise."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you understand compile-time vs runtime resolution?</li>
+        <li>Can you explain <em>why</em> it's dangerous, not just what it does?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What does <code>sealed override</code> mean, and why write it?</li>
+          <li>How does the runtime dispatch a virtual call?</li>
+          <li>Why is calling a virtual method from a constructor dangerous?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How does virtual dispatch work, and what does <code>sealed</code> have to do with performance? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Every object carries a pointer to its type's method table. A non-virtual call is a direct call
+          because the compiler knows the target. A virtual call has to load that table from the object and
+          call through the right slot, so the object's real type decides which code runs. Interface calls
+          add one more step, because the runtime maps the interface slot onto the concrete type's
+          implementation."</p>
+        <p>"The performance story is mostly about inlining rather than the extra indirection. The JIT can't
+          inline a call it can't resolve, and inlining is what unlocks most other optimisations. Modern
+          .NET does guarded devirtualization — it inlines the type it sees most often and guards it with a
+          type check that falls back if something else turns up."</p>
+        <p>"<code>sealed</code> helps because the JIT can prove there's no further override, so it can
+          devirtualize unconditionally. That's why performance-sensitive framework types are often sealed."</p>
+        <p>"I'd be careful how much weight I put on that though. In normal application code the difference
+          isn't measurable. I seal classes for design reasons — I haven't designed them for inheritance, and
+          sealing lets me change internals later without breaking someone."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Does your knowledge go below the language into the runtime?</li>
+        <li>Do you keep performance claims proportionate, or cargo-cult micro-optimisations?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why aren't struct methods virtual? What happens when a struct implements an interface?</li>
+          <li>What's the boxing cost in that case?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Design a payment system supporting card, bank transfer and wallet.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"First I'd figure out what actually varies. All three need authorise, capture and refund. But
+          they differ in timing — a card authorisation is immediate, a bank transfer can settle days later,
+          a wallet may need a balance check first. That timing difference is the important constraint and
+          it's easy to miss."</p>
+        <p>"So I'd define one interface — <code>IPaymentGateway</code> with authorise, capture, refund —
+          and implement it per method. I'd avoid a shared base class at first, because the common parts are
+          usually cross-cutting things like retry, logging and idempotency, and those work better as
+          decorators wrapping each implementation."</p>
+        <p>"For the async case, I would <em>not</em> hide the waiting inside the method — that gives you a
+          method that sometimes blocks for days. Instead the result type is explicit: Authorized, Pending,
+          Declined, Failed. Pending means the caller stores state and reacts to a webhook later. That way no
+          implementation has to lie to satisfy the interface, which is really the Liskov concern."</p>
+        <p>"And I'd make sure every call carries an idempotency key. Retries are guaranteed in payments, and
+          double-charging is the failure that actually costs you."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you find the real axis of variation, or reach for a hierarchy?</li>
+        <li>Do you notice that async settlement breaks a naive uniform interface?</li>
+        <li>Does idempotency occur to you without being prompted?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> an abstract <code>PaymentBase</code> with three subclasses
+          and no discussion of what varies.</li>
+        <li><span class="redflag">Red flag:</span> throwing exceptions for declined payments. A decline is an
+          expected outcome, not an exceptional one.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you add a fourth method without touching existing code?</li>
+          <li>Where do you enforce idempotency — gateway, your service, or the database?</li>
+          <li>How would you test this without hitting the real providers?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

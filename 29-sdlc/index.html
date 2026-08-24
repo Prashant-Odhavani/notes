@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Software Development Lifecycle — Overview</title>
+<meta name="description" content="How software actually gets built, shipped and operated — and what a senior engineer owns at each stage.">
+<meta name="keywords" content="sdlc software development lifecycle stages agile senior engineer responsibilities delivery end to end ownership dora metrics feedback loop">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="29-sdlc/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Software Development Lifecycle</h1>
+    <p class="subtitle">How a vague request becomes a running, supported production system — and what an
+      interviewer expects you to own at each step.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>The lifecycle isn't a sequence you pass through once. On a live product all the stages run at the
+        same time.</li>
+      <li>Junior engineers own <em>code</em>. Senior engineers own <em>outcomes</em>: understood, designed,
+        observable, revertible.</li>
+      <li>A defect gets roughly 10× more expensive each stage it survives. That's the entire argument for
+        shift-left.</li>
+      <li>Non-functional requirements are where projects die. Nobody forgets "users can log in". Everybody
+        forgets "at 3,000 concurrent users with p95 under 400ms".</li>
+      <li>Know the DORA four: deployment frequency, lead time for change, change failure rate, time to
+        restore.</li>
+      <li>SDLC questions are checking one thing: <strong>have you actually owned something end to end?</strong></li>
+    </ul>
+  </div>
+
+  <h2 id="why-this-matters">Why this section exists <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <p>SDLC questions feel like process trivia, so people under-prepare and answer in textbook terms:
+    "requirements, design, development, testing, deployment, maintenance."</p>
+
+  <p>That's technically correct and tells the interviewer nothing. A bootcamp graduate says the same thing.</p>
+
+  <p>What they're actually probing is whether you've lived through the consequences:</p>
+
+  <ul>
+    <li>Have you shipped something that broke at 2am?</li>
+    <li>Have you discovered a requirement was wrong <em>after</em> building it?</li>
+    <li>Have you argued for a rollback?</li>
+    <li>Have you written a postmortem, or paid down debt you personally created?</li>
+  </ul>
+
+  <p>Those stories are what separate seven years of experience from one year repeated seven times.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal</div>
+    <p style="margin:0">Connect the stages <em>causally</em>, don't list them. Something like: "we cut change
+      failure rate by moving contract tests into PR validation, which let us deploy more often, which
+      shrank each release's blast radius, which is what actually reduced time to restore." Cause and
+      effect, with a metric attached.</p>
+  </div>
+
+  <h2 id="the-real-lifecycle">The lifecycle as it actually works <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>The waterfall diagram survives in textbooks because it's easy to draw. On a real team, in a single
+    sprint, you are:</p>
+
+  <ul>
+    <li>Gathering requirements for next quarter</li>
+    <li>Designing the next epic</li>
+    <li>Developing the current one</li>
+    <li>Supporting last month's release</li>
+    <li>Paying down debt from last year</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Stage</th><th>The real question</th><th>How it typically fails</th></tr></thead>
+      <tbody>
+        <tr><td><a href="requirements.html">Requirements</a></td><td>What problem are we solving, and how will we know it worked?</td><td>Building the stated solution instead of solving the real problem</td></tr>
+        <tr><td><a href="estimation-planning.html">Estimation</a></td><td>How big is this, and what's uncertain?</td><td>Treating a forecast as a promise; estimating only the happy path</td></tr>
+        <tr><td><a href="architecture-design.html">Design</a></td><td>What structure survives two years of change?</td><td>Designing for imagined scale — or no design until it's expensive</td></tr>
+        <tr><td><a href="development.html">Development</a></td><td>Is this correct, readable and safe to change?</td><td>Review as style policing; PRs too big to actually review</td></tr>
+        <tr><td><a href="testing.html">Testing</a></td><td>What evidence do we have that it works?</td><td>Coverage as a goal; slow flaky E2E suites nobody trusts</td></tr>
+        <tr><td><a href="cicd-deployment.html">CI/CD</a></td><td>How does a merged commit reach production safely?</td><td>Deploy coupled to release; no rollback path; manual steps</td></tr>
+        <tr><td><a href="operations.html">Operations</a></td><td>How do we know it's healthy, and what happens when it isn't?</td><td>Alerting on causes not symptoms; blame-driven postmortems</td></tr>
+        <tr><td><a href="process.html">Process</a></td><td>How does the team sustain this?</td><td>Ceremonies without feedback loops; debt with no repayment mechanism</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="senior-contribution">What a senior does differently at each stage <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <p>This table is worth knowing in substance. It's the backbone of almost every "walk me through how you'd
+    deliver X" question.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Stage</th><th>Mid-level</th><th>Senior</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Requirements</td>
+          <td>Clarifies ambiguous tickets, asks about edge cases</td>
+          <td>Surfaces the missing non-functional requirements. Challenges scope that doesn't serve the
+              outcome. Negotiates a smaller first slice that de-risks the rest.</td>
+        </tr>
+        <tr>
+          <td>Estimation</td>
+          <td>Estimates own tasks reasonably</td>
+          <td>Separates <em>unknown</em> work from <em>known</em> work. Proposes a spike to convert
+              uncertainty into information. Gives ranges plus the assumptions that would break them.</td>
+        </tr>
+        <tr>
+          <td>Design</td>
+          <td>Follows the existing architecture correctly</td>
+          <td>Writes down the alternatives and why they lost. Picks the boring option deliberately. Spends
+              the design effort on the one decision that's expensive to reverse.</td>
+        </tr>
+        <tr>
+          <td>Development</td>
+          <td>Ships correct, tested code</td>
+          <td>Keeps changes small and independently revertible. Adds the telemetry needed to debug it
+              <em>before</em> it ships.</td>
+        </tr>
+        <tr>
+          <td>Code review</td>
+          <td>Catches bugs and style issues</td>
+          <td>Reviews what tests can't check: failure behaviour, backwards compatibility, concurrency,
+              migration safety.</td>
+        </tr>
+        <tr>
+          <td>Testing</td>
+          <td>Writes unit tests for their code</td>
+          <td>Owns a test <em>strategy</em>: what's verified at which level, what's deliberately not tested,
+              and how the suite stays fast enough that people run it.</td>
+        </tr>
+        <tr>
+          <td>Release</td>
+          <td>Follows the deployment process</td>
+          <td>Decouples deploy from release with flags. Defines the rollback trigger <em>before</em>
+              shipping. Makes the change backwards compatible so both versions can run at once.</td>
+        </tr>
+        <tr>
+          <td>Operations</td>
+          <td>Responds to alerts</td>
+          <td>Defines the SLOs. Makes alerts symptom-based and actionable. Deletes the noisy ones. Runs
+              postmortems that produce two or three tracked actions.</td>
+        </tr>
+        <tr>
+          <td>Maintenance</td>
+          <td>Fixes bugs as assigned</td>
+          <td>Makes debt visible in business terms — "this costs two days a sprint and is implicated in 40%
+              of incidents" — and repays it incrementally alongside features.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="cost-of-delay">The two ideas that justify everything else <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Everything that looks like process overhead is buying a <strong>shorter feedback loop</strong>.</p>
+    <p>The shorter the time between making a decision and learning whether it was right, the cheaper being
+      wrong becomes.</p>
+  </div>
+
+  <p><strong>1. Defects get more expensive the longer they live.</strong></p>
+
+  <ul>
+    <li>Caught in a requirements conversation → costs a conversation.</li>
+    <li>Caught in code review → costs a rewrite of a few files.</li>
+    <li>Caught in QA → costs a cycle of the whole team.</li>
+    <li>Caught in production → costs an incident, possibly data repair, and trust.</li>
+  </ul>
+
+  <p>The "10× per stage" multiplier is unverifiable folklore, but the <em>ordering</em> is unarguable — and
+    it's the ordering that drives decisions. That's why we do shift-left testing, design review and static
+    analysis in the pipeline.</p>
+
+  <p><strong>2. Feedback loop length.</strong> CI, trunk-based development, small PRs, feature flags,
+    canary releases, observability — every one of them is buying a shorter loop.</p>
+
+  <h2 id="contents">Section contents</h2>
+  <div class="card-grid" data-section-index></div>
+
+  <h2 id="interview-questions">Cross-cutting interview questions</h2>
+
+  <details class="qa">
+    <summary>Walk me through how a feature goes from idea to production at your company.</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd use a specific feature rather than the generic pipeline. Take the last one I owned —
+          per-tenant export limits. It came in as a support escalation: one customer's exports were starving
+          everyone else's. Product wrote it as 'add export limits', but the real problem was noisy-neighbour
+          contention, so before designing anything I pulled two weeks of metrics to check whether limits
+          were even the right lever."</p>
+        <p>"Then I'd walk the stages, but anchor each one to a decision I made. What the acceptance criteria
+          were and which non-functional requirements I added. What alternatives I weighed and why I chose
+          the boring one. How I sliced it so the risky part shipped first behind a flag. What I tested at
+          which level — and what I deliberately didn't test."</p>
+        <p>"How it was released: flag off, then one internal tenant, then a percentage rollout, with a
+          specific metric I was watching that would have triggered a rollback."</p>
+        <p>"And I'd finish in production. What telemetry I added before shipping, what actually happened when
+          it went live, and what I'd do differently. If something went wrong I'd say so — a candidate whose
+          every story ends perfectly either isn't remembering accurately or hasn't owned much."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you engage with problems, or only with tickets?</li>
+        <li>Do you think about release and operation, or stop caring at "merged"?</li>
+        <li>Can you compress a big story into a clear narrative? Same skill as writing a design doc.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> reciting the stages with no concrete example.</li>
+        <li><span class="redflag">Red flag:</span> the story ends at merge or "QA tested it".</li>
+        <li><span class="redflag">Red flag:</span> "product gives us requirements and we build them" — that
+          describes a code-typing role.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the metric had gone the wrong way at 10% rollout?</li>
+          <li>Who decided the acceptance criteria, and what did you push back on?</li>
+          <li>How long from first commit to production, and what was the bottleneck?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you decide how much process a project needs?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Process manages two things: the cost of coordination, and the cost of being wrong. So I size it
+          against those."</p>
+        <p>"Three people on an internal tool with no compliance exposure and instant rollback need almost
+          none — trunk-based development, CI, a shared channel. A payments service where an error moves real
+          money and reversal is manual needs approvals, audit trails, staged rollouts and change records.
+          That overhead is genuinely worth it there."</p>
+        <p>"The test I apply to any specific practice is: what failure would this have caught in the last six
+          months, and what did it cost us in the same period? A mandatory two-reviewer policy that's never
+          caught a defect but adds a day of latency to every change is <em>negative</em> value — it's slowing
+          the feedback loop, which makes the system less safe, not more."</p>
+        <p>"What I try not to do is import process wholesale because it worked somewhere else. Most heavy
+          process is scar tissue from a specific failure, and it only makes sense if you're carrying the
+          same scar."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you treat process as cost/benefit, or as identity ("we're Agile")?</li>
+        <li>Can you justify controls in high-risk domains rather than calling them bureaucracy?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Give me an example of process you removed. What happened?</li>
+          <li>What about a regulated environment where you can't remove a control?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your team ships slowly and everyone blames "technical debt". How would you diagnose it?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"'Slow' is a symptom with several possible causes, and debt is only one. So I'd measure before
+          agreeing with the diagnosis."</p>
+        <p>"The cheapest instrumentation is lead time broken into stages. How long does a change sit before
+          review, in review, waiting for a build, waiting for QA, waiting for a release window? Teams that
+          feel slow are very often blocked in <em>queueing</em>, not in coding — and queueing is fixable in
+          weeks, whereas a rewrite isn't."</p>
+        <p>"Then I'd look at change failure rate and where defects come from. High rework means the problem
+          is upstream — unclear requirements causing built-then-rebuilt work. Long review latency means PRs
+          are too big or reviewers are overloaded. A slow flaky test suite shows up as people batching
+          changes to avoid running it, which increases PR size — a nasty loop worth breaking early."</p>
+        <p>"If it genuinely is debt, I'd localise it. Debt is rarely uniform; usually 10–20% of modules cause
+          most of the friction. Cross-referencing change frequency against defect density finds them fast.
+          Then I'd attack the highest-traffic painful module incrementally — seams, characterisation tests,
+          refactor — and track whether lead time in that area improves. That evidence is what makes debt
+          work fundable."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you measure before prescribing?</li>
+        <li>Do you know delivery speed is usually limited by queues and handoffs, not typing?</li>
+        <li>Can you make an engineering-quality argument in terms a business will fund?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "we need a rewrite" as an opening move.</li>
+        <li><span class="redflag">Red flag:</span> proposing <em>more</em> process to fix slowness.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you convince a PM to fund three sprints of that work?</li>
+          <li>What if the bottleneck turns out to be one senior reviewer?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

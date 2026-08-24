@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rendering &amp; Performance — React</title>
+<meta name="description" content="What triggers a re-render, reconciliation and keys, memo and useMemo and useCallback, profiling, virtualisation and the React Compiler.">
+<meta name="keywords" content="React re-render reconciliation virtual DOM diffing keys index as key React.memo useMemo useCallback profiler DevTools virtualization windowing React Compiler concurrent rendering useTransition Suspense">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="32-react/rendering-performance.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Rendering &amp; Performance</h1>
+    <p class="subtitle">Re-rendering is not the problem people think it is. Knowing what's actually expensive is
+      the skill.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>A re-render is running your function and diffing</strong> — not touching the DOM.</li>
+      <li><strong>State change re-renders that component and all its children</strong>, by default.</li>
+      <li><strong>Keys give elements identity.</strong> Index keys break on reorder or insert.</li>
+      <li><strong><code>memo</code> compares props by reference</strong>, so inline objects and functions defeat
+        it.</li>
+      <li><strong>Don't memoise pre-emptively.</strong> Measure first — memoisation has a cost.</li>
+      <li><strong>The real fix is usually fewer DOM nodes</strong> or less work per render.</li>
+      <li><strong>The React Compiler automates memoisation</strong>, which makes most manual tuning
+        obsolete.</li>
+    </ul>
+  </div>
+
+  <h2 id="what-is-render">What a re-render actually costs <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A re-render means React <strong>calls your component function again</strong> and compares the returned
+      description to the previous one.</p>
+    <p>It does <em>not</em> mean the DOM is updated. React only touches the DOM where the descriptions
+      differ.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Phase</th><th>Work</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Render</strong></td><td>Call the function, build the element tree</td><td>Usually cheap — it's just JavaScript</td></tr>
+        <tr><td><strong>Reconcile</strong></td><td>Diff against the previous tree</td><td>Cheap, and proportional to tree size</td></tr>
+        <tr><td><strong>Commit</strong></td><td>Apply DOM changes</td><td><strong>The expensive part</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>A re-render that produces identical output costs almost nothing.</strong> React diffs, finds no
+      change, and touches no DOM.</p>
+    <p>So "this component re-renders too often" is frequently not a problem worth solving. What's expensive
+      is:</p>
+    <ul>
+      <li><strong>Expensive work inside the render</strong> — sorting, filtering, formatting thousands of
+        items.</li>
+      <li><strong>Very large trees</strong> — thousands of components, where even cheap work multiplies.</li>
+      <li><strong>Actual DOM changes</strong> — layout and paint.</li>
+    </ul>
+    <p>Chasing re-render counts without measuring is the most common wasted effort in React performance
+      work.</p>
+  </div>
+
+  <h2 id="triggers">What triggers a re-render <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Scope</th></tr></thead>
+      <tbody>
+        <tr><td><strong>State change</strong> in the component</td><td>That component and <strong>all descendants</strong></td></tr>
+        <tr><td><strong>Parent re-renders</strong></td><td>All children, unless wrapped in <code>memo</code></td></tr>
+        <tr><td><strong>Context value changes</strong></td><td><strong>Every consumer</strong>, regardless of which field changed</td></tr>
+        <tr><td>A hook the component uses updates</td><td>That component</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Props changing is <em>not</em> a trigger</div>
+    <p style="margin:0">This surprises people. A child re-renders because its <strong>parent</strong>
+      re-rendered, not because its props changed. React doesn't check whether props differ before re-rendering a
+      child — it just renders the whole subtree.
+      <br><br>
+      <code>memo</code> is what adds that check: it compares props by reference and skips the render if they're
+      all equal.
+      <br><br>
+      Which is why passing an inline object or arrow function defeats <code>memo</code> entirely — those are new
+      references every render, so the comparison always fails.</p>
+  </div>
+
+  <h2 id="keys">Reconciliation and keys <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why keys exist</span>
+    <p>When React diffs a list, it needs to know which new element corresponds to which old one. Position isn't
+      enough — inserting at the front shifts everything.</p>
+    <p>A <strong>key</strong> is the element's identity. Same key means "this is the same item, update it".
+      Different key means "this is a different item, unmount the old and mount the new".</p>
+  </div>
+
+  <pre data-label="jsx — index keys break on insert" class="code-bad"><code class="language-jsx">{items.map((item, i) =&gt; &lt;TodoRow key={i} todo={item} /&gt;)}
+
+// Insert a new item at the front:
+//   Before: key 0 = "Buy milk",  key 1 = "Walk dog"
+//   After:  key 0 = "NEW ITEM",  key 1 = "Buy milk",  key 2 = "Walk dog"
+//
+// React thinks item 0 CHANGED from "Buy milk" to "NEW ITEM" rather than
+// a new item being inserted. So it reuses the wrong component instances -
+// and any internal state (a checkbox, an open editor, focus) stays with
+// the wrong row.</code></pre>
+
+  <pre data-label="jsx — a stable identity" class="code-good"><code class="language-jsx">{items.map(item =&gt; &lt;TodoRow key={item.id} todo={item} /&gt;)}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Why index keys are a correctness bug, not a performance one</div>
+    <p style="margin:0">The usual explanation is that index keys are "slower". The real problem is
+      <strong>wrong state</strong>.
+      <br><br>
+      If each row has internal state — a checkbox, an inline edit field, focus — that state belongs to the
+      component instance. Reuse the instance for a different item and the state follows the position, not the
+      data. So you tick row 2, insert an item at the top, and the tick is now on the wrong row.
+      <br><br>
+      That's a data-integrity bug the user can see, and it's silent in testing because it needs a specific
+      sequence.
+      <br><br>
+      <strong>Index keys are acceptable only when the list is static</strong> — never reordered, filtered, or
+      added to — and the items have no internal state. Otherwise use a stable id from the data.
+      <br><br>
+      And never use <code>Math.random()</code> as a key: a new key every render means React unmounts and remounts
+      every item, every time. That's genuinely catastrophic for both performance and state.</p>
+  </div>
+
+  <h2 id="memo">memo, useMemo, useCallback <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>Memoises</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><code>memo(Component)</code></td><td>The component's <strong>render output</strong></td><td>An expensive component whose props rarely change</td></tr>
+        <tr><td><code>useMemo(fn, deps)</code></td><td>A <strong>computed value</strong></td><td>Expensive calculation, or a stable object reference</td></tr>
+        <tr><td><code>useCallback(fn, deps)</code></td><td>A <strong>function reference</strong></td><td>Passing a callback to a memoised child or an effect dependency</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="jsx — memo defeated by inline props" class="code-bad"><code class="language-jsx">const Row = memo(function Row({ item, onSelect }) { /* ... */ });
+
+function List({ items }) {
+  return items.map(item =&gt; (
+    &lt;Row
+      key={item.id}
+      item={item}
+      onSelect={() =&gt; select(item.id)}    // NEW function every render
+      style={{ padding: 8 }}              // NEW object every render
+    /&gt;
+  ));
+  // memo compares by reference, so both always differ.
+  // Every Row re-renders. The memo does nothing except add a comparison cost.
+}</code></pre>
+
+  <pre data-label="jsx — stable references" class="code-good"><code class="language-jsx">const ROW_STYLE = { padding: 8 };        // module scope - one object, forever
+
+function List({ items }) {
+  // Stable across renders; the child gets the id from its own props
+  const handleSelect = useCallback((id) =&gt; select(id), []);
+
+  return items.map(item =&gt; (
+    &lt;Row key={item.id} item={item} onSelect={handleSelect} style={ROW_STYLE} /&gt;
+  ));
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — memoisation is not free, and partial application is worse than none</div>
+    <p style="margin:0">Every <code>useMemo</code> and <code>useCallback</code> has a cost: storing the previous
+      value, comparing dependencies on every render, and the memory it holds. For a cheap calculation the
+      bookkeeping can exceed the work saved.
+      <br><br>
+      More importantly, <strong>memoisation is all-or-nothing along a path</strong>. Wrapping a child in
+      <code>memo</code> while passing it an inline arrow function achieves precisely nothing — you've added the
+      comparison cost and kept the re-render. That's a very common pattern in code that looks optimised.
+      <br><br>
+      So the honest position: <strong>measure first, memoise the specific thing that's slow.</strong> Blanket
+      memoisation makes code harder to read, adds bugs when dependency arrays are wrong, and frequently makes
+      things marginally slower.
+      <br><br>
+      The exception where <code>useMemo</code> is right without measuring: <strong>keeping a reference stable
+      because something downstream depends on identity</strong> — a context value, an effect dependency, a prop
+      to a memoised child. That's correctness, not optimisation.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">The React Compiler changes this calculus</div>
+    <p style="margin:0">React 19's compiler analyses your components at build time and inserts memoisation
+      automatically — so it can determine which values are stable and skip re-renders without
+      <code>memo</code>, <code>useMemo</code> or <code>useCallback</code> in your source.
+      <br><br>
+      Where it applies, most manual memoisation becomes unnecessary, and the "should I memoise this?" question
+      largely disappears.
+      <br><br>
+      It requires code that follows the rules — no mutation during render, no side effects in the render body.
+      Which is another reason the rules matter: they're what makes automated optimisation possible.
+      <br><br>
+      For an interview: know it exists, know it doesn't remove the need to understand <em>why</em> re-renders
+      happen, and be aware most production codebases aren't using it yet.</p>
+  </div>
+
+  <h2 id="profiling">Profiling <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>Shows</th></tr></thead>
+      <tbody>
+        <tr><td><strong>React DevTools Profiler</strong></td><td>Which components rendered, how long each took, and <strong>why</strong> it rendered</td></tr>
+        <tr><td><strong>"Highlight updates"</strong> setting</td><td>Visual flash on re-render — quick way to spot excess</td></tr>
+        <tr><td><strong>Chrome Performance panel</strong></td><td>Long tasks, layout, paint — for non-React costs</td></tr>
+        <tr><td><strong>Lighthouse</strong></td><td>Core Web Vitals, initial load</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">"Why did this render?" is the feature to use</div>
+    <p style="margin:0">In the DevTools Profiler settings, enabling <strong>"Record why each component
+      rendered"</strong> attributes each render to a cause — a state change, a props change and which prop, a
+      context update, or a parent re-render.
+      <br><br>
+      That turns guesswork into diagnosis. "This list re-renders because the context value changed" is
+      actionable; "this seems to render a lot" isn't.
+      <br><br>
+      And it frequently reveals that the component you suspected is cheap, while something unexpected — a context
+      provider high in the tree — is causing wide re-renders.</p>
+  </div>
+
+  <h2 id="lists">Long lists <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="jsx — virtualisation renders only what's visible" class="code-good"><code class="language-jsx">import { useVirtualizer } from '@tanstack/react-virtual';
+
+function OrderList({ orders }) {
+  const parentRef = useRef&lt;HTMLDivElement&gt;(null);
+
+  const virtualizer = useVirtualizer({
+    count: orders.length,            // 10,000
+    getScrollElement: () =&gt; parentRef.current,
+    estimateSize: () =&gt; 48
+  });
+
+  return (
+    &lt;div ref={parentRef} style={{ height: 600, overflow: 'auto' }}&gt;
+      &lt;div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}&gt;
+        {virtualizer.getVirtualItems().map(v =&gt; (
+          &lt;div key={orders[v.index].id}
+               style={{ position: 'absolute', top: v.start, height: v.size }}&gt;
+            {orders[v.index].reference}
+          &lt;/div&gt;
+        ))}
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+  // ~15 DOM nodes regardless of list length.
+}</code></pre>
+
+  <div class="remember">
+    <span class="r-label">The insight that matters</span>
+    <p><strong>Memoisation cannot fix a 10,000-node DOM.</strong></p>
+    <p>Browser layout, paint and memory costs scale with node count, independently of React. Even a perfectly
+      memoised list of 10,000 rows is slow to scroll because the browser has 10,000 elements to manage.</p>
+    <p>So the fix is <strong>rendering fewer nodes</strong> — virtualisation, or server-side paging. Same
+      conclusion as <a href="../31-angular/performance-testing.html#rendering">Angular's virtual scrolling</a>,
+      for the same non-framework reason.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Ask whether the data should be there at all</div>
+    <p style="margin:0">Before virtualising, the better question is often whether the client needs 10,000 rows.
+      Server-side paging reduces the payload, the query cost <em>and</em> the DOM — three problems with one
+      change.
+      <br><br>
+      Virtualisation is right when the user genuinely needs to scroll a long list continuously — a log viewer, a
+      large table with sorting. Paging is right when they're looking for something specific, because search and
+      filters serve them better than scrolling.
+      <br><br>
+      That's a product question as much as a technical one, and raising it is usually the more senior
+      response.</p>
+  </div>
+
+  <h2 id="concurrent">Concurrent features <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Feature</th><th>Solves</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>useTransition</code></strong></td><td>Keeps the UI responsive during an expensive state update</td></tr>
+        <tr><td><strong><code>useDeferredValue</code></strong></td><td>Renders a stale value while an expensive update computes</td></tr>
+        <tr><td><strong><code>Suspense</code></strong></td><td>Declarative loading states for async children</td></tr>
+        <tr><td><strong>Streaming SSR</strong></td><td>Sends HTML progressively as parts become ready</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="jsx — keeping typing responsive" class="code-good"><code class="language-jsx">function SearchPage() {
+  const [query, setQuery] = useState('');
+  const [isPending, startTransition] = useTransition();
+  const [results, setResults] = useState&lt;Item[]&gt;([]);
+
+  function onChange(e: ChangeEvent&lt;HTMLInputElement&gt;) {
+    setQuery(e.target.value);            // urgent - the input must stay responsive
+
+    startTransition(() =&gt; {              // non-urgent - can be interrupted
+      setResults(expensiveFilter(e.target.value));
+    });
+  }
+
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={onChange} /&gt;
+      &lt;div style={{ opacity: isPending ? 0.6 : 1 }}&gt;
+        &lt;ResultList items={results} /&gt;
+      &lt;/div&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">What <code>useTransition</code> actually does</div>
+    <p style="margin:0">It marks an update as <strong>interruptible</strong>. If a more urgent update arrives —
+      another keystroke — React abandons the in-progress render and starts again with the newer value.
+      <br><br>
+      Without it, a slow render blocks the main thread and the input visibly lags behind typing, because the
+      keystroke can't be processed until the render finishes.
+      <br><br>
+      This is the closest React gets to the yielding described on the
+      <a href="../30-web-fundamentals/index.html#section-map">web fundamentals page</a> — it doesn't add a
+      thread, it makes rendering abandonable so the single thread can service urgent work first.
+      <br><br>
+      Note it helps with <em>rendering</em> cost, not with a genuinely slow computation. If
+      <code>expensiveFilter</code> takes 400ms of pure JavaScript, that still blocks — that needs a Web Worker or
+      a better algorithm.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>A re-render is a function call plus a diff — the DOM commit is the expensive part.</li>
+      <li>A re-render producing identical output costs almost nothing; don't chase render counts.</li>
+      <li>Children re-render because the parent did, not because props changed.</li>
+      <li>Context re-renders every consumer.</li>
+      <li>Index keys cause wrong state, not just slowness — use stable ids.</li>
+      <li><code>memo</code> compares by reference, so inline objects and arrows defeat it entirely.</li>
+      <li>Memoisation costs something; measure before applying it.</li>
+      <li><code>useMemo</code> for reference stability is correctness, not optimisation.</li>
+      <li>The React Compiler automates most of this, given rule-following code.</li>
+      <li>Use the profiler's "why did this render?" rather than guessing.</li>
+      <li>Memoisation can't fix a huge DOM — virtualise or page.</li>
+      <li><code>useTransition</code> makes renders interruptible; it doesn't speed up computation.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Index keys</strong> on lists that reorder, filter or have row state.</li>
+    <li><strong><code>Math.random()</code> or a new object as a key.</strong></li>
+    <li><strong><code>memo</code> with inline function or object props</strong> — no effect.</li>
+    <li><strong>Blanket memoisation</strong> without measuring.</li>
+    <li><strong>Wrong dependency arrays</strong> in <code>useMemo</code>/<code>useCallback</code>, causing
+      stale values.</li>
+    <li><strong>One large context</strong>, re-rendering everything on any change.</li>
+    <li><strong>Unmemoised context values.</strong></li>
+    <li><strong>Rendering thousands of rows</strong> instead of virtualising or paging.</li>
+    <li><strong>Expensive work in the render body</strong> rather than memoised or moved out.</li>
+    <li><strong>Optimising without the profiler.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Why shouldn't you use array index as a key? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The usual explanation is that it's slower, and that undersells it — <strong>the real problem is
+          incorrect state</strong>."</p>
+        <p>"Keys are how React establishes element <em>identity</em> during reconciliation. Same key means 'this
+          is the same item, update it in place'. Different key means 'different item, unmount the old one and
+          mount a new one'."</p>
+        <p>"With index keys, identity is tied to <em>position</em>. So if you insert an item at the front, the
+          item that was at index 0 is now at index 1 — but React sees key 0 still exists and concludes the item
+          at position 0 simply <em>changed</em>. It reuses that component instance for a completely different
+          piece of data."</p>
+        <p>"That matters because a component instance owns its internal state. If each row has a checkbox, an
+          inline edit field, or focus, that state stays with the <em>position</em> rather than following the
+          data. So you tick row two, insert something at the top, and the tick is now against the wrong
+          record."</p>
+        <p>"That's a data-integrity bug the user can see, and it's silent in testing because it needs a specific
+          sequence of interactions. Uncontrolled inputs are the worst case — the DOM value stays put while the
+          props change around it."</p>
+        <p>"The fix is a <strong>stable identity from the data</strong> — <code>item.id</code>. If the data has
+          no id, generating one when the item is created and keeping it is better than falling back to the
+          index."</p>
+        <p>"Index keys are acceptable in one narrow case: the list is <strong>genuinely static</strong> — never
+          reordered, filtered, sorted or added to — and the items have no internal state. A fixed set of labels,
+          for instance. But it's a small saving for a real risk, so I'd default to a real key."</p>
+        <p>"And the one that's actively harmful: <strong><code>key={Math.random()}</code></strong>. A new key
+          every render means React unmounts and remounts every item on every render — destroying all state,
+          losing focus, and doing maximum possible DOM work. I've seen that added deliberately to 'force a
+          refresh', which is solving a state problem with the most expensive tool available."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's a correctness issue, not just performance?</li>
+        <li>Can you explain the state-follows-position mechanism?</li>
+        <li>Do you know the narrow case where it's fine?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does React use keys during reconciliation?</li>
+          <li>How can a key be used deliberately to reset state?</li>
+          <li>What if the data genuinely has no unique id?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>A React page feels sluggish. Walk me through diagnosing it. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd resist the instinct to start adding <code>memo</code>, because that's usually wasted work.
+          First I'd establish <strong>what kind of slow</strong> — slow to load, or slow to interact — since they
+          have unrelated causes."</p>
+        <p>"For <strong>slow to interact</strong>, I'd open the React DevTools Profiler, record the interaction,
+          and turn on <strong>'record why each component rendered'</strong>. That attributes every render to a
+          cause — state change, specific prop change, context update, or parent render. That turns guesswork into
+          diagnosis."</p>
+        <p>"Then I'd look for which of four things it is."</p>
+        <p>"<strong>Expensive work in a render body.</strong> Sorting or filtering thousands of items on every
+          render. That's a real cost and <code>useMemo</code> is the right answer — this is the case where
+          memoisation genuinely helps."</p>
+        <p>"<strong>Too many DOM nodes.</strong> If it's a large table or list, no amount of memoisation helps —
+          browser layout and paint scale with node count independently of React. The fix is virtualisation or
+          server paging. I'd check the Elements panel for the node count, because this is easy to confirm."</p>
+        <p>"<strong>Wide re-renders from context.</strong> A context value changing re-renders every consumer
+          regardless of which field they use. A single context holding user, theme and cart means a cart update
+          re-renders everything. Fix by splitting contexts by change frequency and memoising the value
+          object — an unmemoised <code>value={{ a, b }}</code> is a new object every provider render."</p>
+        <p>"<strong>Actual DOM thrash.</strong> If the commit phase dominates the profile rather than render,
+          that's real DOM work — which might be a missing key causing unmount/remount of a whole list."</p>
+        <p>"For <strong>slow to load</strong>, that's a bundle and network problem: check the bundle with an
+          analyser, verify routes are code-split, look for the usual heavy libraries, and check the network panel
+          for N+1 API calls or oversized payloads."</p>
+        <p>"Two things I'd be careful about."</p>
+        <p>"<strong>Don't chase re-render counts.</strong> A re-render producing identical output costs almost
+          nothing — React diffs, finds no change, touches no DOM. 'This renders 40 times' is only a problem if
+          those renders are doing expensive work. Optimising cheap re-renders adds complexity for no
+          measurable gain."</p>
+        <p>"<strong>Verify the fix.</strong> Re-profile after each change. I've seen people add memoisation
+          everywhere, ship it, and never confirm anything improved — and partial memoisation frequently achieves
+          nothing, because a <code>memo</code> with an inline arrow prop just adds a comparison cost while still
+          re-rendering."</p>
+        <p>"Worth noting the React Compiler in React 19 automates most of this — it inserts memoisation at build
+          time, so manual tuning becomes largely unnecessary. It still requires understanding <em>why</em>
+          renders happen, and most production codebases aren't on it yet."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you profile before optimising?</li>
+        <li>Do you know "why did this render?" exists?</li>
+        <li>Do you know memoisation can't fix DOM size?</li>
+        <li>Do you know cheap re-renders aren't worth chasing?</li>
+        <li>Do you verify the fix?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "wrap everything in <code>memo</code>".</li>
+        <li><span class="redflag">Red flag:</span> treating any re-render as a problem.</li>
+        <li><span class="redflag">Red flag:</span> no measurement at any point.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>When is <code>useMemo</code> definitely worth it?</li>
+          <li>How would you split a context?</li>
+          <li>What does <code>useTransition</code> help with, and what doesn't it?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service Bus — Azure</title>
+<meta name="description" content="Queues and topics, sessions for ordering, peek-lock semantics, dead-lettering, duplicate detection and scheduled delivery.">
+<meta name="keywords" content="Azure Service Bus queue topic subscription session peek lock receive and delete lock duration renew dead letter queue duplicate detection scheduled message transaction MassTransit tiers premium">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="24-azure/service-bus.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Service Bus</h1>
+    <p class="subtitle">The broker with real messaging semantics. Most of what makes it worth choosing is
+      per-message control that Event Hubs and Kafka structurally cannot offer.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Queue</strong> = one consumer per message. <strong>Topic</strong> = a copy per
+        subscription.</li>
+      <li><strong>Peek-lock is the default and the right choice</strong> — the message returns if you crash.</li>
+      <li><strong>The lock expires.</strong> Slow processing means redelivery, so renew or process faster.</li>
+      <li><strong>Dead-lettering is built in</strong>, and you must monitor the DLQ.</li>
+      <li><strong>Sessions give ordering</strong> — at the cost of one consumer per session.</li>
+      <li><strong>Duplicate detection is by <code>MessageId</code></strong>, within a time window.</li>
+      <li><strong>Scheduled delivery is native</strong> — no polling table needed.</li>
+    </ul>
+  </div>
+
+  <h2 id="queue-vs-topic">Queues and topics <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Queue</th><th>Topic + subscriptions</th></tr></thead>
+      <tbody>
+        <tr><td>Each message goes to</td><td><strong>One consumer</strong></td><td><strong>Every subscription</strong></td></tr>
+        <tr><td>Adding consumers</td><td>Increases throughput (competing consumers)</td><td>Each subscription gets its own copy</td></tr>
+        <tr><td>Filtering</td><td>No</td><td><strong>Yes — SQL or correlation filters per subscription</strong></td></tr>
+        <tr><td>Natural message</td><td>A command — <code>SendInvoice</code></td><td>An event — <code>OrderPlaced</code></td></tr>
+        <tr><td>Adding a new reaction</td><td>Change the consumer</td><td><strong>Add a subscription; publisher unchanged</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — subscription filters do the routing for you" class="code-good"><code class="language-csharp">// Only high-value orders reach this subscription - filtered at the broker,
+// so the consumer never sees or pays for the rest.
+await admin.CreateSubscriptionAsync(
+    new CreateSubscriptionOptions("orders", "high-value"),
+    new CreateRuleOptions("value-filter",
+        new SqlRuleFilter("total &gt; 10000 AND region = 'UK'")));
+
+// A correlation filter is cheaper to evaluate than SQL - prefer it when
+// you're matching on equality alone.
+await admin.CreateSubscriptionAsync(
+    new CreateSubscriptionOptions("orders", "uk-only"),
+    new CreateRuleOptions("uk", new CorrelationRuleFilter { Subject = "UK" }));</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Filter at the broker, not in the consumer</div>
+    <p style="margin:0">A consumer that receives every message and discards 95% of them still pays for the receive
+      operation, the lock, the network transfer and the completion — for messages it doesn't want.
+      <br><br>
+      A subscription filter evaluates at the broker, so those messages never reach you. On a high-volume topic
+      that's a substantial reduction in operations, which on the Standard tier is what you're billed for.
+      <br><br>
+      <strong>Correlation filters are cheaper than SQL filters</strong> because they only do equality matching on
+      system and user properties. So use a correlation filter for "region = UK" and reserve SQL filters for
+      genuine expressions.
+      <br><br>
+      One trap: <strong>a subscription with no rule receives everything</strong>, and creating a subscription
+      adds a default true rule. If you add your own filter without removing the default, you still get
+      everything.</p>
+  </div>
+
+  <h2 id="peek-lock">Peek-lock and the lock duration <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mode</th><th>Behaviour</th><th>On crash</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Peek-lock</strong> (default)</td>
+          <td>Message is locked, not removed. You complete, abandon or dead-letter it</td>
+          <td><strong>Lock expires; message returns</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Receive-and-delete</strong></td>
+          <td>Removed the moment it's delivered</td>
+          <td><strong>Message is lost</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — the processor handles completion for you" class="code-good"><code class="language-csharp">var processor = client.CreateProcessor("orders", new ServiceBusProcessorOptions
+{
+    MaxConcurrentCalls = 10,
+    // Auto-complete on success, abandon on exception. Usually what you want.
+    ReceiveMode = ServiceBusReceiveMode.PeekLock,
+    // Renews the lock while the handler runs - critical for slow processing
+    MaxAutoLockRenewalDuration = TimeSpan.FromMinutes(10)
+});
+
+processor.ProcessMessageAsync += async args =&gt;
+{
+    var order = args.Message.Body.ToObjectFromJson&lt;Order&gt;();
+
+    try
+    {
+        await HandleAsync(order, args.CancellationToken);
+        // Auto-completed on return
+    }
+    catch (ValidationException ex)
+    {
+        // PERMANENT failure - retrying will never work. Dead-letter explicitly.
+        await args.DeadLetterMessageAsync(args.Message,
+            deadLetterReason: "ValidationFailed",
+            deadLetterErrorDescription: ex.Message);
+    }
+    // Transient exceptions propagate -> message is abandoned -> redelivered
+};</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Lock expiry is the failure that produces mysterious duplicates</div>
+    <p style="margin:0">The lock has a duration — 30 seconds by default, maximum 5 minutes. If your handler takes
+      longer and the lock isn't renewed, <strong>the broker assumes you died and redelivers the message to
+      another consumer</strong>.
+      <br><br>
+      So the same message is now being processed twice, concurrently. And when your original handler finishes and
+      tries to complete it, that throws <code>ServiceBusException</code> with
+      <code>MessageLockLost</code> — after the work has already been done.
+      <br><br>
+      The symptom is duplicate side effects with no obvious cause: two emails, two charges, two rows. And it only
+      appears under load, when handlers slow down.
+      <br><br>
+      Two fixes. <strong><code>MaxAutoLockRenewalDuration</code></strong> on the processor, which renews in the
+      background while your handler runs — this is the one people miss. And <strong>make handlers
+      idempotent</strong>, because renewal can still fail and delivery is at-least-once regardless.
+      <br><br>
+      Also note <code>MaxDeliveryCount</code>, default 10: after that many abandons the message is
+      <strong>automatically dead-lettered</strong>. So a message failing on a lock timeout ten times disappears
+      into the DLQ, which is another reason to monitor it.</p>
+  </div>
+
+  <h2 id="dead-letter">Dead-lettering <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>A message is dead-lettered when</th></tr></thead>
+      <tbody>
+        <tr><td><strong><code>MaxDeliveryCount</code> is exceeded</strong> — default 10 abandons</td></tr>
+        <tr><td>You call <code>DeadLetterMessageAsync</code> explicitly</td></tr>
+        <tr><td>The message expires (<code>TimeToLive</code>) and dead-lettering on expiry is enabled</td></tr>
+        <tr><td>It fails a subscription filter evaluation</td></tr>
+        <tr><td>It exceeds the max size or the session can't be accepted</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the DLQ is a real queue, and that has consequences</div>
+    <p style="margin:0">The dead-letter queue isn't a log — it's a <strong>sub-queue you can receive from</strong>,
+      at <code>&lt;queue&gt;/$deadletterqueue</code>. Which means replay is a first-class operation: read from the
+      DLQ, fix or resubmit.
+      <br><br>
+      Three consequences people miss.
+      <br><br>
+      <strong>It counts against your quota.</strong> DLQ messages consume the entity's storage, so an unattended
+      DLQ can eventually fill the queue and block new messages entirely.
+      <br><br>
+      <strong>DLQ messages don't expire by default.</strong> They accumulate indefinitely unless you handle
+      them.
+      <br><br>
+      <strong>You need a replay path built in advance.</strong> The reason to dead-letter rather than drop is
+      that you can reprocess after a fix — and teams dead-letter diligently for a year then discover during an
+      incident that they have no tooling to resubmit, so they're writing it under pressure.
+      <br><br>
+      And the alerting rule: <strong>alert on DLQ depth greater than zero</strong>, not on a threshold. Any
+      dead-lettered message is by definition unhandled, so a threshold means silently accepting some data loss.
+      An unmonitored DLQ is the quietest form of losing data there is.</p>
+  </div>
+
+  <h2 id="sessions">Sessions and ordering <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — ordering per entity, parallelism across entities" class="code-good"><code class="language-csharp">// Publishing: SessionId groups related messages
+await sender.SendMessageAsync(new ServiceBusMessage(payload)
+{
+    SessionId = order.Id.ToString(),     // all messages for THIS order, in order
+    MessageId = eventId.ToString()       // for duplicate detection
+});
+
+// Consuming: a session processor locks a whole session to one consumer
+var processor = client.CreateSessionProcessor("orders", new ServiceBusSessionProcessorOptions
+{
+    MaxConcurrentSessions = 20,          // 20 orders in parallel...
+    MaxConcurrentCallsPerSession = 1     // ...but strictly ordered within each
+});</code></pre>
+
+  <div class="remember">
+    <span class="r-label">The trade</span>
+    <p><strong>A session is locked to a single consumer, and processed one message at a time.</strong> That's what
+      guarantees order.</p>
+    <p>So ordering costs parallelism <em>within</em> a session, and you get parallelism <em>across</em> sessions.
+      With a session per order you can process twenty orders concurrently while each order's messages stay in
+      sequence.</p>
+    <p>Which means the design question is: <strong>what's the smallest scope that genuinely needs ordering?</strong>
+      Usually one entity — never the whole queue.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Sessions must be enabled at creation, and they change the failure mode</div>
+    <p style="margin:0"><strong>You cannot enable sessions on an existing queue.</strong> It's set at creation, so
+      adding ordering later means creating a new entity and migrating — the same shape as
+      <a href="../14-cosmos-db/fundamentals.html#partition-key">an immutable partition key</a>.
+      <br><br>
+      And a session introduces head-of-line blocking: <strong>a message that keeps failing blocks its
+      session</strong>, because the consumer can't skip it without breaking order. Every subsequent message for
+      that order waits.
+      <br><br>
+      Dead-lettering it unblocks the session and <em>breaks ordering for that entity</em>. That's a deliberate
+      choice of availability over ordering, and it should be made consciously rather than discovered.
+      <br><br>
+      Sessions also enable <strong>session state</strong> — a small blob of data associated with the session,
+      which is useful for stateful sequences without an external store.</p>
+  </div>
+
+  <h2 id="duplicate-detection">Duplicate detection <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — broker-side deduplication" class="code-good"><code class="language-csharp">await admin.CreateQueueAsync(new CreateQueueOptions("orders")
+{
+    RequiresDuplicateDetection = true,
+    DuplicateDetectionHistoryTimeWindow = TimeSpan.FromMinutes(10)
+});
+
+// The broker discards a second message with the same MessageId
+// inside the window. So MessageId must be DETERMINISTIC.
+await sender.SendMessageAsync(new ServiceBusMessage(payload)
+{
+    MessageId = $"order-placed:{order.Id}"      // NOT Guid.NewGuid()
+});</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">It only works if <code>MessageId</code> is deterministic</div>
+    <p style="margin:0">Duplicate detection compares <code>MessageId</code>. If you generate a new
+      <code>Guid</code> per send, a retry produces a different id and <strong>the duplicate is not
+      detected</strong> — you've enabled the feature and it does nothing.
+      <br><br>
+      The id must be derived from the <em>event</em>: <code>order-placed:{orderId}</code>, or a business
+      idempotency key. Then a retried publish is recognised as the same message.
+      <br><br>
+      Two limits to know. It's <strong>publisher-side</strong> only — it stops the same message being
+      <em>enqueued</em> twice; it does nothing about a consumer processing one message twice after a lock
+      timeout. So <strong>consumers still need to be idempotent</strong>.
+      <br><br>
+      And the window is bounded — maximum 7 days, and a larger window costs storage and throughput. A retry
+      outside the window isn't detected.
+      <br><br>
+      So it's a useful belt alongside consumer idempotency, not a replacement for it.</p>
+  </div>
+
+  <h2 id="scheduling">Scheduled and deferred messages <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <pre data-label="csharp — native delayed delivery" class="code-good"><code class="language-csharp">// Deliver in 24 hours - no polling table, no timer, no background scanner
+long sequenceNumber = await sender.ScheduleMessageAsync(
+    new ServiceBusMessage(reminderPayload),
+    DateTimeOffset.UtcNow.AddHours(24));
+
+// Cancellable if circumstances change
+await sender.CancelScheduledMessageAsync(sequenceNumber);
+
+// Deferral: set aside a message you can't handle yet, keep the sequence number
+await args.DeferMessageAsync(args.Message);
+var deferred = await receiver.ReceiveDeferredMessageAsync(sequenceNumber);</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this is a genuine differentiator against Kafka</div>
+    <p style="margin:0">Scheduled delivery replaces a whole pattern people otherwise build: a table of pending
+      work, a background service polling it every minute, and the accompanying concerns about missed windows,
+      duplicate scheduling and clock skew.
+      <br><br>
+      With Service Bus it's one call, it's durable, and it's cancellable by sequence number.
+      <br><br>
+      <strong>Kafka has no equivalent.</strong> Delayed retry there means tiered retry topics —
+      <code>orders.retry.5m</code>, <code>orders.retry.1h</code> — with consumers that wait, which is real
+      machinery to build and operate, and a message moved to a retry topic loses its ordering relationship with
+      its siblings.
+      <br><br>
+      <strong>Deferral</strong> is the other one with no Kafka analogue: set a message aside without losing it or
+      blocking the queue, and retrieve it later by sequence number. Useful when a message arrives before its
+      prerequisite — you defer rather than abandon-and-retry, so you don't burn delivery attempts.
+      <br><br>
+      Naming these as reasons to prefer Service Bus over a log-based broker is a stronger answer than "Service Bus
+      is for lower volume".</p>
+  </div>
+
+  <h2 id="tiers">Tiers <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Basic</th><th>Standard</th><th>Premium</th></tr></thead>
+      <tbody>
+        <tr><td>Queues</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td><strong>Topics</strong></td><td><strong>No</strong></td><td>Yes</td><td>Yes</td></tr>
+        <tr><td>Sessions</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td>Max message size</td><td>256 KB</td><td>256 KB</td><td><strong>100 MB</strong></td></tr>
+        <tr><td>Billing</td><td>Per operation</td><td>Per operation</td><td><strong>Per messaging unit</strong></td></tr>
+        <tr><td>Performance</td><td>Shared</td><td>Shared</td><td><strong>Dedicated, predictable</strong></td></tr>
+        <tr><td>VNet, private endpoint</td><td>No</td><td>No</td><td><strong>Yes</strong></td></tr>
+        <tr><td>Geo-DR</td><td>No</td><td>No</td><td><strong>Yes</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Standard is shared capacity, and that means variable latency</div>
+    <p style="margin:0">Basic and Standard run on multi-tenant infrastructure, so throughput and latency vary with
+      what other tenants are doing. It's fine for most workloads and it isn't predictable.
+      <br><br>
+      <strong>Premium gives dedicated resources</strong>, so latency is consistent — plus VNet integration,
+      private endpoints, geo-disaster-recovery, and 100 MB messages.
+      <br><br>
+      The billing difference matters for planning: Standard is <strong>per operation</strong>, so a chatty
+      low-volume system can be surprisingly expensive; Premium is <strong>per messaging unit per hour</strong>,
+      so it's a fixed cost regardless of volume. High steady volume is usually cheaper on Premium.
+      <br><br>
+      Two things that catch people: <strong>Basic has no topics at all</strong>, so choosing it forecloses
+      publish-subscribe entirely. And <strong>large messages should use the claim-check pattern</strong> — store
+      the payload in blob storage, send a reference — rather than reaching for Premium's 100 MB limit, because
+      large messages are slow to move and expensive to retry.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Queue for work (one consumer), topic for events (a copy per subscription).</li>
+      <li>Filter at the broker with subscription rules; correlation filters are cheaper than SQL.</li>
+      <li>A new subscription has a default true rule — remove it or you receive everything.</li>
+      <li>Peek-lock by default. Receive-and-delete loses messages on crash.</li>
+      <li><strong>Lock expiry causes concurrent duplicate processing</strong> — set
+        <code>MaxAutoLockRenewalDuration</code> and be idempotent.</li>
+      <li><code>MaxDeliveryCount</code> (10) auto-dead-letters, so monitor the DLQ.</li>
+      <li>The DLQ is a real queue: it counts against quota, doesn't expire, and needs a replay path.</li>
+      <li>Alert on DLQ depth &gt; 0, not a threshold.</li>
+      <li>Sessions give per-entity ordering, cost intra-session parallelism, and can't be enabled later.</li>
+      <li>Duplicate detection needs a <strong>deterministic <code>MessageId</code></strong> and is
+        publisher-side only.</li>
+      <li>Scheduled delivery and deferral are genuine advantages over log-based brokers.</li>
+      <li>Basic has no topics; Standard is shared capacity; Premium is dedicated and fixed-cost.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Receive-and-delete</strong> for work that matters.</li>
+    <li><strong>No lock renewal</strong> on slow handlers, producing concurrent duplicates.</li>
+    <li><strong>Non-idempotent consumers</strong>, so redelivery duplicates side effects.</li>
+    <li><strong>An unmonitored dead-letter queue.</strong></li>
+    <li><strong>No replay tooling</strong> for dead-lettered messages.</li>
+    <li><strong>Retrying permanent failures</strong> until <code>MaxDeliveryCount</code> instead of
+      dead-lettering explicitly.</li>
+    <li><strong><code>MessageId = Guid.NewGuid()</code></strong> with duplicate detection enabled.</li>
+    <li><strong>Filtering in the consumer</strong> instead of on the subscription.</li>
+    <li><strong>Leaving the default subscription rule</strong> alongside a new filter.</li>
+    <li><strong>Choosing Basic</strong> then needing topics.</li>
+    <li><strong>Large payloads inline</strong> rather than a claim check.</li>
+    <li><strong>Assuming sessions can be added later.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>A consumer processes the same message twice. Why, and how do you fix it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The most likely cause with Service Bus specifically is <strong>lock expiry</strong>, and it's worth
+          explaining the mechanism because the symptom looks like a mystery."</p>
+        <p>"In peek-lock mode the broker locks the message rather than deleting it — 30 seconds by default,
+          maximum five minutes. If my handler takes longer than the lock duration and the lock isn't renewed,
+          <strong>the broker assumes the consumer died and redelivers to another consumer</strong>. So now the same
+          message is being processed twice, concurrently."</p>
+        <p>"And when the original handler finishes and tries to complete, it gets a
+          <code>MessageLockLost</code> exception — <em>after</em> the work has already been done. So you see
+          duplicate side effects plus a confusing exception, and only under load when handlers slow down."</p>
+        <p>"The immediate fix is <strong><code>MaxAutoLockRenewalDuration</code></strong> on the processor, which
+          renews the lock in the background while the handler runs. That's the setting people miss — the default
+          renewal window is short relative to real processing times."</p>
+        <p>"I'd also look at whether the handler <em>should</em> take that long. If it's doing a synchronous HTTP
+          call or a heavy database operation per message, the better fix may be to make it faster, or to accept the
+          message and queue the slow part."</p>
+        <p>"But the durable answer is <strong>idempotency</strong>, because Service Bus is at-least-once by
+          design and no configuration removes that. Renewal can still fail, the process can crash between doing the
+          work and completing the message, and a network blip can lose the completion acknowledgement."</p>
+        <p>"So I'd implement the <strong>inbox pattern</strong>: record the <code>MessageId</code> in a table with
+          a unique constraint, <strong>in the same database transaction as the work</strong>. A duplicate hits the
+          constraint and is skipped."</p>
+        <p>"The same-transaction detail is the critical one — if I record the id and commit separately from the
+          work, a crash between them means the message is marked processed but the work never happened. That turns
+          duplicate delivery into <em>lost</em> work, which is strictly worse and silent."</p>
+        <p>"Two other things I'd check. <strong><code>MaxDeliveryCount</code></strong>, default 10 — if the message
+          keeps failing on lock timeout it'll be auto-dead-lettered after ten attempts, so I'd look at the DLQ for
+          evidence. And <strong>duplicate detection</strong> on the queue, which helps only if
+          <code>MessageId</code> is deterministic — if the publisher generates a fresh
+          <code>Guid</code> per send, a retried publish isn't detected. That's publisher-side anyway, so it
+          wouldn't fix this particular case."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know about lock duration and expiry?</li>
+        <li>Do you know <code>MaxAutoLockRenewalDuration</code>?</li>
+        <li>Do you land on idempotency as the durable fix?</li>
+        <li>Do you know the dedupe record must share the transaction?</li>
+        <li>Do you know duplicate detection is publisher-side?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "switch to receive-and-delete" — that loses messages
+          instead.</li>
+        <li><span class="redflag">Red flag:</span> no mention of idempotency.</li>
+        <li><span class="redflag">Red flag:</span> assuming duplicate detection solves consumer-side
+          duplicates.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you prune the dedupe table?</li>
+          <li>What if the work isn't in a database?</li>
+          <li>How would you detect this happening in production?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>You need messages for one order processed in order, but high throughput overall. How? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"<strong>Sessions</strong>, with the order id as the <code>SessionId</code>. That gives ordering per
+          order and parallelism across orders, which satisfies both requirements."</p>
+        <p>"The mechanism: a session is <strong>locked to a single consumer</strong> and processed one message at a
+          time — that's what guarantees order. So with a session processor I'd set
+          <code>MaxConcurrentSessions</code> to something like 20 and
+          <code>MaxConcurrentCallsPerSession</code> to 1. Twenty orders in flight simultaneously, each
+          internally sequential."</p>
+        <p>"So throughput scales with the number of <em>distinct orders</em>, not with a single consumer's
+          speed."</p>
+        <p>"Three things I'd flag."</p>
+        <p>"<strong>Sessions must be enabled when the queue is created.</strong> You cannot add them to an
+          existing queue — that's a new entity and a migration. So this is a design-time decision, the same shape
+          as an immutable partition key."</p>
+        <p>"<strong>A failing message blocks its session.</strong> Head-of-line blocking: the consumer can't skip
+          it without breaking order, so every subsequent message for that order waits. Dead-lettering it unblocks
+          the session and <em>breaks ordering for that order</em> — which may be fine or may corrupt state,
+          depending on whether the handlers are commutative. That's a deliberate availability-over-ordering choice
+          and it should be made consciously."</p>
+        <p>"<strong>A hot session still serialises.</strong> If one order generates most of the traffic, that
+          session is the bottleneck and adding consumers won't help, because a session can only ever be handled by
+          one consumer. Same shape as a hot partition."</p>
+        <p>"The broader point I'd make though: <strong>I'd first try to make ordering unnecessary</strong>, because
+          it's expensive beyond the throughput cost — it also creates the head-of-line blocking problem."</p>
+        <p>"The most useful technique is <strong>state-based rather than delta-based messages</strong>. 'The order
+          status is now Shipped' is order-independent and idempotent — applying it twice or out of sequence gives
+          the same result. 'Advance the status' is neither. So designing messages as facts about current state
+          rather than increments dissolves the whole problem."</p>
+        <p>"Alternatively, include a <strong>version or sequence number</strong> and have the consumer ignore
+          anything older than what it has already applied. That <em>handles</em> out-of-order arrival rather than
+          preventing it, so you keep full parallelism and lose the blocking risk."</p>
+        <p>"So my order of preference: design so ordering doesn't matter; if it genuinely does, sessions keyed to
+          the smallest scope that needs it — normally one entity, never the whole queue."</p>
+        <p>"One practical warning: <strong>scaling consumers on a non-session queue silently breaks
+          ordering.</strong> If a team adds instances to clear a backlog without realising sessions weren't
+          enabled, they've introduced a correctness bug to fix a throughput problem — and it won't be obvious
+          until something processes out of sequence."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know sessions are the mechanism, and how they trade parallelism?</li>
+        <li>Do you know sessions can't be enabled later?</li>
+        <li>Do you know about head-of-line blocking?</li>
+        <li>Do you try to eliminate the ordering requirement first?</li>
+        <li>Do you know state-vs-delta message design?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "use one consumer" with no session awareness.</li>
+        <li><span class="redflag">Red flag:</span> claiming you can have global ordering and high
+          throughput.</li>
+        <li><span class="redflag">Red flag:</span> no mention of what happens when a message fails.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens if one session's message keeps failing?</li>
+          <li>How would you handle a dominant order generating most traffic?</li>
+          <li>What's session state for?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

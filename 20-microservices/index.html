@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microservices — Overview</title>
+<meta name="description" content="What microservices actually buy you, what they cost, and why the honest senior answer is usually a modular monolith first.">
+<meta name="keywords" content="microservices overview when not to use distributed monolith modular monolith organisational scaling independent deployability operational cost .NET">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="20-microservices/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Microservices</h1>
+    <p class="subtitle">The topic where the strongest interview answer is usually an argument against doing
+      it.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <h2 id="what-they-buy">What microservices actually buy you <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>There is exactly one primary benefit: <strong>independent deployability</strong>.</p>
+    <p>Teams can ship their own service without coordinating a release with everyone else. Every other claimed
+      benefit either follows from that, or isn't real.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Claimed benefit</th><th>Honest assessment</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Independent deployability</strong></td>
+          <td><strong>Real, and the main one.</strong> Ship without a coordinated release</td>
+        </tr>
+        <tr>
+          <td><strong>Team autonomy</strong></td>
+          <td><strong>Real.</strong> A team owns a service end to end and isn't blocked by others</td>
+        </tr>
+        <tr>
+          <td><strong>Independent scaling</strong></td>
+          <td><strong>Real but narrower than claimed.</strong> Usually one component needs scaling — and you can
+              often scale a monolith horizontally instead</td>
+        </tr>
+        <tr>
+          <td><strong>Fault isolation</strong></td>
+          <td><strong>Only if you build for it.</strong> Without timeouts, circuit breakers and fallbacks, one
+              slow service takes down everything calling it</td>
+        </tr>
+        <tr>
+          <td><strong>Technology diversity</strong></td>
+          <td><strong>Usually a liability.</strong> Five languages means five toolchains, five sets of
+              expertise, five security-patch processes</td>
+        </tr>
+        <tr>
+          <td><strong>Smaller, simpler codebases</strong></td>
+          <td><strong>Misleading.</strong> Each service is smaller; the <em>system</em> is considerably more
+              complex</td>
+        </tr>
+        <tr>
+          <td><strong>Better code quality</strong></td>
+          <td><strong>Not a consequence.</strong> Service boundaries don't prevent bad code — you get badly
+              coupled services instead</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Microservices are an organisational solution before they're a technical one.</strong></p>
+    <p>They solve "forty developers can't ship without tripping over each other". They do not solve "our code
+      is messy" — that's a modularity problem, and you can fix modularity inside one deployable.</p>
+    <p>Which is why the first question is always <em>how many teams do you have?</em>, not <em>how much traffic
+      do you have?</em></p>
+  </div>
+
+  <h2 id="the-cost">What they cost <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>A monolith gives you free</th><th>In microservices you must build it</th></tr></thead>
+      <tbody>
+        <tr><td>A function call</td><td>A network call — latency, timeouts, retries, serialisation</td></tr>
+        <tr><td>A database transaction</td><td>A <a href="data-consistency.html#saga">saga</a> with compensation</td></tr>
+        <tr><td>A stack trace</td><td><a href="operations.html#tracing">Distributed tracing</a> and correlation IDs</td></tr>
+        <tr><td>A foreign key</td><td>Eventual consistency and reconciliation</td></tr>
+        <tr><td>Compile-time contract checking</td><td>Versioned APIs and contract tests</td></tr>
+        <tr><td>Run it locally with F5</td><td>Docker Compose, stubs, or a shared dev environment</td></tr>
+        <tr><td>One log file</td><td>Centralised aggregation</td></tr>
+        <tr><td>One deployment</td><td>A pipeline per service, plus orchestration</td></tr>
+        <tr><td>A refactor across a boundary</td><td>A coordinated change across repositories and releases</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The failure mode: a distributed monolith</div>
+    <p style="margin:0">This is what you get when services are split without genuine boundaries: services that
+      must be <strong>deployed together</strong> because they're too coupled to release independently.
+      <br><br>
+      The symptoms are recognisable. A change to one service requires changes to three others. Releases are
+      coordinated across teams anyway. One service being down makes the others useless. Services share a
+      database. Every request fans out through five hops.
+      <br><br>
+      You now have <strong>every cost of distribution and none of the benefit</strong> — the deployability you
+      were buying is exactly what you've lost. It's strictly worse than the monolith you started with, and it's
+      considerably harder to reverse.
+      <br><br>
+      Being able to describe this failure mode specifically is one of the better signals in a microservices
+      interview, because it's the outcome most real projects actually reach.</p>
+  </div>
+
+  <h2 id="when">When they're justified <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Genuine reasons</th><th>Poor reasons</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Many teams blocked by coordinated releases</strong> — the primary one</td>
+          <td>"Monoliths are outdated"</td>
+        </tr>
+        <tr>
+          <td><strong>One component has genuinely different scaling needs</strong> — and scaling the whole
+              thing is proven too expensive</td>
+          <td>"It'll scale better" with no measurement</td>
+        </tr>
+        <tr>
+          <td><strong>Different compliance or data-residency requirements</strong> per capability</td>
+          <td>"We want to try Go"</td>
+        </tr>
+        <tr>
+          <td><strong>Genuinely different availability requirements</strong> — checkout must survive
+              reporting being down</td>
+          <td>"The codebase is a mess" — that's a modularity problem</td>
+        </tr>
+        <tr>
+          <td><strong>Independent lifecycle</strong> — a capability changing weekly next to one changing
+              yearly</td>
+          <td>"It's what everyone does"</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the modular monolith is the right default</div>
+    <p style="margin:0">Most systems that "need microservices" need <strong>clear module boundaries inside one
+      deployable</strong>.
+      <br><br>
+      You get the thing people actually want — separated concerns, independent reasoning, enforced boundaries —
+      while keeping transactions, refactoring, a single stack trace and one deployment.
+      <br><br>
+      And crucially, <strong>a well-modularised monolith is the cheapest possible path to microservices
+      later</strong>, because the boundaries already exist and have been validated by use. Splitting a module
+      that's already independent is mechanical. Splitting a tangled monolith is the project that fails.
+      <br><br>
+      So "I'd start with a modular monolith and extract services when a specific boundary proves it needs
+      independent deployment" is the answer that demonstrates judgement. It's also what
+      <a href="migration.html">the migration page</a> covers in detail.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="boundaries.html">Boundaries &amp; Decomposition</a></td>
+          <td>How to find a boundary, database-per-service, shared-data problems, and why data ownership is the
+              real test</td>
+        </tr>
+        <tr>
+          <td><a href="communication.html">Communication</a></td>
+          <td>Synchronous vs asynchronous, REST and gRPC, service discovery, gateways, contract versioning</td>
+        </tr>
+        <tr>
+          <td><a href="data-consistency.html">Data &amp; Consistency</a></td>
+          <td>Sagas and compensation, eventual consistency, idempotency, why two-phase commit isn't the
+              answer</td>
+        </tr>
+        <tr>
+          <td><a href="operations.html">Resilience &amp; Observability</a></td>
+          <td>Timeouts, circuit breakers, distributed tracing, health checks, deployment and testing
+              strategy</td>
+        </tr>
+        <tr>
+          <td><a href="migration.html">Migration &amp; Modular Monolith</a></td>
+          <td>The strangler approach, when <em>not</em> to split, and how to build a monolith you could split
+              later</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="dotnet-stack">The .NET picture <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Typical choice</th></tr></thead>
+      <tbody>
+        <tr><td>Service host</td><td>ASP.NET Core — minimal APIs or controllers</td></tr>
+        <tr><td>Inter-service sync calls</td><td><code>HttpClient</code> with typed clients, or gRPC</td></tr>
+        <tr><td>Async messaging</td><td>Azure Service Bus, RabbitMQ, or <a href="../22-kafka/index.html">Kafka</a></td></tr>
+        <tr><td>Resilience</td><td>Polly, via <code>AddStandardResilienceHandler</code></td></tr>
+        <tr><td>Observability</td><td>OpenTelemetry — traces, metrics, logs</td></tr>
+        <tr><td>Local orchestration</td><td><strong>.NET Aspire</strong>, or Docker Compose</td></tr>
+        <tr><td>Deployment</td><td>Kubernetes, or Azure Container Apps</td></tr>
+        <tr><td>Gateway</td><td>YARP, or Azure API Management</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">.NET Aspire addresses the genuinely painful part</div>
+    <p style="margin:0">The daily cost of microservices isn't architecture — it's that <strong>running the system
+      locally becomes hard</strong>. Eight services, a database, a message broker and a cache, all needing to
+      start in the right order with the right connection strings.
+      <br><br>
+      Aspire gives you a C# project describing the whole system — services, dependencies, and the wiring between
+      them — so <code>F5</code> starts everything with service discovery and configuration handled, plus a
+      dashboard showing traces and logs across all of it.
+      <br><br>
+      It also configures OpenTelemetry, health checks and resilience defaults, which are the things teams
+      otherwise reimplement inconsistently per service.
+      <br><br>
+      Worth knowing as a current answer to "how do you handle local development with many services?", because
+      the traditional answers — a Compose file everyone maintains, or a shared dev environment people queue
+      for — are both unsatisfying.</p>
+  </div>
+
+  <details class="qa">
+    <summary>Should we move to microservices? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"My default answer is <strong>probably not yet</strong>, and I'd want to know what problem we're
+          solving before agreeing to it — because microservices solve a fairly narrow problem at considerable
+          cost."</p>
+        <p>"The question I'd ask first is <strong>how many teams do we have, and are they blocked by each
+          other?</strong> Not how much traffic — how many teams. Microservices are an organisational solution
+          before a technical one. The primary thing they buy is <strong>independent deployability</strong>: a
+          team ships without coordinating a release with everyone else. Every other claimed benefit either
+          follows from that or doesn't survive scrutiny."</p>
+        <p>"So if the answer is 'we have one team of eight', microservices will make things worse. That team now
+          maintains six pipelines, six sets of infrastructure, and pays network cost between components that used
+          to be method calls — for a coordination benefit they didn't need."</p>
+        <p>"If the reason given is <strong>'the codebase is a mess'</strong>, I'd push back firmly. That's a
+          modularity problem, and distribution doesn't fix it — you get the same tangle with network calls
+          between the tangles, which is strictly harder to reason about. You can fix modularity inside one
+          deployable, and it's much cheaper."</p>
+        <p>"If the reason is <strong>scaling</strong>, I'd want measurements. Usually one component is the
+          bottleneck, and scaling a monolith horizontally is simpler than splitting it. It's also worth noting
+          that the database is frequently the actual constraint, and splitting services doesn't help if they all
+          still hit the same database."</p>
+        <p>"What I'd propose instead is a <strong>modular monolith</strong>: clear module boundaries, each owning
+          its data, communicating through explicit interfaces, with the boundaries enforced — by project
+          references or an architecture test that fails the build on a violation."</p>
+        <p>"That gives the separation people actually want while keeping transactions, refactoring across
+          boundaries, one stack trace and one deployment. And it's the <strong>cheapest path to microservices
+          later</strong>, because the boundaries already exist and have been validated by real use. Extracting a
+          module that's genuinely independent is mechanical work; splitting a tangled monolith is the project
+          that fails."</p>
+        <p>"The failure mode I'd name explicitly is the <strong>distributed monolith</strong> — services split
+          without real boundaries, so they must be deployed together anyway. A change to one needs changes to
+          three others, releases are still coordinated, they share a database, and one being down makes the rest
+          useless. That's every cost of distribution with none of the benefit, and it's much harder to reverse
+          than the monolith you started with."</p>
+        <p>"Where I <em>would</em> extract a service: a capability with genuinely different availability
+          requirements — checkout must survive reporting being down — different compliance or data-residency
+          rules, a genuinely different scaling profile that's been measured, or a team that owns a capability end
+          to end and is being blocked."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you ask about team structure rather than traffic?</li>
+        <li>Do you know independent deployability is the actual benefit?</li>
+        <li>Will you push back on "the codebase is messy"?</li>
+        <li>Do you propose a modular monolith as the default?</li>
+        <li>Can you describe the distributed-monolith failure mode?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "yes, it scales better" with no measurement.</li>
+        <li><span class="redflag">Red flag:</span> listing benefits with no costs.</li>
+        <li><span class="redflag">Red flag:</span> treating it as the modern default.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you find the first service to extract?</li>
+          <li>How do you enforce module boundaries in a monolith?</li>
+          <li>What if one component genuinely needs different scaling?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section builds on
+      <a href="../19-architecture/distributed-data.html">distributed data patterns</a> — outbox, inbox, saga,
+      idempotency — and <a href="../08-http-web-apis/reliability.html">HTTP reliability</a>. Those cover the
+      mechanisms; this section covers when and whether to take them on.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

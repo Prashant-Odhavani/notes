@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tenant Context &amp; Security — Multi-Tenant SaaS</title>
+<meta name="description" content="Resolving and propagating tenant context, enforcing isolation structurally with query filters and row-level security, and the specific ways cross-tenant leaks happen.">
+<meta name="keywords" content="tenant context resolution middleware JWT claim subdomain tenant aware data access EF Core global query filter row level security cross tenant leak cache key background job model cache key factory RBAC">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="23-multi-tenant-saas/tenant-context.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Tenant Context &amp; Security</h1>
+    <p class="subtitle">The most important page in this section. A cross-tenant leak is a breach, and it's always
+      caused by something small.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Never trust a client-supplied tenant id.</strong> Derive it from a signed token, or validate
+        entitlement.</li>
+      <li><strong>Tenant context is a scoped service</strong> — not a static, not a manually-set
+        <code>AsyncLocal</code>.</li>
+      <li><strong>Enforce isolation structurally</strong>: query filters, then row-level security underneath.</li>
+      <li><strong>The tenant id must be in every cache key.</strong></li>
+      <li><strong>Background jobs have no request</strong> — the tenant must travel in the message.</li>
+      <li><strong>EF Core caches the model per context <em>type</em></strong>, which is a real leak vector.</li>
+      <li><strong>Tenant id in logs and trace baggage</strong>, or incidents are unanswerable.</li>
+    </ul>
+  </div>
+
+  <h2 id="resolution">Resolving the tenant <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Source</th><th>Trustworthy?</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>A claim in a validated JWT</strong></td>
+          <td><strong>Yes</strong></td>
+          <td><strong>Best.</strong> Signed, so it can't be altered by the client</td>
+        </tr>
+        <tr>
+          <td><strong>Subdomain</strong> — <code>acme.app.com</code></td>
+          <td>Only after mapping and authorising</td>
+          <td>Good UX; must still check the user belongs to that tenant</td>
+        </tr>
+        <tr>
+          <td><strong>Path segment</strong> — <code>/t/acme/orders</code></td>
+          <td>Same</td>
+          <td>Explicit, and easy to forget to authorise</td>
+        </tr>
+        <tr>
+          <td><strong>A custom header</strong></td>
+          <td><strong>No</strong></td>
+          <td>Client-controlled. Only safe for service-to-service with its own auth</td>
+        </tr>
+        <tr>
+          <td><strong>Request body or query string</strong></td>
+          <td><strong>Absolutely not</strong></td>
+          <td>The most direct possible leak</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The most direct vulnerability in any multi-tenant system</div>
+    <pre data-label="csharp — trusting the client" class="code-bad"><code class="language-csharp">[HttpGet("orders")]
+public async Task&lt;IActionResult&gt; Get([FromQuery] Guid tenantId)
+{
+    // The caller chooses the tenant. Change the parameter, read someone else's data.
+    var orders = await _db.Orders.Where(o =&gt; o.TenantId == tenantId).ToListAsync();
+    return Ok(orders);
+}</code></pre>
+    <pre data-label="csharp — derive it from the authenticated principal" class="code-good"><code class="language-csharp">[HttpGet("orders")]
+public async Task&lt;IActionResult&gt; Get()
+{
+    // Tenant comes from the validated token, not from the request.
+    // The query filter applies it automatically - see below.
+    var orders = await _db.Orders.ToListAsync();
+    return Ok(orders);
+}</code></pre>
+    <p style="margin:0">This looks obviously wrong written out, and it appears in real systems constantly —
+      usually because an internal endpoint took a tenant id for legitimate reasons and later became reachable
+      externally.
+      <br><br>
+      <strong>The rule: the tenant is an attribute of the authenticated identity, never a request
+      parameter.</strong> If an endpoint genuinely needs to act on another tenant — a support tool — that's a
+      separate, explicitly authorised code path with its own audit trail, not the same handler with a
+      parameter.
+      <br><br>
+      This is <a href="../08-http-web-apis/auth-security.html">IDOR</a> at the tenant level, and the blast radius
+      is an entire customer's data rather than one record.</p>
+  </div>
+
+  <pre data-label="csharp — resolution middleware" class="code-good"><code class="language-csharp">public sealed class TenantResolutionMiddleware(RequestDelegate next)
+{
+    public async Task InvokeAsync(HttpContext ctx, ITenantContextSetter setter,
+                                  ITenantStore store)
+    {
+        // 1. From the validated token - authentication has already run
+        var claim = ctx.User.FindFirst("tenant_id")?.Value;
+        if (!Guid.TryParse(claim, out var tenantId))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return;
+        }
+
+        // 2. Look it up - so a deactivated tenant is rejected here, once
+        var tenant = await store.FindAsync(tenantId, ctx.RequestAborted);
+        if (tenant is null || !tenant.IsActive)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return;
+        }
+
+        // 3. If the URL also names a tenant, it MUST match the token
+        if (ctx.Request.RouteValues.TryGetValue("tenantSlug", out var slug) &&
+            !string.Equals(slug?.ToString(), tenant.Slug, StringComparison.OrdinalIgnoreCase))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return;
+        }
+
+        setter.Set(tenant);
+        ctx.Items["TenantId"] = tenant.Id;              // for logging enrichment
+        await next(ctx);
+    }
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Middleware order matters, and getting it wrong fails open</div>
+    <p style="margin:0">Tenant resolution must run <strong>after</strong>
+      <code>UseAuthentication()</code> — otherwise <code>ctx.User</code> is unauthenticated and there's no claim
+      to read.
+      <br><br>
+      And it must run <strong>before</strong> anything that touches tenant data, including
+      <code>UseAuthorization()</code> if your policies are tenant-aware.
+      <br><br>
+      The dangerous ordering mistake is placing it after the endpoint's own logic or in a filter that some routes
+      skip — because then the tenant context is <em>unset</em> rather than wrong, and depending on how the query
+      filter handles a null tenant, you may get <strong>every tenant's data</strong> instead of none.
+      <br><br>
+      <strong>Design the null-tenant case to return nothing, never everything.</strong> Failing closed is the
+      whole point.</p>
+  </div>
+
+  <h2 id="context-service">Holding the context <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — a scoped service, set once, then read-only" class="code-good"><code class="language-csharp">public interface ITenantContext
+{
+    Guid TenantId { get; }
+    string Slug { get; }
+    bool IsResolved { get; }
+}
+
+// Only the middleware can set it - the rest of the app only reads
+public interface ITenantContextSetter { void Set(Tenant tenant); }
+
+internal sealed class TenantContext : ITenantContext, ITenantContextSetter
+{
+    private Tenant? _tenant;
+
+    public bool IsResolved =&gt; _tenant is not null;
+
+    public Guid TenantId =&gt; _tenant?.Id
+        ?? throw new InvalidOperationException("Tenant not resolved.");   // fail loudly
+
+    public string Slug =&gt; _tenant?.Slug
+        ?? throw new InvalidOperationException("Tenant not resolved.");
+
+    public void Set(Tenant tenant) =&gt;
+        _tenant = _tenant is null
+            ? tenant
+            : throw new InvalidOperationException("Tenant already set.");  // set once
+}
+
+// Registered scoped - one per request
+services.AddScoped&lt;TenantContext&gt;();
+services.AddScoped&lt;ITenantContext&gt;(sp =&gt; sp.GetRequiredService&lt;TenantContext&gt;());
+services.AddScoped&lt;ITenantContextSetter&gt;(sp =&gt; sp.GetRequiredService&lt;TenantContext&gt;());</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — three design choices in that code</div>
+    <p style="margin:0"><strong>Throwing when unresolved, rather than returning <code>Guid.Empty</code>.</strong>
+      An empty tenant id flowing into a query silently matches nothing — or worse, matches rows where the column
+      is empty. Throwing makes a missing tenant an immediate, obvious failure rather than a quiet
+      data-correctness problem.
+      <br><br>
+      <strong>Separating the setter interface.</strong> Application code can inject
+      <code>ITenantContext</code> and read; only the middleware gets <code>ITenantContextSetter</code>. So no
+      handler can change the tenant mid-request, accidentally or otherwise.
+      <br><br>
+      <strong>Set-once semantics.</strong> A second <code>Set</code> throws, which catches a bug where two
+      middlewares or a filter both try to resolve.
+      <br><br>
+      And it must be <strong>scoped, never static or singleton</strong>. A static field holding the tenant is a
+      cross-request leak under concurrency, and it's the kind that works perfectly under manual testing and fails
+      under load.</p>
+  </div>
+
+  <h2 id="enforcement">Enforcing isolation structurally <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">The principle</span>
+    <p><strong>If isolation depends on developers remembering to filter, you will have a leak.</strong></p>
+    <p>Not because developers are careless — because there are thousands of queries, new people join, and one
+      missed predicate is enough.</p>
+    <p>So isolation must be enforced by a mechanism that applies <em>by default</em>, with a second layer
+      underneath for when the first is bypassed.</p>
+  </div>
+
+  <h3 id="query-filters">Layer 1 — EF Core global query filters</h3>
+
+  <pre data-label="csharp — applied automatically to every query" class="code-good"><code class="language-csharp">public class AppDbContext(DbContextOptions options, ITenantContext tenant) : DbContext(options)
+{
+    // A FIELD read per query, not a captured constant - see the trap below
+    private Guid TenantId =&gt; tenant.TenantId;
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        // Apply to every entity implementing ITenantOwned - no per-entity opt-in
+        foreach (var entity in builder.Model.GetEntityTypes()
+                     .Where(e =&gt; typeof(ITenantOwned).IsAssignableFrom(e.ClrType)))
+        {
+            var param = Expression.Parameter(entity.ClrType, "e");
+            var body = Expression.Equal(
+                Expression.Property(param, nameof(ITenantOwned.TenantId)),
+                Expression.Property(Expression.Constant(this), nameof(TenantId)));
+
+            builder.Entity(entity.ClrType)
+                   .HasQueryFilter(Expression.Lambda(body, param));
+        }
+    }
+
+    // Also stamp the tenant on insert, so it can't be forgotten
+    public override Task&lt;int&gt; SaveChangesAsync(CancellationToken ct = default)
+    {
+        foreach (var e in ChangeTracker.Entries&lt;ITenantOwned&gt;()
+                     .Where(e =&gt; e.State == EntityState.Added))
+        {
+            e.Entity.TenantId = TenantId;
+        }
+        return base.SaveChangesAsync(ct);
+    }
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">The EF Core model cache trap — the leak that only appears under load</div>
+    <p style="margin:0">EF Core caches the compiled <strong>model per <code>DbContext</code> type</strong>, not per
+      instance. So the query filter expression is compiled once and reused for every context instance.
+      <br><br>
+      If the filter captures the tenant id <em>by value</em> at model-build time — for example
+      <code>HasQueryFilter(e =&gt; e.TenantId == _tenantId)</code> where <code>_tenantId</code> was read in the
+      constructor — then <strong>the first request's tenant id is baked into the cached model and applied to
+      every subsequent request, for every tenant</strong>.
+      <br><br>
+      That's a cross-tenant leak of the worst kind: it works perfectly in single-tenant testing, appears only
+      under concurrent multi-tenant traffic, and reads other tenants' data silently.
+      <br><br>
+      <strong>The fix is to reference a property on the context instance</strong>, as in the code above —
+      <code>Expression.Property(Expression.Constant(this), nameof(TenantId))</code> — so EF evaluates it per
+      query rather than capturing a value. If the filter's <em>shape</em> varies per tenant, you also need a
+      custom <code>IModelCacheKeyFactory</code> so each variant gets its own cached model.
+      <br><br>
+      This is the highest-value .NET-specific detail in this section, and it's a genuinely subtle bug.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Where query filters don't apply</div>
+    <p style="margin:0">Global query filters are excellent and <strong>not complete</strong>. They don't apply
+      to:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong><code>FindAsync</code> by primary key</strong> — it can return another tenant's row if you know
+        the id.</li>
+      <li><strong>Raw SQL</strong> — <code>FromSql</code>, <code>ExecuteSql</code>, Dapper.</li>
+      <li><strong>Explicit <code>IgnoreQueryFilters()</code></strong>, which any developer can add.</li>
+      <li><strong>Direct database access</strong> — a script, an admin tool, a reporting connection.</li>
+    </ul>
+    <p style="margin:8px 0 0"><code>FindAsync</code> is the one that surprises people. It checks the change
+      tracker then queries by key, bypassing the filter — so <code>FindAsync(someOtherTenantsOrderId)</code>
+      returns the row. Use a filtered <code>FirstOrDefaultAsync</code> instead, or accept that you need layer
+      2.</p>
+  </div>
+
+  <h3 id="rls">Layer 2 — row-level security in the database</h3>
+
+  <pre data-label="sql — enforced below the application entirely" class="code-good"><code class="language-sql">-- The predicate function
+CREATE FUNCTION dbo.fn_TenantAccessPredicate(@TenantId uniqueidentifier)
+RETURNS TABLE WITH SCHEMABINDING
+AS
+RETURN SELECT 1 AS ok
+WHERE @TenantId = CAST(SESSION_CONTEXT(N'TenantId') AS uniqueidentifier);
+GO
+
+-- FILTER blocks reads; BLOCK stops writing rows for another tenant
+CREATE SECURITY POLICY dbo.TenantIsolationPolicy
+    ADD FILTER PREDICATE dbo.fn_TenantAccessPredicate(TenantId) ON dbo.[Order],
+    ADD BLOCK PREDICATE dbo.fn_TenantAccessPredicate(TenantId) ON dbo.[Order] AFTER INSERT
+WITH (STATE = ON);</code></pre>
+
+  <pre data-label="csharp — set the session context on every connection" class="code-good"><code class="language-csharp">// An EF Core interceptor, so it can't be forgotten per-query
+public sealed class TenantSessionInterceptor(ITenantContext tenant) : DbConnectionInterceptor
+{
+    public override async Task ConnectionOpenedAsync(
+        DbConnection connection, ConnectionEndEventData eventData, CancellationToken ct = default)
+    {
+        if (!tenant.IsResolved) return;
+
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = "EXEC sp_set_session_context @key=N'TenantId', @value=@tenantId";
+        var p = cmd.CreateParameter();
+        p.ParameterName = "@tenantId";
+        p.Value = tenant.TenantId;
+        cmd.Parameters.Add(p);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why the second layer is what makes this defensible</div>
+    <p style="margin:0">Query filters protect the application's own EF queries. <strong>Row-level security
+      protects everything</strong> — raw SQL, Dapper, a stored procedure, a reporting tool, a developer connected
+      with SSMS, and code that called <code>IgnoreQueryFilters()</code>.
+      <br><br>
+      So the two layers cover genuinely different failure modes, and that's the definition of defence in depth
+      rather than redundancy.
+      <br><br>
+      Two operational requirements. The application's login must <strong>not</strong> be
+      <code>db_owner</code> or have <code>ALTER ANY SECURITY POLICY</code>, because RLS doesn't apply to those —
+      so an over-privileged connection string silently disables the protection you think you have. And the session
+      context must be set on <strong>every connection</strong>, which with connection pooling means using an
+      interceptor rather than doing it once at startup, since a pooled connection is reused across requests and
+      tenants.
+      <br><br>
+      That pooling detail is the one that catches people: set it once and a recycled connection carries the
+      previous tenant's context.
+      <br><br>
+      Being able to explain that layer 2 exists specifically because layer 1 can be bypassed — and naming the
+      privilege and pooling caveats — is the answer that demonstrates you've deployed this rather than read
+      about it.</p>
+  </div>
+
+  <h2 id="leak-vectors">Where leaks actually happen <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Vector</th><th>Why it's missed</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Cache keys without the tenant</strong></td>
+          <td>Caching is added later, by someone thinking about performance not isolation</td>
+          <td>Tenant id in every key; a helper that requires it</td>
+        </tr>
+        <tr>
+          <td><strong>Background jobs</strong></td>
+          <td>No HTTP request, so no middleware ran and no tenant is set</td>
+          <td>Tenant in the message; a scope per tenant</td>
+        </tr>
+        <tr>
+          <td><strong><code>FindAsync</code> by id</strong></td>
+          <td>Query filters don't apply to key lookups</td>
+          <td>Filtered <code>FirstOrDefaultAsync</code>, plus RLS</td>
+        </tr>
+        <tr>
+          <td><strong>Raw SQL and Dapper</strong></td>
+          <td>Bypasses EF entirely</td>
+          <td>RLS, and an explicit predicate</td>
+        </tr>
+        <tr>
+          <td><strong>Admin and support endpoints</strong></td>
+          <td>Deliberately cross-tenant, then reachable by the wrong people</td>
+          <td>A separate authorisation policy and an audit trail</td>
+        </tr>
+        <tr>
+          <td><strong>Reports and exports</strong></td>
+          <td>Often hand-written SQL against a replica</td>
+          <td>RLS on the replica too</td>
+        </tr>
+        <tr>
+          <td><strong>File and blob storage</strong></td>
+          <td>Nobody applies query filters to a container</td>
+          <td>Tenant in the path; scoped SAS tokens</td>
+        </tr>
+        <tr>
+          <td><strong>Search indexes</strong></td>
+          <td>A separate system with its own access model</td>
+          <td>Tenant as a filterable field, enforced server-side</td>
+        </tr>
+        <tr>
+          <td><strong>Error messages and logs</strong></td>
+          <td>An exception echoing another tenant's data</td>
+          <td>Don't include data in messages returned to users</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — the cache key mistake" class="code-bad"><code class="language-csharp">var key = $"product:{productId}";                    // NO TENANT
+var cached = await _cache.GetStringAsync(key);
+// Tenant A's product is served to Tenant B. Silent, and cached for the TTL.</code></pre>
+
+  <pre data-label="csharp — a helper that can't be misused" class="code-good"><code class="language-csharp">public sealed class TenantCache(IDistributedCache cache, ITenantContext tenant)
+{
+    // The tenant is prepended here; callers cannot omit it
+    private string Key(string suffix) =&gt; $"t:{tenant.TenantId}:{suffix}";
+
+    public Task&lt;string?&gt; GetAsync(string suffix) =&gt; cache.GetStringAsync(Key(suffix));
+    public Task SetAsync(string suffix, string value, DistributedCacheEntryOptions o) =&gt;
+        cache.SetStringAsync(Key(suffix), value, o);
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Make the safe path the only path</div>
+    <p style="margin:0">The pattern in that helper generalises: rather than documenting "remember to include the
+      tenant", <strong>remove the ability to omit it</strong>.
+      <br><br>
+      A <code>TenantCache</code> that no caller can bypass. A repository base class that applies the filter. A
+      blob helper that builds the path. If the unsafe call isn't expressible, it can't be written by a new
+      developer on their second day.
+      <br><br>
+      Then add an <strong>architecture test</strong> that fails the build if anything injects
+      <code>IDistributedCache</code> directly — the same
+      <a href="../20-microservices/migration.html#modular-monolith">mechanical enforcement</a> as module
+      boundaries. Conventions erode; a failing build doesn't.</p>
+  </div>
+
+  <h2 id="background-jobs">Background jobs and messages <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the tenant travels with the work" class="code-good"><code class="language-csharp">// Publishing: capture the current tenant into the message
+await _bus.Publish(new RecalculatePricing(
+    TenantId: _tenant.TenantId,          // explicit, not ambient
+    ProductIds: ids), ct);
+
+// Consuming: create a scope and set the tenant BEFORE any data access
+public async Task Consume(ConsumeContext&lt;RecalculatePricing&gt; ctx)
+{
+    await using var scope = _scopeFactory.CreateAsyncScope();
+
+    scope.ServiceProvider.GetRequiredService&lt;ITenantContextSetter&gt;()
+         .Set(await _store.GetAsync(ctx.Message.TenantId));
+
+    var handler = scope.ServiceProvider.GetRequiredService&lt;PricingRecalculator&gt;();
+    await handler.RunAsync(ctx.Message.ProductIds, ctx.CancellationToken);
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Background work is where isolation quietly stops applying</div>
+    <p style="margin:0">All the protection described above hangs off <strong>a request</strong>. Middleware
+      resolves the tenant, a scoped service holds it, and the query filter reads it.
+      <br><br>
+      A <a href="../07-aspnet-core/background-services.html">background service</a> has none of that. It's a
+      singleton, there's no request, no middleware ran, and the tenant context is unresolved.
+      <br><br>
+      So a nightly job that iterates records is operating <strong>with no tenant filter at all</strong> — and
+      depending on how the unresolved case is handled, it either throws (good) or processes every tenant's data
+      (bad, and it may well write results to the wrong tenant).
+      <br><br>
+      Two rules. <strong>The tenant id must be an explicit field in every message and job parameter</strong> —
+      never inferred, never ambient. And <strong>the job must create a scope per tenant</strong> and set the
+      context before touching data, so all the normal protections apply inside it.
+      <br><br>
+      For a job that genuinely spans tenants — a nightly billing run — the correct shape is to <em>enumerate
+      tenants and process each in its own scope</em>, not to run one unscoped query across all of them.</p>
+  </div>
+
+  <h2 id="observability">Tenant in logs and traces <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — enrich logs and propagate through traces" class="code-good"><code class="language-csharp">// Logging: a scope so every log line in the request carries it
+using (_logger.BeginScope(new Dictionary&lt;string, object&gt;
+{
+    ["TenantId"] = tenant.TenantId,
+    ["TenantSlug"] = tenant.Slug
+}))
+{
+    await next(ctx);
+}
+
+// Tracing: baggage travels across service and message boundaries
+Activity.Current?.SetBaggage("tenant.id", tenant.TenantId.ToString());</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The first question in every incident is "one tenant or all of them?"</div>
+    <p style="margin:0">Without the tenant on log lines and traces, that question takes an hour of correlation. With
+      it, it's a filter.
+      <br><br>
+      It also lets you answer things you'll be asked routinely: which tenant is generating this load, which
+      tenants were affected by the outage window, is this error specific to one customer's data.
+      <br><br>
+      Use <strong>baggage</strong> rather than a span attribute for the tenant, because baggage propagates across
+      service boundaries and through message headers — so a downstream service and an async consumer both have it
+      without passing it explicitly.
+      <br><br>
+      One caution: <strong>the tenant identifier is fine to log; tenant <em>data</em> is not.</strong> A log line
+      containing another customer's record is itself a leak, and logs are frequently more widely readable than
+      the database.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>The tenant is an attribute of the authenticated identity — never a request parameter.</li>
+      <li>Resolve from a signed claim; if the URL also names a tenant, it must match.</li>
+      <li>Tenant context is scoped, set once, read-only, and throws when unresolved.</li>
+      <li>Design the unresolved case to return nothing, never everything.</li>
+      <li>Layer 1: EF Core global query filters applied to every tenant-owned entity.</li>
+      <li>Reference a context property in the filter — a captured value gets baked into the cached model and
+        leaks.</li>
+      <li>Query filters don't cover <code>FindAsync</code>, raw SQL, or <code>IgnoreQueryFilters</code>.</li>
+      <li>Layer 2: row-level security, with a non-<code>db_owner</code> login and session context set per
+        connection.</li>
+      <li>Every cache key needs the tenant. Make the safe path the only path.</li>
+      <li>Background jobs have no request — carry the tenant in the message, scope per tenant.</li>
+      <li>Tenant id in logs and as trace baggage; tenant data in neither.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Tenant id from a query string or body</strong>, trusted.</li>
+    <li><strong>Tenant context in a static or singleton</strong>, leaking across requests.</li>
+    <li><strong>Returning <code>Guid.Empty</code></strong> when unresolved instead of throwing.</li>
+    <li><strong>A query filter capturing the tenant id by value</strong>, baked into the cached model.</li>
+    <li><strong>Relying on query filters alone</strong>, with no RLS underneath.</li>
+    <li><strong>An application login with <code>db_owner</code></strong>, silently bypassing RLS.</li>
+    <li><strong>Session context set once</strong> rather than per pooled connection.</li>
+    <li><strong><code>FindAsync</code></strong> for tenant-owned entities.</li>
+    <li><strong>Cache keys without the tenant.</strong></li>
+    <li><strong>Background jobs with no tenant scope.</strong></li>
+    <li><strong>Admin endpoints sharing the normal authorisation policy.</strong></li>
+    <li><strong>Blob paths and search indexes</strong> without tenant scoping.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>How do you guarantee one tenant can never see another's data? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by rejecting the approach that fails: <strong>if isolation depends on developers remembering
+          to add a filter, there will eventually be a leak.</strong> Not through carelessness — there are thousands
+          of queries, people join and leave, and one missed predicate is enough. So it has to be structural, with
+          more than one layer."</p>
+        <p>"<strong>First, where the tenant comes from.</strong> It must be derived from the authenticated
+          identity — a claim in a validated JWT — and <strong>never</strong> from a request parameter. An endpoint
+          taking <code>?tenantId=</code> and trusting it is the most direct possible breach: change the
+          parameter, read someone else's data. That's IDOR at the tenant level, and the blast radius is an entire
+          customer rather than one record. If the URL also names a tenant for UX reasons, it must be checked
+          against the token."</p>
+        <p>"<strong>Second, holding it.</strong> A scoped service, set once by middleware, read-only thereafter. I
+          split the setter into its own interface so application code can only read. And it
+          <strong>throws</strong> when unresolved rather than returning <code>Guid.Empty</code> — because an empty
+          id flowing into a query silently matches nothing or, worse, matches rows with an empty column.
+          <strong>The unresolved case must return nothing, never everything.</strong>"</p>
+        <p>"<strong>Layer one: EF Core global query filters.</strong> Applied automatically to every entity
+          implementing a marker interface, so it's not a per-entity opt-in someone can forget. Plus stamping the
+          tenant on insert in <code>SaveChanges</code>, so a new record can't be created without one."</p>
+        <p>"There's a .NET-specific trap I'd flag here because it's subtle and severe. <strong>EF Core caches the
+          compiled model per <code>DbContext</code> type, not per instance.</strong> So if the filter captures the
+          tenant id <em>by value</em> — read in the constructor into a field the expression closes over — then the
+          first request's tenant is baked into the cached model and applied to <em>every</em> subsequent request
+          for every tenant. That's a cross-tenant leak that works perfectly in single-tenant testing and appears
+          only under concurrent traffic. The fix is referencing a property on the context instance so EF evaluates
+          it per query."</p>
+        <p>"<strong>Layer two: row-level security in the database.</strong> This is what makes it defensible,
+          because query filters only protect the application's own EF queries. RLS protects everything — raw SQL,
+          Dapper, stored procedures, a reporting tool, a developer in SSMS, and code that called
+          <code>IgnoreQueryFilters()</code>."</p>
+        <p>"Two caveats there. The application login must <strong>not</strong> be <code>db_owner</code>, because
+          RLS doesn't apply to it — an over-privileged connection string silently disables the protection. And the
+          session context must be set on <strong>every connection</strong> via an interceptor, not once at
+          startup, because connection pooling means a recycled connection would otherwise carry the previous
+          tenant's context."</p>
+        <p>"<strong>Then the vectors people miss</strong>, which is where leaks actually come from."</p>
+        <p>"<strong>Cache keys.</strong> A key of <code>product:123</code> with no tenant serves one tenant's data
+          to another, silently, for the whole TTL. I'd wrap the cache in a helper that prepends the tenant so
+          callers cannot omit it — and add an architecture test failing the build if anything injects
+          <code>IDistributedCache</code> directly."</p>
+        <p>"<strong>Background jobs.</strong> All the protection hangs off a request. A background service is a
+          singleton with no middleware and no resolved tenant — so a nightly job operates with no filter at all.
+          The tenant must be an explicit field in the message, and the job creates a scope per tenant and sets the
+          context before touching data. For a genuinely cross-tenant job like billing, enumerate tenants and
+          process each in its own scope rather than running one unscoped query."</p>
+        <p>"<strong><code>FindAsync</code></strong>, which surprises people — it queries by key and bypasses the
+          query filter, so <code>FindAsync(anotherTenantsId)</code> returns the row. That's specifically why layer
+          two matters."</p>
+        <p>"And <strong>blob storage, search indexes and admin endpoints</strong> — each a separate system with its
+          own access model that query filters don't touch."</p>
+        <p>"Finally, <strong>detection</strong>: tenant id on every log line and as trace baggage, so I can answer
+          'one tenant or all of them?' immediately. And I'd write tests that specifically attempt cross-tenant
+          access — authenticate as tenant A, request tenant B's resource by id, assert 404 — because that's the
+          only way to know the enforcement actually works rather than assuming."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you insist on structural enforcement with layers?</li>
+        <li>Do you refuse a client-supplied tenant id?</li>
+        <li>Do you know the EF model-cache trap?</li>
+        <li>Do you know why RLS is needed on top of query filters, and its caveats?</li>
+        <li>Do you cover caches, background jobs, <code>FindAsync</code>, blobs?</li>
+        <li>Do you test for cross-tenant access explicitly?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "filter by TenantId in every query" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> query filters presented as complete.</li>
+        <li><span class="redflag">Red flag:</span> no mention of caches or background jobs.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you build a support tool that legitimately crosses tenants?</li>
+          <li>How do you test isolation automatically?</li>
+          <li>What about tenant isolation in Cosmos or Redis?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

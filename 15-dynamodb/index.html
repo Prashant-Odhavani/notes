@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DynamoDB — Overview</title>
+<meta name="description" content="Why DynamoDB requires a fundamentally different design process, what it gives you in return, and how this section is organised.">
+<meta name="keywords" content="DynamoDB overview access pattern driven design key value store single table design when to use vs Cosmos vs MongoDB AWS SDK .NET">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="15-dynamodb/index.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>DynamoDB</h1>
+    <p class="subtitle">The most constrained database in this handbook, and the most predictable. It forces a
+      design process that other databases let you skip.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="the-shift">The fundamental difference <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Every other database in this handbook lets you store data first and work out queries later. Relational
+      normalisation, MongoDB documents, even Cosmos — you can retrofit a query with an index.</p>
+    <p><strong>DynamoDB does not.</strong> You must enumerate every access pattern before you design the table,
+      because the key structure <em>is</em> the query capability.</p>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">The design process, reversed</span>
+    <p><strong>Relational:</strong> model the entities → normalise → write queries → add indexes as needed.</p>
+    <p><strong>DynamoDB:</strong> list every access pattern → design keys that serve them → then see what the
+      data looks like.</p>
+    <p>If you design a DynamoDB table by thinking about entities, you will build something that can't answer
+      your queries — and the fix is a table migration, not an index.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A relational database is a library with a catalogue. Any question can be answered by searching, and
+      you can add a new index for a new kind of question.</p>
+    <p>DynamoDB is a set of pre-sorted shelves. Anything the shelving supports is instant. Anything it doesn't
+      means walking every shelf — or rebuilding the shelving.</p>
+  </div>
+
+  <h2 id="what-you-get">What the constraint buys you <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Predictable latency at any scale</strong></td>
+          <td>Single-digit milliseconds whether the table holds a thousand items or a trillion. Not "usually" —
+              the design guarantees it</td>
+        </tr>
+        <tr>
+          <td><strong>No query planner</strong></td>
+          <td>Nothing to tune, nothing to regress. There is no plan to go wrong at 3am</td>
+        </tr>
+        <tr>
+          <td><strong>Genuinely zero operations</strong></td>
+          <td>No instances, no version upgrades, no vacuum, no index maintenance</td>
+        </tr>
+        <tr>
+          <td><strong>Scales to zero and to enormous</strong></td>
+          <td>On-demand billing means an idle table costs almost nothing</td>
+        </tr>
+        <tr>
+          <td><strong>Cost is calculable in advance</strong></td>
+          <td>You can compute the bill from the access patterns before writing code</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why "no query planner" is a feature</div>
+    <p style="margin:0">Every other database in this handbook has a section on the planner going wrong: stale
+      statistics, parameter sniffing, a plan flip after a failover, cross-partition fan-out that worsens as data
+      grows.
+      <br><br>
+      DynamoDB has none of those failure modes, because there is nothing to decide. A query either matches the
+      key structure and is fast, or it doesn't and you can see that in the code.
+      <br><br>
+      That's the trade: <strong>you give up query flexibility and get predictability</strong>. For a system where
+      p99 latency is a product requirement and 3am plan regressions are unacceptable, that's a genuinely good
+      deal — and it's the strongest argument for DynamoDB that isn't about scale.</p>
+  </div>
+
+  <h2 id="when">When to choose it <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Good fit</th><th>Poor fit</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Access patterns are known and stable</strong> — the hard requirement</td>
+          <td><strong>Ad-hoc or evolving queries</strong> — you'll be migrating tables repeatedly</td>
+        </tr>
+        <tr>
+          <td><strong>High-volume key-based access</strong> — sessions, carts, user state, device data</td>
+          <td><strong>Reporting and analytics</strong> — no aggregation, no joins</td>
+        </tr>
+        <tr>
+          <td><strong>Predictable latency is a requirement</strong></td>
+          <td><strong>Complex relational integrity</strong> — no foreign keys, no constraints</td>
+        </tr>
+        <tr>
+          <td><strong>Serverless / AWS-native</strong> — pairs naturally with Lambda</td>
+          <td><strong>Small internal apps</strong> — RDS or Aurora Serverless is simpler and more flexible</td>
+        </tr>
+        <tr>
+          <td><strong>Spiky or unpredictable traffic</strong> — on-demand absorbs it</td>
+          <td><strong>Teams new to it</strong> — single-table design has a real learning curve</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The honest warning</div>
+    <p style="margin:0">DynamoDB punishes uncertainty harder than anything else here. If the product is still
+      discovering what it needs, you will design a table, ship it, discover a new access pattern, and face a
+      choice between an expensive scan, a new GSI, or a table migration.
+      <br><br>
+      A relational database absorbs that churn — you add an index and move on. DynamoDB makes it structural.
+      <br><br>
+      So "we don't know all our queries yet" is a strong argument <em>against</em> DynamoDB, and saying so is
+      better than demonstrating you can do single-table design. The pattern is impressive and it's not free.</p>
+  </div>
+
+  <h2 id="section-map">What's on each page</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Page</th><th>Covers</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="fundamentals.html">Fundamentals</a></td>
+          <td>Partition and sort keys, query vs scan, GSIs and LSIs, consistency options, item limits</td>
+        </tr>
+        <tr>
+          <td><a href="data-modeling.html">Single-Table Design</a></td>
+          <td>The access-pattern-first process, overloaded keys, hierarchies, adjacency lists, and when
+              <em>not</em> to use a single table</td>
+        </tr>
+        <tr>
+          <td><a href="operations.html">Capacity, Streams &amp; Operations</a></td>
+          <td>On-demand vs provisioned, hot partitions, transactions, TTL, DynamoDB Streams, global tables</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="dotnet">The .NET side <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>API level</th><th>What it gives you</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Low-level</strong> (<code>AmazonDynamoDBClient</code>)</td>
+          <td>Raw requests, full control over expressions and consumed capacity</td>
+          <td><strong>Single-table design</strong> — you need the control</td>
+        </tr>
+        <tr>
+          <td><strong>Document model</strong> (<code>Table</code>, <code>Document</code>)</td>
+          <td>Dictionary-like access, less ceremony</td>
+          <td>Dynamic shapes</td>
+        </tr>
+        <tr>
+          <td><strong>Object persistence</strong> (<code>DynamoDBContext</code>)</td>
+          <td>Attribute-mapped POCOs, closest to an ORM</td>
+          <td>Simple one-table-per-entity designs</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — client registration" class="code-good"><code class="language-csharp">// Singleton - it holds an HTTP connection pool
+builder.Services.AddSingleton&lt;IAmazonDynamoDB&gt;(_ =&gt;
+    new AmazonDynamoDBClient(new AmazonDynamoDBConfig
+    {
+        RegionEndpoint = RegionEndpoint.EUWest1,
+        // Adaptive retries handle throttling with backoff
+        RetryMode      = RequestRetryMode.Adaptive,
+        MaxErrorRetry  = 5
+    }));</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The object persistence model fights single-table design</div>
+    <p style="margin:0"><code>DynamoDBContext</code> maps one POCO to one table with named properties. That's
+      comfortable and it assumes a relational-style layout — one entity type per table.
+      <br><br>
+      Single-table design does the opposite: several entity types share a table with <strong>overloaded generic
+      key names</strong> like <code>PK</code> and <code>SK</code>, whose meaning depends on the item type. The
+      high-level mapper has no good way to express that.
+      <br><br>
+      So in practice: <strong>low-level API for single-table designs</strong>, object persistence only for
+      simple one-entity-per-table models. Choosing the friendly API first and then trying to do single-table
+      design is a common source of pain.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Always log consumed capacity in development</div>
+    <pre data-label="csharp"><code class="language-csharp">var request = new QueryRequest
+{
+    TableName = "app",
+    ReturnConsumedCapacity = ReturnConsumedCapacity.TOTAL,
+    // ...
+};
+var response = await client.QueryAsync(request);
+logger.LogInformation("Consumed {Units} RCU", response.ConsumedCapacity.CapacityUnits);</code></pre>
+    <p style="margin:0">Same reasoning as
+      <a href="../14-cosmos-db/index.html#dotnet">logging Cosmos RU charges</a> and
+      <a href="../11-ef-core/index.html#leaky">EF Core's SQL</a>. Consumed capacity is the signal that tells you
+      whether an operation is a targeted query or an accidental scan — and a scan returns correct results, so
+      nothing else warns you.</p>
+  </div>
+
+  <h2 id="vs-others">Compared to Cosmos and MongoDB <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>DynamoDB</th><th>Cosmos DB</th><th>MongoDB</th></tr></thead>
+      <tbody>
+        <tr><td>Query without the key</td><td><strong>Scan — avoid entirely</strong></td><td>Cross-partition query</td><td>Scatter-gather</td></tr>
+        <tr><td>Secondary access paths</td><td><strong>Must define a GSI</strong></td><td>Any indexed field</td><td>Any indexed field</td></tr>
+        <tr><td>Indexing default</td><td>Keys only</td><td><strong>Everything</strong></td><td>Nothing (plus <code>_id</code>)</td></tr>
+        <tr><td>Aggregation</td><td><strong>None</strong> — do it in the application</td><td>Limited</td><td>Full pipeline</td></tr>
+        <tr><td>Joins</td><td><strong>None</strong></td><td>None across documents</td><td><code>$lookup</code></td></tr>
+        <tr><td>Transactions</td><td>Up to 100 items, cross-partition</td><td><strong>Single partition only</strong></td><td>Multi-document</td></tr>
+        <tr><td>Design flexibility</td><td><strong>Lowest</strong></td><td>Low</td><td>Moderate</td></tr>
+        <tr><td>Predictability</td><td><strong>Highest</strong></td><td>High</td><td>Moderate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">One place DynamoDB is more capable than Cosmos</div>
+    <p style="margin:0"><strong>Transactions span partitions.</strong> <code>TransactWriteItems</code> handles up
+      to 100 items across different partition keys and even different tables, atomically.
+      <br><br>
+      Cosmos has <em>no</em> cross-partition transaction at all — its transactional batch is scoped to one
+      logical partition. So in Cosmos the partition key is your transaction boundary; in DynamoDB it isn't.
+      <br><br>
+      That's a genuine and often-overlooked advantage, because DynamoDB is usually characterised as the more
+      restrictive of the two.</p>
+  </div>
+
+  <details class="qa">
+    <summary>When would you choose DynamoDB, and when would you avoid it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The deciding question is: <strong>do we know all our access patterns, and are they stable?</strong>
+          Everything else follows from that."</p>
+        <p>"DynamoDB is different from every other database in this space because the key structure
+          <em>is</em> the query capability. There's no query planner, so you can't retrofit a query with an
+          index the way you would in Postgres or MongoDB. You enumerate the access patterns first, design keys
+          to serve them, and the data layout falls out of that. If you design by thinking about entities, you'll
+          build something that can't answer your questions."</p>
+        <p>"So I'd choose it when the access patterns are genuinely known and stable — session stores, shopping
+          carts, user or device state, event ingestion, anything key-based at high volume. Also when
+          <strong>predictable latency is a product requirement</strong>: single-digit milliseconds whether the
+          table has a thousand items or a trillion, and no plan to regress at 3am. Every other database in this
+          handbook has a failure mode where the planner picks something different after a failover or a
+          statistics update. DynamoDB doesn't have that category of problem, because there's nothing to
+          decide."</p>
+        <p>"And it's genuinely zero-operations — no instances, no upgrades, no vacuum, no index maintenance. On
+          demand pricing means an idle table costs almost nothing, and you can calculate the bill from the
+          access patterns before writing code."</p>
+        <p>"I'd avoid it when the queries aren't settled. That's the honest warning: DynamoDB punishes
+          uncertainty harder than anything else. If the product discovers a new access pattern after launch,
+          the options are an expensive scan, a new GSI, or a table migration — where a relational database would
+          absorb it with one index. <strong>'We don't know all our queries yet' is a strong argument against
+          DynamoDB</strong>, and I'd rather say that than demonstrate I can do single-table design."</p>
+        <p>"I'd also avoid it for anything needing <strong>aggregation or reporting</strong> — there's no
+          <code>GROUP BY</code>, no joins, no aggregate functions at all. You either maintain counters via
+          streams or export to something else. And for <strong>relational integrity</strong>: no foreign keys,
+          no constraints, so every invariant lives in application code."</p>
+        <p>"One thing I'd correct if it comes up: DynamoDB is usually described as the most restrictive option,
+          but <strong>its transactions span partitions and even tables</strong> — up to 100 items atomically.
+          Cosmos has no cross-partition transaction at all. So on that specific axis DynamoDB is the more
+          capable of the two."</p>
+        <p>"The other practical consideration is team familiarity. Single-table design has a real learning
+          curve, and a team applying relational instincts to DynamoDB tends to produce a table-per-entity layout
+          with scans everywhere — which gets the costs of DynamoDB without the benefits."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you lead with access patterns rather than scale?</li>
+        <li>Do you know the design process is reversed?</li>
+        <li>Will you argue against it when appropriate?</li>
+        <li>Do you know what it genuinely can't do — aggregation, joins?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "it scales infinitely" as the main reason.</li>
+        <li><span class="redflag">Red flag:</span> "it's schemaless so it's flexible" — the opposite is
+          true.</li>
+        <li><span class="redflag">Red flag:</span> no awareness that new access patterns are expensive.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's the difference between a query and a scan?</li>
+          <li>How would you add a new access pattern after launch?</li>
+          <li>What is single-table design and why?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <div class="note info">
+    <div class="note-title">Prerequisites</div>
+    <p style="margin:0">This section assumes <a href="../13-mongodb/fundamentals.html">document modelling</a> and
+      the partitioning material from <a href="../14-cosmos-db/fundamentals.html">Cosmos DB</a> — hot partitions,
+      key cardinality and denormalization all transfer directly, and this section covers what's specific to
+      DynamoDB rather than repeating them.</p>
+  </div>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

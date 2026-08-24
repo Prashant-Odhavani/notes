@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>File / Document Processing — System Design Exercises</title>
+<meta name="description" content="A worked design: direct upload, event-driven triggering, a durable multi-stage pipeline, poison inputs, malware scanning and very large files.">
+<meta name="keywords" content="document processing pipeline design direct upload SAS Event Grid blob trigger durable functions orchestration OCR virus scanning quarantine poison input idempotent stages progress reporting large file chunked upload retention">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="36-system-design/document-processing.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>File / Document Processing</h1>
+    <p class="subtitle">Long-running work triggered by an upload. The design questions are all about durability,
+      progress and what happens to the file that breaks stage three.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <h2 id="requirements">Requirements <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Question</th><th>Assumed answer</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td>File sizes?</td><td><strong>Mostly under 10 MB; some up to 2 GB</strong></td><td>Rules out uploading through the API</td></tr>
+        <tr><td>Processing time?</td><td><strong>Seconds to 20 minutes</strong></td><td>Rules out synchronous request handling</td></tr>
+        <tr><td>Stages?</td><td>Validate, scan, extract text, classify, index, thumbnail</td><td>A pipeline, and stages fail independently</td></tr>
+        <tr><td>Must the user wait?</td><td>No — they need progress and a notification</td><td>Async with status polling</td></tr>
+        <tr><td>Untrusted input?</td><td><strong>Yes — customer uploads</strong></td><td>Malware scanning and quarantine are mandatory</td></tr>
+        <tr><td>Volume?</td><td>Thousands per day, bursty (bulk imports)</td><td>Queue-based levelling</td></tr>
+        <tr><td>Out of scope</td><td>The OCR/ML models themselves, the viewer UI</td><td>Focus on the pipeline and its failure modes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Two numbers eliminate the obvious designs</div>
+    <p style="margin:0"><strong>2 GB files</strong> mean the upload cannot go through your API. A single 2 GB upload
+      occupies a web instance for its whole duration — bandwidth, memory, request timeout, a thread — and a handful of
+      concurrent ones exhausts the app while storage sits idle.
+      <br><br>
+      <strong>20-minute processing</strong> means it cannot happen in a request, and it also rules out several
+      serverless defaults: the Consumption plan for Functions has an execution limit well below that.
+      <br><br>
+      So both the ingress and the processing have to be restructured, and saying so early frames the whole design:
+      <strong>direct-to-storage upload, event-driven trigger, durable orchestration</strong>. Everything else follows.
+      <br><br>
+      The third answer that matters is <strong>untrusted input</strong>. Customer-supplied files are an attack surface
+      in a way that internal data isn't — malformed PDFs that crash parsers, zip bombs, macro-laden documents, files
+      that claim one type and are another. That makes quarantine and scanning structural requirements rather than
+      nice-to-haves.</p>
+  </div>
+
+  <h2 id="architecture">Shape <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="text — upload, detect, orchestrate"><code class="language-text">1  Client asks for an upload URL
+      API authorises, CHOOSES the blob name, returns a short-lived
+      write-only user delegation SAS  ->  quarantine container
+
+2  Client uploads DIRECTLY to blob storage
+      chunked block upload; the file never passes through the API
+
+3  Blob created  ->  EVENT GRID  ->  starts a Durable Functions orchestration
+      (not the polling blob trigger - see below)
+
+4  ORCHESTRATION (durable, resumable, each activity idempotent)
+      a. validate     type sniffing, size, page count      -> reject early
+      b. scan         malware; infected -> quarantine + alert, stop
+      c. move         quarantine -> processed container
+      d. extract      OCR / text extraction  (the slow stage)
+      e. classify     model inference
+      f. index        push to search
+      g. thumbnail    render preview
+      h. complete     update status, notify the user
+
+5  Status endpoint     client polls, or receives a SignalR push
+      Failure at any stage -> recorded, retried, then parked for a human</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Decision</th><th>Choice</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Upload path</strong></td><td><strong>Direct to blob via SAS</strong></td><td>Keeps large files out of the app tier entirely</td></tr>
+        <tr><td><strong>Trigger</strong></td><td><strong>Event Grid</strong>, not the polling blob trigger</td><td>Seconds instead of minutes; reliable at volume</td></tr>
+        <tr><td><strong>Orchestration</strong></td><td><strong>Durable Functions</strong>, or a saga</td><td>State survives crashes; each stage retries independently</td></tr>
+        <tr><td><strong>Containers</strong></td><td>Quarantine → processed → archive</td><td>Unvalidated content is never servable</td></tr>
+        <tr><td>Slow stages</td><td>Own activity, own scaling, own timeout</td><td>OCR is the bottleneck; scale it alone</td></tr>
+        <tr><td>Status</td><td>A row per document with stage and progress</td><td>Users and support both need it</td></tr>
+        <tr><td>Failures</td><td>Retry, then a failed state with the reason</td><td>Never silently discard a customer's file</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — three specific choices, each with a reason</div>
+    <p style="margin:0"><strong>Direct upload via a user delegation SAS.</strong> The API issues a short-lived,
+      write-only URL and the client uploads straight to storage, which is built for it and scales independently. I'd
+      use a <em>user delegation</em> SAS rather than one signed with the account key, because an account-key SAS
+      <strong>cannot be revoked</strong> without rotating the key and breaking everything else using it. And the
+      <strong>API chooses the blob name</strong>, never the client, so a client can't overwrite someone else's file or
+      escape the container with a path.
+      <br><br>
+      <strong>Event Grid rather than the classic blob trigger.</strong> The polling blob trigger scans logs, so it can
+      be minutes late on a busy container and is unreliable at volume. Event Grid is push-based and arrives in
+      seconds. Microsoft's own guidance is to prefer it, and knowing that specific limitation is a good signal.
+      <br><br>
+      <strong>Durable orchestration rather than a chain of queues.</strong> Chained queues work and you end up
+      hand-building the state machine: which stage are we on, what were the intermediate results, how do we resume
+      after a crash, how do we report progress. Durable Functions gives you that — state persisted between activities,
+      per-activity retry policies, and a queryable status endpoint for free.
+      <br><br>
+      The one thing to be careful of: <strong>orchestrator code must be deterministic</strong>, because it replays
+      from history to rebuild state. No <code>DateTime.Now</code>, no random values, no direct I/O in the
+      orchestrator — all of that belongs in activities. That constraint surprises people and it's the source of most
+      Durable Functions bugs.</p>
+  </div>
+
+  <h2 id="upload">The upload, in detail <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Handling</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Who knows it finished?</strong></td><td><strong>Storage does, via Event Grid.</strong> Never trust the client to tell you</td></tr>
+        <tr><td><strong>Abandoned uploads</strong></td><td>Lifecycle rule deleting quarantine blobs after a few days</td></tr>
+        <tr><td>SAS scope</td><td>Write-only, minutes, HTTPS, one blob, IP-restricted if known</td></tr>
+        <tr><td>Large files</td><td>SDK chunked block upload — resumable, parallel</td></tr>
+        <tr><td>Declared vs actual type</td><td><strong>Sniff the content; never trust the extension</strong></td></tr>
+        <tr><td>Size limits</td><td>Enforced server-side after upload, and in the client</td></tr>
+        <tr><td>Duplicate uploads</td><td>Content hash — skip processing if already done</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Never trust the client to report completion</div>
+    <p style="margin:0">The tempting design is: client uploads, then calls <code>POST /documents/{id}/complete</code>.
+      It fails in two directions.
+      <br><br>
+      <strong>The client may not call it</strong> — the browser closed, the connection dropped, the mobile app was
+      backgrounded. Now a file sits in storage that will never be processed, and nothing knows.
+      <br><br>
+      <strong>The client may call it dishonestly</strong>, claiming completion for a file it never uploaded, or for
+      someone else's blob name.
+      <br><br>
+      <strong>Storage is the authority.</strong> The <code>BlobCreated</code> event fires when the blob actually
+      exists, with its real size and path. That's the only trustworthy completion signal, and it works whatever the
+      client does afterwards.
+      <br><br>
+      The related detail: <strong>sniff the content type</strong> rather than trusting the extension or the declared
+      MIME type. A file named <code>invoice.pdf</code> can be anything, and handing an executable to a PDF parser is
+      how parser exploits get delivered. Read the magic bytes and verify they match what the pipeline expects.
+      <br><br>
+      And add a <strong>lifecycle rule on the quarantine container</strong>, because clients request upload URLs and
+      never use them. Those blobs accumulate and cost money indefinitely if nothing removes them.</p>
+  </div>
+
+  <h2 id="poison">Poison inputs <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Hostile or broken input</th><th>Defence</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Malware</strong></td><td>Scan in quarantine before anything else touches it</td></tr>
+        <tr><td><strong>Zip bomb / decompression bomb</strong></td><td>Cap expanded size and nesting depth</td></tr>
+        <tr><td><strong>A PDF that crashes the parser</strong></td><td><strong>Isolate the stage; cap memory and time</strong></td></tr>
+        <tr><td><strong>A 50,000-page document</strong></td><td>Page limit, or split into chunked work items</td></tr>
+        <tr><td><strong>XXE / SSRF via embedded references</strong></td><td>Disable external entity resolution in every parser</td></tr>
+        <tr><td>An infinite loop in extraction</td><td>Hard timeout per activity, not just per orchestration</td></tr>
+        <tr><td>The same bad file retried forever</td><td><strong>Retry limit, then park it</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">One bad file must not stop the pipeline</div>
+    <p style="margin:0">The failure mode that takes down document pipelines: a file that crashes the extraction stage,
+      retried indefinitely, occupying a worker forever. Then a second arrives. Eventually every worker is looping on
+      poison input and <strong>nothing else is processed</strong> — while the queue looks healthy and no error rate
+      spikes.
+      <br><br>
+      Three defences, and all three are needed:
+      <br><br>
+      <strong>A bounded retry count</strong>, after which the document moves to a <code>Failed</code> state with the
+      reason recorded. The customer is told their file couldn't be processed, which is a much better outcome than
+      silence.
+      <br><br>
+      <strong>Hard resource limits per activity</strong> — a timeout and a memory cap. A parser that hangs must be
+      killed, not waited on. In a container that means a memory limit; in a Function, an explicit timeout on the
+      activity rather than relying on the orchestration's overall limit.
+      <br><br>
+      <strong>Isolation for the risky stage.</strong> Parsing untrusted documents is the highest-risk operation here,
+      so it should run somewhere a crash or a compromise is contained — its own container, its own identity with
+      minimal permissions, no network egress if the parser doesn't need it. Then a parser exploit gets an attacker
+      into a sandbox rather than into your application's identity.
+      <br><br>
+      And the operational necessity: <strong>alert on the failed count.</strong> A steady trickle of failures is a
+      bug; a sudden spike is either an attack or a regression in a parser library. Neither is visible if failures just
+      accumulate in a table nobody queries.</p>
+  </div>
+
+  <h2 id="idempotency">Idempotent stages <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — an activity safe to run twice" class="code-good"><code class="language-csharp">[Function(nameof(ExtractText))]
+public async Task&lt;ExtractResult&gt; ExtractText([ActivityTrigger] DocumentRef doc,
+                                              CancellationToken ct)
+{
+    // Deterministic output location, derived from the input.
+    // A retry overwrites the same blob rather than creating a second one.
+    var outputPath = $"extracted/{doc.TenantId}/{doc.DocumentId}/text.json";
+    var output = _processed.GetBlobClient(outputPath);
+
+    // Already done by a previous attempt? Return, don't redo 15 minutes of OCR.
+    if (await output.ExistsAsync(ct))
+    {
+        _log.StageAlreadyComplete(doc.DocumentId, nameof(ExtractText));
+        return await ReadResultAsync(output, ct);
+    }
+
+    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    cts.CancelAfter(TimeSpan.FromMinutes(15));       // hard cap on a hostile input
+
+    var text = await _ocr.ExtractAsync(doc.BlobUri, cts.Token);
+
+    // Overwrite is safe BECAUSE the path is deterministic
+    await output.UploadAsync(Serialize(text), overwrite: true, ct);
+    return new ExtractResult(outputPath, text.PageCount);
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Deterministic output paths make retries free</div>
+    <p style="margin:0">Durable Functions retries activities, and a crashed orchestration replays. So every activity
+      <strong>will</strong> run more than once at some point, and the design has to make that harmless.
+      <br><br>
+      The technique is a <strong>deterministic output location derived from the input</strong> — tenant, document id,
+      stage. Then a retry overwrites the same blob instead of creating <code>text-1.json</code>,
+      <code>text-2.json</code>, and there's no accumulation to clean up.
+      <br><br>
+      The existence check on top is what makes it <em>efficient</em> as well as correct: if a 15-minute OCR already
+      completed and the orchestration crashed afterwards, the retry returns immediately rather than redoing the
+      work. On a slow expensive stage that's the difference between a minor blip and a serious delay.
+      <br><br>
+      The general pattern, which applies well beyond this design: <strong>make each stage's effect
+      content-addressed</strong> so repeating it converges rather than accumulating. That's the same instinct as
+      "prefer absolute over relative operations" in idempotent message handling — <em>set the value</em> rather than
+      <em>append a value</em>.</p>
+  </div>
+
+  <h2 id="progress">Progress and status <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Need</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td><strong>"Where is my document?"</strong></td><td>A row per document: stage, percentage, updated timestamp</td></tr>
+        <tr><td>Immediate feedback</td><td>202 with a status URL on upload initiation</td></tr>
+        <tr><td>Live updates</td><td>SignalR push, with polling as the fallback</td></tr>
+        <tr><td><strong>Stuck detection</strong></td><td><strong>Alert on documents in a stage longer than expected</strong></td></tr>
+        <tr><td>Failure explanation</td><td>A user-safe reason, plus the technical detail internally</td></tr>
+        <tr><td>Support investigation</td><td>Orchestration instance id stored on the document row</td></tr>
+        <tr><td>Bulk imports</td><td>A batch entity aggregating child document statuses</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">The status people forget is "stuck"</div>
+    <p style="margin:0">Designs usually cover <code>Pending</code>, <code>Processing</code>, <code>Complete</code> and
+      <code>Failed</code>. The state that actually generates support tickets is <strong>documents that are still
+      <code>Processing</code> and never will be</strong> — because the orchestration died in a way that produced no
+      failure, or a worker was killed mid-activity and nothing resumed it.
+      <br><br>
+      Nothing errors. The document sits in <code>Processing</code> forever, the customer waits, and you find out when
+      they complain.
+      <br><br>
+      So: <strong>store a last-updated timestamp per stage and alert on anything exceeding an expected
+      duration.</strong> That converts a silent stall into a detected problem — and it's the kind of alert that catches
+      failures you didn't anticipate, which is where its value is.
+      <br><br>
+      Store the <strong>orchestration instance id</strong> on the document row too. Then support can query the
+      orchestration's history directly and see which activity it stopped at, rather than reasoning from
+      logs.
+      <br><br>
+      And distinguish <strong>user-safe failure reasons from technical ones</strong>. "This PDF is password-protected"
+      is helpful and actionable. A stack trace is neither, and exposing it leaks internal detail — so store both,
+      surface the first.</p>
+  </div>
+
+  <h2 id="scale">Scaling and cost <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concern</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Bursty bulk imports</strong></td><td>Queue absorbs it; process at a sustainable rate</td></tr>
+        <tr><td><strong>OCR is the bottleneck</strong></td><td>Scale that activity independently; it's the expensive one</td></tr>
+        <tr><td><strong>Scaling out overwhelms a dependency</strong></td><td><strong>Cap concurrency</strong> — the ML endpoint or database has a limit</td></tr>
+        <tr><td>Fairness across tenants</td><td>Per-tenant concurrency, or round-robin scheduling</td></tr>
+        <tr><td>Storage growth</td><td>Lifecycle rules: hot → cool → archive; delete intermediates</td></tr>
+        <tr><td>Cost per document</td><td>OCR and ML inference dominate — measure per document</td></tr>
+        <tr><td>Reprocessing</td><td>Keep originals so a pipeline improvement can be replayed</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — keep the originals, and delete the intermediates</div>
+    <p style="margin:0">Two storage decisions that pull in opposite directions, and both are right.
+      <br><br>
+      <strong>Keep the original uploads.</strong> When the extraction model improves, or a bug is found in
+      classification, you need to reprocess — and you can only do that if the source still exists. A pipeline that
+      discards inputs after processing can never be improved retrospectively, which is a decision you make once and
+      regret for years.
+      <br><br>
+      <strong>Delete the intermediates.</strong> Extracted text, page images, thumbnails at three sizes — these are
+      derived, regenerable, and they accumulate faster than the originals. A lifecycle rule removing intermediates
+      after a retention window is straightforward cost control.
+      <br><br>
+      The framing: <strong>keep what you cannot recreate; delete what you can.</strong>
+      <br><br>
+      On archival tiering, one caution worth stating: <strong>Archive is not readable.</strong> Rehydration takes
+      hours, so archiving originals means reprocessing becomes an overnight operation rather than an afternoon one.
+      Cool or Cold is usually the better tier for anything you might genuinely reprocess — and the minimum-retention
+      charges mean a colder tier can cost <em>more</em> if you move data too early.
+      <br><br>
+      And the scaling constraint worth raising: <strong>cap the concurrency of the expensive stage.</strong> If OCR
+      calls an ML endpoint with a rate limit, unbounded scale-out means every call is throttled — elastic compute in
+      front of a fixed-capacity dependency moves the failure rather than removing it.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Large files and long processing rule out synchronous handling in both directions.</li>
+      <li>Direct upload via a short-lived, write-only user delegation SAS; the API picks the blob name.</li>
+      <li>Event Grid, not the polling blob trigger.</li>
+      <li>Storage reports completion — never trust the client.</li>
+      <li>Sniff content types; never trust the extension.</li>
+      <li>Lifecycle rule for abandoned uploads.</li>
+      <li>Durable orchestration gives resumable state, per-stage retries and status for free.</li>
+      <li>Orchestrator code must be deterministic — no time, randomness or I/O.</li>
+      <li>Quarantine first, scan, then move to processed.</li>
+      <li>Bounded retries, hard timeouts, and isolate the parsing stage.</li>
+      <li>Alert on failure count — a spike is an attack or a library regression.</li>
+      <li>Deterministic output paths make retries converge rather than accumulate.</li>
+      <li>Alert on documents stuck in a stage; store the orchestration instance id.</li>
+      <li>Keep originals so you can reprocess; delete intermediates.</li>
+      <li>Cap concurrency on the expensive stage.</li>
+    </ul>
+  </div>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced</h3>
+
+  <details class="qa">
+    <summary>Design a document processing pipeline. Files up to 2 GB, processing up to 20 minutes. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Those two numbers eliminate the obvious design straight away, so I'd start there.
+          <strong>2 GB means the upload can't go through my API</strong> — a single upload occupies a web instance for
+          its whole duration and a handful of concurrent ones exhausts the app while storage sits idle. And
+          <strong>20 minutes means processing can't happen in a request</strong>, which also rules out the Functions
+          Consumption plan, whose execution limit is well below that."</p>
+        <p>"So: <strong>direct-to-storage upload, event-driven trigger, durable orchestration.</strong>"</p>
+        <p>"<strong>Upload.</strong> The client asks for an upload URL; the API authorises, <em>chooses the blob
+          name</em>, and returns a short-lived write-only SAS to a quarantine container. The client uploads directly,
+          using chunked block upload for large files so it's resumable."</p>
+        <p>"I'd use a <strong>user delegation SAS</strong> rather than one signed with the account key, because an
+          account-key SAS can't be revoked without rotating the key and breaking everything else. And the API picking
+          the blob name matters — otherwise a client can overwrite someone else's file."</p>
+        <p>"<strong>Detection: Event Grid on <code>BlobCreated</code></strong>, not the classic blob trigger. The
+          polling trigger scans logs, so it can be minutes late on a busy container and is unreliable at volume."</p>
+        <p>"The important principle there is that <strong>storage reports completion, not the client.</strong> A client
+          callback fails in two directions: it may never arrive because the browser closed, leaving a file nothing
+          knows about, or it may be dishonest — claiming completion for a file that was never uploaded."</p>
+        <p>"<strong>Processing: Durable Functions.</strong> Chained queues would work and I'd end up hand-building the
+          state machine — which stage, what intermediate results, how to resume after a crash, how to report progress.
+          Durable gives me persisted state between activities, per-activity retry policies, and a queryable status
+          endpoint."</p>
+        <p>"The constraint I'd flag: <strong>orchestrator code must be deterministic</strong>, because it replays from
+          history. No <code>DateTime.Now</code>, no randomness, no I/O in the orchestrator — all of that goes in
+          activities. That's the source of most Durable Functions bugs."</p>
+        <p>"<strong>The stages</strong>: validate — sniffing the actual content type rather than trusting the
+          extension — then malware scan while still in quarantine, then move to the processed container, then
+          extraction, classification, indexing, thumbnails."</p>
+        <p>"The quarantine-then-move structure matters: <strong>unvalidated content is never in a container anything
+          serves from</strong>, so there's no window where a malicious file is reachable."</p>
+        <p>"<strong>Every activity has to be idempotent</strong>, because Durable retries and replays mean each will
+          run more than once. I'd do that with a <strong>deterministic output path</strong> derived from tenant,
+          document and stage — so a retry overwrites rather than creating a second output — plus an existence check
+          first, so a 15-minute OCR that already completed returns immediately instead of redoing the work."</p>
+        <p>"<strong>The failure mode I'd raise unprompted is poison input.</strong> A file that crashes the extraction
+          stage, retried indefinitely, occupying a worker forever. Then a second arrives, and eventually every worker
+          is looping on bad files while nothing else processes — and the queue looks healthy the whole time."</p>
+        <p>"Three defences, all needed. A <strong>bounded retry count</strong>, then a Failed state with the reason —
+          telling the customer their file couldn't be processed is far better than silence. <strong>Hard timeouts and
+          memory caps per activity</strong>, so a hanging parser is killed rather than waited on. And
+          <strong>isolating the parsing stage</strong>, since parsing untrusted documents is the highest-risk operation
+          here — its own container, minimal permissions, no network egress if it doesn't need it, so a parser exploit
+          lands in a sandbox rather than in my application's identity."</p>
+        <p>"<strong>On status</strong>, the state people forget is <strong>stuck</strong>. Pending, Processing,
+          Complete and Failed are obvious; documents sitting in Processing forever because the orchestration died
+          silently are what generate support tickets. So a last-updated timestamp per stage and an alert on anything
+          exceeding its expected duration — that catches failures I didn't anticipate."</p>
+        <p>"<strong>Two storage decisions</strong> that pull opposite ways and are both right. <strong>Keep the
+          originals</strong>, because when the extraction model improves you need to reprocess, and a pipeline that
+          discards inputs can never be improved retrospectively. <strong>Delete the intermediates</strong> — extracted
+          text, page images, thumbnails — because they're regenerable and they accumulate faster. Keep what you can't
+          recreate; delete what you can."</p>
+        <p>"And I'd <strong>cap the concurrency of the expensive stage</strong>. If OCR calls a rate-limited ML
+          endpoint, unbounded scale-out means everything is throttled — elastic compute in front of a fixed-capacity
+          dependency moves the failure rather than removing it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you keep large files out of the app tier?</li>
+        <li>Do you know the polling blob trigger's limitation?</li>
+        <li>Do you make storage the completion authority?</li>
+        <li>Do you use durable orchestration and know the determinism rule?</li>
+        <li>Do you make stages idempotent with deterministic outputs?</li>
+        <li>Do you volunteer poison-input handling and isolation?</li>
+        <li>Do you cover the stuck state and retention policy?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> uploading through the API.</li>
+        <li><span class="redflag">Red flag:</span> trusting a client completion callback.</li>
+        <li><span class="redflag">Red flag:</span> unlimited retries on a failing document.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you reprocess everything after improving the model?</li>
+          <li>How do you stop one tenant's bulk import starving others?</li>
+          <li>What if a stage needs a result from two stages back?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

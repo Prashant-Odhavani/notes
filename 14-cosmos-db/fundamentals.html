@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture &amp; Partitioning — Cosmos DB</title>
+<meta name="description" content="Logical vs physical partitions, the 20 GB limit, choosing and synthesising partition keys, hierarchical keys and hot partitions.">
+<meta name="keywords" content="Cosmos DB partition key logical partition physical partition 20GB limit hot partition synthetic partition key hierarchical partition key subpartitioning cross partition query point read container item id uniqueness TTL">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="14-cosmos-db/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Architecture &amp; Partitioning</h1>
+    <p class="subtitle">The most important page in this section. The partition key can't be changed, and it
+      determines cost, latency and scale ceiling.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Logical partition</strong> = all items sharing one partition-key value. Hard limit
+        <strong>20 GB</strong> and <strong>10,000 RU/s</strong>.</li>
+      <li><strong>Physical partition</strong> = the actual storage/compute unit. Cosmos manages these; you never
+        see them directly.</li>
+      <li><strong>A point read</strong> (partition key + id) is ~1 RU. Everything else costs more.</li>
+      <li><strong>Queries without the partition key fan out</strong> across every physical partition.</li>
+      <li><strong>Hot partition</strong> = one key value taking disproportionate traffic. It throttles while the
+        rest idles.</li>
+      <li><strong>Synthetic keys</strong> combine fields to raise cardinality.</li>
+      <li><strong>Hierarchical keys</strong> (up to 3 levels) solve the 20 GB problem without losing routing.</li>
+    </ul>
+  </div>
+
+  <h2 id="hierarchy">The resource hierarchy <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Account</strong></td><td>The billing and global-distribution boundary. Regions are configured here</td></tr>
+        <tr><td><strong>Database</strong></td><td>A namespace. Can hold shared throughput for its containers</td></tr>
+        <tr><td><strong>Container</strong></td><td><strong>The unit that matters.</strong> Has a partition key, an indexing policy and throughput. Equivalent to a table or collection</td></tr>
+        <tr><td><strong>Item</strong></td><td>A JSON document. Max 2 MB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">Container throughput vs database throughput</div>
+    <p style="margin:0"><strong>Container-level</strong> throughput is dedicated — that container's RU/s are
+      guaranteed and isolated.
+      <br><br>
+      <strong>Database-level</strong> (shared) throughput is pooled across all containers in the database.
+      Cheaper when you have many small containers, and it means <strong>one busy container can starve the
+      others</strong> — the noisy-neighbour problem, same as an
+      <a href="../10-sql/azure-sql.html#elastic-pools">elastic pool</a>.
+      <br><br>
+      Practical rule: shared throughput for many low-traffic containers, dedicated for anything with meaningful
+      or unpredictable load.</p>
+  </div>
+
+  <h2 id="partitions">Logical vs physical partitions <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A <strong>logical partition</strong> is all the items that share one partition-key value. If the key is
+      <code>tenantId</code>, then everything for <code>tenant-acme</code> is one logical partition.</p>
+    <p>A <strong>physical partition</strong> is real storage and compute. Cosmos assigns logical partitions to
+      physical ones by hashing the key, and splits physical partitions automatically as data grows.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Logical partition</th><th>Physical partition</th></tr></thead>
+      <tbody>
+        <tr><td>Defined by</td><td><strong>Your partition-key value</strong></td><td>Cosmos, automatically</td></tr>
+        <tr><td>Storage limit</td><td><strong>20 GB — hard</strong></td><td>50 GB</td></tr>
+        <tr><td>Throughput limit</td><td><strong>10,000 RU/s</strong></td><td>10,000 RU/s</td></tr>
+        <tr><td>Can be split</td><td><strong>No</strong></td><td>Yes, automatically</td></tr>
+        <tr><td>You control it</td><td><strong>Yes</strong></td><td>No</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The 20 GB limit is the one that ends projects</div>
+    <p style="margin:0">A logical partition <strong>cannot be split</strong>. All items with the same
+      partition-key value must fit in 20 GB, on one physical partition.
+      <br><br>
+      So if you partition orders by <code>tenantId</code> and one tenant grows past 20 GB, writes for that
+      tenant <strong>start failing</strong>. Not slowing — failing. And you can't fix it by adding throughput or
+      scaling anything, because the constraint is per logical partition.
+      <br><br>
+      The only fixes are migrating to a new container with a different key, or having chosen a
+      <a href="#hierarchical">hierarchical key</a> up front.
+      <br><br>
+      This is why "will any single key value exceed 20 GB in the lifetime of this system?" is the first question
+      to ask about a partition key — before distribution, before query routing.</p>
+  </div>
+
+  <div class="note info">
+    <div class="note-title">How throughput is actually divided</div>
+    <p style="margin:0">Provisioned RU/s are split <strong>evenly across physical partitions</strong>. With
+      30,000 RU/s across 3 physical partitions, each gets 10,000.
+      <br><br>
+      Which means a hot partition throttles at 10,000 RU/s <em>even though you provisioned 30,000</em>. The
+      other 20,000 are sitting on partitions with no traffic.
+      <br><br>
+      That's the mechanism behind hot partitions, and it's why people are baffled to see 429s while the portal
+      shows overall RU consumption at 35%. Knowing this explains the symptom.</p>
+  </div>
+
+  <h2 id="partition-key">Choosing a partition key <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="remember">
+    <span class="r-label">Four requirements, in priority order</span>
+    <ol>
+      <li><strong>No single value can approach 20 GB.</strong> A hard failure, so it comes first.</li>
+      <li><strong>High cardinality</strong> — many distinct values, so data and traffic spread.</li>
+      <li><strong>Even access distribution</strong> — no value taking a disproportionate share of requests.</li>
+      <li><strong>Present in your queries</strong> — otherwise every read fans out across all partitions.</li>
+    </ol>
+    <p>Requirements 2 and 4 often pull in opposite directions. Resolving that tension <em>is</em> the design
+      work.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Candidate</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>/id</code></td>
+          <td><strong>Maximum distribution</strong>, and every query that isn't a point read fans out. Good for
+              pure key-value access</td>
+        </tr>
+        <tr>
+          <td><code>/tenantId</code></td>
+          <td><strong>Good if tenants are small and numerous.</strong> Dangerous with a few large tenants — 20
+              GB and hot-partition risk</td>
+        </tr>
+        <tr>
+          <td><code>/userId</code></td>
+          <td><strong>Usually good</strong> — high cardinality, naturally bounded per user, and in most
+              queries</td>
+        </tr>
+        <tr>
+          <td><code>/country</code></td>
+          <td><strong>Bad.</strong> Low cardinality and hugely uneven</td>
+        </tr>
+        <tr>
+          <td><code>/status</code></td>
+          <td><strong>Bad.</strong> A handful of values, and items move between partitions as status
+              changes</td>
+        </tr>
+        <tr>
+          <td><code>/date</code></td>
+          <td><strong>Bad for writes</strong> — today's partition takes every write while historical ones
+              idle</td>
+        </tr>
+        <tr>
+          <td><code>/deviceId</code></td>
+          <td><strong>Good</strong> for telemetry — high cardinality, and queries are usually per device</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">A partition key value is immutable</div>
+    <p style="margin:0">You cannot update an item's partition-key value. Changing it means <strong>delete and
+      re-insert</strong>, which isn't atomic across partitions.
+      <br><br>
+      So never partition by something that changes — <code>status</code>, <code>assignedTo</code>,
+      <code>currentStage</code>. A workflow item that moves through states would have to be deleted and
+      recreated on every transition, and a failure between the two loses it.
+      <br><br>
+      Partition by something intrinsic and permanent: which tenant it belongs to, which user, which device.</p>
+  </div>
+
+  <h2 id="synthetic">Synthetic partition keys <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The problem they solve</span>
+    <p>Sometimes no single field works. <code>tenantId</code> has too few distinct values and some tenants are
+      huge; <code>id</code> distributes perfectly but makes every query fan out.</p>
+    <p>A <strong>synthetic key</strong> is a field you compute and store, combining values to get the
+      cardinality you need while keeping routing.</p>
+  </div>
+
+  <pre data-label="csharp — combine tenant with a time bucket" class="code-good"><code class="language-csharp">public class TelemetryItem
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = Guid.NewGuid().ToString();
+
+    public string TenantId { get; set; } = null!;
+    public DateTime Timestamp { get; set; }
+
+    // Stored synthetic key: "acme-2024-06"
+    // Bounds each logical partition to one tenant-month, and queries for a
+    // tenant's data in a known month stay single-partition.
+    [JsonPropertyName("pk")]
+    public string PartitionKey =&gt; $"{TenantId}-{Timestamp:yyyy-MM}";
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>Example</th><th>Gets you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Concatenate fields</strong></td><td><code>tenantId + "-" + category</code></td><td>Higher cardinality, still routable if both are known</td></tr>
+        <tr><td><strong>Add a time bucket</strong></td><td><code>tenantId + "-" + yyyyMM</code></td><td><strong>Bounds partition growth</strong> — the 20 GB fix</td></tr>
+        <tr><td><strong>Add a random suffix</strong></td><td><code>tenantId + "-" + rand(0..9)</code></td><td>Spreads a hot key across 10 partitions — but reads now fan out to all 10</td></tr>
+        <tr><td><strong>Hash suffix from the id</strong></td><td><code>tenantId + "-" + (hash(id) % 10)</code></td><td>Same spread, and <strong>deterministic</strong> so a point read still works</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — deterministic beats random suffixes</div>
+    <p style="margin:0">The random-suffix trick is widely cited and has a real flaw: once the suffix is random,
+      <strong>you can no longer compute an item's partition key from its identity</strong>. So a point read
+      becomes a fan-out query across all N suffixes — you've traded a 1 RU read for an N-partition query.
+      <br><br>
+      Deriving the suffix deterministically from the item's own id — <code>hash(id) % 10</code> — gives the same
+      write distribution while keeping point reads at 1 RU, because the reader can recompute the same suffix.
+      <br><br>
+      Making that distinction unprompted is a strong signal, because it shows you're thinking about the read
+      path rather than just fixing the hot partition.</p>
+  </div>
+
+  <h2 id="hierarchical">Hierarchical partition keys <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Cosmos supports up to <strong>three levels</strong> of partition key —
+      <code>/tenantId</code>, <code>/userId</code>, <code>/sessionId</code>.</p>
+    <p>The 20 GB limit then applies to the <strong>full key combination</strong>, not the first level. So one
+      tenant can hold far more than 20 GB in total, as long as no single tenant-user-session combination
+      does.</p>
+  </div>
+
+  <pre data-label="csharp — creating a container with a hierarchical key" class="code-good"><code class="language-csharp">await database.CreateContainerIfNotExistsAsync(new ContainerProperties
+{
+    Id = "events",
+    PartitionKeyPaths = new List&lt;string&gt; { "/tenantId", "/userId", "/sessionId" }
+});
+
+// Full key: a point-read-class single-partition operation
+var pk = new PartitionKeyBuilder()
+    .Add(tenantId).Add(userId).Add(sessionId)
+    .Build();
+
+// PREFIX key: routed to the subset of partitions holding that tenant's data,
+// NOT a full fan-out across the container
+var prefix = new PartitionKeyBuilder().Add(tenantId).Build();
+var query = container.GetItemQueryIterator&lt;Event&gt;(
+    "SELECT * FROM c WHERE c.type = 'login'",
+    requestOptions: new QueryRequestOptions { PartitionKey = prefix });</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — this resolves the multi-tenant dilemma</div>
+    <p style="margin:0">The classic bind: partition by <code>tenantId</code> and queries route beautifully, but a
+      large tenant hits 20 GB. Partition by <code>id</code> and it scales forever, but every tenant query fans
+      out.
+      <br><br>
+      A hierarchical key <code>/tenantId/userId</code> gets both. The limit applies per tenant-user combination
+      so a tenant can be terabytes; and because <code>tenantId</code> is the <strong>prefix</strong>, a
+      tenant-scoped query is routed to just that tenant's partitions rather than the whole container.
+      <br><br>
+      This is the current best answer to "how would you model multi-tenant data in Cosmos?", and a lot of
+      material predates it — so knowing it exists is genuinely differentiating.
+      <br><br>
+      The constraint: you must query by a <strong>prefix</strong>, left to right. Querying by
+      <code>userId</code> alone still fans out, because it isn't a prefix of the key.</p>
+  </div>
+
+  <h2 id="hot-partitions">Hot partitions <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Ten supermarket checkouts, and everyone queues at one of them.</p>
+    <p>You've paid for ten. Throughput is one checkout's worth. The other nine stand idle while customers
+      complain about the wait.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td><strong>429s while overall RU usage is low</strong></td><td>The classic hot-partition signature. One partition is at its share of the limit</td></tr>
+        <tr><td>Uneven <em>Normalized RU Consumption</em> in metrics</td><td>The direct measurement. Look for one partition near 100%</td></tr>
+        <tr><td>Storage skew across partitions</td><td>Hot from a data-volume perspective; heading for 20 GB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Throughput is divided evenly across physical partitions, regardless of where the traffic
+      goes.</strong></p>
+    <p>So 100,000 RU/s across 10 physical partitions means each gets 10,000. A single hot key throttles at
+      10,000 while 90,000 goes unused.</p>
+    <p><strong>Adding RU/s does not fix a hot partition</strong> — it just adds capacity to partitions that
+      weren't busy. This is the single most common Cosmos misunderstanding.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Fix</th><th>When it applies</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Better partition key</strong></td><td>The real fix. Requires container migration</td></tr>
+        <tr><td><strong>Synthetic key with a deterministic suffix</strong></td><td>Spreads one hot value while keeping point reads</td></tr>
+        <tr><td><strong>Hierarchical key</strong></td><td>Multi-tenant with uneven tenant sizes</td></tr>
+        <tr><td><strong>Cache the hot items</strong></td><td>A genuinely hot single item — a global config document, a leaderboard</td></tr>
+        <tr><td><strong>Separate container</strong></td><td>One outsized tenant gets its own container with its own throughput</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="ids">Item ids and uniqueness <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rule</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code> is unique <strong>per logical partition</strong></td><td>Not container-wide. Two partitions can hold the same <code>id</code></td></tr>
+        <tr><td>A point read needs <strong>both</strong></td><td>Partition key <em>and</em> <code>id</code>. That's the ~1 RU operation</td></tr>
+        <tr><td>Unique keys</td><td>Enforce uniqueness on other fields — also <strong>scoped to the logical partition</strong></td></tr>
+        <tr><td><code>id</code> must be a string</td><td>Max 1023 bytes, and can't contain <code>/</code>, <code>\</code>, <code>#</code>, <code>?</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">There is no global uniqueness</div>
+    <p style="margin:0">Both <code>id</code> and unique-key constraints are enforced <strong>within a logical
+      partition only</strong>.
+      <br><br>
+      So "email must be unique across all users" is <strong>not enforceable</strong> unless email is the
+      partition key. If you partition by <code>tenantId</code>, you get uniqueness per tenant — which may be
+      exactly right for a B2B product, and is wrong if you needed it globally.
+      <br><br>
+      The workaround is a separate container partitioned by the value you need unique, holding a reservation
+      item you insert first. That's more moving parts, so it's worth checking whether per-tenant uniqueness
+      actually satisfies the requirement before building it.</p>
+  </div>
+
+  <h2 id="ttl">TTL <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <pre data-label="csharp — automatic expiry"><code class="language-csharp">// Container default: -1 means "TTL enabled but no default expiry"
+var props = new ContainerProperties("events", "/tenantId")
+{
+    DefaultTimeToLive = -1
+};
+
+// Per-item override, in seconds
+public class Event
+{
+    [JsonPropertyName("ttl")]
+    public int? TimeToLive { get; set; } = 60 * 60 * 24 * 30;   // 30 days
+}</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">TTL deletes are cheap, and that matters</div>
+    <p style="margin:0">TTL deletion uses <strong>leftover RU</strong> rather than your provisioned budget. So
+      expiring old data is effectively free, whereas issuing millions of explicit deletes would cost real RU
+      and could throttle live traffic.
+      <br><br>
+      That makes TTL the right answer for event data, sessions, caches and audit logs — set it at write time and
+      never write a cleanup job.
+      <br><br>
+      Two caveats: deletion is best-effort, so it may lag under sustained load; and setting the container
+      default to <code>-1</code> rather than a number is what enables <em>per-item</em> control, which is the
+      form you usually want.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Logical partition = one partition-key value. 20 GB and 10,000 RU/s, both hard, and it can't be
+        split.</li>
+      <li>Throughput divides evenly across physical partitions, so a hot key throttles below your provisioned
+        total.</li>
+      <li>Adding RU/s does not fix a hot partition.</li>
+      <li>Partition-key priority: 20 GB safety, cardinality, even access, then query routing.</li>
+      <li>Never partition on a mutable field — key values are immutable.</li>
+      <li>Synthetic keys raise cardinality; derive suffixes deterministically to keep point reads.</li>
+      <li>Hierarchical keys apply the 20 GB limit to the full combination and route on prefixes — the
+        multi-tenant answer.</li>
+      <li><code>id</code> and unique keys are scoped to the logical partition. No global uniqueness.</li>
+      <li>A point read needs partition key plus id, and costs ~1 RU.</li>
+      <li>TTL uses spare RU, so expiry is effectively free.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Partitioning by a low-cardinality field</strong> such as status, type or country.</li>
+    <li><strong>Partitioning by a mutable field</strong>, requiring delete-and-recreate on change.</li>
+    <li><strong>Not asking whether any key value could reach 20 GB.</strong></li>
+    <li><strong>Adding RU/s to fix a hot partition.</strong></li>
+    <li><strong>Random synthetic suffixes</strong>, destroying point reads.</li>
+    <li><strong>Assuming <code>id</code> is globally unique.</strong></li>
+    <li><strong>Assuming a unique key is container-wide.</strong></li>
+    <li><strong>Partitioning by date</strong>, so all writes hit one partition.</li>
+    <li><strong>Not knowing hierarchical keys exist</strong> and choosing between routing and scale.</li>
+    <li><strong>Explicit delete jobs</strong> where TTL would be free.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>What's the difference between a logical and a physical partition? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A <strong>logical partition</strong> is all the items sharing one partition-key value — so if the key
+          is <code>tenantId</code>, everything for <code>tenant-acme</code> is one logical partition. That's
+          defined by my data and my key choice."</p>
+        <p>"A <strong>physical partition</strong> is actual storage and compute. Cosmos hashes partition-key
+          values to assign logical partitions to physical ones, and splits physical partitions automatically as
+          data or throughput grows. I don't control or see them directly."</p>
+        <p>"The distinction matters because of where the limits sit."</p>
+        <p>"A <strong>logical partition has a hard 20 GB limit and cannot be split</strong>. All items with the
+          same key value must fit on one physical partition. So if one tenant grows past 20 GB, writes for that
+          tenant start <em>failing</em> — not slowing, failing — and no amount of scaling fixes it, because the
+          constraint is per logical partition. The only remedies are migrating to a new container with a
+          different key, or having chosen a hierarchical key up front."</p>
+        <p>"The throughput consequence is the one that confuses people most. <strong>Provisioned RU/s are
+          divided evenly across physical partitions.</strong> So with 30,000 RU/s across three physical
+          partitions, each gets 10,000. If one partition-key value takes most of the traffic, it throttles at
+          10,000 while 20,000 RU/s sits unused on quiet partitions."</p>
+        <p>"That's why you can see 429s in production while the portal shows overall RU consumption at 35% —
+          which looks like a bug until you know how throughput is allocated. And it's why
+          <strong>adding RU/s doesn't fix a hot partition</strong>: you're adding capacity to partitions that
+          weren't busy."</p>
+        <p>"For diagnosis I'd look at <em>Normalized RU Consumption</em> per partition key range in Azure
+          Monitor. Overall averages hide this completely; per-partition is where you see one at 100% and the
+          rest near zero."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the 20 GB limit is per logical partition and unsplittable?</li>
+        <li>Do you know throughput divides evenly across physical partitions?</li>
+        <li>Can you explain 429s at low overall utilisation?</li>
+        <li>Do you know which metric to look at?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens when a logical partition reaches 20 GB?</li>
+          <li>How do you fix a hot partition?</li>
+          <li>How would you change a partition key on a live container?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Design the partition key for a multi-tenant SaaS where tenants range from 10 users to 50,000. <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The tenant size range is the whole problem, so I'd start there. Uniform tenants would make
+          <code>tenantId</code> the obvious answer; a 5,000-times spread means the obvious answer breaks at the
+          top end."</p>
+        <p>"Let me rule out the two simple options first, because each fails in an instructive way."</p>
+        <p>"<strong><code>/tenantId</code> alone</strong> routes queries perfectly — nearly every query in a
+          SaaS is already tenant-scoped, so every read would be single-partition. But a 50,000-user tenant will
+          exceed the <strong>20 GB logical partition limit</strong>, and at that point writes for my largest and
+          most valuable customer start failing. It's also a hot-partition risk: that tenant is capped at 10,000
+          RU/s regardless of what I provision overall."</p>
+        <p>"<strong><code>/id</code></strong> distributes perfectly and scales forever, and every tenant-scoped
+          query becomes a cross-partition fan-out. That's expensive in RU and the latency becomes the slowest
+          partition's. I'd have solved scale by making the common case bad."</p>
+        <p>"<strong>So my answer is a hierarchical partition key: <code>/tenantId/userId</code>.</strong>"</p>
+        <p>"That resolves both. The 20 GB limit applies to the <em>full combination</em>, so a tenant can hold
+          terabytes as long as no single tenant-user pair exceeds 20 GB — which for per-user data is a
+          comfortable bound. And because <code>tenantId</code> is the <strong>prefix</strong>, a tenant-scoped
+          query is routed to just that tenant's partitions rather than the entire container. Per-user queries
+          supply the full key and are effectively single-partition."</p>
+        <p>"The constraint I'd state: queries must use a <strong>left-to-right prefix</strong>. Querying by
+          <code>userId</code> alone still fans out, because that isn't a prefix. So I'd want to confirm the
+          access patterns are tenant-first — in a SaaS they almost always are, since you need tenant scoping for
+          data isolation anyway."</p>
+        <p>"Two additions I'd make."</p>
+        <p>"<strong>Consider giving the very largest tenants their own container.</strong> If one tenant is 40%
+          of the data and traffic, a dedicated container with its own provisioned throughput isolates them —
+          both so they can't throttle everyone else, and so their cost is attributable. That's a routing lookup
+          in the application, and it's the same reasoning as graduating a tenant out of an
+          <a href="../10-sql/azure-sql.html#elastic-pools">elastic pool</a>."</p>
+        <p>"<strong>Enforce tenant scoping structurally.</strong> Every query must include the tenant, and
+          because it's the partition key that's both a correctness requirement and a performance one — a query
+          missing it is simultaneously a cross-tenant data leak and a fan-out. I'd centralise that in the
+          repository layer so a single query can't omit it."</p>
+        <p>"One thing I'd flag as a limitation: <strong>unique keys are scoped to the logical
+          partition</strong>. So 'email must be unique' means unique per tenant-user combination here, which is
+          almost certainly not what's wanted. If global email uniqueness is a requirement, that needs a separate
+          container partitioned by email holding reservation items. Worth surfacing early, because it's the kind
+          of requirement that appears late and is awkward to retrofit."</p>
+        <p>"And I'd say plainly: <strong>get this right now</strong>. Cosmos has no resharding — unlike MongoDB
+          5.0 — so changing the partition key means a new container, dual writes, a backfill and a cutover.
+          It's worth spending real time on this decision at design time."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you identify tenant size variance as the core problem?</li>
+        <li>Do you know why both simple options fail?</li>
+        <li>Do you know hierarchical partition keys?</li>
+        <li>Do you know the prefix constraint?</li>
+        <li>Do you consider isolating the largest tenants?</li>
+        <li>Do you catch the uniqueness scoping issue?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> <code>/tenantId</code> with no mention of 20 GB.</li>
+        <li><span class="redflag">Red flag:</span> <code>/id</code> with no mention of fan-out cost.</li>
+        <li><span class="redflag">Red flag:</span> "we can change it later."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you migrate if you did get it wrong?</li>
+          <li>How do you enforce global email uniqueness?</li>
+          <li>What if queries were mostly per-user rather than per-tenant?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

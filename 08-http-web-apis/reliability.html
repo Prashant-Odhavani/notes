@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reliability, Rate Limits &amp; Webhooks — HTTP &amp; Web APIs</title>
+<meta name="description" content="Idempotency keys, safe retries, timeout budgets, rate limit headers and how to design a webhook that consumers can actually trust.">
+<meta name="keywords" content="idempotency key retry timeout budget exponential backoff jitter Retry-After rate limit headers webhook signature HMAC replay attack delivery guarantees dead letter">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="08-http-web-apis/reliability.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Reliability, Rate Limits &amp; Webhooks</h1>
+    <p class="subtitle">Designing an API that survives retries, protects itself from callers, and can call
+      other people back without losing events.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>A <strong>timeout</strong> is the ambiguous case: you don't know whether the request succeeded.
+        Everything here follows from that.</li>
+      <li><strong>Idempotency keys</strong> make a <code>POST</code> safe to retry. Client supplies the key,
+        server stores the result.</li>
+      <li>Retry <strong>only transient failures</strong>, with backoff <strong>and jitter</strong>, and a
+        cap.</li>
+      <li><strong>Timeout budgets:</strong> each hop's timeout must be shorter than its caller's, or you do
+        work nobody is waiting for.</li>
+      <li><strong>429 needs <code>Retry-After</code></strong>, and rate limit headers so clients can
+        self-regulate.</li>
+      <li><strong>Webhooks need signatures, timestamps and idempotency</strong> — you're asking someone to
+        trust an unsolicited request.</li>
+    </ul>
+  </div>
+
+  <h2 id="the-ambiguous-timeout">Why a timeout is the hard case <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>If a request returns 500, you know it failed. If it returns 200, you know it worked.</p>
+    <p>If it <strong>times out</strong>, you know nothing. It may have completed and only the response was
+      lost.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>You post a letter with a cheque and hear nothing back. Did it arrive and the reply got lost, or did the
+      letter never arrive?</p>
+    <p>Send a second cheque and you might pay twice. Don't send it and the bill might go unpaid. You need a
+      reference number on the cheque so the recipient can tell it's the same one.</p>
+    <p>That reference number is an idempotency key.</p>
+  </div>
+
+  <h2 id="idempotency-keys">Idempotency keys <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="http — the client supplies a key it can repeat" class="code-good"><code class="language-http">POST /api/payments
+Idempotency-Key: 7f3a9c21-4e8b-11ee-be56-0242ac120002
+Content-Type: application/json
+
+{ "orderId": "42", "amount": 4999, "currency": "GBP" }</code></pre>
+
+  <p>The server stores the key with the response. A repeat with the same key returns the
+    <strong>stored response</strong> rather than charging again.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Request</th><th>Server behaviour</th></tr></thead>
+      <tbody>
+        <tr><td>First time with key <code>K</code></td><td>Process it, store the response against <code>K</code>, return it</td></tr>
+        <tr><td>Repeat with key <code>K</code>, same body</td><td>Return the stored response. Do <strong>not</strong> reprocess</td></tr>
+        <tr><td>Repeat with <code>K</code> while the first is still running</td><td>Return <strong>409</strong> — "in progress, retry shortly"</td></tr>
+        <tr><td>Repeat with <code>K</code> but a <em>different</em> body</td><td>Return <strong>422</strong> — the key is being reused incorrectly</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">The two rows people forget</div>
+    <p style="margin:0">The <strong>in-progress</strong> case is the one that bites. A client times out after
+      two seconds and retries, but the original request is still running. If you just check "have I seen this
+      key?" and find nothing stored yet, you'll process it twice concurrently — which is exactly the scenario
+      the key existed to prevent.
+      <br><br>
+      So the key needs to be <strong>claimed</strong> before processing, not recorded after. Insert the key
+      with a status of <em>in progress</em> inside the same transaction, and let a unique constraint reject the
+      duplicate.
+      <br><br>
+      The <strong>different body, same key</strong> case matters too — that's a client bug, and silently
+      returning the old response hides it.</p>
+  </div>
+
+  <pre data-label="csharp — claim the key first, in the same transaction" class="code-good"><code class="language-csharp">public async Task&lt;Result&lt;Payment&gt;&gt; ChargeAsync(
+    string idempotencyKey, ChargeRequest request, CancellationToken ct)
+{
+    // 1. Already completed? Replay the stored response.
+    var existing = await _db.IdempotencyRecords
+        .FirstOrDefaultAsync(r =&gt; r.Key == idempotencyKey, ct);
+
+    if (existing is { Status: RecordStatus.Completed })
+        return Result.Success(existing.DeserializeResponse&lt;Payment&gt;());
+
+    if (existing is { Status: RecordStatus.InProgress })
+        return Result.Conflict("Request already in progress");
+
+    // 2. CLAIM the key. The unique index is what actually makes this safe -
+    //    two concurrent requests race here and exactly one wins.
+    _db.IdempotencyRecords.Add(new IdempotencyRecord
+    {
+        Key = idempotencyKey,
+        RequestHash = Hash(request),       // detect key reuse with a different body
+        Status = RecordStatus.InProgress
+    });
+
+    try   { await _db.SaveChangesAsync(ct); }
+    catch (DbUpdateException) when (IsUniqueViolation)
+    {
+        return Result.Conflict("Request already in progress");
+    }
+
+    // 3. Do the work, then record the outcome.
+    var payment = await _gateway.ChargeAsync(request, ct);
+    await MarkCompletedAsync(idempotencyKey, payment, ct);
+
+    return Result.Success(payment);
+}</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Practical details</div>
+    <ul style="margin:8px 0 0">
+      <li><strong>The client generates the key</strong>, not the server. It has to survive the client's own
+        retry, so it's created before the first attempt.</li>
+      <li><strong>Scope it per client.</strong> Two customers must be able to use the same key value without
+        colliding — the uniqueness is on (client, key).</li>
+      <li><strong>Set a retention period.</strong> Keys don't need to live forever; long enough to cover any
+        plausible retry window — usually 24 hours to a few days — then purge.</li>
+      <li><strong>Hash the request body.</strong> That's how you detect a client reusing a key for a different
+        operation.</li>
+    </ul>
+  </div>
+
+  <p>This is the HTTP-level expression of the same idea as the
+    <a href="../19-architecture/distributed-data.html#idempotency">inbox pattern</a> for message consumers —
+    and both rely on a unique constraint rather than a check.</p>
+
+  <h2 id="retries">Retries that help rather than hurt <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Status</th><th>Retry?</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>408, 429</td><td>✅ Yes, after <code>Retry-After</code></td><td>Explicitly transient</td></tr>
+        <tr><td>500, 502, 503, 504</td><td>✅ Yes, with backoff</td><td>Server-side, likely transient</td></tr>
+        <tr><td>Timeout / connection reset</td><td>⚠️ Only if idempotent or keyed</td><td>Outcome unknown</td></tr>
+        <tr><td>400, 422</td><td>❌ No</td><td>The request is wrong. It'll be wrong next time</td></tr>
+        <tr><td>401, 403</td><td>❌ No (401 → refresh token once, then stop)</td><td>Retrying won't grant permission</td></tr>
+        <tr><td>404</td><td>❌ No</td><td>Won't appear by retrying</td></tr>
+        <tr><td>409</td><td>⚠️ Depends</td><td>Concurrency conflict → re-read and retry. Duplicate → don't</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Retrying a 4xx is <strong>pure extra load for zero chance of success</strong>.</p>
+    <p>The rule: retry when the <em>server</em> or the <em>network</em> failed, never when the
+      <em>request</em> was wrong.</p>
+  </div>
+
+  <h3 id="jitter">Why jitter matters more than backoff</h3>
+
+  <pre data-label="text — 1,000 clients failing at the same moment" class="code-bad"><code class="language-text" data-nohl>Fixed backoff, no jitter:
+  t=0s     1000 requests fail
+  t=1s     1000 retries arrive SIMULTANEOUSLY   ← recreates the spike
+  t=3s     1000 retries arrive simultaneously
+  t=7s     1000 retries arrive simultaneously
+
+The dependency never gets a quiet moment to recover.</code></pre>
+
+  <pre data-label="text — with jitter" class="code-good"><code class="language-text" data-nohl>Exponential backoff + jitter:
+  t=0s        1000 requests fail
+  t=1.0-2.0s  retries spread across a window   ← recovery is possible
+  t=2.1-4.3s  spread wider
+  t=4.4-8.9s  spread wider still</code></pre>
+
+  <p>Backoff alone reduces the <em>rate</em>. Jitter breaks the <strong>synchronisation</strong> — and
+    synchronisation is what turns a blip into a sustained outage. It's the more important half.</p>
+
+  <div class="note danger">
+    <div class="note-title">Retry amplification across layers</div>
+    <p style="margin:0">If service A retries 3× into B, and B retries 3× into C, then C sees up to
+      <strong>16×</strong> the original load — at the exact moment it's struggling.
+      <br><br>
+      Two defences: <strong>only retry at one layer</strong> (usually the outermost, closest to the user), and
+      pair retries with a <a href="../19-architecture/resilience-patterns.html#circuit-breaker">circuit
+      breaker</a> so you stop entirely once a dependency is clearly down.</p>
+  </div>
+
+  <h2 id="timeout-budgets">Timeout budgets <span class="lvl lvl-a">🔴 Advanced</span> <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Each service in a chain must give up <strong>before</strong> its caller does.</p>
+    <p>Otherwise you're doing work for a request nobody is waiting for any more.</p>
+  </div>
+
+  <pre data-label="text — a budget that works" class="code-good"><code class="language-text" data-nohl>Browser        30s   ── gives up here
+  └─ Gateway   25s   ── must be under 30
+      └─ API   20s   ── must be under 25
+          ├─ DB          3s
+          └─ Service B   8s  (incl. its own retries)
+              └─ DB      2s
+
+Each layer leaves headroom for its own error handling and response.</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — the inverted budget</div>
+    <p style="margin:0">The common failure is the opposite shape: the browser gives up after 30 seconds while
+      the API's HTTP client has the default <strong>100-second</strong> timeout.
+      <br><br>
+      So the user sees an error at 30s, retries, and the API is now doing <em>two</em> pieces of abandoned
+      work — for another 70 seconds each. Under load that's how you exhaust the thread pool with work whose
+      results will be discarded.
+      <br><br>
+      Always set explicit timeouts, and check the arithmetic holds from the outside in.</p>
+  </div>
+
+  <p><strong>Also: retries consume the budget.</strong> Three retries at 5 seconds each is 15 seconds plus
+    backoff — so an inner timeout of 5s with 3 retries needs a total budget of at least 20s, not 5s. That's
+    why resilience pipelines have both a per-attempt and a total timeout.</p>
+
+  <h2 id="rate-limiting">Rate limit responses <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="http — tell the client what happened and what to do" class="code-good"><code class="language-http">HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+RateLimit-Reset: 30
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.example.com/errors/rate-limit",
+  "title": "Rate limit exceeded",
+  "status": 429,
+  "detail": "100 requests per minute allowed. Retry in 30 seconds."
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Header</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>Retry-After</code></td><td><strong>The important one.</strong> Seconds (or a date) until the client may retry</td></tr>
+        <tr><td><code>RateLimit-Limit</code></td><td>The quota for the window</td></tr>
+        <tr><td><code>RateLimit-Remaining</code></td><td>How much is left — lets clients self-throttle <em>before</em> hitting 429</td></tr>
+        <tr><td><code>RateLimit-Reset</code></td><td>When the window resets</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Why the headers matter</span>
+    <p>Without <code>Retry-After</code>, a well-behaved client has to <strong>guess</strong> — and it will
+      usually guess too aggressively, keeping you overloaded.</p>
+    <p>The <code>Remaining</code> header is better still: it lets clients slow down <em>before</em> they get
+      rejected, which is the outcome you actually want.</p>
+  </div>
+
+  <p>Configuring the limiter itself is covered in
+    <a href="../07-aspnet-core/performance-resilience.html#rate-limiting">ASP.NET Core performance</a> —
+    including the important caveat that the built-in limiter is per-instance.</p>
+
+  <h2 id="webhooks">Webhooks <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A webhook is your API making an HTTP call <em>to your customer</em> when something happens — the
+      inverse of them polling you.</p>
+    <p>Which means you're asking them to trust an unsolicited request from the internet. That drives every
+      design decision below.</p>
+  </div>
+
+  <h3 id="webhook-signing">Signing — so the receiver can trust it</h3>
+
+  <pre data-label="http — a signed webhook delivery" class="code-good"><code class="language-http">POST /customer-endpoint
+X-Webhook-Id: evt_9f8e7d
+X-Webhook-Timestamp: 1735689600
+X-Webhook-Signature: v1=5257a869e7bcd...
+Content-Type: application/json
+
+{ "type": "order.shipped", "data": { "orderId": "42" } }</code></pre>
+
+  <p>The signature is an HMAC of <code>timestamp + "." + body</code>, using a shared secret. The receiver
+    recomputes it and compares.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Element</th><th>What it prevents</th></tr></thead>
+      <tbody>
+        <tr><td><strong>HMAC signature</strong></td><td>Forged deliveries — only someone with the secret can produce a valid one</td></tr>
+        <tr><td><strong>Timestamp in the signed payload</strong></td><td><strong>Replay attacks</strong> — the receiver rejects anything older than a few minutes</td></tr>
+        <tr><td><strong>Event ID</strong></td><td>Duplicate processing — the receiver dedupes on it</td></tr>
+        <tr><td><strong>Constant-time comparison</strong></td><td>Timing attacks on signature verification</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Why the timestamp must be inside the signature</div>
+    <p style="margin:0">If you sign only the body, an attacker who captures one valid delivery can replay it
+      forever — the signature stays valid because the body hasn't changed.
+      <br><br>
+      Signing <code>timestamp.body</code> means the receiver can reject old deliveries, and an attacker can't
+      change the timestamp without invalidating the signature. That's the whole mechanism.</p>
+  </div>
+
+  <h3 id="webhook-delivery">Delivery guarantees you should promise</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Property</th><th>What to promise</th></tr></thead>
+      <tbody>
+        <tr><td>Delivery</td><td><strong>At least once.</strong> Never claim exactly-once — you can't</td></tr>
+        <tr><td>Ordering</td><td><strong>Not guaranteed.</strong> Include a sequence number or timestamp instead</td></tr>
+        <tr><td>Retries</td><td>Exponential backoff over hours, then dead-letter</td></tr>
+        <tr><td>Success</td><td>Any 2xx. Treat 4xx as permanent, 5xx and timeouts as retryable</td></tr>
+        <tr><td>Timeout</td><td>A few seconds — the receiver should acknowledge and process async</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">What to tell consumers to do</div>
+    <p style="margin:0">Good webhook documentation tells the receiver to:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Return 2xx immediately</strong> and process asynchronously. If they do work before
+        responding and it takes longer than your timeout, you'll retry a delivery they actually handled.</li>
+      <li><strong>Deduplicate on the event ID</strong>, because at-least-once means duplicates will happen.</li>
+      <li><strong>Not rely on order</strong> — use the sequence number or event timestamp.</li>
+      <li><strong>Verify the signature</strong> before doing anything with the payload.</li>
+    </ul>
+    <p style="margin:8px 0 0">Saying that unprompted shows you've operated a webhook system rather than just
+      sent an HTTP POST.</p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — webhooks and SSRF</div>
+    <p style="margin:0">Letting customers register an arbitrary URL means <strong>your server</strong> makes
+      requests to addresses they choose. That's a server-side request forgery vector: they can point it at
+      <code>http://169.254.169.254/</code> to hit a cloud metadata endpoint, or at internal addresses to probe
+      your network.
+      <br><br>
+      Defences: require HTTPS, block private and link-local IP ranges after DNS resolution, don't follow
+      redirects, and send webhooks from an egress-restricted network path — not from the same context that
+      can reach your internal services.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>A timeout is ambiguous. Every reliability pattern here exists because of that.</li>
+      <li>Idempotency keys make <code>POST</code> retry-safe. Claim the key before processing, using a unique
+        constraint.</li>
+      <li>Handle the in-progress case, or concurrent retries defeat the whole mechanism.</li>
+      <li>Retry 5xx and timeouts; never 4xx. Backoff reduces rate, jitter breaks synchronisation.</li>
+      <li>Retry at one layer only, or you amplify load 16× across three hops.</li>
+      <li>Each hop's timeout must be under its caller's — and retries consume that budget.</li>
+      <li>429 without <code>Retry-After</code> makes clients guess badly.</li>
+      <li>Webhooks: sign with a timestamp inside the signature, promise at-least-once, no ordering.</li>
+      <li>Customer-supplied webhook URLs are an SSRF risk.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Retrying a non-idempotent <code>POST</code></strong> with no key — duplicate charges.</li>
+    <li><strong>Checking the idempotency key instead of claiming it</strong>, so concurrent retries both
+      process.</li>
+    <li><strong>Retrying 400s and 404s</strong> — load with no possible benefit.</li>
+    <li><strong>Fixed-delay retries</strong>, so all clients retry in lockstep.</li>
+    <li><strong>Retrying at every layer</strong>, multiplying load on a struggling dependency.</li>
+    <li><strong>Inner timeout longer than the caller's</strong>, doing abandoned work.</li>
+    <li><strong>429 with no <code>Retry-After</code>.</strong></li>
+    <li><strong>Webhooks signed without a timestamp</strong> — replayable forever.</li>
+    <li><strong>Promising webhook ordering</strong> you can't actually guarantee.</li>
+    <li><strong>No allowlist on webhook URLs</strong> — SSRF.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>How do you make a POST endpoint safe to retry? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"With an idempotency key. The client generates a unique key — usually a GUID — and sends it in a
+          header on the first attempt and on every retry. The server stores the key with the outcome, so a
+          repeat returns the stored response rather than doing the work again."</p>
+        <p>"The reason it's necessary is that a timeout is ambiguous. The client doesn't know whether the
+          charge went through or the request never arrived. Without a key, retrying is a coin flip between
+          'failed request' and 'charged twice'."</p>
+        <p>"The implementation detail that actually matters — and the one people get wrong — is that you have
+          to <strong>claim</strong> the key before processing, not record it after. If you just check 'have I
+          seen this key?' and the original request is still in flight, you'll find nothing stored and process
+          it a second time concurrently. Which is exactly the scenario the key was meant to prevent."</p>
+        <p>"So I'd insert the key with an in-progress status inside the transaction, and rely on a
+          <strong>unique constraint</strong> to reject the duplicate. Two concurrent requests race on the
+          insert and exactly one wins; the loser gets a 409 saying 'in progress, retry shortly'."</p>
+        <p>"A few other details. I'd scope the key per client, so two customers can't collide. I'd hash the
+          request body and store it, so if a client reuses a key with a <em>different</em> payload I can
+          return 422 rather than silently replaying the wrong response — that's a client bug worth surfacing.
+          And I'd set a retention window, maybe 24 hours, rather than keeping keys forever."</p>
+        <p>"This is the same idea as the inbox pattern for message consumers — and in both cases the unique
+          constraint is what provides the guarantee, not the check."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the timeout is the ambiguous case?</li>
+        <li>Do you handle the in-progress race — the discriminating detail?</li>
+        <li>Do you know the unique constraint, not the check, is the guarantee?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "make it a <code>PUT</code>" — doesn't work when the server
+          assigns the ID.</li>
+        <li><span class="redflag">Red flag:</span> checking for existence without claiming.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if the same key arrives with a different body?</li>
+          <li>How long do you keep the keys?</li>
+          <li>Where do you store them, and what if that store fails?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Design a webhook system. What would you get right? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The framing I'd start from is that I'm asking a customer to trust an unsolicited HTTP request from
+          the internet. Everything else follows from that."</p>
+        <p>"<strong>Signing.</strong> An HMAC over the payload using a per-customer secret, so they can verify
+          it came from me. Critically, the signature covers a <strong>timestamp as well as the body</strong>
+          — if I sign only the body, someone who captures one valid delivery can replay it forever, because
+          the signature stays valid. With the timestamp inside, the receiver rejects anything older than a few
+          minutes and an attacker can't alter it without breaking the signature."</p>
+        <p>"<strong>Delivery guarantees.</strong> I'd promise at-least-once and explicitly <em>not</em>
+          promise ordering, because I can't. I'd include an event ID so receivers can deduplicate, and a
+          sequence number or timestamp so they can detect out-of-order arrival. Claiming exactly-once would be
+          a lie I'd have to defend later."</p>
+        <p>"<strong>Retries.</strong> Exponential backoff with jitter over several hours, treating 5xx and
+          timeouts as retryable and 4xx as permanent. Then dead-letter it and notify the customer — ideally
+          disabling the endpoint after sustained failure so I'm not retrying a dead URL forever."</p>
+        <p>"<strong>Reliability on my side.</strong> The event has to be written in the same transaction as
+          the state change it describes, otherwise I'll either lose events or send ones for changes that
+          rolled back. So an outbox, with a dispatcher reading from it."</p>
+        <p>"<strong>Documentation.</strong> I'd tell receivers to return 2xx immediately and process
+          asynchronously — if they do the work before responding and exceed my timeout, I'll retry something
+          they already handled. And to verify the signature before parsing the payload."</p>
+        <p>"The security thing I'd raise unprompted is <strong>SSRF</strong>. Letting customers register an
+          arbitrary URL means my servers make requests to addresses they choose — including cloud metadata
+          endpoints or internal IPs. So: require HTTPS, resolve the DNS and block private and link-local
+          ranges, don't follow redirects, and send from an egress-restricted path rather than from a context
+          that can reach internal services."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you sign, and do you know the timestamp must be inside the signature?</li>
+        <li>Are you honest about at-least-once and no ordering?</li>
+        <li>Do you connect it to the outbox pattern?</li>
+        <li>Does SSRF occur to you? That's the senior signal.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "POST the JSON to their URL" with no signing.</li>
+        <li><span class="redflag">Red flag:</span> promising ordering or exactly-once delivery.</li>
+        <li><span class="redflag">Red flag:</span> no retry or dead-letter strategy.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you handle a customer whose endpoint is down for a day?</li>
+          <li>How would you let them replay missed events?</li>
+          <li>How do you rotate the signing secret without downtime?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

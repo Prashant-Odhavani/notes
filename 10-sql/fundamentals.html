@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relational Fundamentals — SQL</title>
+<meta name="description" content="Keys, constraints, relationships, normalization and when to denormalize — with the data-modelling decisions that cause real production problems.">
+<meta name="keywords" content="primary key foreign key unique constraint check constraint normalization 1NF 2NF 3NF denormalization surrogate natural key GUID clustered index nullable many to many">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="10-sql/fundamentals.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Relational Fundamentals</h1>
+    <p class="subtitle">Keys, constraints and normalization. The decisions here are the hardest to change
+      later, because data accumulates under them.</p>
+    <div class="meta">
+      <span class="lvl lvl-b">🟢 Beginner</span>
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Constraints are the cheapest correctness you can buy.</strong> The database enforces them
+        regardless of which application, script or admin tool writes.</li>
+      <li><strong>Normalize to 3NF by default</strong>, then denormalize deliberately with a measured reason.</li>
+      <li><strong>Surrogate keys</strong> (an ID column) for stability; <strong>natural keys</strong> as a
+        unique constraint alongside.</li>
+      <li>A random <code>GUID</code> as a clustered primary key causes <strong>page splits and
+        fragmentation</strong>. Use sequential IDs or a sequential GUID.</li>
+      <li><code>NULL</code> means "unknown", not "empty". It breaks equality comparisons and skews
+        aggregates.</li>
+      <li>The <strong>many-to-many junction table</strong> is where people forget the composite unique
+        constraint.</li>
+    </ul>
+  </div>
+
+  <h2 id="constraints">Constraints: correctness the app can't bypass <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A constraint is a rule the <strong>database</strong> enforces — not your application.</p>
+    <p>That matters because your application is not the only thing that writes to the database.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Validating in the application is a bouncer on the front door. Effective — until someone comes in
+      through the fire exit.</p>
+    <p>A constraint is a lock on the thing itself. The migration script, the admin tool, the support engineer
+      running an <code>UPDATE</code>, and the second application nobody told you about all hit the same lock.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Constraint</th><th>Guarantees</th><th>Also gives you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>PRIMARY KEY</strong></td><td>Unique and not null</td><td>An index (clustered by default in SQL Server)</td></tr>
+        <tr><td><strong>FOREIGN KEY</strong></td><td>The referenced row exists</td><td>Prevents orphans; drives cascade behaviour</td></tr>
+        <tr><td><strong>UNIQUE</strong></td><td>No duplicates</td><td>An index — and it's how you make idempotency work</td></tr>
+        <tr><td><strong>CHECK</strong></td><td>A value satisfies a predicate</td><td>The optimiser can sometimes use it</td></tr>
+        <tr><td><strong>NOT NULL</strong></td><td>A value is present</td><td>Simpler queries; better plans</td></tr>
+        <tr><td><strong>DEFAULT</strong></td><td>A value when none is supplied</td><td>Lets you add a column without touching every writer</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="sql — constraints doing real work" class="code-good"><code class="language-sql">CREATE TABLE dbo.OrderLine
+(
+    Id          int IDENTITY(1,1) NOT NULL,
+    OrderId     int               NOT NULL,
+    Sku         varchar(50)       NOT NULL,
+    Quantity    int               NOT NULL,
+    UnitPrice   decimal(19,4)     NOT NULL,
+
+    CONSTRAINT PK_OrderLine PRIMARY KEY (Id),
+
+    -- No orphan lines, ever
+    CONSTRAINT FK_OrderLine_Order FOREIGN KEY (OrderId)
+        REFERENCES dbo.[Order](Id) ON DELETE CASCADE,
+
+    -- The same SKU can't appear twice on one order
+    CONSTRAINT UQ_OrderLine_Order_Sku UNIQUE (OrderId, Sku),
+
+    -- Rules that hold no matter who writes
+    CONSTRAINT CK_OrderLine_Quantity  CHECK (Quantity &gt; 0),
+    CONSTRAINT CK_OrderLine_UnitPrice CHECK (UnitPrice &gt;= 0)
+);</code></pre>
+
+  <p>Every one of those has caught a real bug somewhere. The <code>UNIQUE (OrderId, Sku)</code> in particular
+    is how you stop a double-click adding two identical lines — and it works even when the application's
+    check-then-insert has a race window.</p>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — constraints as concurrency control</div>
+    <p style="margin:0">A unique constraint isn't just data hygiene, it's a <strong>concurrency
+      primitive</strong>.
+      <br><br>
+      Application-level "check if it exists, then insert" always has a gap where another request can insert
+      between the two. A unique constraint closes it — one insert wins, the other gets a violation you catch
+      and handle.
+      <br><br>
+      That's exactly the mechanism behind
+      <a href="../08-http-web-apis/reliability.html#idempotency-keys">idempotency keys</a> and the
+      <a href="../19-architecture/distributed-data.html#inbox">inbox pattern</a>. Same idea, three contexts.</p>
+  </div>
+
+  <h3 id="foreign-key-actions">Cascade behaviour — choose it deliberately</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th><code>ON DELETE</code></th><th>Effect</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><code>NO ACTION</code> / <code>RESTRICT</code></td><td>Blocks the delete</td><td><strong>Default choice.</strong> Forces the caller to be explicit</td></tr>
+        <tr><td><code>CASCADE</code></td><td>Deletes the children too</td><td>True ownership — order lines with an order</td></tr>
+        <tr><td><code>SET NULL</code></td><td>Nulls the reference</td><td>Optional relationships</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — cascade chains</div>
+    <p style="margin:0"><code>CASCADE</code> is transitive. Deleting one customer can cascade to orders, then
+      order lines, then shipments — and you've deleted 50,000 rows from a one-row <code>DELETE</code>,
+      inside one transaction, holding locks the whole time.
+      <br><br>
+      Worse, it's silent: nothing warns you how much you just removed.
+      <br><br>
+      My default is <code>NO ACTION</code> and an explicit delete in the right order, or a soft delete. Use
+      <code>CASCADE</code> only for genuine composition — where the child is meaningless without the parent —
+      and never across more than one level.</p>
+  </div>
+
+  <h2 id="keys">Choosing a primary key <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Surrogate key (<code>int</code>/<code>bigint</code> identity)</th><th>Natural key (email, ISBN, code)</th></tr></thead>
+      <tbody>
+        <tr><td>Stability</td><td><strong>Never changes</strong></td><td>Can change — people change email addresses</td></tr>
+        <tr><td>Size</td><td>4–8 bytes</td><td>Often much larger</td></tr>
+        <tr><td>Meaning</td><td>None — that's the point</td><td>Meaningful, so it leaks business rules into keys</td></tr>
+        <tr><td>Joins</td><td>Fast and narrow</td><td>Wider; slower to index</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Use a <strong>surrogate primary key</strong> and add the natural key as a <strong>unique
+      constraint</strong>.</p>
+    <p>You get stable joins <em>and</em> the business rule enforced. Choosing one or the other is a false
+      dilemma.</p>
+  </div>
+
+  <h3 id="guids">The GUID problem <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <div class="simple">
+    <span class="sm-label">Why random GUIDs hurt as clustered keys</span>
+    <p>In SQL Server, the clustered index <strong>is</strong> the table — rows are stored in key order.</p>
+    <p>A random GUID inserts into the <em>middle</em> of that order. When the target page is full, SQL Server
+      splits it: allocates a new page and moves half the rows. Do that constantly and you get fragmentation,
+      wasted space, and far more I/O.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key choice</th><th>Insert pattern</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td><code>int IDENTITY</code></td><td>Always at the end</td><td>No splits. Compact. Fastest</td></tr>
+        <tr><td><code>NEWID()</code> (random GUID)</td><td>Random position</td><td><strong>Constant page splits, heavy fragmentation</strong></td></tr>
+        <tr><td><code>NEWSEQUENTIALID()</code></td><td>Mostly at the end</td><td>Good — but restarts on reboot, so not globally monotonic</td></tr>
+        <tr><td>Sequential GUID (e.g. GUID v7)</td><td>Mostly at the end</td><td>Good, and client-generatable</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>GUIDs have real advantages: the client can generate the ID before a round trip, they don't leak row
+    counts, and they're safe to merge across databases. So the answer isn't "never use GUIDs".</p>
+
+  <pre data-label="sql — GUID identity, sequential storage" class="code-good"><code class="language-sql">CREATE TABLE dbo.[Order]
+(
+    Id          uniqueidentifier NOT NULL,   -- the public, client-generatable key
+    OrderNumber bigint IDENTITY  NOT NULL,   -- sequential, for physical ordering
+    CreatedUtc  datetime2(3)     NOT NULL,
+
+    -- Unique but NON-clustered: no page splits from random inserts
+    CONSTRAINT PK_Order PRIMARY KEY NONCLUSTERED (Id)
+);
+
+-- Cluster on something that increases monotonically
+CREATE CLUSTERED INDEX IX_Order_OrderNumber ON dbo.[Order](OrderNumber);</code></pre>
+
+  <div class="note info">
+    <div class="note-title">The key insight</div>
+    <p style="margin:0"><strong>Primary key and clustered index are separate decisions.</strong> SQL Server
+      makes the PK clustered by default, but you can override it.
+      <br><br>
+      So you can keep a GUID as the logical identity while clustering on something sequential. That's how you
+      get GUID benefits without the fragmentation — and knowing they're separable is the senior-level part of
+      this answer.</p>
+  </div>
+
+  <h2 id="normalization">Normalization <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Normalization means <strong>storing each fact in exactly one place</strong>.</p>
+    <p>If a value appears twice, the two copies can disagree — and eventually they will.</p>
+  </div>
+
+  <h3 id="normal-forms">The three that matter</h3>
+
+  <pre data-label="sql — unnormalized, and every problem it causes" class="code-bad"><code class="language-sql">CREATE TABLE Orders
+(
+    OrderId       int,
+    CustomerName  varchar(100),      -- repeated on every order
+    CustomerEmail varchar(200),      -- repeated, and can disagree
+    ProductSkus   varchar(500),      -- 'SKU-1,SKU-2,SKU-3'  ← not atomic
+    Total         decimal(19,4)
+);</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Form</th><th>Rule</th><th>What it prevents</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1NF</strong></td>
+          <td>Every column holds a single atomic value; no repeating groups</td>
+          <td>The comma-separated SKU list. You can't index, join or constrain it</td>
+        </tr>
+        <tr>
+          <td><strong>2NF</strong></td>
+          <td>1NF, plus every non-key column depends on the <em>whole</em> key</td>
+          <td>Partial dependencies in composite-key tables</td>
+        </tr>
+        <tr>
+          <td><strong>3NF</strong></td>
+          <td>2NF, plus no non-key column depends on another non-key column</td>
+          <td><code>CustomerName</code> depending on customer, not on order</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>The concrete problems with that table:</strong></p>
+
+  <ul>
+    <li><strong>Update anomaly.</strong> A customer changes email — you must update every order they ever
+      placed, and if one <code>UPDATE</code> misses a row, the data now disagrees with itself.</li>
+    <li><strong>Insert anomaly.</strong> You can't record a customer who hasn't ordered yet.</li>
+    <li><strong>Delete anomaly.</strong> Delete their last order and you lose the customer entirely.</li>
+    <li><strong>Unqueryable.</strong> "Which orders contain SKU-2?" needs a string search that can't use an
+      index — and matches <code>SKU-20</code> too.</li>
+  </ul>
+
+  <pre data-label="sql — 3NF: each fact in one place" class="code-good"><code class="language-sql">CREATE TABLE dbo.Customer
+(
+    Id    int IDENTITY PRIMARY KEY,
+    Name  varchar(100) NOT NULL,
+    Email varchar(200) NOT NULL,
+    CONSTRAINT UQ_Customer_Email UNIQUE (Email)
+);
+
+CREATE TABLE dbo.[Order]
+(
+    Id         int IDENTITY PRIMARY KEY,
+    CustomerId int NOT NULL REFERENCES dbo.Customer(Id),
+    CreatedUtc datetime2(3) NOT NULL
+);
+
+CREATE TABLE dbo.OrderLine
+(
+    Id        int IDENTITY PRIMARY KEY,
+    OrderId   int NOT NULL REFERENCES dbo.[Order](Id) ON DELETE CASCADE,
+    Sku       varchar(50) NOT NULL,
+    Quantity  int NOT NULL CHECK (Quantity &gt; 0),
+    UnitPrice decimal(19,4) NOT NULL,
+    CONSTRAINT UQ_OrderLine_Order_Sku UNIQUE (OrderId, Sku)
+);</code></pre>
+
+  <div class="remember">
+    <span class="r-label">How to remember 3NF</span>
+    <p>Every non-key column must depend on <strong>the key, the whole key, and nothing but the key</strong>.</p>
+  </div>
+
+  <h2 id="denormalization">When to denormalize <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Denormalization means <strong>deliberately duplicating data</strong> to make reads faster.</p>
+    <p>You're trading write complexity and a risk of inconsistency for read speed. That trade needs a reason.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Case</th><th>Why it's legitimate</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Historical snapshot</strong></td>
+          <td>Copying the price and address onto an order isn't duplication — an invoice must show what was
+              charged <em>then</em>, not today's price. This is the most defensible case</td>
+        </tr>
+        <tr>
+          <td><strong>Expensive aggregate</strong></td>
+          <td>A cached <code>OrderCount</code> on a customer, when counting live is measurably too slow</td>
+        </tr>
+        <tr>
+          <td><strong>Reporting / read model</strong></td>
+          <td>A flattened table optimised for queries, kept separate from the write model — the
+              <a href="../18-design-patterns/enterprise.html#cqrs">CQRS</a> approach</td>
+        </tr>
+        <tr>
+          <td><strong>Avoiding a cross-service join</strong></td>
+          <td>In a distributed system you may have to copy data because you can't join across services</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the snapshot distinction</div>
+    <p style="margin:0">Storing the unit price on an order line looks like denormalization and isn't. The
+      product's <em>current</em> price and the price <em>this customer paid</em> are two different facts.
+      <br><br>
+      Joining to <code>Product.Price</code> to display an old invoice is a genuine <strong>bug</strong> — the
+      invoice total would change when someone edits the product. I've seen that ship.
+      <br><br>
+      Being able to make that distinction is worth more than reciting the normal forms.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">If you denormalize, decide how it stays consistent</div>
+    <p style="margin:0">A cached count or total will drift. Pick a mechanism and write it down:
+    </p>
+    <ul style="margin:8px 0 0">
+      <li><strong>Same transaction</strong> — always correct, adds write contention on the parent row.</li>
+      <li><strong>Trigger</strong> — automatic, but invisible to developers reading the app code.</li>
+      <li><strong>Async update</strong> — cheap writes, briefly stale.</li>
+      <li><strong>Periodic reconciliation</strong> — necessary regardless, because the others will drift.</li>
+    </ul>
+    <p style="margin:8px 0 0">The mistake is denormalizing and never deciding — then discovering the count has
+      been wrong for eight months.</p>
+  </div>
+
+  <h2 id="nulls">NULL <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>NULL</code> means <strong>unknown</strong>, not zero and not empty string.</p>
+    <p>Which is why comparing to it doesn't work the way you'd expect.</p>
+  </div>
+
+  <pre data-label="sql — three-valued logic in practice"><code class="language-sql">SELECT * FROM Customer WHERE MiddleName = NULL;      -- returns NOTHING, ever
+SELECT * FROM Customer WHERE MiddleName IS NULL;     -- correct
+
+-- NULL propagates through arithmetic and concatenation
+SELECT 100 + NULL;                                   -- NULL
+SELECT 'Hello ' + NULL;                              -- NULL
+
+-- Aggregates SKIP nulls - which changes the answer
+SELECT COUNT(*)        FROM Customer;                -- 1000 (all rows)
+SELECT COUNT(Phone)    FROM Customer;                -- 640  (non-null only)
+SELECT AVG(Discount)   FROM [Order];                 -- average of non-nulls,
+                                                     -- NOT (sum / row count)</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — <code>NOT IN</code> with nulls</div>
+    <p style="margin:0">If the subquery returns even one <code>NULL</code>, <code>NOT IN</code> returns
+      <strong>no rows at all</strong>:</p>
+    <pre data-label="sql" class="code-bad"><code class="language-sql">-- Returns nothing if ANY CustomerId in Order is NULL
+SELECT * FROM Customer
+WHERE Id NOT IN (SELECT CustomerId FROM [Order]);</code></pre>
+    <pre data-label="sql — NOT EXISTS handles nulls correctly" class="code-good"><code class="language-sql">SELECT * FROM Customer c
+WHERE NOT EXISTS (SELECT 1 FROM [Order] o WHERE o.CustomerId = c.Id);</code></pre>
+    <p style="margin:0">The logic is that <code>x NOT IN (1, NULL)</code> means
+      <code>x &lt;&gt; 1 AND x &lt;&gt; NULL</code>, and the second comparison is <em>unknown</em> — so the
+      whole predicate can never be true. It returns an empty result with no error, which is why it survives
+      testing on data that happens to have no nulls.
+      <br><br>
+      <strong>Prefer <code>NOT EXISTS</code> as a habit.</strong></p>
+  </div>
+
+  <h2 id="relationships">Modelling relationships <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Relationship</th><th>Implementation</th></tr></thead>
+      <tbody>
+        <tr><td><strong>One-to-many</strong></td><td>Foreign key on the "many" side. The common case</td></tr>
+        <tr><td><strong>Many-to-many</strong></td><td>A junction table with a foreign key to each side</td></tr>
+        <tr><td><strong>One-to-one</strong></td><td>Shared primary key, or a unique foreign key</td></tr>
+        <tr><td><strong>Self-referencing</strong></td><td>A nullable foreign key to the same table (manager, parent category)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="sql — the junction table detail people miss" class="code-good"><code class="language-sql">CREATE TABLE dbo.ProductCategory
+(
+    ProductId  int NOT NULL REFERENCES dbo.Product(Id)  ON DELETE CASCADE,
+    CategoryId int NOT NULL REFERENCES dbo.Category(Id) ON DELETE CASCADE,
+
+    -- The composite PK is what prevents duplicate pairs.
+    -- Without it, the same product can be added to a category twice.
+    CONSTRAINT PK_ProductCategory PRIMARY KEY (ProductId, CategoryId)
+);
+
+-- The PK indexes (ProductId, CategoryId). Queries filtering by CategoryId
+-- alone can't use it efficiently, so add the reverse index.
+CREATE INDEX IX_ProductCategory_Category ON dbo.ProductCategory(CategoryId, ProductId);</code></pre>
+
+  <p>Both details matter. The composite primary key enforces uniqueness; the reverse index makes
+    "which products are in this category?" fast. Column order in a composite index is covered on the
+    <a href="indexing.html#column-order">indexing page</a>.</p>
+
+  <h2 id="data-types">Choosing types <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>For</th><th>Use</th><th>Not</th></tr></thead>
+      <tbody>
+        <tr><td>Money</td><td><code>decimal(19,4)</code></td><td><code>float</code>/<code>real</code> — can't represent 0.1 exactly</td></tr>
+        <tr><td>Timestamps</td><td><code>datetime2</code>, stored UTC</td><td><code>datetime</code> (less precise), local time</td></tr>
+        <tr><td>Dates only</td><td><code>date</code></td><td>A datetime with a zero time you must remember to strip</td></tr>
+        <tr><td>Text</td><td><code>nvarchar</code> with a realistic length</td><td><code>nvarchar(max)</code> by default — it can't be indexed normally</td></tr>
+        <tr><td>Flags</td><td><code>bit</code></td><td><code>varchar(1)</code> holding 'Y'/'N'</td></tr>
+        <tr><td>Enums</td><td><code>tinyint</code> with explicit values, or <code>varchar</code></td><td>An implicit ordinal you later reorder</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Two type mistakes with real consequences</div>
+    <p style="margin:0"><strong>Oversized strings.</strong> <code>nvarchar(4000)</code> for a country code
+      isn't just wasteful. SQL Server estimates memory grants from declared size, so oversized columns cause
+      excessive memory reservations — and a query that spills to disk because of a bad grant is dramatically
+      slower.
+      <br><br>
+      <strong>Storing local time.</strong> Store UTC and convert at the edges. Local time breaks across
+      daylight-saving transitions — an hour that occurs twice, and an hour that doesn't exist — and it's
+      almost impossible to fix retroactively because you can't tell which offset each row used.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Constraints are enforced regardless of who writes. They're the cheapest correctness available.</li>
+      <li>A unique constraint is also a concurrency primitive — it closes check-then-insert races.</li>
+      <li>Default to <code>NO ACTION</code>; <code>CASCADE</code> chains delete more than you expect.</li>
+      <li>Surrogate PK plus a unique constraint on the natural key. Not either/or.</li>
+      <li>PK and clustered index are separate decisions — that's how you use GUIDs safely.</li>
+      <li>Normalize to 3NF; denormalize with a measured reason and a stated consistency mechanism.</li>
+      <li>Historical snapshots aren't denormalization — they're a different fact.</li>
+      <li><code>NULL</code> is unknown. Use <code>IS NULL</code>, and prefer <code>NOT EXISTS</code> over
+        <code>NOT IN</code>.</li>
+      <li><code>decimal</code> for money, <code>datetime2</code> in UTC, realistic string lengths.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No foreign keys</strong> "for performance" — you get orphans and the optimiser loses
+      information it could have used.</li>
+    <li><strong>Random GUID as a clustered PK</strong>, causing constant page splits.</li>
+    <li><strong>Comma-separated values in a column</strong> — unindexable, unjoinable, unconstrained.</li>
+    <li><strong>Joining to current product price</strong> to display a historical invoice.</li>
+    <li><strong><code>= NULL</code></strong> instead of <code>IS NULL</code>.</li>
+    <li><strong><code>NOT IN</code> with a nullable subquery</strong>, silently returning nothing.</li>
+    <li><strong><code>float</code> for money.</strong></li>
+    <li><strong>Local time in the database.</strong></li>
+    <li><strong>Junction table with no composite key</strong>, allowing duplicate pairs.</li>
+    <li><strong>Denormalized counts with no reconciliation</strong>, drifting silently.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-basic">Basic</h3>
+
+  <details class="qa">
+    <summary>What is normalization, and would you always normalize? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Normalization is organising data so each fact lives in exactly one place. The practical
+          formulation I use is that every non-key column must depend on the key, the whole key, and nothing
+          but the key — that gets you to third normal form, which is where I'd default."</p>
+        <p>"The reason isn't tidiness, it's the anomalies. If a customer's email is copied onto every order,
+          then changing it means updating every one of those rows — and if one <code>UPDATE</code> misses a
+          row, your data now contradicts itself. Same with inserts: you can't record a customer who hasn't
+          ordered yet. And deletes: removing their last order loses the customer."</p>
+        <p>"So I'd normalize to 3NF by default and denormalize deliberately, with a measured reason."</p>
+        <p>"Legitimate reasons: an expensive aggregate where counting live is genuinely too slow, a separate
+          read model for reporting, or in a distributed system where you can't join across services so you
+          have to copy data."</p>
+        <p>"The distinction I'd make though — and people get this wrong — is that <strong>historical
+          snapshots aren't denormalization</strong>. Storing the unit price on an order line looks like
+          duplication, but the product's current price and the price this customer paid are two different
+          facts. Joining to the product table to display an old invoice is a genuine bug: the total would
+          change when someone edits the product."</p>
+        <p>"And if I do denormalize, I'd decide upfront how it stays consistent — same transaction, trigger,
+          async update — plus a reconciliation job, because it will drift. The failure I've seen is
+          denormalizing and never deciding, then finding the cached count has been wrong for months."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you state the rule usefully rather than reciting 1NF/2NF/3NF definitions?</li>
+        <li>Do you know the anomalies it prevents?</li>
+        <li>Do you know the snapshot distinction? That's the senior part.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Give me an example where you'd denormalize.</li>
+          <li>How do you keep a denormalized count accurate?</li>
+          <li>What's the downside of too many joins?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Would you use a GUID or an int for a primary key? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"It depends on whether I need client-side generation and distributed uniqueness, and my answer is
+          usually that the trade-off is avoidable — because the primary key and the clustered index are
+          separate decisions."</p>
+        <p>"The problem with GUIDs isn't the type, it's <strong>random insert position</strong> when the GUID
+          is the clustered key. In SQL Server the clustered index <em>is</em> the table, so rows are stored
+          in key order. A random GUID inserts into the middle. When that page is full, SQL Server splits it —
+          allocates a new page and moves half the rows. Constant inserts means constant splits, so you get
+          heavy fragmentation, wasted space and much more I/O."</p>
+        <p>"An <code>int IDENTITY</code> always appends, so there are no splits, and it's 4 bytes instead of
+          16 — which matters because every non-clustered index carries the clustering key."</p>
+        <p>"But GUIDs have real advantages. The client can generate the ID before a round trip, which is
+          useful for offline-capable apps and for building an object graph before saving. They don't leak row
+          counts. And they merge safely across databases."</p>
+        <p>"So the answer I'd usually give is: keep the GUID as the primary key but make it
+          <strong>non-clustered</strong>, and cluster on something monotonic — an identity column or a
+          creation timestamp. You get the logical benefits without the fragmentation."</p>
+        <p>"If I do need a GUID as the clustered key, I'd use a <strong>sequential</strong> one —
+          <code>NEWSEQUENTIALID()</code> server-side, or a GUID v7 style value client-side. Worth knowing that
+          <code>NEWSEQUENTIALID</code> restarts after a reboot, so it's mostly-sequential rather than globally
+          monotonic."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know <em>why</em> random GUIDs are a problem — page splits, specifically?</li>
+        <li>Do you know PK and clustered index are separable? That's the discriminating answer.</li>
+        <li>Do you know non-clustered indexes carry the clustering key?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "GUIDs are slower" with no mechanism.</li>
+        <li><span class="redflag">Red flag:</span> "always use int" with no acknowledgement of distributed cases.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What's a page split, exactly?</li>
+          <li>Why does clustering key width affect every other index?</li>
+          <li>How does this differ in PostgreSQL?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why not just enforce all your rules in application code?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Because the application isn't the only thing that writes to the database. There's the migration
+          script, the admin tool, the support engineer running an <code>UPDATE</code> at 2am, the reporting
+          job, and eventually a second application nobody told you about."</p>
+        <p>"Application validation is a bouncer on the front door. A constraint is a lock on the thing
+          itself — it holds regardless of the route in."</p>
+        <p>"There's a second reason that's less obvious: constraints give the <strong>query optimiser</strong>
+          information. A <code>NOT NULL</code> column, a foreign key, a unique constraint — these let it
+          eliminate joins, choose better plans and make better cardinality estimates. Dropping foreign keys
+          'for performance' often makes queries slower, not faster."</p>
+        <p>"And a unique constraint is genuinely a <strong>concurrency primitive</strong>, not just data
+          hygiene. Application-level check-then-insert always has a race window where two requests both find
+          nothing and both insert. A unique constraint closes it — one wins, the other gets a violation you
+          catch. That's the mechanism behind idempotency keys and the inbox pattern."</p>
+        <p>"I'd still validate in the application, for a good user experience — you want a clear field-level
+          error, not a constraint violation surfaced as a 500. But that's for UX. The constraint is for
+          correctness, and you want both."</p>
+        <p>"The one place I'd push back on myself: very complex cross-row business rules usually don't belong
+          in <code>CHECK</code> constraints or triggers, because they become invisible logic that's hard to
+          test and debug. Those belong in the domain model. Constraints are for invariants that are simple
+          and absolute."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know the app isn't the only writer?</li>
+        <li>Do you know constraints help the optimiser?</li>
+        <li>Do you know where the boundary is — what shouldn't be a constraint?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you surface a constraint violation as a friendly error?</li>
+          <li>When would you use a trigger?</li>
+          <li>How do you add a <code>NOT NULL</code> column to a table with existing rows?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

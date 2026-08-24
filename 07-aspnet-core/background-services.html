@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Background &amp; Hosted Services — ASP.NET Core</title>
+<meta name="description" content="BackgroundService, scoped work, graceful shutdown, scheduling, running safely across multiple instances, and fire-and-forget done properly.">
+<meta name="keywords" content="BackgroundService IHostedService ExecuteAsync scoped scope factory graceful shutdown StopAsync cancellation token scheduling multiple instances leader election fire and forget channel">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="07-aspnet-core/background-services.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Background &amp; Hosted Services</h1>
+    <p class="subtitle">Work that happens outside a request. Simple to start, and there are four specific
+      traps that bite in production.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><code>BackgroundService</code> is registered as a <strong>singleton</strong> — so create a DI
+        <strong>scope</strong> per unit of work.</li>
+      <li>An <strong>unhandled exception</strong> in <code>ExecuteAsync</code> stops the whole host. Catch
+        inside the loop.</li>
+      <li>Honour the <strong>cancellation token</strong>, or the platform kills you mid-work.</li>
+      <li>With <strong>multiple instances</strong>, your job runs on every one. Plan for that.</li>
+      <li>Don't block startup: heavy work in <code>StartAsync</code> delays the app becoming ready.</li>
+      <li>For request-triggered background work, use a <strong>Channel</strong>, not fire-and-forget
+        <code>Task.Run</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="basics">The shape of a background service <span class="lvl lvl-b">🟢 Beginner</span></h2>
+
+  <pre data-label="csharp — the minimum, and it has three bugs" class="code-bad"><code class="language-csharp">public class OrderProcessor(AppDbContext db) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            var pending = await db.Orders.Where(o =&gt; !o.Processed).ToListAsync();
+            foreach (var o in pending) Process(o);
+            await Task.Delay(10_000);
+        }
+    }
+}</code></pre>
+
+  <p>Three problems, all of which show up in production rather than development:</p>
+
+  <ol class="steps">
+    <li><strong>Injected <code>DbContext</code>.</strong> The service is a singleton, so this context lives
+      for the lifetime of the app — accumulating tracked entities, returning stale data, and eventually
+      throwing.</li>
+    <li><strong>No exception handling.</strong> One transient database failure throws out of
+      <code>ExecuteAsync</code> and takes down the entire host, including your API.</li>
+    <li><strong>Cancellation ignored.</strong> <code>while (true)</code> and an unparameterised
+      <code>Task.Delay</code> mean shutdown waits, then the process is killed mid-work.</li>
+  </ol>
+
+  <pre data-label="csharp — the version that survives production" class="code-good"><code class="language-csharp">public sealed class OrderProcessor(
+    IServiceScopeFactory scopeFactory,
+    ILogger&lt;OrderProcessor&gt; log) : BackgroundService
+{
+    private static readonly TimeSpan Interval = TimeSpan.FromSeconds(10);
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await ProcessBatchAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;                                  // normal shutdown
+            }
+            catch (Exception ex)
+            {
+                // Log and continue - do NOT let this escape
+                log.LogError(ex, "Order processing batch failed");
+            }
+
+            try
+            {
+                await Task.Delay(Interval, ct);
+            }
+            catch (OperationCanceledException) { break; }
+        }
+
+        log.LogInformation("Order processor stopped cleanly");
+    }
+
+    private async Task ProcessBatchAsync(CancellationToken ct)
+    {
+        // A fresh scope per batch: fresh DbContext, disposed at the end
+        using var scope = scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+
+        var pending = await db.Orders
+            .Where(o =&gt; !o.Processed)
+            .Take(50)                                   // bounded batch
+            .ToListAsync(ct);
+
+        foreach (var order in pending)
+        {
+            ct.ThrowIfCancellationRequested();          // check between items
+            order.MarkProcessed();
+        }
+
+        await db.SaveChangesAsync(ct);
+    }
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — one failure takes down the API</div>
+    <p style="margin:0">Since .NET 6, an unhandled exception in <code>ExecuteAsync</code> stops the host by
+      default. So a background job that fails once will take your web API offline.
+      <br><br>
+      You can change that with <code>HostOptions.BackgroundServiceExceptionBehavior</code>, but the right
+      answer is to handle exceptions in the loop. Swallowing at the batch level and continuing is almost
+      always what you want — with an alert on the error rate so silent failure doesn't become permanent.</p>
+  </div>
+
+  <h2 id="scope-boundary">Where to put the scope boundary <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>One scope per <strong>unit of work you'd want to succeed or fail together</strong>.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Scope per…</th><th>Behaviour</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td>Whole service lifetime</td><td>❌ Same as injecting the context. Don't</td><td>Never</td></tr>
+        <tr><td>Loop iteration / batch</td><td>One transaction per batch; all-or-nothing</td><td>Batch processing where partial success is fine to retry</td></tr>
+        <tr><td>Individual item</td><td>One transaction per item; failures isolated</td><td>Message processing, where one bad item mustn't block the rest</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>The trade-off:</strong> per-batch is fewer scopes and fewer round trips, but one poison record
+    fails the whole batch — and if you retry the batch, it fails again forever. Per-item is more overhead but
+    isolates failures, which is why message consumers work that way.</p>
+
+  <h2 id="shutdown">Graceful shutdown <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <p>The sequence when the platform stops your app:</p>
+
+  <ol class="steps">
+    <li>SIGTERM arrives (Kubernetes, Azure, Ctrl+C).</li>
+    <li>The host triggers <code>ApplicationStopping</code>; the API stops accepting new requests.</li>
+    <li>The token passed to <code>ExecuteAsync</code> is <strong>cancelled</strong>.</li>
+    <li><code>StopAsync</code> is called on each hosted service.</li>
+    <li>The host waits up to <code>ShutdownTimeout</code> (default 30s), then kills what's left.</li>
+  </ol>
+
+  <pre data-label="csharp — finishing current work before stopping" class="code-good"><code class="language-csharp">public override async Task StopAsync(CancellationToken ct)
+{
+    log.LogInformation("Draining: waiting for the current batch");
+
+    // Let in-flight work finish, but respect the caller's timeout
+    await _currentBatch.WaitAsync(ct);
+
+    await base.StopAsync(ct);
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">Production trap — timeout mismatch with Kubernetes</div>
+    <p style="margin:0">Kubernetes sends SIGTERM, waits <code>terminationGracePeriodSeconds</code> (default
+      30), then SIGKILL.
+      <br><br>
+      If your .NET <code>ShutdownTimeout</code> is <em>longer</em> than that, Kubernetes kills you
+      mid-drain — and you lose exactly the in-flight work you were trying to protect.
+      <br><br>
+      <strong>Set the .NET timeout below the grace period</strong>, and make sure work checks cancellation
+      often enough to actually stop inside it. A batch that takes 60 seconds and never checks the token can't
+      be drained gracefully no matter what the timeouts say.</p>
+  </div>
+
+  <h2 id="multiple-instances">The multi-instance problem <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Your background service runs in <strong>every instance</strong> of your app.</p>
+    <p>Three replicas means the job runs three times, concurrently. Nobody tells you this — it just starts
+      happening when you scale out.</p>
+  </div>
+
+  <p>Whether that's a problem depends on the work:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Work type</th><th>Multiple instances?</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Consuming a queue</td><td>✅ <strong>Good</strong></td><td>Competing consumers — each message goes to one instance, and you get throughput</td></tr>
+        <tr><td>Polling a table with a claim</td><td>✅ Fine</td><td>If you atomically claim rows, instances don't collide</td></tr>
+        <tr><td>"Send the daily summary email"</td><td>❌ <strong>Bad</strong></td><td>Three emails per customer</td></tr>
+        <tr><td>Regenerating a shared cache</td><td>⚠️ Wasteful</td><td>Same work three times; usually harmless</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>The options, in order of how much I'd reach for them:</strong></p>
+
+  <ol class="steps">
+    <li><strong>Make the work claim-based.</strong> A conditional <code>UPDATE</code> that claims rows means
+      instances naturally divide the work with no coordination:
+      <code>UPDATE TOP (50) ... SET ClaimedBy = @me WHERE ClaimedBy IS NULL</code>. This is my default,
+      because it needs no new infrastructure and scales.</li>
+    <li><strong>Make it idempotent with a unique key.</strong> "Daily summary for tenant X on date Y" with a
+      unique constraint — the second and third instances fail the insert and stop. Much more robust than
+      trying to prevent the double-run.</li>
+    <li><strong>Take a distributed lease.</strong> A database row or Redis key with a TTL, so one instance
+      wins. Simple, but a lease can expire mid-job — so the work still needs to be safe if two instances
+      briefly overlap.</li>
+    <li><strong>Move it out of the app.</strong> A Kubernetes <code>CronJob</code>, an Azure Function with a
+      singleton trigger, or Hangfire/Quartz with a shared store. If the platform guarantees single execution,
+      use that rather than building it.</li>
+  </ol>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p>Prefer <strong>idempotent work</strong> over a perfect lock.</p>
+    <p>Locks fail — leases expire, networks partition, processes pause for GC. Work that's safe to run twice
+      doesn't care.</p>
+  </div>
+
+  <p>The lock mechanics are covered in
+    <a href="../05-csharp-advanced/concurrency.html#choosing">concurrency</a> and
+    <a href="../16-redis/distributed-primitives.html">Redis distributed primitives</a>.</p>
+
+  <h2 id="request-triggered">Background work triggered by a request <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <pre data-label="csharp — bad: fire-and-forget" class="code-bad"><code class="language-csharp">[HttpPost("/api/orders")]
+public async Task&lt;IActionResult&gt; Create(CreateOrderRequest r, CancellationToken ct)
+{
+    var order = await _repo.CreateAsync(r, ct);
+
+    _ = Task.Run(() =&gt; _email.SendConfirmationAsync(order));   // fire and forget
+    return Ok();
+}</code></pre>
+
+  <p>Four things wrong with that:</p>
+
+  <ul>
+    <li><strong>Exceptions vanish.</strong> Nothing observes the task, so a failure is silent.</li>
+    <li><strong>It uses request-scoped services after the request ends</strong> — the scope is disposed, so
+      you get <code>ObjectDisposedException</code>.</li>
+    <li><strong>Shutdown loses it.</strong> The host doesn't know about it and won't wait.</li>
+    <li><strong>It's unbounded.</strong> A traffic spike starts thousands of concurrent tasks.</li>
+  </ul>
+
+  <pre data-label="csharp — a bounded channel plus a consumer" class="code-good"><code class="language-csharp">// 1. A bounded queue, registered as a singleton
+public sealed class EmailQueue
+{
+    private readonly Channel&lt;EmailJob&gt; _channel =
+        Channel.CreateBounded&lt;EmailJob&gt;(new BoundedChannelOptions(1000)
+        {
+            FullMode = BoundedChannelFullMode.Wait     // apply backpressure
+        });
+
+    public ValueTask EnqueueAsync(EmailJob job, CancellationToken ct) =&gt;
+        _channel.Writer.WriteAsync(job, ct);
+
+    public IAsyncEnumerable&lt;EmailJob&gt; ReadAllAsync(CancellationToken ct) =&gt;
+        _channel.Reader.ReadAllAsync(ct);
+}</code></pre>
+
+  <pre data-label="csharp — 2. the endpoint just enqueues" class="code-good"><code class="language-csharp">var order = await _repo.CreateAsync(r, ct);
+await _queue.EnqueueAsync(new EmailJob(order.Id, order.Email), ct);
+return Ok();</code></pre>
+
+  <pre data-label="csharp — 3. a hosted service consumes it, with its own scope" class="code-good"><code class="language-csharp">public sealed class EmailWorker(
+    EmailQueue queue, IServiceScopeFactory scopes, ILogger&lt;EmailWorker&gt; log)
+    : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        await foreach (var job in queue.ReadAllAsync(ct))
+        {
+            try
+            {
+                using var scope = scopes.CreateScope();
+                var sender = scope.ServiceProvider.GetRequiredService&lt;IEmailSender&gt;();
+                await sender.SendAsync(job, ct);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Failed to send email for order {OrderId}", job.OrderId);
+            }
+        }
+    }
+}</code></pre>
+
+  <p>Now failures are logged, services come from a live scope, the host drains the queue on shutdown, and the
+    bound means a spike causes backpressure rather than unbounded memory growth.</p>
+
+  <div class="note warn">
+    <div class="note-title">The honest limitation</div>
+    <p style="margin:0">An in-memory channel is still <strong>lost on restart</strong>. If losing a
+      confirmation email is unacceptable, the queue has to be durable — Service Bus, or the
+      <a href="../19-architecture/distributed-data.html#outbox">outbox pattern</a> so the job is committed in
+      the same transaction as the order.
+      <br><br>
+      Say that in an interview. "A channel is right for work I can afford to lose; an outbox for work I
+      can't" shows you know where the boundary is.</p>
+  </div>
+
+  <h2 id="startup">Don't block startup <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>When it runs</th><th>Blocks startup?</th></tr></thead>
+      <tbody>
+        <tr><td><code>IHostedService.StartAsync</code></td><td>Before the app accepts requests</td><td><strong>Yes</strong> — until it returns</td></tr>
+        <tr><td><code>BackgroundService.ExecuteAsync</code></td><td>Called from <code>StartAsync</code></td><td>Only until the first <code>await</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>So heavy work directly in <code>StartAsync</code> delays the app becoming ready — and if it exceeds the
+    readiness probe's tolerance, the deployment fails.</p>
+
+  <p>Two exceptions worth making deliberately: applying database migrations and validating configuration.
+    Those you often <em>want</em> to block on, because starting up with a bad schema or missing config is
+    worse than failing the deployment. Everything else belongs after the first <code>await</code>.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li><code>BackgroundService</code> is a singleton — create a scope per unit of work.</li>
+      <li>Catch exceptions in the loop, or one failure stops the whole host.</li>
+      <li>Handle <code>OperationCanceledException</code> separately — shutdown isn't an error.</li>
+      <li>Keep the .NET shutdown timeout below the platform grace period, and check the token often.</li>
+      <li>Your job runs on every instance. Prefer claim-based or idempotent work over a lock.</li>
+      <li>Use a bounded channel for request-triggered work, never fire-and-forget <code>Task.Run</code>.</li>
+      <li>An in-memory channel loses work on restart — use an outbox if that matters.</li>
+      <li>Don't do heavy work in <code>StartAsync</code>; it delays readiness.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Injecting <code>DbContext</code></strong> instead of creating a scope.</li>
+    <li><strong>No try/catch in the loop</strong>, so one failure takes the API down with it.</li>
+    <li><strong>Logging <code>OperationCanceledException</code> as an error</strong> on every deployment.</li>
+    <li><strong><code>while (true)</code></strong> and <code>Task.Delay</code> without the token.</li>
+    <li><strong>Assuming the job runs once</strong> when there are three replicas.</li>
+    <li><strong>Fire-and-forget <code>Task.Run</code></strong> from a controller.</li>
+    <li><strong>Unbounded channels</strong>, converting a slow consumer into an out-of-memory crash.</li>
+    <li><strong>Unbounded batch size</strong>, so a backlog loads a million rows in one query.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>You've written a <code>BackgroundService</code> that polls the database. What can go wrong? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Four things, and I've hit all of them."</p>
+        <p>"First, <strong>DI lifetime</strong>. A <code>BackgroundService</code> is a singleton, so injecting
+          a <code>DbContext</code> means one context alive for the lifetime of the app. It accumulates every
+          tracked entity, returns stale data because the change tracker caches, and isn't thread-safe. The fix
+          is <code>IServiceScopeFactory</code> and a scope per unit of work."</p>
+        <p>"Second, <strong>exceptions</strong>. Since .NET 6, an unhandled exception in
+          <code>ExecuteAsync</code> shuts down the host — so a transient database blip in a background job
+          takes my API offline. The loop body needs its own try/catch that logs and continues, with an alert
+          on the error rate so it doesn't fail silently forever."</p>
+        <p>"Third, <strong>shutdown</strong>. If I use <code>while (true)</code> and a bare
+          <code>Task.Delay</code>, the service ignores cancellation and gets killed mid-work. I'd loop on the
+          token, pass it to <code>Delay</code>, and check it between items so a long batch can actually stop.
+          And I'd keep the .NET shutdown timeout below the platform's grace period, otherwise Kubernetes
+          SIGKILLs me during the drain."</p>
+        <p>"Fourth, and the one people miss: <strong>it runs on every instance</strong>. Scale to three
+          replicas and the job runs three times concurrently. For queue consumption that's a feature. For
+          'send the daily summary' it means three emails per customer."</p>
+        <p>"My preferred fix there is to make the work claim-based — a conditional UPDATE that claims a batch
+          of rows — so instances divide the work naturally with no coordination. Or make it idempotent with a
+          unique key, so a double run is harmless. I'd reach for a distributed lease only if neither works,
+          because leases expire and you still need the work to be safe if two instances overlap."</p>
+        <p>"I'd also bound the batch size. A polling job that does <code>ToListAsync()</code> with no
+          <code>Take</code> is fine until there's a backlog, and then it loads a million rows."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know it's a singleton and needs a scope?</li>
+        <li>Do you know an exception stops the host?</li>
+        <li>Do you think about multiple instances unprompted? That's the senior signal.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> only mentioning the <code>DbContext</code> issue.</li>
+        <li><span class="redflag">Red flag:</span> assuming the job runs once.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where exactly do you put the scope boundary?</li>
+          <li>How would you make the claim-based query safe under concurrency?</li>
+          <li>How do you monitor that the job is actually running?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>A controller needs to send an email without making the caller wait. How?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The thing I'd avoid is fire-and-forget <code>Task.Run</code>, because it fails in four ways at
+          once. Nothing observes the task so exceptions disappear silently. It typically uses request-scoped
+          services after the request ended, giving <code>ObjectDisposedException</code>. The host doesn't
+          know about it, so shutdown loses it. And it's unbounded — a traffic spike starts thousands of
+          concurrent tasks."</p>
+        <p>"The in-process answer is a <strong>bounded channel</strong> plus a hosted service consumer. The
+          controller writes a job to the channel and returns immediately. The consumer reads from it, creates
+          its own DI scope per job, and handles failures. Bounded matters: if the consumer falls behind,
+          writers wait rather than the queue growing until the process dies."</p>
+        <p>"That fixes all four problems — failures are logged, services come from a live scope, the host
+          drains the channel on shutdown, and backpressure replaces unbounded growth."</p>
+        <p>"But I'd be honest about the limitation: an in-memory channel is <strong>lost on restart</strong>.
+          For a confirmation email that might be acceptable. For something the business depends on, I'd use a
+          durable queue — Service Bus — or better, the <strong>outbox pattern</strong>, where the job is
+          written to a table in the same transaction as the order. Then it can't be lost, because either both
+          committed or neither did."</p>
+        <p>"So the decision I'd actually make depends on the cost of losing it. Channel for
+          nice-to-have work, outbox for anything where a silent loss is a real problem — and an email
+          confirming a payment is probably in the second category."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know why fire-and-forget is wrong — specifically?</li>
+        <li>Do you know the channel + hosted service pattern?</li>
+        <li>Do you recognise the durability limit and name the outbox?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "<code>Task.Run</code> and don't await it."</li>
+        <li><span class="redflag">Red flag:</span> an unbounded channel with no mention of the risk.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What happens to queued items when the app restarts?</li>
+          <li>How would you retry a failed email?</li>
+          <li>How does this change with three instances?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

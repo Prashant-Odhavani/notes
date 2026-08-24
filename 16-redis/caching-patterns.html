@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caching Patterns &amp; Invalidation — Redis</title>
+<meta name="description" content="Cache-aside and the alternatives, TTL strategy, stampede and penetration, delete vs update on write, and why invalidation is the genuinely hard part.">
+<meta name="keywords" content="cache-aside read-through write-through write-behind cache invalidation TTL jitter cache stampede thundering herd dogpile cache penetration negative caching HybridCache stale-while-revalidate tag invalidation double delete">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="16-redis/caching-patterns.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Caching Patterns &amp; Invalidation</h1>
+    <p class="subtitle">Reading from a cache is easy. Knowing when the cached value became wrong is the whole
+      problem.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Cache-aside</strong> is the default: check cache, miss → load → populate.</li>
+      <li><strong>Delete on write, don't update.</strong> Updating races; deleting doesn't.</li>
+      <li><strong>Add jitter to TTLs</strong> or everything written together expires together.</li>
+      <li><strong>Stampede:</strong> a hot key expires and every request hits the database at once.</li>
+      <li><strong>Penetration:</strong> requests for keys that don't exist bypass the cache entirely.</li>
+      <li><strong>Cache the absence too</strong> — a short-TTL null marker.</li>
+      <li><strong>Never let a cache failure fail the request.</strong> Degrade to the database.</li>
+    </ul>
+  </div>
+
+  <h2 id="patterns">The four patterns <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pattern</th><th>How it works</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Cache-aside</strong> (lazy loading)</td>
+          <td>App checks cache; on miss, loads from the database and populates</td>
+          <td><strong>The default.</strong> Only caches what's asked for; first request is always slow</td>
+        </tr>
+        <tr>
+          <td><strong>Read-through</strong></td>
+          <td>The cache layer loads on miss, transparently to the app</td>
+          <td>Cleaner call sites; needs a library that supports it</td>
+        </tr>
+        <tr>
+          <td><strong>Write-through</strong></td>
+          <td>Writes go to cache and database together, synchronously</td>
+          <td>Cache is always warm and correct; every write is slower</td>
+        </tr>
+        <tr>
+          <td><strong>Write-behind</strong></td>
+          <td>Write to cache, flush to the database asynchronously</td>
+          <td><strong>Fastest writes, and you can lose data.</strong> Rarely worth it</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — cache-aside, the shape you'll write most often" class="code-good"><code class="language-csharp">public async Task&lt;Product?&gt; GetAsync(int id, CancellationToken ct)
+{
+    var key = $"v1:product:{id}";
+
+    // 1. Try the cache - and never let a cache failure fail the request
+    try
+    {
+        var cached = await _cache.StringGetAsync(key);
+        if (cached.HasValue)
+            return JsonSerializer.Deserialize&lt;Product&gt;(cached!);
+    }
+    catch (RedisException ex)
+    {
+        _logger.LogWarning(ex, "Cache read failed for {Key}, falling through", key);
+    }
+
+    // 2. Load from the source of truth
+    var product = await _repository.GetAsync(id, ct);
+    if (product is null) return null;
+
+    // 3. Populate, fire-and-forget so a slow cache doesn't slow the response
+    try
+    {
+        await _cache.StringSetAsync(key,
+            JsonSerializer.Serialize(product),
+            TtlWithJitter(TimeSpan.FromMinutes(10)));
+    }
+    catch (RedisException ex)
+    {
+        _logger.LogWarning(ex, "Cache write failed for {Key}", key);
+    }
+
+    return product;
+}</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">A cache failure must never fail the request</div>
+    <p style="margin:0">Without the try/catch, a Redis outage takes down every endpoint that reads from the
+      cache — so you've turned a performance optimisation into a hard dependency and <em>reduced</em>
+      availability.
+      <br><br>
+      The correct behaviour is to <strong>log and fall through to the database</strong>. Slower, still working.
+      <br><br>
+      One caveat worth stating: if the database can't handle 100% of traffic uncached, falling through turns a
+      cache outage into a database outage. So this needs a
+      <a href="../07-aspnet-core/performance-resilience.html">circuit breaker</a> and a load-shedding plan for
+      caches that are load-bearing rather than merely helpful. Knowing which of the two you have is the real
+      question.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Where write-behind is genuinely right</div>
+    <p style="margin:0">Write-behind looks reckless — you acknowledge a write that isn't durable yet. And for
+      <strong>high-volume, low-value, aggregate-shaped data</strong> it's exactly right.
+      <br><br>
+      View counts, "last seen" timestamps, analytics events. Incrementing Redis on every page view and flushing
+      to the database every 30 seconds turns a million writes into a few thousand. Losing 30 seconds of view
+      counts on a crash costs nothing.
+      <br><br>
+      The rule: write-behind is acceptable when <strong>the data is statistical rather than
+      transactional</strong>. Never for anything a user or an auditor would notice missing.</p>
+  </div>
+
+  <h2 id="invalidation">Delete or update on write <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The question</span>
+    <p>When data changes, do you <strong>update</strong> the cache with the new value, or <strong>delete</strong>
+      the entry and let the next read repopulate it?</p>
+    <p>The answer is almost always delete, and the reason is a race condition.</p>
+  </div>
+
+  <pre data-label="text — why updating races" class="code-bad"><code class="language-text">Two concurrent writers, A setting price=10 and B setting price=20:
+
+  A: writes price=10 to the database
+  B: writes price=20 to the database        <-- database now says 20
+  B: writes price=20 to the cache
+  A: writes price=10 to the cache           <-- cache now says 10
+
+Database: 20. Cache: 10. Permanently inconsistent until the TTL expires.</code></pre>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Write to the database, then delete the cache key.</strong></p>
+    <p>Deleting is idempotent and order-independent — two concurrent deletes leave the same state. Two
+      concurrent updates can leave the cache holding the older value indefinitely.</p>
+    <p>Order matters too: <strong>database first, then cache</strong>. Delete-then-write leaves a window where a
+      reader repopulates the cache with the old value just before the database changes.</p>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Even delete-after-write has a small window</div>
+    <pre data-label="text"><code class="language-text">  Reader:  cache miss, reads price=10 from the database
+  Writer:  writes price=20 to the database
+  Writer:  deletes the cache key
+  Reader:  writes price=10 into the cache      <-- stale value, no TTL pressure</code></pre>
+    <p style="margin:0">Rare — it needs the reader's database read to land before the write and its cache write
+      to land after the delete — but on a hot key it happens.
+      <br><br>
+      Mitigations, in increasing order of effort: <strong>a short TTL</strong> so the window is bounded (usually
+      enough); <strong>delayed double-delete</strong>, deleting again after a second; or
+      <strong>invalidating from the database change log</strong> — the
+      <a href="../19-architecture/distributed-data.html#outbox">outbox</a> or CDC approach — which removes the
+      race entirely because invalidation is driven by committed changes.
+      <br><br>
+      Being able to say "a short TTL bounds this and I'd only build more if the data genuinely can't be stale"
+      is the calibrated answer. Reaching straight for CDC is over-engineering for most systems.</p>
+  </div>
+
+  <h2 id="ttl">TTL strategy <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Data</th><th>Typical TTL</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>Reference data — countries, categories</td><td>Hours to days</td><td>Changes rarely; staleness is harmless</td></tr>
+        <tr><td>Product catalogue</td><td>Minutes</td><td>Changes occasionally; brief staleness acceptable</td></tr>
+        <tr><td>User profile</td><td>Minutes, plus invalidate on write</td><td>The user notices their own edits immediately</td></tr>
+        <tr><td>Stock levels, prices</td><td><strong>Seconds, or don't cache</strong></td><td>Stale data has commercial consequences</td></tr>
+        <tr><td>Computed reports</td><td>Match the reporting period</td><td>Expensive to build, inherently a snapshot</td></tr>
+        <tr><td>Session data</td><td>Sliding, matching session length</td><td>Should extend on activity</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — always jitter the TTL" class="code-good"><code class="language-csharp">private static TimeSpan TtlWithJitter(TimeSpan baseTtl)
+{
+    // +/- 10%, so keys written together don't expire together
+    var jitterMs = Random.Shared.Next(
+        (int)(-baseTtl.TotalMilliseconds * 0.1),
+        (int)( baseTtl.TotalMilliseconds * 0.1));
+    return baseTtl + TimeSpan.FromMilliseconds(jitterMs);
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why jitter is not optional</div>
+    <p style="margin:0">Without jitter, everything cached in the same burst expires in the same instant.
+      <br><br>
+      The scenario: you deploy, the cache is cold, the first minute of traffic populates ten thousand keys all
+      with a 10-minute TTL. Exactly ten minutes later, all ten thousand expire simultaneously and every
+      subsequent request is a miss. The database gets the full uncached load in one spike.
+      <br><br>
+      Worse, it's <strong>self-perpetuating</strong>: the repopulation happens in another tight burst, so it
+      recurs every ten minutes. A periodic latency spike with no obvious cause, and the interval is a clue
+      nobody thinks to look for.
+      <br><br>
+      Ten percent of random jitter spreads it out completely. It's three lines of code and it's the same
+      reasoning as <a href="../08-http-web-apis/reliability.html#jitter">jitter in retry backoff</a> —
+      synchronised clients are the problem in both cases.</p>
+  </div>
+
+  <h2 id="stampede">Cache stampede <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A shop with one item everyone wants. It's in stock, so nobody queues.</p>
+    <p>The moment it sells out, <strong>every customer simultaneously</strong> asks the stockroom for another.
+      The stockroom, which was handling one request a minute, gets a thousand at once.</p>
+  </div>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>A popular key expires. Between expiry and repopulation, <strong>every concurrent request misses</strong>
+      and they all query the database for the same thing.</p>
+    <p>Also called thundering herd or dogpile. It's most dangerous on exactly the keys the cache was protecting
+      — the hottest ones.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mitigation</th><th>How</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Per-key locking</strong></td>
+          <td>First miss acquires a lock and loads; others wait for it</td>
+          <td>Waiting requests are held. <strong>Usually the right answer</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Stale-while-revalidate</strong></td>
+          <td>Serve the expired value while one request refreshes it</td>
+          <td>Briefly stale, no latency spike. <strong>Best UX</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Probabilistic early refresh</strong></td>
+          <td>Refresh at random before expiry, more likely as expiry approaches</td>
+          <td>Elegant; the value never actually expires under load</td>
+        </tr>
+        <tr>
+          <td><strong>Background refresh</strong></td>
+          <td>A job repopulates hot keys before they expire</td>
+          <td>Needs to know which keys are hot</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — HybridCache handles this for you (.NET 9)" class="code-good"><code class="language-csharp">builder.Services.AddHybridCache(options =&gt;
+{
+    options.DefaultEntryOptions = new HybridCacheEntryOptions
+    {
+        Expiration      = TimeSpan.FromMinutes(10),   // L2 (Redis)
+        LocalCacheExpiration = TimeSpan.FromMinutes(1) // L1 (in-process)
+    };
+});
+
+// Concurrent calls for the same key run the factory ONCE.
+// The rest await that result - stampede protection is built in.
+var product = await _hybridCache.GetOrCreateAsync(
+    $"product:{id}",
+    async token =&gt; await _repository.GetAsync(id, token),
+    cancellationToken: ct);</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">This is the main reason to use <code>HybridCache</code></div>
+    <p style="margin:0">Hand-rolling stampede protection correctly is fiddly — you need per-key coordination
+      that works across instances, doesn't deadlock, and releases properly when the loader throws.
+      <br><br>
+      <code>HybridCache</code> gives you that plus the L1/L2 layering and tag-based invalidation. For new caching
+      code in .NET 9 it's the default choice, and "I'd use <code>HybridCache</code> because it solves stampede"
+      is a better answer than describing a lock you'd write yourself.
+      <br><br>
+      Note it dedupes <em>within an instance</em> by default. Across many instances you can still get one loader
+      per instance — far better than one per request, and worth knowing the limit.</p>
+  </div>
+
+  <h2 id="penetration">Cache penetration <span class="lvl lvl-a">🔴 Advanced</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Requests for keys that <strong>don't exist</strong>. Cache miss, database miss, nothing cached — so every
+      single request reaches the database.</p>
+    <p>The cache provides no protection at all, because there's nothing to cache.</p>
+  </div>
+
+  <pre data-label="csharp — cache the absence" class="code-good"><code class="language-csharp">const string NullMarker = "\0null";
+
+var cached = await _cache.StringGetAsync(key);
+if (cached.HasValue)
+    return cached == NullMarker ? null : Deserialize(cached!);
+
+var product = await _repository.GetAsync(id, ct);
+
+if (product is null)
+{
+    // Short TTL - it may be created shortly
+    await _cache.StringSetAsync(key, NullMarker, TimeSpan.FromSeconds(30));
+    return null;
+}
+
+await _cache.StringSetAsync(key, Serialize(product), TtlWithJitter(TenMinutes));
+return product;</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Why this matters beyond performance</div>
+    <p style="margin:0">Penetration is an <strong>attack vector</strong>. Someone requesting
+      <code>/api/products/999999999</code> in a loop with random ids bypasses your cache entirely and sends
+      every request to the database. A cache that protects you at 10,000 requests per second provides zero
+      protection against this.
+      <br><br>
+      Negative caching with a short TTL fixes it — the second request for a non-existent id is a cache hit.
+      <br><br>
+      The TTL should be <strong>short</strong>, because the entity might be created moments later and a long
+      negative TTL means new records appear to 404 for minutes. Thirty seconds is a reasonable default.
+      <br><br>
+      For very large key spaces a <strong>Bloom filter</strong> is the heavier answer — it can say "definitely
+      not present" without a lookup. Worth knowing as an option, rarely necessary.</p>
+  </div>
+
+  <h2 id="what-to-cache">What to cache, and what not to <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Good candidate</th><th>Bad candidate</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Expensive to compute, cheap to store</strong></td><td>Cheap queries — an indexed primary-key lookup is already fast</td></tr>
+        <tr><td><strong>Read far more than written</strong></td><td>Write-heavy data — you'd invalidate constantly</td></tr>
+        <tr><td><strong>Tolerates being seconds stale</strong></td><td><strong>Anything you act on irreversibly</strong> — balances, stock at checkout</td></tr>
+        <tr><td><strong>Shared across users</strong></td><td>Highly personalised data with a low hit rate</td></tr>
+        <tr><td><strong>External API responses</strong></td><td>Data subject to per-user authorisation, unless the key includes the user</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">The security trap: caching authorised data under an unauthorised key</div>
+    <p style="margin:0">Cache a response under <code>document:1041</code> without the requesting user in the key,
+      and the first authorised user's copy is served to <strong>everyone</strong> who asks — including people who
+      shouldn't see it.
+      <br><br>
+      That's a data breach caused by a caching decision, and it's easy to introduce when adding caching to an
+      existing endpoint that already does its own authorisation.
+      <br><br>
+      Two correct approaches: <strong>include the identity in the key</strong> when the response varies by
+      permission, or <strong>cache the raw entity and authorise after reading</strong> — so the cache holds data
+      and the authorisation check still runs per request. The second is usually better because it keeps the hit
+      rate high.
+      <br><br>
+      Same class of bug as <a href="../08-http-web-apis/http-protocol.html#caching">a
+      <code>Cache-Control: public</code> header on a personalised response</a>.</p>
+  </div>
+
+  <h2 id="hit-rate">Measuring it <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Metric</th><th>Tells you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Hit rate</strong></td><td>Whether the cache is earning its place. Below ~80% is worth investigating</td></tr>
+        <tr><td><strong>Latency, cached vs uncached</strong></td><td>Whether it's actually helping</td></tr>
+        <tr><td><strong>Eviction rate</strong></td><td>Non-zero means memory pressure — keys are dying before their TTL</td></tr>
+        <tr><td><strong>Memory used vs <code>maxmemory</code></strong></td><td>How close you are to eviction</td></tr>
+        <tr><td><strong>Key count and memory per key type</strong></td><td>Which prefix is consuming the space</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — a low hit rate means the cache is pure cost</div>
+    <p style="margin:0">A 20% hit rate means 80% of requests pay the cache lookup <em>and</em> the database
+      query, plus the serialization cost of populating. That's slower than no cache at all.
+      <br><br>
+      Common causes worth naming: <strong>TTL too short</strong> relative to access frequency;
+      <strong>keys too specific</strong>, so nothing is ever requested twice; <strong>eviction pressure</strong>
+      killing entries early; or the data is simply <strong>not reused</strong>, which means caching was the wrong
+      answer.
+      <br><br>
+      "I'd measure the hit rate and remove the cache if it's low" is a good answer, because removing a cache is
+      a move most people never consider.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Cache-aside by default; write-behind only for statistical data you can afford to lose.</li>
+      <li>Delete the key on write, don't update it — deletes are idempotent and order-independent.</li>
+      <li>Database first, then invalidate.</li>
+      <li>A short TTL bounds the remaining race; CDC-driven invalidation removes it if you really need that.</li>
+      <li>Jitter every TTL, or keys written together expire together and the spike recurs.</li>
+      <li>Stampede hits your hottest keys. <code>HybridCache</code> solves it; stale-while-revalidate is the
+        best UX.</li>
+      <li>Cache negative results with a short TTL — penetration is also an attack vector.</li>
+      <li>Never cache authorised responses under a key that omits the identity.</li>
+      <li>A cache failure must degrade to the database, not fail the request.</li>
+      <li>Measure hit rate; a low one means the cache is costing you.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>Updating the cache on write</strong> instead of deleting, creating a permanent-until-TTL
+      inconsistency.</li>
+    <li><strong>Invalidating before the database write.</strong></li>
+    <li><strong>No jitter</strong>, producing synchronised expiry spikes.</li>
+    <li><strong>No stampede protection</strong> on hot keys.</li>
+    <li><strong>Not caching nulls</strong>, leaving penetration open.</li>
+    <li><strong>Caching per-user data under a shared key</strong> — a data leak.</li>
+    <li><strong>A cache exception failing the request.</strong></li>
+    <li><strong>Caching data that must be current</strong>, like stock at checkout.</li>
+    <li><strong>No TTL at all</strong>, relying on invalidation being perfect.</li>
+    <li><strong>Never measuring the hit rate.</strong></li>
+    <li><strong>Caching a cheap indexed lookup</strong>, adding complexity for no gain.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>How do you keep a cache consistent with the database? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd start by being honest that you don't get perfect consistency — a cache is a second copy of the
+          data, so there's always a window. The goal is to make the window small and bounded, and to decide how
+          much staleness the data can tolerate."</p>
+        <p>"My default is <strong>write to the database, then delete the cache key</strong>. Two specifics
+          there, and both matter."</p>
+        <p>"<strong>Delete rather than update.</strong> If two writers both update the cache, they can land in
+          the opposite order to their database writes — writer A commits price 10, writer B commits price 20,
+          then B updates the cache to 20 and A updates it to 10. The database says 20, the cache says 10, and it
+          stays wrong until the TTL expires. Deleting is idempotent and order-independent, so concurrent deletes
+          converge on the same state."</p>
+        <p>"<strong>Database first, then invalidate.</strong> If you delete first, a reader can repopulate the
+          cache from the old database value in the gap before the write commits — and now you've cached stale
+          data with a full TTL ahead of it."</p>
+        <p>"There's still a smaller race even doing it in that order: a reader that reads the database just
+          before the write, and writes to the cache just after the delete. Rare, but real on a hot key."</p>
+        <p>"For that I'd rely on a <strong>short TTL</strong> as the backstop, because it bounds how long any
+          inconsistency can survive. That's usually enough. If the data genuinely can't be stale, the
+          heavier options are a delayed double-delete — deleting again a second later — or driving invalidation
+          from the database change log via CDC or an outbox, which removes the race because invalidation follows
+          committed changes rather than racing them."</p>
+        <p>"I'd frame that as a ladder and stop at the cheapest rung that meets the requirement. Reaching
+          straight for CDC is over-engineering for most systems."</p>
+        <p>"<strong>Always set a TTL</strong>, even with explicit invalidation. Invalidation code has bugs, gets
+          missed on new code paths, and doesn't know about writes from other services or manual data fixes. The
+          TTL is what stops one missed invalidation being permanent."</p>
+        <p>"And the product question that determines all of this: <strong>how stale can this be?</strong>
+          Reference data can be hours old. A user's own profile needs invalidating on write because they notice
+          their own edits immediately. Stock levels at checkout shouldn't be cached at all — I'd rather read the
+          database than oversell."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know why delete beats update — the specific race?</li>
+        <li>Do you get the ordering right?</li>
+        <li>Do you keep a TTL as a backstop, and say why?</li>
+        <li>Do you treat staleness tolerance as a product question?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "update the cache when the data changes" with no race
+          analysis.</li>
+        <li><span class="redflag">Red flag:</span> claiming perfect consistency is achievable.</li>
+        <li><span class="redflag">Red flag:</span> no TTL because "we invalidate properly".</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>What if two services write to the same table?</li>
+          <li>How would CDC-based invalidation work?</li>
+          <li>How do you invalidate a list that contains the changed item?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>Your database gets a huge traffic spike every 10 minutes. Why? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"A regular ten-minute interval is a strong clue — that's almost certainly a <strong>cache TTL</strong>,
+          and I'd expect to find a 10-minute expiry somewhere in the caching code."</p>
+        <p>"The mechanism is <strong>synchronised expiry</strong>. If a batch of keys was written at roughly the
+          same time — after a deployment, a cache flush, or a restart — and they all got the same fixed
+          10-minute TTL, they all expire in the same instant. Every request in that moment is a miss, so the
+          database receives the full uncached load at once."</p>
+        <p>"And it's <strong>self-perpetuating</strong>: the repopulation happens in another tight burst, all
+          with the same TTL, so it recurs every ten minutes indefinitely. That's why it looks like a scheduled
+          job when there isn't one."</p>
+        <p>"There may be a <strong>stampede</strong> layered on top. If one very hot key expires, every
+          concurrent request for it misses simultaneously and they all issue the same database query — so
+          instead of one refresh you get hundreds of identical queries."</p>
+        <p>"The fixes, and I'd do the first two immediately."</p>
+        <p>"<strong>Jitter the TTLs.</strong> Plus or minus ten percent random, so keys written together don't
+          expire together. Three lines of code, and it breaks the synchronisation permanently. Same principle as
+          jitter in retry backoff — synchronised clients are the problem in both cases."</p>
+        <p>"<strong>Add stampede protection.</strong> In .NET 9 that's <code>HybridCache</code>, where concurrent
+          <code>GetOrCreateAsync</code> calls for the same key run the factory once and the rest await the
+          result. Hand-rolling per-key coordination that works across instances and releases correctly when the
+          loader throws is genuinely fiddly, so I'd use the built-in one."</p>
+        <p>"<strong>Consider stale-while-revalidate</strong> for the hottest keys — serve the expired value while
+          one request refreshes in the background. Nobody waits, and the database sees one query instead of a
+          spike. Best user experience of the options, at the cost of briefly serving stale data."</p>
+        <p>"To confirm the diagnosis rather than assume it, I'd correlate the database spike timestamps against
+          cache miss rate and eviction metrics. If misses spike at the same instant, it's expiry. If the spike
+          correlates with <em>evictions</em> instead, that's a different problem — memory pressure killing keys
+          early — and the fix is more memory or a better eviction policy, not jitter."</p>
+        <p>"One more possibility worth ruling out: if there genuinely is a scheduled job on a ten-minute cron —
+          a cache warmer, a sync, a report — that would look identical from the database side. So I'd check for
+          that before rewriting caching code."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you recognise a regular interval as a TTL signature?</li>
+        <li>Can you explain why it's self-perpetuating?</li>
+        <li>Do you know jitter is the fix?</li>
+        <li>Do you distinguish expiry from eviction?</li>
+        <li>Do you confirm before fixing?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "increase the database size."</li>
+        <li><span class="redflag">Red flag:</span> "increase the TTL" — that changes the interval, not the
+          spike.</li>
+        <li><span class="redflag">Red flag:</span> no mention of jitter.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does stale-while-revalidate work in practice?</li>
+          <li>How would you warm the cache after a deployment?</li>
+          <li>What if the spike were on eviction rather than expiry?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

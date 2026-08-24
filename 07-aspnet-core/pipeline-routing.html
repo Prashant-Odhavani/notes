@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Middleware, Pipeline &amp; Routing — ASP.NET Core</title>
+<meta name="description" content="The ASP.NET Core middleware pipeline: how it works, the ordering rules that matter, writing custom middleware, and endpoint routing.">
+<meta name="keywords" content="middleware pipeline order Use Run Map RequestDelegate custom middleware endpoint routing route constraints UseRouting UseAuthentication UseAuthorization terminal middleware">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="07-aspnet-core/pipeline-routing.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Middleware, Pipeline &amp; Routing</h1>
+    <p class="subtitle">The most asked ASP.NET Core topic, because getting the order wrong produces bugs that
+      don't throw — they just quietly misbehave.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li>Middleware runs in <strong>registration order</strong> on the way in, and <strong>reverse
+        order</strong> on the way out.</li>
+      <li>Each component gets the context plus <code>next</code> — it can pass along, modify, or
+        short-circuit.</li>
+      <li><strong>Exception handling first.</strong> It can only catch what's registered below it.</li>
+      <li><strong>Authentication before authorization.</strong> You can't check permissions before you know
+        who it is.</li>
+      <li><code>UseRouting</code> before anything that depends on which endpoint was matched.</li>
+      <li>Once the response has started, you <strong>cannot</strong> change headers or status. That's the
+        "Headers are read-only" error.</li>
+    </ul>
+  </div>
+
+  <h2 id="how-it-works">How the pipeline works <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Each piece of middleware is handed the request and a function representing <em>"everything after
+      me"</em>.</p>
+    <p>It can do work before calling that function, after calling it, or refuse to call it at all.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>Airport security. You pass through check-in, then bag drop, then passport control, then the gate.
+      Each stage can process you and send you on — or stop you entirely.</p>
+    <p>On the way back from your flight, you pass through the same stages in reverse. That's the response
+      unwinding.</p>
+  </div>
+
+  <pre data-label="csharp — the minimal shape of middleware"><code class="language-csharp">app.Use(async (context, next) =&gt;
+{
+    // ---- on the way IN ----
+    var sw = Stopwatch.StartNew();
+
+    await next(context);          // hand off to everything below
+
+    // ---- on the way OUT ----
+    logger.LogInformation("{Path} took {Ms}ms", context.Request.Path, sw.ElapsedMilliseconds);
+});</code></pre>
+
+  <p>That single example shows why the pipeline is bidirectional: the timing only works because code after
+    <code>next()</code> runs once the response is ready.</p>
+
+  <h3 id="use-run-map">Use, Run and Map</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>Behaviour</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td><code>Use</code></td><td>Can call <code>next</code>, so the pipeline continues</td><td>Almost always</td></tr>
+        <tr><td><code>Run</code></td><td><strong>Terminal</strong> — no <code>next</code>, nothing after it runs</td><td>The end of a branch</td></tr>
+        <tr><td><code>Map</code></td><td>Branches the pipeline on a path prefix</td><td>A sub-pipeline for <code>/admin</code>, say</td></tr>
+        <tr><td><code>UseWhen</code></td><td>Conditionally inserts middleware, then rejoins</td><td>Extra logging only for <code>/api</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — Map creates a separate branch"><code class="language-csharp">app.Map("/admin", admin =&gt;
+{
+    admin.UseMiddleware&lt;AdminAuditMiddleware&gt;();   // only for /admin/*
+    admin.Run(async ctx =&gt; await ctx.Response.WriteAsync("admin"));
+});
+
+// UseWhen adds middleware but rejoins the main pipeline afterwards
+app.UseWhen(ctx =&gt; ctx.Request.Path.StartsWithSegments("/api"),
+    api =&gt; api.UseMiddleware&lt;ApiKeyMiddleware&gt;());</code></pre>
+
+  <h2 id="ordering">The order that matters <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — a correct order, with the reason for each position" class="code-good"><code class="language-csharp">var app = builder.Build();
+
+// 1. FIRST - it can only catch exceptions from middleware BELOW it
+app.UseExceptionHandler("/error");
+
+// 2. Before anything writes a response
+app.UseHsts();
+app.UseHttpsRedirection();
+
+// 3. Cheap short-circuit - don't run auth for a CSS file
+app.UseStaticFiles();
+
+// 4. Decides WHICH endpoint - anything below can now read endpoint metadata
+app.UseRouting();
+
+// 5. Before auth: a rejected CORS preflight must not need credentials
+app.UseCors();
+
+// 6. Who are you?  ...then...  may you do this?
+app.UseAuthentication();
+app.UseAuthorization();
+
+// 7. After auth, so limits can be per-user rather than per-IP
+app.UseRateLimiter();
+
+// 8. Terminal - executes the matched endpoint
+app.MapControllers();
+
+app.Run();</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Rule</th><th>What breaks if you get it wrong</th></tr></thead>
+      <tbody>
+        <tr><td>Exception handling first</td><td>Exceptions from middleware above it are unhandled — generic 500, no ProblemDetails, no correlation ID in the log</td></tr>
+        <tr><td>Authentication before authorization</td><td>Authorization sees no identity, so every authenticated endpoint returns 401 even with a valid token</td></tr>
+        <tr><td>Routing before authorization</td><td>Endpoint-specific policies (<code>[Authorize(Policy=...)]</code>) can't be read, so they don't apply</td></tr>
+        <tr><td>Static files before auth</td><td>Deliberate — it avoids running auth for assets. But it means static files are <strong>public</strong>. If they must be protected, move it below auth</td></tr>
+        <tr><td>CORS before auth</td><td>A preflight <code>OPTIONS</code> request carries no credentials, so auth would reject it and the browser blocks the real request</td></tr>
+        <tr><td>Rate limiting after auth</td><td>Lets you limit per user or tenant rather than per IP — much more useful</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Why this is dangerous rather than just wrong</div>
+    <p style="margin:0"><strong>Mis-ordering almost never throws.</strong> The app starts, most requests
+      work, and the failure is specific and subtle:
+      <br><br>
+      Authorization before authentication → valid tokens rejected, but only on protected endpoints.
+      <br>
+      Exception handler too late → your error format applies to <em>most</em> errors but not all.
+      <br>
+      Static files after auth → suddenly every image request runs a database-backed auth check.
+      <br><br>
+      That's why the pipeline block deserves careful review rather than being appended to.</p>
+  </div>
+
+  <h2 id="custom-middleware">Writing custom middleware <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <p>Two forms. The class form is preferred for anything non-trivial.</p>
+
+  <pre data-label="csharp — the conventional class form" class="code-good"><code class="language-csharp">public sealed class TenantResolutionMiddleware(RequestDelegate next)
+{
+    // Note: this class is effectively a SINGLETON - constructed once.
+    // Per-request dependencies must be parameters on InvokeAsync, not the constructor.
+    public async Task InvokeAsync(HttpContext context, ITenantContext tenantContext)
+    {
+        var host = context.Request.Host.Host;
+        var tenant = TenantFromHost(host);
+
+        if (tenant is null)
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;                          // short-circuit: nothing below runs
+        }
+
+        tenantContext.Set(tenant);
+        await next(context);
+    }
+}
+
+// Registered as:  app.UseMiddleware&lt;TenantResolutionMiddleware&gt;();</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">The middleware DI trap</div>
+    <p style="margin:0">Middleware classes are instantiated <strong>once</strong>, at startup. So a
+      constructor parameter is captured for the app's lifetime — injecting a scoped service there is a
+      <a href="../06-dotnet-platform/hosting-di-config.html#captive-dependency">captive dependency</a>.
+      <br><br>
+      <strong>Put per-request dependencies on <code>InvokeAsync</code></strong>, which is called per request
+      and resolved from the request scope. Singletons and <code>IOptions</code> are fine in the constructor.
+      <br><br>
+      (Factory-based middleware via <code>IMiddleware</code> is created per request, so its constructor
+      <em>can</em> take scoped services — but then it must be registered in DI explicitly.)</p>
+  </div>
+
+  <h3 id="response-started">The "response has already started" error <span class="lvl lvl-a">🔴 Advanced</span></h3>
+
+  <pre data-label="csharp — this throws" class="code-bad"><code class="language-csharp">app.Use(async (context, next) =&gt;
+{
+    await next(context);                              // endpoint writes the response
+
+    context.Response.StatusCode = 500;                // InvalidOperationException
+    context.Response.Headers["X-Custom"] = "value";   // headers already sent
+});</code></pre>
+
+  <p>Once the first byte is flushed, the status line and headers are already on the wire. You cannot change
+    them.</p>
+
+  <p>Two consequences worth knowing:</p>
+
+  <ul>
+    <li><strong>Check before writing.</strong> <code>if (!context.Response.HasStarted)</code> — that's how
+      the built-in exception handler decides whether it can still produce an error response.</li>
+    <li><strong>This is why an exception thrown late gives a broken response</strong> rather than a clean
+      500. If the endpoint streamed half a JSON document and then threw, the client gets truncated JSON with
+      a 200 status. That's a genuinely nasty failure mode, and it's an argument for buffering small responses
+      or validating before you start writing.</li>
+  </ul>
+
+  <h2 id="routing">Endpoint routing <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p><code>UseRouting</code> works out <em>which</em> endpoint matches. The endpoint isn't
+      <em>executed</em> until the end of the pipeline.</p>
+    <p>That gap is deliberate: it lets middleware in between read the endpoint's metadata and act on it.</p>
+  </div>
+
+  <p>That's why <code>[Authorize(Policy = "AdminOnly")]</code> works — the authorization middleware, sitting
+    between routing and execution, can see the policy attached to the matched endpoint.</p>
+
+  <pre data-label="csharp — route templates and constraints"><code class="language-csharp">app.MapGet("/orders/{id:guid}", GetOrder);              // must parse as a Guid
+app.MapGet("/orders/{page:int:min(1)}", GetOrderPage);  // int, at least 1
+app.MapGet("/files/{*path}", GetFile);                  // catch-all, includes slashes
+
+// Constraints are for ROUTING, not validation.
+// A non-Guid id gives 404 (no route matched), not 400.</code></pre>
+
+  <div class="note info">
+    <div class="note-title">Constraints vs validation</div>
+    <p style="margin:0">A route constraint decides whether a route <em>matches</em>. If it doesn't match, the
+      client gets <strong>404</strong>, not 400.
+      <br><br>
+      That's usually what you want for an obviously malformed URL, but it's worth being deliberate: if you'd
+      rather return "400 Bad Request — id must be a GUID", bind it as a <code>string</code> and validate.
+      Otherwise a typo in an ID looks identical to a deleted resource.</p>
+  </div>
+
+  <h3 id="route-groups">Route groups (.NET 7+)</h3>
+
+  <pre data-label="csharp — shared prefix, policy and filters" class="code-good"><code class="language-csharp">var orders = app.MapGroup("/api/orders")
+                .RequireAuthorization("OrdersPolicy")
+                .WithTags("Orders")
+                .AddEndpointFilter&lt;ValidationFilter&gt;();
+
+orders.MapGet("/{id:guid}", GetOrder);
+orders.MapPost("/", CreateOrder);
+orders.MapDelete("/{id:guid}", CancelOrder);</code></pre>
+
+  <p>This is what makes minimal APIs viable at scale — the shared concerns are declared once rather than
+    repeated per endpoint.</p>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Registration order = execution order in, reverse order out.</li>
+      <li>Exception handling first; authentication before authorization; routing before both.</li>
+      <li>Mis-ordering fails silently — review the pipeline block, don't append to it.</li>
+      <li>Static files before auth means static files are public. Decide deliberately.</li>
+      <li>CORS before auth, so preflight requests aren't rejected.</li>
+      <li>Middleware constructors are singleton-scoped — per-request dependencies go on
+        <code>InvokeAsync</code>.</li>
+      <li>You can't change status or headers after the response has started.</li>
+      <li>Routing matches early and executes late, which is what lets middleware read endpoint metadata.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong><code>UseAuthorization</code> before <code>UseAuthentication</code></strong> — valid tokens
+      get 401.</li>
+    <li><strong>Exception handler registered late</strong>, so it misses errors from earlier middleware.</li>
+    <li><strong>Scoped service in a middleware constructor</strong> — captive dependency.</li>
+    <li><strong>Forgetting <code>await next()</code></strong>, silently ending the request with a 200 and an
+      empty body.</li>
+    <li><strong>Writing to the response then calling <code>next()</code></strong>, then hitting "response
+      already started".</li>
+    <li><strong>Reading the request body without enabling buffering</strong> — it's a forward-only stream, so
+      the endpoint then sees nothing.</li>
+    <li><strong>Using route constraints as validation</strong> and getting 404 where you wanted 400.</li>
+    <li><strong>Putting business logic in middleware</strong> — it applies to every request and is hard to
+      test.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <details class="qa">
+    <summary>Why does middleware order matter? Give examples. <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"Because each piece of middleware wraps everything registered after it, and any of them can
+          short-circuit. So position determines both what a component can see and whether it runs at all."</p>
+        <p>"The clearest example is exception handling. It has to be first, because it can only catch
+          exceptions thrown by middleware <em>below</em> it. Register it third and anything that throws in the
+          first two gets an unhandled 500 with none of your error formatting or correlation ID."</p>
+        <p>"Authentication before authorization is the other classic. Authentication establishes who the
+          caller is; authorization checks what they may do. Reverse them and authorization sees an
+          unauthenticated user, so every protected endpoint returns 401 even with a perfectly valid token."</p>
+        <p>"Routing needs to come before authorization too, because policies are attached to endpoints as
+          metadata. If routing hasn't run, there's no matched endpoint, so
+          <code>[Authorize(Policy = ...)]</code> has nothing to read."</p>
+        <p>"A subtler one is CORS before authentication. A browser preflight is an <code>OPTIONS</code>
+          request with no credentials, so if auth runs first it rejects the preflight and the browser blocks
+          the real request — which presents as a confusing CORS error when the actual cause is ordering."</p>
+        <p>"And I'd flag static files deliberately. Putting it before auth is normal, because you don't want
+          a database-backed auth check for every CSS file — but it does mean those files are public. If they
+          need protecting, it has to move below auth."</p>
+        <p>"The thing that makes this worth reviewing carefully is that mis-ordering almost never throws. The
+          app starts, most requests work, and you get a narrow, confusing failure."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you give the <em>reason</em> for each ordering rule, not just the sequence?</li>
+        <li>Do you know it fails silently?</li>
+        <li>Bonus: the CORS preflight and static-files trade-offs.</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> reciting the order from the template with no reasoning.</li>
+        <li><span class="redflag">Red flag:</span> "order doesn't really matter as long as they're all there."</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Where would you put rate limiting, and why?</li>
+          <li>What happens if middleware doesn't call <code>next</code>?</li>
+          <li>How would you add a correlation ID to every log line?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Write middleware that logs every request's duration. What do you have to be careful about?</summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The structure is: start a stopwatch, <code>await next(context)</code>, then log after it returns
+          — because that's the point at which the response has been produced. The bidirectional nature of the
+          pipeline is what makes this possible at all."</p>
+        <p>"Things I'd be careful about. First, <strong>where I register it</strong> — near the top, so it
+          measures the whole pipeline rather than a fraction of it. Though above the exception handler means
+          I'd need my own try/finally to make sure the log still happens when something throws."</p>
+        <p>"Second, <strong>use a <code>finally</code></strong>. If the endpoint throws, I still want the
+          timing — a slow failing request is exactly the case I care about."</p>
+        <p>"Third, <strong>dependency injection</strong>. The middleware class is constructed once, so a
+          scoped dependency in the constructor is a captive dependency. <code>ILogger&lt;T&gt;</code> is a
+          singleton so it's fine there, but anything per-request goes on <code>InvokeAsync</code>."</p>
+        <p>"Fourth, <strong>don't touch the response after it's started</strong>. If I wanted to add a timing
+          header I'd have to set it before calling <code>next</code>, or use
+          <code>OnStarting</code> — because once bytes are flushed, headers are read-only."</p>
+        <p>"And I'd log it as <strong>structured</strong> data — path, status code and elapsed milliseconds as
+          separate fields — so it's queryable rather than a string I'd have to parse."</p>
+        <p>"Honestly though, I'd check first whether I need this at all. ASP.NET Core has
+          <code>UseHttpLogging</code>, and the built-in metrics plus OpenTelemetry already emit request
+          duration with far better dimensionality. I'd rather configure that than hand-roll it."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know code after <code>next()</code> runs on the way out?</li>
+        <li>Do you use <code>finally</code> so failures are measured too?</li>
+        <li>Do you know the middleware DI lifetime trap?</li>
+        <li>Bonus: knowing the framework already does this.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you add a response header from middleware?</li>
+          <li>How do you read the request body in middleware without breaking the endpoint?</li>
+          <li>Where does this sit relative to the exception handler?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

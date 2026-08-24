@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Creational Patterns — Design Patterns</title>
+<meta name="description" content="Factory Method, Abstract Factory, Builder, Singleton and Prototype — with the naive code each one replaces and how they wire into .NET DI.">
+<meta name="keywords" content="factory method pattern C# abstract factory builder pattern singleton thread safe Lazy static readonly prototype clone deep copy keyed services dependency injection strategy vs factory">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="18-design-patterns/creational.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Creational Patterns</h1>
+    <p class="subtitle">Patterns about <em>how objects get made</em>. In .NET, the DI container already does
+      most of this — so the useful skill is knowing which ones it replaces.</p>
+    <div class="meta">
+      <span class="lvl lvl-i">🟡 Intermediate</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>Factory Method</strong> — one place decides which implementation you get.</li>
+      <li><strong>Abstract Factory</strong> — creates a <em>family</em> of related objects that must match.</li>
+      <li><strong>Builder</strong> — step-by-step construction when there are many optional parts.</li>
+      <li><strong>Singleton</strong> — one instance. In .NET, use
+        <code>AddSingleton</code>, not a static property.</li>
+      <li><strong>Prototype</strong> — copy an existing object instead of building a new one.</li>
+      <li><strong>The container replaces most of these.</strong> Reach for a pattern when the decision is
+        runtime data, not a type.</li>
+    </ul>
+  </div>
+
+  <h2 id="factory-method">Factory Method <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>You need one of several implementations, and <strong>which one depends on runtime data</strong> — an
+      enum, a country code, a customer tier.</p>
+    <p>A factory puts that decision in <em>one</em> place, so callers ask for "the right one for this payment
+      method" instead of knowing all the options themselves.</p>
+  </div>
+
+  <div class="analogy">
+    <span class="an-label">Think of it this way</span>
+    <p>A hotel concierge. You say "I need to get to the airport"; they decide whether that's a taxi, a shuttle
+      or the train.</p>
+    <p>You don't need to know which transport companies exist, and when a new option appears, only the
+      concierge learns about it.</p>
+  </div>
+
+  <h3 id="factory-before">The problem it solves</h3>
+
+  <pre data-label="csharp — before: the decision is duplicated everywhere" class="code-bad"><code class="language-csharp">public class CheckoutService
+{
+    public async Task&lt;Result&gt; PayAsync(Order order)
+    {
+        // This switch is about to appear in RefundService, SubscriptionService,
+        // and anywhere else that touches payments.
+        IPaymentGateway gateway;
+        switch (order.PaymentMethod)
+        {
+            case PaymentMethod.Card:
+                gateway = new StripeGateway(
+                    new HttpClient(), _config["Stripe:Key"], _logger);   // caller builds it
+                break;
+            case PaymentMethod.BankTransfer:
+                gateway = new OpenBankingGateway(new HttpClient(), _config["OB:Cert"]);
+                break;
+            case PaymentMethod.Wallet:
+                gateway = new WalletGateway(_walletDb);
+                break;
+            default:
+                throw new NotSupportedException();
+        }
+        return await gateway.AuthorizeAsync(order.ToRequest());
+    }
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What's wrong with it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>The rule is duplicated.</strong> Add a payment method and you hunt for every switch</td></tr>
+        <tr><td><strong>Every caller knows every implementation</strong>, so it references all of them</td></tr>
+        <tr><td><strong>The caller constructs dependencies</strong> — HTTP clients, config, loggers. It shouldn't know Stripe needs an API key</td></tr>
+        <tr><td><strong>Untestable.</strong> You cannot substitute a fake gateway without changing this code</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 id="factory-after">The pattern applied</h3>
+
+  <pre data-label="csharp — the decision lives in exactly one place" class="code-good"><code class="language-csharp">public interface IPaymentGatewayFactory
+{
+    IPaymentGateway For(PaymentMethod method);
+}
+
+public sealed class PaymentGatewayFactory(IServiceProvider services) : IPaymentGatewayFactory
+{
+    public IPaymentGateway For(PaymentMethod method) =&gt; method switch
+    {
+        PaymentMethod.Card         =&gt; services.GetRequiredService&lt;StripeGateway&gt;(),
+        PaymentMethod.BankTransfer =&gt; services.GetRequiredService&lt;OpenBankingGateway&gt;(),
+        PaymentMethod.Wallet       =&gt; services.GetRequiredService&lt;WalletGateway&gt;(),
+        _ =&gt; throw new NotSupportedException($"No gateway for {method}.")
+    };
+}
+
+// The caller now knows nothing about gateways
+public class CheckoutService(IPaymentGatewayFactory factory)
+{
+    public Task&lt;Result&gt; PayAsync(Order order) =&gt;
+        factory.For(order.PaymentMethod).AuthorizeAsync(order.ToRequest());
+}</code></pre>
+
+  <pre data-label="csharp — registration" class="code-good"><code class="language-csharp">// Each gateway keeps its OWN dependencies and lifetime
+services.AddHttpClient&lt;StripeGateway&gt;();
+services.AddHttpClient&lt;OpenBankingGateway&gt;();
+services.AddScoped&lt;WalletGateway&gt;();
+services.AddSingleton&lt;IPaymentGatewayFactory, PaymentGatewayFactory&gt;();</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">The key detail: resolve, don't <code>new</code></div>
+    <p style="margin:0">The factory calls <code>GetRequiredService</code> rather than a constructor. That's what
+      keeps it a <strong>routing decision</strong> instead of a construction procedure.
+      <br><br>
+      Each gateway declares its own dependencies and lifetime in the container. <code>StripeGateway</code> gets
+      a typed <code>HttpClient</code> with its own retry policy; <code>WalletGateway</code> is scoped because it
+      touches the database. The factory never learns any of that.
+      <br><br>
+      A factory full of <code>new StripeGateway(new HttpClient(), ...)</code> has just moved the problem into one
+      file. It's still constructing, and it still breaks when a gateway gains a dependency.</p>
+  </div>
+
+  <h3 id="factory-alternative">In .NET you often don't need a factory at all <span class="pill pill-senior">⭐ Senior-level</span></h3>
+
+  <pre data-label="csharp — implementations declare what they handle" class="code-good"><code class="language-csharp">public interface IPaymentGateway
+{
+    PaymentMethod Method { get; }                     // self-describing
+    Task&lt;Result&gt; AuthorizeAsync(PaymentRequest r, CancellationToken ct);
+}
+
+public sealed class StripeGateway : IPaymentGateway
+{
+    public PaymentMethod Method =&gt; PaymentMethod.Card;
+    // ...
+}
+
+// The container injects EVERY registered implementation
+public sealed class PaymentService(IEnumerable&lt;IPaymentGateway&gt; gateways)
+{
+    private readonly Dictionary&lt;PaymentMethod, IPaymentGateway&gt; _byMethod =
+        gateways.ToDictionary(g =&gt; g.Method);
+
+    public Task&lt;Result&gt; AuthorizeAsync(PaymentRequest r, CancellationToken ct) =&gt;
+        _byMethod.TryGetValue(r.Method, out var gateway)
+            ? gateway.AuthorizeAsync(r, ct)
+            : throw new NotSupportedException($"No gateway for {r.Method}.");
+}</code></pre>
+
+  <pre data-label="csharp — or keyed services (.NET 8+)" class="code-good"><code class="language-csharp">services.AddKeyedScoped&lt;IPaymentGateway, StripeGateway&gt;(PaymentMethod.Card);
+services.AddKeyedScoped&lt;IPaymentGateway, WalletGateway&gt;(PaymentMethod.Wallet);
+
+// Resolve by key - no factory class needed
+public class CheckoutService(IServiceProvider sp)
+{
+    public Task&lt;Result&gt; PayAsync(Order o) =&gt;
+        sp.GetRequiredKeyedService&lt;IPaymentGateway&gt;(o.PaymentMethod)
+          .AuthorizeAsync(o.ToRequest(), default);
+}</code></pre>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — why the self-describing version is usually better</div>
+    <p style="margin:0">With a switch-based factory, adding a payment method means editing <strong>two</strong>
+      places: the registration and the factory's switch. Forget the switch and you get a runtime
+      <code>NotSupportedException</code> that compiles perfectly.
+      <br><br>
+      With <code>IEnumerable&lt;IPaymentGateway&gt;</code>, adding a gateway means <strong>one</strong> line of
+      registration. The dictionary builds itself. That's the open/closed principle actually working rather than
+      being asserted.
+      <br><br>
+      Keyed services achieve the same thing with less code, though you lose the compile-time visibility of what's
+      registered.
+      <br><br>
+      Being able to say "the classic Factory Method is largely replaced by
+      <code>IEnumerable&lt;T&gt;</code> injection or keyed services in .NET" is the answer that shows you know
+      the pattern <em>and</em> the platform — rather than reciting the GoF version.</p>
+  </div>
+
+  <h2 id="abstract-factory">Abstract Factory <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Factory Method makes <em>one</em> thing. Abstract Factory makes a <strong>family of related things that
+      must be consistent with each other</strong>.</p>
+    <p>The point isn't creating several objects — it's guaranteeing they <em>match</em>.</p>
+  </div>
+
+  <pre data-label="csharp — a family that must not be mixed"><code class="language-csharp">public interface IStorageFactory
+{
+    IBlobStore   CreateBlobStore();
+    IQueueClient CreateQueue();
+    ISecretStore CreateSecrets();
+}
+
+public sealed class AzureStorageFactory : IStorageFactory
+{
+    public IBlobStore   CreateBlobStore() =&gt; new AzureBlobStore(...);
+    public IQueueClient CreateQueue()     =&gt; new ServiceBusQueue(...);
+    public ISecretStore CreateSecrets()   =&gt; new KeyVaultSecrets(...);
+}
+
+public sealed class AwsStorageFactory : IStorageFactory
+{
+    public IBlobStore   CreateBlobStore() =&gt; new S3BlobStore(...);
+    public IQueueClient CreateQueue()     =&gt; new SqsQueue(...);
+    public ISecretStore CreateSecrets()   =&gt; new SecretsManagerSecrets(...);
+}</code></pre>
+
+  <div class="note info">
+    <div class="note-title">Where the value is — and why it's rare</div>
+    <p style="margin:0">The guarantee is that you can't accidentally get an Azure blob store with an AWS queue.
+      One factory choice fixes the whole family, so mismatched combinations are unrepresentable.
+      <br><br>
+      Genuinely useful for cloud abstraction, database provider families, and cross-platform UI toolkits.
+      <br><br>
+      But it's <strong>rare in application code</strong>, because DI registration already achieves it: register
+      the Azure implementations in one <code>if</code> block at startup and the whole graph is consistent. The
+      factory class earns its place mainly when the choice must be made <em>per request</em> rather than per
+      deployment — a multi-cloud SaaS where the tenant decides.
+      <br><br>
+      It's also the pattern most likely to be over-applied: three factories to abstract something that only ever
+      has one implementation.</p>
+  </div>
+
+  <h2 id="builder">Builder <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>When an object has many optional parts, a constructor becomes unusable — you get six overloads and
+      parameter lists nobody can read.</p>
+    <p>A builder lets you <strong>name the parts you care about</strong> and ignore the rest.</p>
+  </div>
+
+  <pre data-label="csharp — before: the telescoping constructor problem" class="code-bad"><code class="language-csharp">// Which one do I call? What is `null, null, true, false, 30`?
+var report = new Report("Sales", null, null, true, false, 30, null, "USD");
+
+public Report(string title) { }
+public Report(string title, DateRange? range) { }
+public Report(string title, DateRange? range, string[]? columns) { }
+public Report(string title, DateRange? range, string[]? columns, bool grouped) { }
+// ... and it keeps growing</code></pre>
+
+  <pre data-label="csharp — after: the intent is readable" class="code-good"><code class="language-csharp">var report = new ReportBuilder("Sales")
+    .ForPeriod(lastQuarter)
+    .WithColumns("Region", "Revenue")
+    .GroupedBy("Region")
+    .InCurrency("USD")
+    .Build();</code></pre>
+
+  <div class="note tip">
+    <div class="note-title">Modern C# removes most of the need</div>
+    <pre data-label="csharp — required + init achieves the same readability" class="code-good"><code class="language-csharp">public sealed record ReportRequest
+{
+    public required string Title { get; init; }
+    public DateRange? Period { get; init; }
+    public string[] Columns { get; init; } = [];
+    public string Currency { get; init; } = "GBP";
+}
+
+var report = new ReportRequest
+{
+    Title = "Sales",              // `required` - compile error if omitted
+    Period = lastQuarter,
+    Columns = ["Region", "Revenue"]
+};</code></pre>
+    <p style="margin:0">Named, optional, immutable, and the compiler enforces the mandatory parts. No builder
+      class to maintain.
+      <br><br>
+      <strong>A builder still earns its place when construction involves validation between steps, ordering
+      rules, or non-trivial assembly</strong> — which is exactly why
+      <code>WebApplicationBuilder</code>, <code>HostBuilder</code> and EF Core's
+      <code>ModelBuilder</code> exist. Those aren't just setting properties; each call registers behaviour and
+      the final <code>Build()</code> validates the whole configuration.</p>
+  </div>
+
+  <h2 id="singleton">Singleton <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Exactly one instance exists, and everything shares it.</p>
+    <p>Asked constantly in interviews — and the interesting part is that <strong>the classic implementation is
+      the wrong answer in modern .NET</strong>.</p>
+  </div>
+
+  <h3 id="singleton-broken">The version that's broken</h3>
+
+  <pre data-label="csharp — two threads can create two instances" class="code-bad"><code class="language-csharp">public sealed class Cache
+{
+    private static Cache? _instance;
+
+    public static Cache Instance =&gt; _instance ??= new Cache();
+    // Thread A checks _instance: null. Thread B checks: also null.
+    // Both construct. Both assign. Two "singletons" exist, and each
+    // caller has whichever one won the race.
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Implementation</th><th>Thread-safe</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>_instance ??= new()</code></td><td><strong>No</strong></td><td>The classic interview trap</td></tr>
+        <tr><td><code>lock</code> around the check</td><td>Yes</td><td>Correct, and locks on every access unless double-checked</td></tr>
+        <tr><td>Double-checked locking</td><td>Yes, if written exactly right</td><td>Needs <code>volatile</code>; easy to get subtly wrong</td></tr>
+        <tr><td><strong><code>static readonly</code> field</strong></td><td><strong>Yes</strong></td><td><strong>Simplest correct option</strong></td></tr>
+        <tr><td><strong><code>Lazy&lt;T&gt;</code></strong></td><td><strong>Yes</strong></td><td>When construction is expensive or must be deferred</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — correct, and simplest" class="code-good"><code class="language-csharp">public sealed class Cache
+{
+    private static readonly Cache _instance = new();
+    private Cache() { }
+    public static Cache Instance =&gt; _instance;
+}
+// The CLR guarantees static initialization runs exactly once, thread-safely.
+// There is no lock to write and therefore none to get wrong.</code></pre>
+
+  <pre data-label="csharp — Lazy&lt;T&gt; when you need deferred construction" class="code-good"><code class="language-csharp">public sealed class Cache
+{
+    private static readonly Lazy&lt;Cache&gt; _lazy =
+        new(() =&gt; new Cache(), LazyThreadSafetyMode.ExecutionAndPublication);
+
+    private Cache() { }
+    public static Cache Instance =&gt; _lazy.Value;
+}</code></pre>
+
+  <h3 id="singleton-di">What you should actually do</h3>
+
+  <pre data-label="csharp — the real answer in .NET" class="code-good"><code class="language-csharp">// Registration
+services.AddSingleton&lt;ICache, MemoryCache&gt;();
+
+// Consumption - the dependency is visible in the signature
+public class ProductService(ICache cache)
+{
+    // ...
+}</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th><code>Cache.Instance</code></th><th><code>AddSingleton</code></th></tr></thead>
+      <tbody>
+        <tr><td>One instance</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td>Dependencies visible</td><td><strong>No</strong> — hidden inside methods</td><td><strong>Yes</strong> — in the constructor</td></tr>
+        <tr><td>Substitutable in tests</td><td><strong>No</strong></td><td><strong>Yes</strong></td></tr>
+        <tr><td>Can have its own dependencies</td><td>Awkward</td><td>Naturally</td></tr>
+        <tr><td>Lifetime controlled by</td><td>The class itself</td><td>The composition root</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="remember">
+    <span class="r-label">Remember this</span>
+    <p><strong>Almost every criticism of "Singleton" is really a criticism of static global access</strong>, not
+      of having one instance.</p>
+    <p>One instance is often exactly right — a connection multiplexer, an in-memory cache, an
+      <code>HttpClient</code> factory.</p>
+    <p>What causes the pain is <code>Cache.Instance</code> called from deep inside a method: an invisible
+      dependency you can't substitute, so any class touching it becomes untestable without also constructing its
+      cache.</p>
+    <p><strong>A DI singleton gives you the same single instance with visible, replaceable
+      dependencies.</strong></p>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">A singleton must be thread-safe — and this catches people out</div>
+    <p style="margin:0">A singleton is shared by definition, so <strong>every</strong> member is potentially
+      called concurrently. A <code>Dictionary&lt;K,V&gt;</code> field will corrupt under concurrent writes;
+      <code>ConcurrentDictionary</code> won't.
+      <br><br>
+      The specific .NET trap: <strong>injecting a scoped service into a singleton</strong>. The singleton captures
+      that instance for the application's lifetime, so a <code>DbContext</code> intended to live for one request
+      lives forever — accumulating tracked entities and being used concurrently by every request. That's the
+      <a href="../06-dotnet-platform/hosting-di-config.html">captive dependency</a> problem, and it produces the
+      "second operation started on this context" error.
+      <br><br>
+      The fix is to inject <code>IServiceScopeFactory</code> and create a scope per unit of work — the same
+      reasoning as <a href="../11-ef-core/fundamentals.html#factory">using
+      <code>IDbContextFactory</code> in a background service</a>.</p>
+  </div>
+
+  <h2 id="prototype">Prototype <span class="pill pill-good">💡 Good to know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">In simple terms</span>
+    <p>Copy an existing object rather than constructing a new one — useful when construction is expensive or the
+      configuration is complex and you want a variant of it.</p>
+  </div>
+
+  <pre data-label="csharp — records make this a language feature" class="code-good"><code class="language-csharp">public sealed record SearchCriteria(string Term, int Page, int PageSize, string Sort);
+
+var baseline = new SearchCriteria("laptop", 1, 20, "relevance");
+
+// `with` produces a copy with specific changes - shallow, by design
+var pageTwo   = baseline with { Page = 2 };
+var byPrice   = baseline with { Sort = "price", Page = 1 };</code></pre>
+
+  <div class="note warn">
+    <div class="note-title">Shallow versus deep copy is the thing to know</div>
+    <p style="margin:0"><code>with</code> and <code>MemberwiseClone</code> both produce a <strong>shallow</strong>
+      copy: reference-type fields are shared between the original and the copy.
+      <br><br>
+      So a copied object holding a <code>List&lt;T&gt;</code> shares that list — mutate it through either
+      reference and both see the change. That's a genuinely surprising bug when the copy was made specifically to
+      avoid interference.
+      <br><br>
+      For value-like records of primitives, shallow is fine and cheap. If the object holds mutable collections
+      you need an explicit deep copy, and the cleanest way is usually to make the nested types immutable too so
+      the question stops mattering.
+      <br><br>
+      Serialize-and-deserialize as a deep-copy mechanism works and is slow — acceptable for a one-off, not on a
+      hot path.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>Factory Method centralises "which implementation?" when the answer is runtime data.</li>
+      <li>A factory should <em>resolve</em> from the container, not <code>new</code> things up.</li>
+      <li><code>IEnumerable&lt;T&gt;</code> injection or keyed services usually beat a switch-based factory —
+        one place to change instead of two.</li>
+      <li>Abstract Factory guarantees a consistent family; DI registration often achieves the same thing.</li>
+      <li>Builder is largely replaced by <code>required</code> and <code>init</code> — unless construction has
+        real logic, as in <code>WebApplicationBuilder</code>.</li>
+      <li><code>_instance ??= new()</code> is not thread-safe. <code>static readonly</code> is.</li>
+      <li>Prefer <code>AddSingleton</code> to a static <code>Instance</code>: same guarantee, visible and
+        substitutable dependencies.</li>
+      <li>Singletons must be thread-safe, and must never capture a scoped dependency.</li>
+      <li><code>with</code> is a shallow copy — shared references surprise people.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>A factory that calls <code>new</code></strong>, so it still knows every dependency.</li>
+    <li><strong>A switch-based factory</strong> where <code>IEnumerable&lt;T&gt;</code> would be
+      self-extending.</li>
+    <li><strong>Forgetting to update the factory switch</strong> after registering a new implementation.</li>
+    <li><strong>Abstract Factory for something with one implementation.</strong></li>
+    <li><strong>A builder for a simple data object</strong> that <code>init</code> properties would cover.</li>
+    <li><strong><code>_instance ??= new()</code></strong> presented as a correct singleton.</li>
+    <li><strong>Static <code>Instance</code> access</strong> hiding dependencies and blocking tests.</li>
+    <li><strong>A non-thread-safe collection</strong> inside a singleton.</li>
+    <li><strong>A scoped service injected into a singleton.</strong></li>
+    <li><strong>Assuming <code>with</code> deep-copies.</strong></li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-intermediate">Intermediate</h3>
+
+  <details class="qa">
+    <summary>Implement a thread-safe Singleton. Would you actually use it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"I'd write it, then argue against it — because in modern .NET the pattern is usually the wrong
+          tool."</p>
+        <p>"The version people write first is <code>private static Cache? _instance;</code> with
+          <code>public static Cache Instance =&gt; _instance ??= new Cache();</code>. That's <strong>not
+          thread-safe</strong>. Two threads can both find <code>_instance</code> null, both construct, and both
+          assign — so you get two instances, and each caller holds whichever won the race. On a web server that's
+          not theoretical."</p>
+        <p>"The simplest correct version is a <strong><code>static readonly</code> field</strong> with a private
+          constructor. The CLR guarantees static initialisation runs exactly once, thread-safely — so there's no
+          lock to write and therefore none to get wrong."</p>
+        <p>"If construction is expensive or must be deferred, <strong><code>Lazy&lt;T&gt;</code></strong> with
+          <code>LazyThreadSafetyMode.ExecutionAndPublication</code>. I'd mention double-checked locking exists
+          and I wouldn't hand-write it — it needs <code>volatile</code> and it's easy to get subtly wrong for no
+          benefit over <code>Lazy&lt;T&gt;</code>."</p>
+        <p>"But the answer I'd actually give for production code is <strong><code>services.AddSingleton&lt;ICache,
+          MemoryCache&gt;()</code></strong>."</p>
+        <p>"The reasoning: <strong>almost every criticism of Singleton is really a criticism of static global
+          access</strong>, not of having one instance. One instance is frequently correct — a Redis
+          multiplexer, an in-memory cache, an options object."</p>
+        <p>"What causes the pain is <code>Cache.Instance</code> called from inside a method. That's an
+          <em>invisible</em> dependency — you can't see it in the constructor, you can't substitute it in a test,
+          and any class touching it drags the real cache into every test that exercises it. It also makes the
+          singleton's own dependencies awkward, because it has to reach for them statically too."</p>
+        <p>"A DI singleton gives the identical single-instance guarantee, with the dependency visible in the
+          constructor and replaceable with a fake. And the lifetime decision moves to the composition root where
+          it belongs, so the class doesn't have an opinion about how many of itself should exist."</p>
+        <p>"Two things I'd add unprompted. <strong>A singleton must be thread-safe</strong> — every member is
+          potentially concurrent, so a plain <code>Dictionary</code> field will corrupt and needs to be
+          <code>ConcurrentDictionary</code>. And <strong>never inject a scoped service into a
+          singleton</strong>: it captures that instance forever, so a per-request <code>DbContext</code> ends up
+          shared across every request. The fix is <code>IServiceScopeFactory</code> and a scope per unit of
+          work."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you spot the race in the naive version?</li>
+        <li>Do you know <code>static readonly</code> is thread-safe by CLR guarantee?</li>
+        <li>Can you separate "one instance" from "static global access"?</li>
+        <li>Do you raise thread safety and captive dependencies?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> <code>??=</code> presented as thread-safe.</li>
+        <li><span class="redflag">Red flag:</span> "Singleton is an anti-pattern" with no distinction.</li>
+        <li><span class="redflag">Red flag:</span> hand-rolled double-checked locking without
+          <code>volatile</code>.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>Why is <code>static readonly</code> thread-safe?</li>
+          <li>What breaks if a singleton holds a <code>DbContext</code>?</li>
+          <li>How would you test a class that uses <code>Cache.Instance</code>?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>You need a different payment gateway per payment method. How do you wire that up? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"The naive version is a <code>switch</code> at the call site, and I'd name what's wrong with it
+          before offering an alternative: the rule gets duplicated in every service that touches payments, every
+          caller ends up referencing every gateway, and the caller has to know how to <em>construct</em> them —
+          that Stripe needs an HTTP client and an API key. That last part is what makes it untestable."</p>
+        <p>"The textbook answer is a <strong>factory</strong>: one class with the switch, returning
+          <code>IPaymentGateway</code>. The important detail is that it should <strong>resolve from the
+          container</strong> rather than call <code>new</code> — <code>GetRequiredService&lt;StripeGateway&gt;()</code>
+          not <code>new StripeGateway(...)</code>. That keeps it a routing decision, so each gateway declares its
+          own dependencies and lifetime in registration. A factory full of constructor calls has just moved the
+          problem into one file."</p>
+        <p>"But in .NET I'd usually do something better: <strong>let the implementations declare what they
+          handle</strong>."</p>
+        <p>"Each gateway exposes a <code>Method</code> property. The consumer injects
+          <code>IEnumerable&lt;IPaymentGateway&gt;</code> — the container supplies every registered
+          implementation — and builds a dictionary keyed by method."</p>
+        <p>"The reason that's better is concrete: with a switch-based factory, adding a payment method means
+          editing <strong>two</strong> places, the registration and the switch. Miss the switch and you get a
+          runtime <code>NotSupportedException</code> from code that compiled fine. With
+          <code>IEnumerable&lt;T&gt;</code>, adding a gateway is <strong>one</strong> line of registration and the
+          dictionary builds itself. That's open/closed actually working rather than being claimed."</p>
+        <p>"Since .NET 8 there's a third option — <strong>keyed services</strong>.
+          <code>AddKeyedScoped&lt;IPaymentGateway, StripeGateway&gt;(PaymentMethod.Card)</code> and resolve with
+          <code>GetRequiredKeyedService</code>. Least code, though you lose the compile-time visibility of what's
+          registered and it couples the consumer to <code>IServiceProvider</code>."</p>
+        <p>"Which I'd pick depends on the shape. If the set of gateways is stable and small, keyed services are
+          fine. If new gateways get added regularly — which is typical for payments — the self-registering
+          <code>IEnumerable</code> version, because it's the one where adding an implementation can't be done
+          half-way."</p>
+        <p>"One design point worth raising: <strong>if the gateways differ in behaviour rather than just
+          identity</strong> — different retry policies, different idempotency requirements — that's Strategy
+          rather than Factory, and the distinction matters for where the logic lives. Factory answers 'which
+          object?'; Strategy answers 'which algorithm?'. Here it's genuinely a factory, because the caller just
+          wants the right gateway."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Can you name what's wrong with the inline switch?</li>
+        <li>Do you know a factory should resolve, not construct?</li>
+        <li>Do you know the <code>IEnumerable&lt;T&gt;</code> and keyed-service alternatives?</li>
+        <li>Can you articulate the two-places-to-change argument?</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How would you test the routing?</li>
+          <li>What if a gateway needs per-tenant configuration?</li>
+          <li>How is this different from Strategy?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>

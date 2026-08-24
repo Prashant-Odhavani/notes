@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Resilience &amp; Observability — Microservices</title>
+<meta name="description" content="Timeouts, circuit breakers and bulkheads; distributed tracing and correlation; health checks, deployment strategy and testing across services.">
+<meta name="keywords" content="microservices resilience timeout circuit breaker bulkhead retry Polly cascading failure distributed tracing OpenTelemetry correlation id health checks readiness liveness blue green canary contract testing observability">
+<link rel="stylesheet" href="../assets/handbook.css">
+</head>
+<body data-page="20-microservices/operations.html" data-root="..">
+
+<div class="hb-layout">
+<main class="hb-main">
+<article class="hb-article">
+
+  <header class="hb-pagehead">
+    <h1>Resilience &amp; Observability</h1>
+    <p class="subtitle">In a distributed system, partial failure is the normal state. These are the mechanisms
+      that keep it from becoming total failure — and the tooling that lets you see it.</p>
+    <div class="meta">
+      <span class="lvl lvl-a">🔴 Advanced</span>
+      <span class="pill pill-senior">⭐ Senior-level</span>
+      <span class="pill pill-must">🔥 Must know</span>
+    </div>
+  </header>
+
+  <div class="quickrev">
+    <div class="note-title">Quick revision</div>
+    <ul>
+      <li><strong>A slow dependency is more dangerous than a dead one.</strong> Timeouts are mandatory.</li>
+      <li><strong>Circuit breakers stop you hammering something that's already failing</strong> — and fail
+        fast.</li>
+      <li><strong>Bulkheads stop one dependency exhausting all your threads.</strong></li>
+      <li><strong>Only retry idempotent operations</strong>, with jitter.</li>
+      <li><strong>Distributed tracing is not optional</strong> — a stack trace stops at the network
+        boundary.</li>
+      <li><strong>Liveness and readiness are different checks.</strong> Confusing them causes restart
+        loops.</li>
+      <li><strong>Test at the contract level</strong>, not by spinning up everything.</li>
+    </ul>
+  </div>
+
+  <h2 id="resilience">Timeouts, breakers and bulkheads <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">Why a slow service is worse than a dead one</span>
+    <p>A dead service fails immediately — you handle the error and move on.</p>
+    <p>A <strong>slow</strong> service holds your threads. Each waiting request occupies a thread; requests
+      arrive faster than they complete; your thread pool exhausts; <strong>you</strong> now fail — including
+      requests that had nothing to do with the slow dependency.</p>
+    <p>Then your callers do the same. That's a <strong>cascading failure</strong>, and it's how one struggling
+      service takes down an entire system.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mechanism</th><th>Protects against</th><th>Without it</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Timeout</strong></td>
+          <td>Waiting indefinitely</td>
+          <td>Threads accumulate until the pool is exhausted</td>
+        </tr>
+        <tr>
+          <td><strong>Retry</strong></td>
+          <td>Transient failures</td>
+          <td>A momentary blip becomes a user-visible error</td>
+        </tr>
+        <tr>
+          <td><strong>Circuit breaker</strong></td>
+          <td>Hammering a failing dependency</td>
+          <td>You add load to something already struggling, and pay the timeout every request</td>
+        </tr>
+        <tr>
+          <td><strong>Bulkhead</strong></td>
+          <td>One dependency consuming all capacity</td>
+          <td>A slow non-critical call starves critical paths</td>
+        </tr>
+        <tr>
+          <td><strong>Fallback</strong></td>
+          <td>Hard failure when degraded would do</td>
+          <td>The whole request fails because one optional part did</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre data-label="csharp — the standard resilience handler (.NET 8+)" class="code-good"><code class="language-csharp">builder.Services.AddHttpClient&lt;PricingClient&gt;(c =&gt;
+    {
+        c.BaseAddress = new Uri("https://pricing");
+        c.Timeout = TimeSpan.FromSeconds(10);          // overall ceiling
+    })
+    .AddStandardResilienceHandler(o =&gt;
+    {
+        // Per-attempt timeout - must be shorter than the overall one
+        o.AttemptTimeout.Timeout = TimeSpan.FromSeconds(3);
+
+        o.Retry.MaxRetryAttempts = 3;
+        o.Retry.BackoffType = DelayBackoffType.Exponential;
+        o.Retry.UseJitter = true;                      // avoid synchronised retries
+
+        // Open the circuit when 10% of calls in the window fail
+        o.CircuitBreaker.FailureRatio = 0.1;
+        o.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(30);
+        o.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(15);
+    });</code></pre>
+
+  <div class="note danger">
+    <div class="note-title">The timeout budget: retries multiply your latency ceiling</div>
+    <p style="margin:0">A 3-second per-attempt timeout with 3 retries is potentially <strong>12 seconds</strong>
+      before you give up — plus backoff delays. If the caller's own timeout is 5 seconds, your retries are
+      pointless: the caller gave up long ago and you're doing work nobody will read.
+      <br><br>
+      Worse, in a chain each layer retrying multiplies. Three layers each retrying three times is up to
+      <strong>27 requests</strong> for one user action — so a struggling service at the bottom receives an order
+      of magnitude more load exactly when it can least handle it. That's
+      <a href="../08-http-web-apis/reliability.html#retries">retry amplification</a>.
+      <br><br>
+      <strong>The rule: each layer's total timeout must be shorter than its caller's, and retry at one level
+      only.</strong> Usually the outermost, or the one closest to the failure. Deciding a timeout budget across
+      the call chain — and writing it down — is the part teams skip.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Breaker state</th><th>Behaviour</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Closed</strong></td><td>Requests pass through; failures are counted</td></tr>
+        <tr><td><strong>Open</strong></td><td><strong>Fail immediately</strong> without calling. Gives the dependency room to recover</td></tr>
+        <tr><td><strong>Half-open</strong></td><td>Let one request through. Success closes it; failure re-opens</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the circuit breaker's real job is protecting the <em>caller</em></div>
+    <p style="margin:0">People describe it as giving the failing service room to recover. That's a benefit and
+      it's secondary.
+      <br><br>
+      <strong>The primary value is that you stop paying the timeout.</strong> With the circuit open you fail in
+      microseconds instead of waiting 3 seconds — so your threads stay free and <em>you</em> stay healthy. That's
+      what prevents the cascade.
+      <br><br>
+      Which leads to the question that actually matters and is usually unanswered: <strong>what do you do when
+      the circuit is open?</strong> Failing fast is only useful if you have something to do with the fast
+      failure.
+      <br><br>
+      Options: serve <strong>cached or stale data</strong> — often perfectly acceptable; return a
+      <strong>degraded response</strong> with the optional part omitted; <strong>queue the work</strong> for later
+      if it needn't be synchronous; or <strong>fail the request clearly</strong> with a 503 and
+      <code>Retry-After</code> if the data is genuinely essential.
+      <br><br>
+      A breaker with no defined fallback just converts slow failures into fast ones. That's an improvement, and
+      it isn't resilience.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Bulkheads: the detail people forget</div>
+    <p style="margin:0">Named after ship compartments — one flooded section doesn't sink the vessel.
+      <br><br>
+      Concretely: give each dependency its own limited concurrency allowance. If the recommendations service can
+      only ever consume 10 concurrent slots, then even when it's slow, the other 90 remain available for checkout.
+      <br><br>
+      Without it, a slow <em>non-critical</em> dependency can consume every thread and take down your critical
+      paths. That's a particularly frustrating outage: the important feature fails because an optional one was
+      slow.
+      <br><br>
+      In Polly this is <code>RateLimiter</code> or a concurrency limiter in the pipeline. It's the least-used of
+      these patterns and often the one that would have prevented the incident.</p>
+  </div>
+
+  <h2 id="tracing">Distributed tracing <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <div class="simple">
+    <span class="sm-label">The problem it solves</span>
+    <p>In a monolith, an exception gives you a stack trace covering the whole operation.</p>
+    <p>Across services, <strong>the stack trace stops at the network boundary</strong>. You get "the call to
+      Pricing failed" with no visibility into why. And the log lines for one user action are scattered across
+      five services' logs with nothing linking them.</p>
+  </div>
+
+  <pre data-label="csharp — OpenTelemetry wiring" class="code-good"><code class="language-csharp">builder.Services.AddOpenTelemetry()
+    .ConfigureResource(r =&gt; r.AddService("orders-api"))
+    .WithTracing(t =&gt; t
+        .AddAspNetCoreInstrumentation()        // incoming requests
+        .AddHttpClientInstrumentation()        // outgoing calls - propagates context
+        .AddEntityFrameworkCoreInstrumentation()
+        .AddOtlpExporter())
+    .WithMetrics(m =&gt; m
+        .AddAspNetCoreInstrumentation()
+        .AddRuntimeInstrumentation()
+        .AddOtlpExporter());
+
+// Logs correlate automatically - trace and span ids are attached
+builder.Logging.AddOpenTelemetry(o =&gt; o.AddOtlpExporter());</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Concept</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Trace</strong></td><td>One end-to-end operation across all services</td></tr>
+        <tr><td><strong>Span</strong></td><td>One unit of work within it — an HTTP call, a query</td></tr>
+        <tr><td><strong>Trace ID</strong></td><td>Shared by every span in the operation. <strong>The thing you search by</strong></td></tr>
+        <tr><td><strong>Context propagation</strong></td><td>Passing trace ids across boundaries via <code>traceparent</code></td></tr>
+        <tr><td><strong>Baggage</strong></td><td>Custom key-values carried along — tenant id, user id</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — the trace id must reach your logs and your users</div>
+    <p style="margin:0">Tracing tells you <em>where</em> time went. Logs tell you <em>why</em>. They're only
+      useful together, and that requires the trace id to be on every log line — which
+      <code>AddOpenTelemetry</code> on the logging pipeline does automatically, and which hand-rolled correlation
+      usually gets wrong in async code.
+      <br><br>
+      The step most teams miss: <strong>return the trace id to the client</strong> on an error response.
+      <br><br>
+      Then a user reporting a problem can quote a reference, and you can retrieve the entire distributed trace for
+      that exact request. Without it, you're searching by timestamp and hoping — and the
+      <code>traceId</code> in a <a href="../07-aspnet-core/api-lifecycle.html">ProblemDetails</a> response costs
+      nothing to add.
+      <br><br>
+      One operational caveat: <strong>sampling</strong>. Tracing every request is expensive at volume, so you
+      sample — but then the interesting request may not be sampled. Tail-based sampling (decide after seeing the
+      whole trace, keeping errors and slow traces) is the answer, and it's worth knowing the trade-off exists
+      rather than discovering the trace you need was discarded.</p>
+  </div>
+
+  <h2 id="health">Health checks <span class="pill pill-must">🔥 Must know</span></h2>
+
+  <pre data-label="csharp — the two checks are different" class="code-good"><code class="language-csharp">builder.Services.AddHealthChecks()
+    .AddDbContextCheck&lt;AppDbContext&gt;("database", tags: ["ready"])
+    .AddRedis(redisConnection, "cache", tags: ["ready"])
+    .AddUrlGroup(new Uri("https://pricing/health/live"), "pricing", tags: ["ready"]);
+
+// LIVENESS: is the process alive? No dependency checks.
+app.MapHealthChecks("/health/live", new() { Predicate = _ =&gt; false });
+
+// READINESS: can it serve traffic? Dependencies included.
+app.MapHealthChecks("/health/ready", new() { Predicate = c =&gt; c.Tags.Contains("ready") });</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Liveness</th><th>Readiness</th></tr></thead>
+      <tbody>
+        <tr><td>Question</td><td>Is the process alive?</td><td>Can it serve traffic <em>now</em>?</td></tr>
+        <tr><td>Checks dependencies</td><td><strong>No</strong></td><td><strong>Yes</strong></td></tr>
+        <tr><td>On failure the platform</td><td><strong>Restarts the container</strong></td><td>Removes it from load balancing</td></tr>
+        <tr><td>Should be</td><td>Trivial and always fast</td><td>Meaningful but cheap</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger">
+    <div class="note-title">Checking dependencies in liveness causes cluster-wide restart loops</div>
+    <p style="margin:0">This is the classic mistake. If liveness checks the database and the database has a brief
+      blip, Kubernetes concludes <strong>every pod is unhealthy and restarts them all</strong>.
+      <br><br>
+      Restarting doesn't fix a database problem. And now you've lost all your warm caches and connection pools, so
+      when the database recovers, every pod simultaneously reconnects and rebuilds — turning a 30-second blip into
+      a multi-minute outage that you caused.
+      <br><br>
+      <strong>Liveness answers only "is this process wedged?"</strong> — a deadlock, a stuck event loop. Restart is
+      the correct remedy for that and nothing else.
+      <br><br>
+      <strong>Readiness</strong> is where dependency checks belong: the pod stays running but stops receiving
+      traffic, and recovers automatically when the dependency does.
+      <br><br>
+      A related trap: <strong>readiness that checks a downstream service can propagate unreadiness</strong>. If A
+      reports unready because B is unready, and C checks A, then one failure marks the whole graph unready. Check
+      the dependencies you genuinely cannot function without, and prefer a circuit breaker with a fallback over
+      declaring yourself unready.</p>
+  </div>
+
+  <h2 id="deployment">Deployment <span class="lvl lvl-i">🟡 Intermediate</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Rolling</strong></td><td>Replace instances gradually</td><td><strong>Default.</strong> Both versions run at once — so contracts must be compatible</td></tr>
+        <tr><td><strong>Blue-green</strong></td><td>Two environments; switch traffic</td><td>Instant rollback; double the infrastructure</td></tr>
+        <tr><td><strong>Canary</strong></td><td>Small traffic share to the new version</td><td><strong>Best risk reduction</strong>; needs good metrics to judge</td></tr>
+        <tr><td><strong>Feature flags</strong></td><td>Deploy dark, enable separately</td><td>Decouples deploy from release; flags accumulate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <div class="note-title">Rolling deployment means both versions run simultaneously</div>
+    <p style="margin:0">During the rollout, v1 and v2 of a service are both live and both handling traffic. So
+      <strong>every change must be backward <em>and</em> forward compatible</strong> for the duration.
+      <br><br>
+      That constrains more than API shapes. A <strong>database migration</strong> must work with both versions of
+      the code — so you cannot rename a column in one step. The pattern is expand/contract: add the new column,
+      write to both, migrate readers, then remove the old one across separate releases.
+      <br><br>
+      Same for messages: v2 might publish an event v1 consumers don't understand. Additive changes only, and
+      consumers must tolerate unknown fields.
+      <br><br>
+      This is the same discipline as <a href="communication.html#contracts">API versioning</a>, applied to
+      schemas and message formats.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Feature flags separate deployment from release</div>
+    <p style="margin:0">The most useful property: you can deploy code at 2pm on a Tuesday with the flag off, then
+      turn it on when you're ready — and turn it off instantly if it misbehaves, <strong>without a
+      deployment</strong>.
+      <br><br>
+      That converts "roll back a release" into "flip a switch", which is dramatically faster and lower risk during
+      an incident.
+      <br><br>
+      The cost is real and worth stating: <strong>flags accumulate</strong>. Every flag doubles the paths through
+      the code, and a codebase with forty stale flags is untestable in any meaningful sense. So each flag needs an
+      owner and a removal date, and removing them has to be actual work someone does.</p>
+  </div>
+
+  <h2 id="testing">Testing across services <span class="pill pill-senior">⭐ Senior-level</span></h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Level</th><th>Tests</th><th>Proportion</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Unit</strong></td><td>Domain logic in isolation</td><td><strong>Most</strong></td></tr>
+        <tr><td><strong>Service / integration</strong></td><td>One service with real database, stubbed dependencies</td><td>Many</td></tr>
+        <tr><td><strong>Contract</strong></td><td>Consumer expectations verified against the producer</td><td><strong>One per interaction — critical</strong></td></tr>
+        <tr><td><strong>End-to-end</strong></td><td>Everything running together</td><td><strong>Very few</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note senior">
+    <div class="note-title">Senior signal — end-to-end tests don't scale with service count</div>
+    <p style="margin:0">The instinct is to test the whole system together. With eight services that means an
+      environment running all eight plus their databases and brokers, kept consistent, for every pipeline run.
+      <br><br>
+      What happens: the suite becomes <strong>slow</strong> (tens of minutes), <strong>flaky</strong> (any of eight
+      services can be misbehaving), and <strong>ambiguous</strong> — a failure doesn't tell you which service is at
+      fault. Teams then start re-running until green, at which point the suite has negative value: it consumes CI
+      time and trains people to ignore failures.
+      <br><br>
+      It also <strong>reintroduces coordination</strong> — you need a shared environment with compatible versions
+      of everything, which is exactly what independent deployability was meant to eliminate.
+      <br><br>
+      <strong>Contract tests are the answer.</strong> Each consumer declares what it needs; the producer's pipeline
+      verifies it still provides that, <em>without running the consumer</em>. So breakage is caught in the
+      producer's own build, in seconds, with an unambiguous cause.
+      <br><br>
+      Then keep a <strong>handful</strong> of end-to-end tests for genuinely critical journeys — place an order,
+      complete a payment — and accept they're slow. Being able to argue for contract tests over a large E2E suite
+      is one of the better testing signals for a distributed system.</p>
+  </div>
+
+  <div class="note tip">
+    <div class="note-title">Testcontainers for the integration layer</div>
+    <p style="margin:0">Service-level tests need a real database — an in-memory provider doesn't catch SQL
+      translation problems, constraint violations or migration errors.
+      <br><br>
+      <strong>Testcontainers</strong> starts a real SQL Server, Postgres or Redis in Docker for the test run, so
+      you get genuine behaviour with no shared environment to maintain and no cleanup between runs.
+      <br><br>
+      That's the sweet spot for most tests: real infrastructure, stubbed <em>services</em>. It catches the class of
+      bug an in-memory provider hides while remaining fast enough to run in CI on every commit.</p>
+  </div>
+
+  <div class="takeaways">
+    <span class="t-label">Key takeaways</span>
+    <ul>
+      <li>A slow dependency exhausts your threads and cascades. Timeouts are mandatory, not optional.</li>
+      <li>Each layer's total timeout must be shorter than its caller's; retry at one level only.</li>
+      <li>A circuit breaker's main value is that <em>you</em> stop paying the timeout.</li>
+      <li>A breaker without a defined fallback just makes failures faster.</li>
+      <li>Bulkheads stop a non-critical dependency starving critical paths.</li>
+      <li>Distributed tracing is required — a stack trace ends at the network boundary.</li>
+      <li>Put the trace id on every log line and return it to the client on errors.</li>
+      <li>Liveness must not check dependencies, or a blip becomes a cluster-wide restart loop.</li>
+      <li>Rolling deployment means both versions run at once — including against the database.</li>
+      <li>Feature flags turn rollback into a switch, and they accumulate.</li>
+      <li>Contract tests scale; large end-to-end suites don't.</li>
+    </ul>
+  </div>
+
+  <h2 id="mistakes">Common mistakes</h2>
+  <ul>
+    <li><strong>No timeout</strong> on outbound calls.</li>
+    <li><strong>Retries at every layer</strong>, multiplying load on a failing service.</li>
+    <li><strong>Retrying non-idempotent operations.</strong></li>
+    <li><strong>A circuit breaker with no fallback behaviour.</strong></li>
+    <li><strong>No bulkhead</strong>, so an optional dependency takes down critical paths.</li>
+    <li><strong>Dependency checks in liveness</strong>, causing restart loops.</li>
+    <li><strong>Readiness that propagates</strong> unreadiness across the service graph.</li>
+    <li><strong>No distributed tracing</strong>, debugging by correlating timestamps.</li>
+    <li><strong>Trace id not returned to clients.</strong></li>
+    <li><strong>Renaming a database column in one release</strong> during a rolling deploy.</li>
+    <li><strong>A large end-to-end suite</strong> instead of contract tests.</li>
+    <li><strong>Stale feature flags</strong> nobody removes.</li>
+  </ul>
+
+  <h2 id="interview-questions">Interview questions</h2>
+
+  <h3 id="q-advanced">Advanced / scenario</h3>
+
+  <details class="qa">
+    <summary>One service slows down and the whole system becomes unavailable. What happened, and how do you prevent it? <span class="pill pill-must">🔥 Must know</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"That's a <strong>cascading failure</strong>, and the key insight is that <strong>a slow dependency is
+          more dangerous than a dead one</strong>."</p>
+        <p>"A dead service fails immediately — you get a connection refused, handle the error, and move on. A
+          <em>slow</em> service holds your threads. Each waiting request occupies one, requests arrive faster
+          than they complete, and your thread pool exhausts. Now <strong>you</strong> fail — including requests
+          that never touched the slow dependency. Then your callers do the same thing, and it propagates
+          upward."</p>
+        <p>"So the mechanism is thread exhaustion, not the dependency's failure. That's why 'the pricing service
+          got slow' can produce 'the entire site is down'."</p>
+        <p>"Preventing it, in order of importance:"</p>
+        <p>"<strong>Timeouts on every outbound call.</strong> This is the non-negotiable one — without it you
+          wait indefinitely and the rest doesn't matter. And the timeout has to be <em>shorter than your
+          caller's</em>, or you're doing work nobody will read."</p>
+        <p>"<strong>A circuit breaker.</strong> After a failure threshold it opens and fails immediately without
+          calling. People describe this as giving the failing service room to recover — that's secondary. The
+          primary benefit is that <em>you</em> stop paying the timeout: you fail in microseconds instead of three
+          seconds, so your threads stay free and you stay healthy."</p>
+        <p>"But the question that follows is the one usually unanswered: <strong>what do you do when the circuit
+          is open?</strong> A breaker with no fallback just converts slow failures into fast ones. Options are
+          serving cached or stale data — often perfectly acceptable — returning a degraded response with the
+          optional part omitted, queueing the work if it needn't be synchronous, or failing clearly with a 503 and
+          <code>Retry-After</code> if the data is genuinely essential. That decision is per-dependency and it's
+          part of the design."</p>
+        <p>"<strong>A bulkhead</strong>, which is the one people forget. Give each dependency its own limited
+          concurrency allowance — if recommendations can only ever consume 10 slots, then even when it's slow the
+          other 90 remain available for checkout. Without it, a slow <em>optional</em> feature can starve your
+          critical paths, which is a particularly annoying outage."</p>
+        <p>"<strong>And I'd check the retry configuration</strong>, because retries often make this worse. Three
+          layers each retrying three times is up to 27 requests for one user action — so a struggling service
+          receives an order of magnitude more load precisely when it can least handle it. Retry at one level only,
+          with jitter so clients don't synchronise."</p>
+        <p>"In .NET all of this is <code>AddStandardResilienceHandler</code> on a typed
+          <code>HttpClient</code>, which gives timeout, retry with jitter, and a circuit breaker with sensible
+          defaults — so there's little excuse for not having it."</p>
+        <p>"The structural point I'd make: <strong>if a call being slow can take me down, I should question
+          whether it needs to be synchronous at all.</strong> If the data could be replicated via events and read
+          locally, or the work could be queued, the failure mode disappears rather than being mitigated. Resilience
+          patterns manage a coupling; removing the coupling is better where it's possible."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know slow is worse than dead, and why — thread exhaustion?</li>
+        <li>Do you know the breaker protects the caller?</li>
+        <li>Do you have a fallback strategy rather than just failing fast?</li>
+        <li>Do you know about bulkheads?</li>
+        <li>Do you spot retry amplification?</li>
+        <li>Do you question the synchronous coupling itself?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "add retries" — which makes it worse.</li>
+        <li><span class="redflag">Red flag:</span> a circuit breaker with no fallback.</li>
+        <li><span class="redflag">Red flag:</span> no mention of timeouts.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How do you choose the timeout value?</li>
+          <li>What do you serve when the circuit is open?</li>
+          <li>How would you have detected this before users did?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you debug a request that failed somewhere across eight services? <span class="pill pill-senior">⭐ Senior-level</span></summary>
+    <div class="qa-body">
+      <div class="say-it">
+        <span class="s-label">How I'd answer</span>
+        <p>"This is the question that makes observability non-optional rather than nice to have. In a monolith an
+          exception gives me a stack trace covering the whole operation. Across services, <strong>the stack trace
+          stops at the network boundary</strong> — I get 'the call to Pricing failed' and nothing about why."</p>
+        <p>"So the foundation is <strong>distributed tracing</strong>. Every request gets a trace id at the edge,
+          propagated to every downstream call via the <code>traceparent</code> header. Each service records spans
+          — an incoming request, a database query, an outbound call — all sharing that trace id."</p>
+        <p>"Then I can pull up one trace and see the whole operation as a waterfall: which service was slow, which
+          one errored, how long each hop took, and what the call graph actually was. In .NET that's OpenTelemetry
+          with the ASP.NET Core, HttpClient and EF Core instrumentation, and it's mostly configuration rather than
+          code."</p>
+        <p>"<strong>Tracing tells me where. Logs tell me why.</strong> So the trace id has to be on every log
+          line — which <code>AddOpenTelemetry</code> on the logging pipeline does automatically, and which
+          hand-rolled correlation usually gets wrong in async code. Then I search logs by trace id and get every
+          line from every service for that one request, in order."</p>
+        <p>"The step most teams miss: <strong>return the trace id to the client on errors.</strong> Put it in the
+          ProblemDetails response. Then a user reporting a problem quotes a reference and I retrieve the exact
+          trace — instead of searching by timestamp and hoping. It costs nothing and it's the difference between
+          minutes and hours."</p>
+        <p>"<strong>Metrics</strong> for the pattern rather than the instance — request rate, error rate and
+          latency percentiles per service. That's what tells me whether this is one bad request or a systemic
+          problem, and it's what I'd alert on. Traces explain individual failures; metrics tell me there's
+          something to investigate."</p>
+        <p>"Two practical caveats I'd raise."</p>
+        <p>"<strong>Sampling.</strong> Tracing every request at volume is expensive, so you sample — and then the
+          interesting request may not have been sampled, which is infuriating. <strong>Tail-based
+          sampling</strong> is the answer: decide after seeing the whole trace, and always keep errors and slow
+          traces. Worth knowing the trade-off exists rather than discovering the trace you need was
+          discarded."</p>
+        <p>"<strong>Asynchronous flows.</strong> Trace context doesn't propagate through a message broker
+          automatically — you have to put <code>traceparent</code> in the message headers and restore it in the
+          consumer. Otherwise the trace stops at the publish and the consumer's work looks unrelated. Most .NET
+          messaging libraries handle this now, but it's worth verifying rather than assuming, because a broken
+          trace across a queue is exactly where the hard bugs live."</p>
+        <p>"And I'd add <strong>baggage</strong> for domain context — tenant id, user id — carried across the
+          whole trace. Then I can answer 'is this affecting one tenant or everyone?', which is usually the first
+          question during an incident."</p>
+      </div>
+      <h5>What they're really checking</h5>
+      <ul>
+        <li>Do you know a stack trace doesn't cross service boundaries?</li>
+        <li>Do you know traces and logs must be correlated by trace id?</li>
+        <li>Do you return the trace id to clients?</li>
+        <li>Do you distinguish metrics from traces?</li>
+        <li>Do you know sampling and async propagation are gaps?</li>
+      </ul>
+      <h5>Weak answers</h5>
+      <ul>
+        <li><span class="redflag">Red flag:</span> "check the logs in each service".</li>
+        <li><span class="redflag">Red flag:</span> correlating by timestamp.</li>
+        <li><span class="redflag">Red flag:</span> no mention of context propagation.</li>
+      </ul>
+      <div class="followups">
+        <div class="note-title">Likely follow-ups</div>
+        <ul>
+          <li>How does trace context survive a message queue?</li>
+          <li>What would you alert on?</li>
+          <li>How do you keep tracing costs reasonable?</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+
+</article>
+</main>
+</div>
+
+<script src="../assets/nav-data.js"></script>
+<script src="../assets/search-index.js"></script>
+<script src="../assets/handbook.js"></script>
+</body>
+</html>
